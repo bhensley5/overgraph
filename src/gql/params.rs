@@ -1,7 +1,8 @@
 use crate::error::EngineError;
 use crate::gql::ast::{
     Expr, ExprKind, GqlMutationStatement, GqlPipelineClause, GqlQuery, GqlReadPipeline,
-    GqlStatementBody, MapLiteral, MutationClause, Pattern, RemoveItem, ReturnBody, SetItem,
+    GqlSchemaDropItem, GqlSchemaItem, GqlSchemaLiteral, GqlSchemaStatement, GqlStatementBody,
+    MapLiteral, MutationClause, Pattern, RemoveItem, ReturnBody, SetItem,
 };
 use crate::gql::parser::{parse_statement, GqlParseOptions};
 use crate::gql::semantic::{GqlMutationSemanticPlan, GqlSemanticPlan};
@@ -23,6 +24,8 @@ pub(crate) fn referenced_param_names_for_query(
     let spans = match &statement.body {
         GqlStatementBody::Query(query) => collect_query_parameter_spans(query),
         GqlStatementBody::Mutation(mutation) => collect_mutation_parameter_spans(mutation),
+        GqlStatementBody::Schema(schema) => collect_schema_parameter_spans(schema),
+        GqlStatementBody::Index(_) => BTreeMap::new(),
     };
     Ok(spans.into_keys().collect())
 }
@@ -51,6 +54,16 @@ pub(crate) fn validate_referenced_gql_mutation_params(
         params,
         options,
     )
+}
+
+pub(crate) fn validate_referenced_gql_schema_ast_params(
+    schema: &GqlSchemaStatement,
+    params: &GqlParams,
+    options: &GqlExecutionOptions,
+) -> Result<(), EngineError> {
+    let spans = collect_schema_parameter_spans(schema);
+    let parameters = spans.keys().cloned().collect::<Vec<_>>();
+    validate_referenced_param_set(&parameters, &spans, params, options)
 }
 
 fn validate_referenced_param_set(
@@ -193,6 +206,58 @@ fn collect_mutation_parameter_spans(
         }
     }
     spans
+}
+
+fn collect_schema_parameter_spans(schema: &GqlSchemaStatement) -> BTreeMap<String, SourceSpan> {
+    let mut spans = BTreeMap::new();
+    match schema {
+        GqlSchemaStatement::AlterGraphType(statement) => {
+            for item in &statement.items {
+                collect_schema_item_parameter_spans(item, &mut spans);
+            }
+            if let Some(options) = statement.options.as_ref() {
+                collect_schema_literal_parameter_spans(options, &mut spans);
+            }
+            for item in &statement.drop_items {
+                match item {
+                    GqlSchemaDropItem::Node { .. } | GqlSchemaDropItem::Edge { .. } => {}
+                }
+            }
+        }
+        GqlSchemaStatement::CheckGraphType(statement) => {
+            for item in &statement.items {
+                collect_schema_item_parameter_spans(item, &mut spans);
+            }
+            if let Some(options) = statement.options.as_ref() {
+                collect_schema_literal_parameter_spans(options, &mut spans);
+            }
+        }
+        GqlSchemaStatement::DropCurrentGraphType { .. } | GqlSchemaStatement::Show(_) => {}
+    }
+    spans
+}
+
+fn collect_schema_item_parameter_spans(
+    item: &GqlSchemaItem,
+    spans: &mut BTreeMap<String, SourceSpan>,
+) {
+    match item {
+        GqlSchemaItem::Node { schema, .. } | GqlSchemaItem::Edge { schema, .. } => {
+            collect_schema_literal_parameter_spans(schema, spans);
+        }
+    }
+}
+
+fn collect_schema_literal_parameter_spans(
+    literal: &GqlSchemaLiteral,
+    spans: &mut BTreeMap<String, SourceSpan>,
+) {
+    match literal {
+        GqlSchemaLiteral::Map(map) => collect_map_parameter_spans(map, spans),
+        GqlSchemaLiteral::Parameter { name, span } => {
+            spans.entry(name.clone()).or_insert_with(|| span.clone());
+        }
+    }
 }
 
 fn collect_set_parameter_spans(
@@ -444,5 +509,59 @@ fn param_resource_error(
         expected,
         message,
         span: span.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn referenced(source: &str) -> Vec<String> {
+        referenced_param_names_for_query(source, &GqlExecutionOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn gql_schema_params_collect_whole_maps_and_nested_values() {
+        let params = referenced(
+            "ALTER CURRENT GRAPH TYPE ADD {
+                NODE Person = $person_schema,
+                EDGE WORKS_ON = {
+                    properties: {
+                        role: { enum_values: [$role, $fallback_role] }
+                    }
+                }
+            } OPTIONS { max_violations: $max_violations, chunk_size: $chunk_size, scan_limit: $scan_limit }",
+        );
+        assert_eq!(
+            params,
+            vec![
+                "chunk_size",
+                "fallback_role",
+                "max_violations",
+                "person_schema",
+                "role",
+                "scan_limit"
+            ]
+        );
+    }
+
+    #[test]
+    fn gql_schema_params_collect_options_parameter() {
+        let params = referenced(
+            "CHECK CURRENT GRAPH TYPE SET { NODE Person = { properties: { name: $name_schema } } } OPTIONS $options",
+        );
+        assert_eq!(params, vec!["name_schema", "options"]);
+    }
+
+    #[test]
+    fn gql_schema_params_preserve_query_and_mutation_behavior() {
+        assert_eq!(
+            referenced("MATCH (n:Person {key: $key}) RETURN n.name"),
+            vec!["key"]
+        );
+        assert_eq!(
+            referenced("MATCH (n:Person) SET n.name = $name RETURN n"),
+            vec!["name"]
+        );
     }
 }

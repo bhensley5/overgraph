@@ -143,6 +143,167 @@ pub(crate) struct GqlStatement {
 pub(crate) enum GqlStatementBody {
     Query(GqlQuery),
     Mutation(GqlMutationStatement),
+    Schema(GqlSchemaStatement),
+    Index(GqlIndexStatement),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GqlIndexStatement {
+    Create(GqlCreatePropertyIndexStatement),
+    Drop(GqlDropPropertyIndexStatement),
+    Show(GqlShowPropertyIndexStatement),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlCreatePropertyIndexStatement {
+    pub(crate) target: GqlPropertyIndexTarget,
+    pub(crate) kind: GqlPropertyIndexKind,
+    pub(crate) kind_span: SourceSpan,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlDropPropertyIndexStatement {
+    pub(crate) target: GqlPropertyIndexTarget,
+    pub(crate) kind: GqlPropertyIndexKind,
+    pub(crate) kind_span: SourceSpan,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlShowPropertyIndexStatement {
+    pub(crate) scope: GqlShowPropertyIndexScope,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GqlPropertyIndexTarget {
+    Node {
+        variable: Ident,
+        label: GqlIndexName,
+        on_variable: Ident,
+        prop_key: GqlIndexName,
+        property_ref_span: SourceSpan,
+        span: SourceSpan,
+    },
+    Edge {
+        variable: Ident,
+        label: GqlIndexName,
+        on_variable: Ident,
+        prop_key: GqlIndexName,
+        property_ref_span: SourceSpan,
+        span: SourceSpan,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GqlIndexName {
+    pub(crate) name: String,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GqlPropertyIndexKind {
+    Equality,
+    Range,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GqlShowPropertyIndexScope {
+    All,
+    Node,
+    Edge,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GqlSchemaStatement {
+    AlterGraphType(GqlAlterGraphTypeStatement),
+    DropCurrentGraphType { span: SourceSpan },
+    CheckGraphType(GqlCheckGraphTypeStatement),
+    Show(GqlShowSchemaStatement),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlAlterGraphTypeStatement {
+    pub(crate) mode: GqlGraphTypeAlterMode,
+    pub(crate) items: Vec<GqlSchemaItem>,
+    pub(crate) drop_items: Vec<GqlSchemaDropItem>,
+    pub(crate) options: Option<GqlSchemaLiteral>,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlCheckGraphTypeStatement {
+    pub(crate) mode: GqlGraphTypeCheckMode,
+    pub(crate) items: Vec<GqlSchemaItem>,
+    pub(crate) options: Option<GqlSchemaLiteral>,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GqlShowSchemaStatement {
+    pub(crate) kind: GqlShowSchemaKind,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GqlGraphTypeAlterMode {
+    Add,
+    Set,
+    Drop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GqlGraphTypeCheckMode {
+    Add,
+    Set,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GqlSchemaItem {
+    Node {
+        label: GqlSchemaLabel,
+        schema: GqlSchemaLiteral,
+        span: SourceSpan,
+    },
+    Edge {
+        label: GqlSchemaLabel,
+        schema: GqlSchemaLiteral,
+        span: SourceSpan,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GqlSchemaDropItem {
+    Node {
+        label: GqlSchemaLabel,
+        span: SourceSpan,
+    },
+    Edge {
+        label: GqlSchemaLabel,
+        span: SourceSpan,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GqlSchemaLabel {
+    pub(crate) name: String,
+    pub(crate) span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GqlSchemaLiteral {
+    Map(MapLiteral),
+    Parameter { name: String, span: SourceSpan },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GqlShowSchemaKind {
+    CurrentGraphType,
+    NodeSchemas,
+    EdgeSchemas,
+    NodeSchema { label: GqlSchemaLabel },
+    EdgeSchema { label: GqlSchemaLabel },
 }
 
 #[derive(Clone, Debug, PartialEq)]

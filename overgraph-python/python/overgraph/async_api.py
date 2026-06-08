@@ -14,8 +14,11 @@ from .overgraph import (
     DbStats,
     EdgePageResult,
     EdgePropertyIndexInfo,
+    EdgeSchemaInfo,
     EdgeView,
     EdgeLabelInfo,
+    GraphSchemaCheckReport,
+    GraphSchemaPublishResult,
     IdPageResult,
     NamedPrunePolicy,
     NeighborEntry,
@@ -23,6 +26,7 @@ from .overgraph import (
     NodeLabelInfo,
     NodePropertyIndexInfo,
     NodePageResult,
+    NodeSchemaInfo,
     NodeView,
     PatchResult,
     PprResult,
@@ -32,6 +36,7 @@ from .overgraph import (
     PruneResult,
     ScrubReport,
     SegmentInfo,
+    SchemaValidationReport,
     ShortestPath,
     Subgraph,
     TraversalCursor,
@@ -268,6 +273,165 @@ class AsyncOverGraph:
 
     async def list_edge_labels(self) -> list[EdgeLabelInfo]:
         return await asyncio.to_thread(self._db.list_edge_labels)
+
+    # --- Schemas ---
+
+    async def set_node_schema(
+        self,
+        label: str,
+        schema: dict[str, Any],
+        *,
+        max_violations: int = 1,
+        chunk_size: int = 4096,
+        scan_limit: int | None = None,
+    ) -> NodeSchemaInfo:
+        return await asyncio.to_thread(
+            self._db.set_node_schema,
+            label,
+            schema,
+            max_violations=max_violations,
+            chunk_size=chunk_size,
+            scan_limit=scan_limit,
+        )
+
+    async def check_node_schema(
+        self,
+        label: str,
+        schema: dict[str, Any],
+        *,
+        max_violations: int = 100,
+        chunk_size: int = 4096,
+        scan_limit: int | None = None,
+    ) -> SchemaValidationReport:
+        return await asyncio.to_thread(
+            self._db.check_node_schema,
+            label,
+            schema,
+            max_violations=max_violations,
+            chunk_size=chunk_size,
+            scan_limit=scan_limit,
+        )
+
+    async def drop_node_schema(self, label: str) -> bool:
+        return await asyncio.to_thread(self._db.drop_node_schema, label)
+
+    async def get_node_schema(self, label: str) -> NodeSchemaInfo | None:
+        return await asyncio.to_thread(self._db.get_node_schema, label)
+
+    async def list_node_schemas(self) -> list[NodeSchemaInfo]:
+        return await asyncio.to_thread(self._db.list_node_schemas)
+
+    async def set_edge_schema(
+        self,
+        label: str,
+        schema: dict[str, Any],
+        *,
+        max_violations: int = 1,
+        chunk_size: int = 4096,
+        scan_limit: int | None = None,
+    ) -> EdgeSchemaInfo:
+        return await asyncio.to_thread(
+            self._db.set_edge_schema,
+            label,
+            schema,
+            max_violations=max_violations,
+            chunk_size=chunk_size,
+            scan_limit=scan_limit,
+        )
+
+    async def check_edge_schema(
+        self,
+        label: str,
+        schema: dict[str, Any],
+        *,
+        max_violations: int = 100,
+        chunk_size: int = 4096,
+        scan_limit: int | None = None,
+    ) -> SchemaValidationReport:
+        return await asyncio.to_thread(
+            self._db.check_edge_schema,
+            label,
+            schema,
+            max_violations=max_violations,
+            chunk_size=chunk_size,
+            scan_limit=scan_limit,
+        )
+
+    async def drop_edge_schema(self, label: str) -> bool:
+        return await asyncio.to_thread(self._db.drop_edge_schema, label)
+
+    async def get_edge_schema(self, label: str) -> EdgeSchemaInfo | None:
+        return await asyncio.to_thread(self._db.get_edge_schema, label)
+
+    async def list_edge_schemas(self) -> list[EdgeSchemaInfo]:
+        return await asyncio.to_thread(self._db.list_edge_schemas)
+
+    async def set_graph_schema(
+        self,
+        schema: dict[str, Any],
+        *,
+        max_violations: int = 1,
+        chunk_size: int = 4096,
+        scan_limit: int | None = None,
+    ) -> GraphSchemaPublishResult:
+        return await asyncio.to_thread(
+            self._db.set_graph_schema,
+            schema,
+            max_violations=max_violations,
+            chunk_size=chunk_size,
+            scan_limit=scan_limit,
+        )
+
+    async def alter_graph_schema(
+        self,
+        operations: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+        *,
+        max_violations: int = 1,
+        chunk_size: int = 4096,
+        scan_limit: int | None = None,
+    ) -> GraphSchemaPublishResult:
+        return await asyncio.to_thread(
+            self._db.alter_graph_schema,
+            operations,
+            max_violations=max_violations,
+            chunk_size=chunk_size,
+            scan_limit=scan_limit,
+        )
+
+    async def check_graph_schema_set(
+        self,
+        schema: dict[str, Any],
+        *,
+        max_violations: int = 100,
+        chunk_size: int = 4096,
+        scan_limit: int | None = None,
+    ) -> GraphSchemaCheckReport:
+        return await asyncio.to_thread(
+            self._db.check_graph_schema_set,
+            schema,
+            max_violations=max_violations,
+            chunk_size=chunk_size,
+            scan_limit=scan_limit,
+        )
+
+    async def check_graph_schema_add(
+        self,
+        schema: dict[str, Any],
+        *,
+        max_violations: int = 100,
+        chunk_size: int = 4096,
+        scan_limit: int | None = None,
+    ) -> GraphSchemaCheckReport:
+        return await asyncio.to_thread(
+            self._db.check_graph_schema_add,
+            schema,
+            max_violations=max_violations,
+            chunk_size=chunk_size,
+            scan_limit=scan_limit,
+        )
+
+    async def drop_graph_schema(self) -> GraphSchemaPublishResult:
+        return await asyncio.to_thread(self._db.drop_graph_schema)
 
     # --- Single CRUD ---
 

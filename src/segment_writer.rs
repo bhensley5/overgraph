@@ -1585,8 +1585,9 @@ fn write_flush_node_index_components<'a>(
 ) -> Result<FlushNodeIndexOutput<'a>, EngineError> {
     let mut records = Vec::with_capacity(node_eq_indexes.len() + node_range_indexes.len());
     let key_index = prepare_key_index_payload(nodes)?;
-    let label_node_index = memtable.label_node_index();
-    let node_label_index = prepare_label_posting_index_payload(&label_node_index);
+    let node_label_index = LabelPostingIndexPayloadPlan {
+        groups: memtable.node_label_posting_groups_current(),
+    };
 
     let mut evidence = write_flush_declared_equality_components(
         seg_dir,

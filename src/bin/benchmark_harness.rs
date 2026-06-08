@@ -1,11 +1,13 @@
 use overgraph::{
     DatabaseEngine, DbOptions, DegreeOptions, DenseMetric, DenseVectorConfig, Direction,
-    EdgeFilterExpr, EdgeInput, EdgeQuery, ExportOptions, GqlExecutionOptions, GqlParamValue,
-    GqlParams, GraphBinaryOp, GraphEdgePattern, GraphExpr, GraphNodeField, GraphNodePattern,
-    GraphOrderDirection, GraphOrderItem, GraphOutputOptions, GraphPageRequest, GraphParamValue,
-    GraphPatternPiece, GraphQueryOptions, GraphReturnItem, GraphReturnProjection, GraphRowQuery,
-    HnswConfig, IsConnectedOptions, LabelMatchMode, NeighborOptions, NodeFilterExpr, NodeInput,
-    NodeLabelFilter, NodeQuery, PageRequest, PprOptions, PropValue, PropertyRangeBound,
+    EdgeFilterExpr, EdgeInput, EdgeQuery, EdgeSchema, EndpointLabelSchema, EngineError,
+    ExportOptions, GqlExecutionOptions, GqlParamValue, GqlParams, GraphBinaryOp, GraphEdgePattern,
+    GraphExpr, GraphNodeField, GraphNodePattern, GraphOrderDirection, GraphOrderItem,
+    GraphOutputOptions, GraphPageRequest, GraphParamValue, GraphPatternPiece, GraphQueryOptions,
+    GraphReturnItem, GraphReturnProjection, GraphRowQuery, GraphSchemaOperation,
+    GraphSchemaSetOptions, HnswConfig, IsConnectedOptions, LabelMatchMode, NeighborOptions,
+    NodeFilterExpr, NodeInput, NodeLabelFilter, NodeQuery, NodeSchema, PageRequest, PprOptions,
+    PropValue, PropertyRangeBound, PropertySchema, SchemaAdditionalProperties, SchemaValueType,
     SecondaryIndexKind, SecondaryIndexState, ShortestPathOptions, TopKOptions, TraverseOptions,
     UpsertEdgeOptions, UpsertNodeOptions, VectorSearchMode, VectorSearchRequest, WalSyncMode,
 };
@@ -300,6 +302,15 @@ fn main() -> Result<(), String> {
 
     if args.scenario_set.includes_query() {
         push_query_scenarios(&args, &scenario_contract, &cfg, &tmp_root, &mut scenarios)?;
+    }
+
+    if args.scenario_set.includes_legacy()
+        || args
+            .scenario_ids
+            .iter()
+            .any(|scenario_id| scenario_id.starts_with("S-SCHEMA-"))
+    {
+        push_schema_scenarios(&args, &scenario_contract, &cfg, &tmp_root, &mut scenarios)?;
     }
 
     if !args.scenario_set.includes_legacy() || !args.scenario_ids.is_empty() {
@@ -2519,6 +2530,302 @@ fn graph_row_scenario_params(
     })
 }
 
+fn schema_required_string_node_schema() -> NodeSchema {
+    NodeSchema {
+        additional_properties: SchemaAdditionalProperties::Allow,
+        properties: BTreeMap::from([(
+            "name".to_string(),
+            PropertySchema {
+                required: true,
+                nullable: false,
+                types: vec![SchemaValueType::String],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    }
+}
+
+fn schema_name_props(i: usize) -> BTreeMap<String, PropValue> {
+    BTreeMap::from([("name".to_string(), PropValue::String(format!("name-{i}")))])
+}
+
+fn schema_role_props(i: usize) -> BTreeMap<String, PropValue> {
+    BTreeMap::from([("role".to_string(), PropValue::String(format!("role-{i}")))])
+}
+
+fn schema_work_edge_schema() -> EdgeSchema {
+    EdgeSchema {
+        properties: BTreeMap::from([(
+            "role".to_string(),
+            PropertySchema {
+                required: true,
+                nullable: false,
+                types: vec![SchemaValueType::String],
+                ..Default::default()
+            },
+        )]),
+        from: Some(EndpointLabelSchema {
+            all_of: vec!["SchemaPerson".to_string()],
+            ..Default::default()
+        }),
+        to: Some(EndpointLabelSchema {
+            all_of: vec!["SchemaCompany".to_string()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn schema_graph_operations() -> Vec<GraphSchemaOperation> {
+    vec![
+        GraphSchemaOperation::SetNode {
+            label: "SchemaPerson".to_string(),
+            schema: schema_required_string_node_schema(),
+        },
+        GraphSchemaOperation::SetEdge {
+            label: "SCHEMA_WORKS_AT".to_string(),
+            schema: schema_work_edge_schema(),
+        },
+    ]
+}
+
+fn seed_schema_publish_data(engine: &DatabaseEngine) -> Result<(), String> {
+    let person = engine
+        .upsert_node(
+            "SchemaPerson",
+            "person-0",
+            UpsertNodeOptions {
+                props: schema_name_props(0),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    let company = engine
+        .upsert_node("SchemaCompany", "company-0", UpsertNodeOptions::default())
+        .map_err(|e| e.to_string())?;
+    engine
+        .upsert_edge(
+            person,
+            company,
+            "SCHEMA_WORKS_AT",
+            UpsertEdgeOptions {
+                props: schema_role_props(0),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn schema_publish_params(operation: &str) -> Value {
+    json!({
+        "api": if operation.starts_with("gql_") { "gql" } else { "native" },
+        "operation": operation,
+        "node_targets": ["SchemaPerson"],
+        "edge_targets": ["SCHEMA_WORKS_AT"],
+        "preload_nodes": 2,
+        "preload_edges": 1,
+        "chunk_size": 128
+    })
+}
+
+fn schema_active_write_params() -> Value {
+    json!({
+        "api": "native",
+        "operation": "upsert_node_active_schema",
+        "registered_node_schemas": ["SchemaPerson"],
+        "registered_edge_schemas": ["SCHEMA_WORKS_AT"],
+        "write_label": "SchemaPerson",
+        "with_props": true
+    })
+}
+
+const GQL_SCHEMA_ALTER_ADD: &str = "ALTER CURRENT GRAPH TYPE ADD { NODE SchemaPerson = { properties: { name: { required: true, nullable: false, types: ['string'] } } }, EDGE SCHEMA_WORKS_AT = { from: { all_of: ['SchemaPerson'] }, to: { all_of: ['SchemaCompany'] }, properties: { role: { required: true, nullable: false, types: ['string'] } } } } OPTIONS { chunk_size: 128 }";
+const GQL_SCHEMA_CHECK_ADD: &str = "CHECK CURRENT GRAPH TYPE ADD { NODE SchemaPerson = { properties: { name: { required: true, nullable: false, types: ['string'] } } }, EDGE SCHEMA_WORKS_AT = { from: { all_of: ['SchemaPerson'] }, to: { all_of: ['SchemaCompany'] }, properties: { role: { required: true, nullable: false, types: ['string'] } } } } OPTIONS { chunk_size: 128, max_violations: 4 }";
+
+fn push_schema_scenarios(
+    args: &CliArgs,
+    scenario_contract: &ScenarioContract,
+    _cfg: &EffectiveConfigResolved,
+    tmp_root: &TempBenchDir,
+    scenarios: &mut Vec<ScenarioOutput>,
+) -> Result<(), String> {
+    {
+        let scenario_id = "S-SCHEMA-001";
+        if scenario_selected(args, scenario_id) {
+            let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+            let engine = open_db(&tmp_root.db_path("schema-gql-alter-add"))?;
+            seed_schema_publish_data(&engine)?;
+            let options = GqlExecutionOptions::default();
+            let stats = run_bench_with_setup(
+                iter_cfg,
+                |_i| engine.drop_graph_schema().map(|_| ()),
+                |_i| {
+                    let result =
+                        engine.execute_gql(GQL_SCHEMA_ALTER_ADD, &GqlParams::new(), &options)?;
+                    if result
+                        .schema_stats
+                        .as_ref()
+                        .map(|stats| stats.targets_published)
+                        == Some(2)
+                    {
+                        Ok(())
+                    } else {
+                        Err(EngineError::InvalidOperation(
+                            "GQL schema ALTER benchmark expected two published targets".to_string(),
+                        ))
+                    }
+                },
+            )?;
+            engine.close().map_err(|e| e.to_string())?;
+
+            scenarios.push(make_scenario(
+                scenario_id,
+                "gql_schema_alter_add_existing_data",
+                "schema",
+                iter_cfg,
+                1,
+                stats,
+                schema_publish_params("gql_alter_current_graph_type_add"),
+                scenario_comparability(scenario_contract, scenario_id),
+            ));
+        }
+    }
+
+    {
+        let scenario_id = "S-SCHEMA-002";
+        if scenario_selected(args, scenario_id) {
+            let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+            let engine = open_db(&tmp_root.db_path("schema-native-bulk-add"))?;
+            seed_schema_publish_data(&engine)?;
+            let options = GraphSchemaSetOptions {
+                chunk_size: 128,
+                ..Default::default()
+            };
+            let stats = run_bench_with_setup(
+                iter_cfg,
+                |_i| engine.drop_graph_schema().map(|_| ()),
+                |_i| {
+                    let result =
+                        engine.alter_graph_schema(schema_graph_operations(), options.clone())?;
+                    if result.targets_published == 2 {
+                        Ok(())
+                    } else {
+                        Err(EngineError::InvalidOperation(
+                            "bulk graph-schema benchmark expected two published targets"
+                                .to_string(),
+                        ))
+                    }
+                },
+            )?;
+            engine.close().map_err(|e| e.to_string())?;
+
+            scenarios.push(make_scenario(
+                scenario_id,
+                "bulk_graph_schema_add_existing_data",
+                "schema",
+                iter_cfg,
+                1,
+                stats,
+                schema_publish_params("alter_graph_schema_add"),
+                scenario_comparability(scenario_contract, scenario_id),
+            ));
+        }
+    }
+
+    {
+        let scenario_id = "S-SCHEMA-003";
+        if scenario_selected(args, scenario_id) {
+            let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+            let engine = open_db(&tmp_root.db_path("schema-active-upsert-node"))?;
+            seed_schema_publish_data(&engine)?;
+            engine
+                .alter_graph_schema(
+                    schema_graph_operations(),
+                    GraphSchemaSetOptions {
+                        chunk_size: 128,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            let stats = run_bench_growth(iter_cfg, |i| {
+                engine
+                    .upsert_node(
+                        "SchemaPerson",
+                        &format!("person-write-{i}"),
+                        UpsertNodeOptions {
+                            props: schema_name_props(i),
+                            ..Default::default()
+                        },
+                    )
+                    .map(|_| ())
+            })?;
+            engine.close().map_err(|e| e.to_string())?;
+
+            scenarios.push(make_scenario(
+                scenario_id,
+                "upsert_node_active_schema",
+                "schema",
+                iter_cfg,
+                1,
+                stats,
+                schema_active_write_params(),
+                scenario_comparability(scenario_contract, scenario_id),
+            ));
+        }
+    }
+
+    {
+        let scenario_id = "S-SCHEMA-004";
+        if scenario_selected(args, scenario_id) {
+            let iter_cfg = scenario_iterations(args, scenario_contract, scenario_id);
+            let engine = open_db(&tmp_root.db_path("schema-gql-check-add"))?;
+            seed_schema_publish_data(&engine)?;
+            let options = GqlExecutionOptions::default();
+            let stats = run_bench(iter_cfg, |_i| {
+                let result =
+                    engine.execute_gql(GQL_SCHEMA_CHECK_ADD, &GqlParams::new(), &options)?;
+                if result
+                    .schema_stats
+                    .as_ref()
+                    .map(|stats| stats.violation_count)
+                    == Some(0)
+                {
+                    Ok(())
+                } else {
+                    Err(EngineError::InvalidOperation(
+                        "GQL schema CHECK benchmark expected zero violations".to_string(),
+                    ))
+                }
+            })?;
+            engine.close().map_err(|e| e.to_string())?;
+
+            scenarios.push(make_scenario(
+                scenario_id,
+                "gql_schema_check_add_existing_data",
+                "schema",
+                iter_cfg,
+                1,
+                stats,
+                json!({
+                    "api": "gql",
+                    "operation": "gql_check_current_graph_type_add",
+                    "node_targets": ["SchemaPerson"],
+                    "edge_targets": ["SCHEMA_WORKS_AT"],
+                    "preload_nodes": 2,
+                    "preload_edges": 1,
+                    "chunk_size": 128,
+                    "max_violations": 4
+                }),
+                scenario_comparability(scenario_contract, scenario_id),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn push_query_scenarios(
     args: &CliArgs,
     scenario_contract: &ScenarioContract,
@@ -2863,6 +3170,28 @@ where
     F: FnMut(usize) -> Result<(), overgraph::EngineError>,
 {
     run_bench_inner(iter_cfg, f, true)
+}
+
+fn run_bench_with_setup<S, F>(iter_cfg: IterConfig, mut setup: S, mut f: F) -> Result<Stats, String>
+where
+    S: FnMut(usize) -> Result<(), overgraph::EngineError>,
+    F: FnMut(usize) -> Result<(), overgraph::EngineError>,
+{
+    for i in 0..iter_cfg.warmup {
+        setup(i).map_err(|e| e.to_string())?;
+        f(i).map_err(|e| e.to_string())?;
+    }
+
+    let mut samples_us = Vec::with_capacity(iter_cfg.iters);
+    for i in 0..iter_cfg.iters {
+        let idx = iter_cfg.warmup + i;
+        setup(idx).map_err(|e| e.to_string())?;
+        let started = Instant::now();
+        f(idx).map_err(|e| e.to_string())?;
+        samples_us.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+    }
+
+    Ok(compute_stats(&samples_us))
 }
 
 fn run_bench_inner<F>(iter_cfg: IterConfig, mut f: F, growth: bool) -> Result<Stats, String>

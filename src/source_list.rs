@@ -13,7 +13,7 @@ use crate::error::EngineError;
 use crate::memtable::Memtable;
 use crate::property_value_semantics::NumericRangeSortKey;
 use crate::row_projection::{EdgeSelectedFieldNeeds, NodeSelectedFieldNeeds, PropertySelection};
-use crate::segment_reader::SegmentReader;
+use crate::segment_reader::{SegmentAdjPostingCursor, SegmentReader};
 use crate::types::*;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
@@ -43,6 +43,236 @@ struct MemtableEndpointLimit<'a> {
     label_filter_ids: Option<&'a [u32]>,
     snapshot_seq: u64,
     limit: usize,
+}
+
+#[derive(Clone, Copy)]
+enum EndpointEdgeScanLayer {
+    Active,
+    Immutable(usize),
+    Segment(usize),
+}
+
+enum EndpointEdgeScanSource<'a> {
+    Memtable(MemtableEndpointEdgeScanSource<'a>),
+    Segment(SegmentEndpointEdgeScanSource<'a>),
+}
+
+enum MemtableEndpointScanDirection {
+    Outgoing,
+    Incoming,
+}
+
+struct MemtableEndpointScanCursor<'a> {
+    memtable: &'a Memtable,
+    node_id: u64,
+    direction: MemtableEndpointScanDirection,
+    label_filter_ids: Option<&'a [u32]>,
+    snapshot_seq: u64,
+    next_after: Option<u64>,
+}
+
+struct MemtableEndpointEdgeScanSource<'a> {
+    cursors: Vec<MemtableEndpointScanCursor<'a>>,
+    heap: BinaryHeap<Reverse<(u64, usize)>>,
+    last_seen: Option<u64>,
+}
+
+struct SegmentEndpointEdgeScanSource<'a> {
+    segment: &'a SegmentReader,
+    cursors: Vec<SegmentAdjPostingCursor>,
+    heap: BinaryHeap<Reverse<(u64, usize)>>,
+    last_seen: Option<u64>,
+}
+
+impl<'a> EndpointEdgeScanSource<'a> {
+    fn memtable(
+        memtable: &'a Memtable,
+        node_ids: &[u64],
+        direction: Direction,
+        label_filter_ids: Option<&'a [u32]>,
+        snapshot_seq: u64,
+        after: Option<u64>,
+    ) -> Self {
+        Self::Memtable(MemtableEndpointEdgeScanSource::new(
+            memtable,
+            node_ids,
+            direction,
+            label_filter_ids,
+            snapshot_seq,
+            after,
+        ))
+    }
+
+    fn segment(
+        segment: &'a SegmentReader,
+        node_ids: &[u64],
+        direction: Direction,
+        label_filter_ids: Option<&[u32]>,
+        after: Option<u64>,
+    ) -> Result<Self, EngineError> {
+        Ok(Self::Segment(SegmentEndpointEdgeScanSource::new(
+            segment,
+            node_ids,
+            direction,
+            label_filter_ids,
+            after,
+        )?))
+    }
+
+    fn next_id(&mut self) -> Result<Option<u64>, EngineError> {
+        match self {
+            Self::Memtable(source) => Ok(source.next_id()),
+            Self::Segment(source) => source.next_id(),
+        }
+    }
+}
+
+impl<'a> MemtableEndpointEdgeScanSource<'a> {
+    fn new(
+        memtable: &'a Memtable,
+        node_ids: &[u64],
+        direction: Direction,
+        label_filter_ids: Option<&'a [u32]>,
+        snapshot_seq: u64,
+        after: Option<u64>,
+    ) -> Self {
+        let mut cursors = Vec::new();
+        for &node_id in node_ids {
+            match direction {
+                Direction::Outgoing => cursors.push(MemtableEndpointScanCursor {
+                    memtable,
+                    node_id,
+                    direction: MemtableEndpointScanDirection::Outgoing,
+                    label_filter_ids,
+                    snapshot_seq,
+                    next_after: after,
+                }),
+                Direction::Incoming => cursors.push(MemtableEndpointScanCursor {
+                    memtable,
+                    node_id,
+                    direction: MemtableEndpointScanDirection::Incoming,
+                    label_filter_ids,
+                    snapshot_seq,
+                    next_after: after,
+                }),
+                Direction::Both => {
+                    cursors.push(MemtableEndpointScanCursor {
+                        memtable,
+                        node_id,
+                        direction: MemtableEndpointScanDirection::Outgoing,
+                        label_filter_ids,
+                        snapshot_seq,
+                        next_after: after,
+                    });
+                    cursors.push(MemtableEndpointScanCursor {
+                        memtable,
+                        node_id,
+                        direction: MemtableEndpointScanDirection::Incoming,
+                        label_filter_ids,
+                        snapshot_seq,
+                        next_after: after,
+                    });
+                }
+            }
+        }
+
+        let mut source = Self {
+            cursors,
+            heap: BinaryHeap::new(),
+            last_seen: None,
+        };
+        for cursor_index in 0..source.cursors.len() {
+            if let Some(edge_id) = source.next_cursor_id(cursor_index) {
+                source.heap.push(Reverse((edge_id, cursor_index)));
+            }
+        }
+        source
+    }
+
+    fn next_cursor_id(&mut self, cursor_index: usize) -> Option<u64> {
+        let cursor = &mut self.cursors[cursor_index];
+        let edge_id = match cursor.direction {
+            MemtableEndpointScanDirection::Outgoing => {
+                cursor.memtable.next_visible_edge_from_endpoint_after(
+                    cursor.node_id,
+                    cursor.label_filter_ids,
+                    cursor.snapshot_seq,
+                    cursor.next_after,
+                )
+            }
+            MemtableEndpointScanDirection::Incoming => {
+                cursor.memtable.next_visible_edge_to_endpoint_after(
+                    cursor.node_id,
+                    cursor.label_filter_ids,
+                    cursor.snapshot_seq,
+                    cursor.next_after,
+                )
+            }
+        };
+        if let Some(edge_id) = edge_id {
+            cursor.next_after = Some(edge_id);
+        }
+        edge_id
+    }
+
+    fn next_id(&mut self) -> Option<u64> {
+        while let Some(Reverse((edge_id, cursor_index))) = self.heap.pop() {
+            if let Some(next_id) = self.next_cursor_id(cursor_index) {
+                self.heap.push(Reverse((next_id, cursor_index)));
+            }
+            if self.last_seen == Some(edge_id) {
+                continue;
+            }
+            self.last_seen = Some(edge_id);
+            return Some(edge_id);
+        }
+        None
+    }
+}
+
+impl<'a> SegmentEndpointEdgeScanSource<'a> {
+    fn new(
+        segment: &'a SegmentReader,
+        node_ids: &[u64],
+        direction: Direction,
+        label_filter_ids: Option<&[u32]>,
+        after: Option<u64>,
+    ) -> Result<Self, EngineError> {
+        let mut cursors =
+            segment.endpoint_adj_posting_cursors(node_ids, direction, label_filter_ids)?;
+        let mut heap = BinaryHeap::new();
+        for (cursor_index, cursor) in cursors.iter_mut().enumerate() {
+            while let Some(edge_id) = segment.next_adj_posting_edge_id(cursor)? {
+                if after.is_none_or(|after| edge_id > after) {
+                    heap.push(Reverse((edge_id, cursor_index)));
+                    break;
+                }
+            }
+        }
+        Ok(Self {
+            segment,
+            cursors,
+            heap,
+            last_seen: None,
+        })
+    }
+
+    fn next_id(&mut self) -> Result<Option<u64>, EngineError> {
+        while let Some(Reverse((edge_id, cursor_index))) = self.heap.pop() {
+            if let Some(next_id) = self
+                .segment
+                .next_adj_posting_edge_id(&mut self.cursors[cursor_index])?
+            {
+                self.heap.push(Reverse((next_id, cursor_index)));
+            }
+            if self.last_seen == Some(edge_id) {
+                continue;
+            }
+            self.last_seen = Some(edge_id);
+            return Ok(Some(edge_id));
+        }
+        Ok(None)
+    }
 }
 
 impl<'a> SourceList<'a> {
@@ -1037,6 +1267,147 @@ impl<'a> SourceList<'a> {
         Ok(())
     }
 
+    fn endpoint_edge_scan_sources<'b>(
+        &'b self,
+        node_ids: &[u64],
+        direction: Direction,
+        label_filter_ids: Option<&'b [u32]>,
+        start_after: Option<u64>,
+    ) -> Result<Vec<(EndpointEdgeScanLayer, EndpointEdgeScanSource<'b>)>, EngineError> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut sorted_node_ids = node_ids.to_vec();
+        sorted_node_ids.sort_unstable();
+        sorted_node_ids.dedup();
+
+        let mut sources = Vec::with_capacity(1 + self.immutable.len() + self.segments.len());
+        sources.push((
+            EndpointEdgeScanLayer::Active,
+            EndpointEdgeScanSource::memtable(
+                self.active,
+                &sorted_node_ids,
+                direction,
+                label_filter_ids,
+                self.snapshot_seq,
+                start_after,
+            ),
+        ));
+        for (index, epoch) in self.immutable.iter().enumerate() {
+            sources.push((
+                EndpointEdgeScanLayer::Immutable(index),
+                EndpointEdgeScanSource::memtable(
+                    &epoch.memtable,
+                    &sorted_node_ids,
+                    direction,
+                    label_filter_ids,
+                    self.snapshot_seq,
+                    start_after,
+                ),
+            ));
+        }
+        for (index, segment) in self.segments.iter().enumerate() {
+            sources.push((
+                EndpointEdgeScanLayer::Segment(index),
+                EndpointEdgeScanSource::segment(
+                    segment.as_ref(),
+                    &sorted_node_ids,
+                    direction,
+                    label_filter_ids,
+                    start_after,
+                )?,
+            ));
+        }
+        Ok(sources)
+    }
+
+    fn endpoint_scan_source_shadowed(&self, layer: EndpointEdgeScanLayer, edge_id: u64) -> bool {
+        match layer {
+            EndpointEdgeScanLayer::Active => false,
+            EndpointEdgeScanLayer::Immutable(index) => {
+                self.is_edge_shadowed_above_immutable(edge_id, index)
+            }
+            EndpointEdgeScanLayer::Segment(index) => {
+                self.is_edge_shadowed_above_segment(edge_id, index)
+            }
+        }
+    }
+
+    pub(crate) fn scan_edge_ids_by_endpoints_after<F>(
+        &self,
+        node_ids: &[u64],
+        direction: Direction,
+        label_filter_ids: Option<&[u32]>,
+        start_after: Option<u64>,
+        chunk_limit: usize,
+        mut visitor: F,
+    ) -> Result<(), EngineError>
+    where
+        F: FnMut(&[u64]) -> Result<ControlFlow<()>, EngineError>,
+    {
+        let mut sources =
+            self.endpoint_edge_scan_sources(node_ids, direction, label_filter_ids, start_after)?;
+        let mut heap = BinaryHeap::new();
+        for (source_index, (_, source)) in sources.iter_mut().enumerate() {
+            if let Some(edge_id) = source.next_id()? {
+                heap.push(Reverse((edge_id, source_index)));
+            }
+        }
+
+        let chunk_limit = chunk_limit.max(1);
+        let mut chunk = Vec::with_capacity(chunk_limit);
+        let mut last_seen = None;
+        while let Some(Reverse((edge_id, source_index))) = heap.pop() {
+            if let Some(next_id) = sources[source_index].1.next_id()? {
+                heap.push(Reverse((next_id, source_index)));
+            }
+
+            if last_seen == Some(edge_id) {
+                continue;
+            }
+            last_seen = Some(edge_id);
+            let layer = sources[source_index].0;
+            if self.endpoint_scan_source_shadowed(layer, edge_id) {
+                continue;
+            }
+
+            chunk.push(edge_id);
+            if chunk.len() >= chunk_limit {
+                if visitor(&chunk)?.is_break() {
+                    return Ok(());
+                }
+                chunk.clear();
+            }
+        }
+
+        if !chunk.is_empty() {
+            let _ = visitor(&chunk)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn scan_edge_ids_by_endpoints<F>(
+        &self,
+        node_ids: &[u64],
+        direction: Direction,
+        label_filter_ids: Option<&[u32]>,
+        chunk_limit: usize,
+        visitor: F,
+    ) -> Result<(), EngineError>
+    where
+        F: FnMut(&[u64]) -> Result<ControlFlow<()>, EngineError>,
+    {
+        self.scan_edge_ids_by_endpoints_after(
+            node_ids,
+            direction,
+            label_filter_ids,
+            None,
+            chunk_limit,
+            visitor,
+        )
+    }
+
     fn optional_edge_index_or_scan(
         sidecar_result: Result<Option<ControlFlow<()>>, EngineError>,
         scan: impl FnOnce() -> Result<ControlFlow<()>, EngineError>,
@@ -1977,6 +2348,55 @@ mod tests {
                 .unwrap(),
             vec![20]
         );
+    }
+
+    #[test]
+    fn test_scan_edge_ids_by_endpoints_streams_chunks_and_skips_shadowed_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let segment_mt = Memtable::new();
+        segment_mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)), 1);
+        segment_mt.apply_op(&WalOp::UpsertEdge(make_edge(11, 1, 3, 5)), 1);
+        segment_mt.apply_op(&WalOp::UpsertEdge(make_edge(12, 1, 4, 5)), 1);
+        segment_mt.apply_op(&WalOp::UpsertEdge(make_edge(14, 1, 5, 6)), 1);
+        write_segment_without_degree_sidecar_for_test(&seg_dir, 1, &segment_mt, None).unwrap();
+        let segments = vec![Arc::new(
+            SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap(),
+        )];
+
+        let active = Memtable::new();
+        active.apply_op(&WalOp::UpsertEdge(make_edge(9, 1, 6, 5)), 2);
+        active.apply_op(
+            &WalOp::DeleteEdge {
+                id: 11,
+                deleted_at: 3000,
+            },
+            3,
+        );
+
+        let frozen = {
+            let mt = Memtable::new();
+            mt.apply_op(&WalOp::UpsertEdge(make_edge(13, 1, 7, 5)), 2);
+            mt
+        };
+        let immutable = vec![wrap_imm(frozen)];
+        let sources = SourceList {
+            active: &active,
+            immutable: &immutable,
+            segments: &segments,
+            snapshot_seq: 3,
+            selected_field_read_counters: None,
+        };
+
+        let mut chunks = Vec::new();
+        sources
+            .scan_edge_ids_by_endpoints(&[1], Direction::Outgoing, Some(&[5]), 2, |chunk| {
+                assert!(chunk.len() <= 2);
+                chunks.push(chunk.to_vec());
+                Ok(ControlFlow::Continue(()))
+            })
+            .unwrap();
+        assert_eq!(chunks, vec![vec![9, 10], vec![12, 13]]);
     }
 
     #[test]

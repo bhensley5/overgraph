@@ -12,6 +12,256 @@ NodeLabelFilter = Mapping[str, Any]
 GqlScalar = None | bool | int | float | str | bytes
 GqlParam = GqlScalar | list["GqlParam"] | tuple["GqlParam", ...] | Mapping[str, "GqlParam"]
 GqlParams = Mapping[str, GqlParam]
+SchemaValueTypeName = Literal[
+    "bool",
+    "int",
+    "uint",
+    "float",
+    "number",
+    "string",
+    "bytes",
+    "array",
+    "map",
+]
+SchemaVectorPresenceName = Literal["optional", "required", "forbidden"]
+SchemaAdditionalPropertiesMode = Literal["allow", "reject"]
+
+class SchemaUIntLiteral(TypedDict):
+    type: Literal["uint"]
+    value: int | str
+
+class SchemaUIntOutputLiteral(TypedDict):
+    type: Literal["uint"]
+    value: int
+
+SchemaLiteral = (
+    None
+    | bool
+    | int
+    | float
+    | str
+    | bytes
+    | bytearray
+    | SchemaUIntLiteral
+    | list["SchemaLiteral"]
+    | tuple["SchemaLiteral", ...]
+    | dict[str, "SchemaLiteral"]
+)
+SchemaOutputLiteral = (
+    None
+    | bool
+    | int
+    | float
+    | str
+    | bytes
+    | SchemaUIntOutputLiteral
+    | list["SchemaOutputLiteral"]
+    | dict[str, "SchemaOutputLiteral"]
+)
+
+class SchemaNumericBoundBase(TypedDict):
+    value: SchemaLiteral
+
+class SchemaNumericBound(SchemaNumericBoundBase, total=False):
+    inclusive: bool
+
+class SchemaOutputNumericBound(TypedDict):
+    value: SchemaOutputLiteral
+    inclusive: bool
+
+class StringFieldSchema(TypedDict, total=False):
+    min_bytes: int | None
+    max_bytes: int | None
+    enum_values: list[str]
+
+class NumericFieldSchema(TypedDict, total=False):
+    min: SchemaNumericBound | None
+    max: SchemaNumericBound | None
+    finite: bool
+
+class NumericFieldSchemaOutput(TypedDict, total=False):
+    min: SchemaOutputNumericBound | None
+    max: SchemaOutputNumericBound | None
+    finite: bool
+
+class PropertySchema(TypedDict, total=False):
+    required: bool
+    nullable: bool
+    types: list[SchemaValueTypeName]
+    numeric_min: SchemaNumericBound | None
+    numeric_max: SchemaNumericBound | None
+    string_min_bytes: int | None
+    string_max_bytes: int | None
+    bytes_min_len: int | None
+    bytes_max_len: int | None
+    array_min_items: int | None
+    array_max_items: int | None
+    map_min_entries: int | None
+    map_max_entries: int | None
+    enum_values: list[SchemaLiteral]
+
+class PropertySchemaOutput(TypedDict, total=False):
+    required: bool
+    nullable: bool
+    types: list[SchemaValueTypeName]
+    numeric_min: SchemaOutputNumericBound | None
+    numeric_max: SchemaOutputNumericBound | None
+    string_min_bytes: int | None
+    string_max_bytes: int | None
+    bytes_min_len: int | None
+    bytes_max_len: int | None
+    array_min_items: int | None
+    array_max_items: int | None
+    map_min_entries: int | None
+    map_max_entries: int | None
+    enum_values: list[SchemaOutputLiteral]
+
+class NodeLabelConstraintSchema(TypedDict, total=False):
+    all_of: list[str]
+    any_of: list[str]
+    none_of: list[str]
+
+class DenseVectorSchema(TypedDict, total=False):
+    presence: SchemaVectorPresenceName
+    dimension: int | None
+
+class SparseVectorSchema(TypedDict, total=False):
+    presence: SchemaVectorPresenceName
+    min_entries: int | None
+    max_entries: int | None
+    max_dimension_id: int | None
+
+class EndpointLabelSchema(TypedDict, total=False):
+    all_of: list[str]
+    any_of: list[str]
+    none_of: list[str]
+
+class EdgeValiditySchema(TypedDict, total=False):
+    require_valid_from_before_valid_to: bool
+    valid_from_min: int | None
+    valid_from_max: int | None
+    valid_to_min: int | None
+    valid_to_max: int | None
+    allow_open_ended_valid_to: bool
+
+class NodeSchema(TypedDict, total=False):
+    additional_properties: SchemaAdditionalPropertiesMode
+    properties: dict[str, PropertySchema]
+    key: StringFieldSchema | None
+    label_constraints: NodeLabelConstraintSchema | None
+    weight: NumericFieldSchema | None
+    dense_vector: DenseVectorSchema | None
+    sparse_vector: SparseVectorSchema | None
+
+class NodeSchemaOutput(TypedDict, total=False):
+    additional_properties: SchemaAdditionalPropertiesMode
+    properties: dict[str, PropertySchemaOutput]
+    key: StringFieldSchema | None
+    label_constraints: NodeLabelConstraintSchema | None
+    weight: NumericFieldSchemaOutput | None
+    dense_vector: DenseVectorSchema | None
+    sparse_vector: SparseVectorSchema | None
+
+EdgeSchema = TypedDict(
+    "EdgeSchema",
+    {
+        "additional_properties": SchemaAdditionalPropertiesMode,
+        "properties": dict[str, PropertySchema],
+        "from": EndpointLabelSchema | None,
+        "to": EndpointLabelSchema | None,
+        "allow_self_loops": bool,
+        "weight": NumericFieldSchema | None,
+        "validity": EdgeValiditySchema | None,
+    },
+    total=False,
+)
+EdgeSchemaOutput = TypedDict(
+    "EdgeSchemaOutput",
+    {
+        "additional_properties": SchemaAdditionalPropertiesMode,
+        "properties": dict[str, PropertySchemaOutput],
+        "from": EndpointLabelSchema | None,
+        "to": EndpointLabelSchema | None,
+        "allow_self_loops": bool,
+        "weight": NumericFieldSchemaOutput | None,
+        "validity": EdgeValiditySchema | None,
+    },
+    total=False,
+)
+
+class SchemaScanOptions(TypedDict, total=False):
+    max_violations: int
+    chunk_size: int
+    scan_limit: int | None
+
+class SchemaViolationTarget(TypedDict, total=False):
+    kind: Literal["node", "edge"]
+    id: int
+    labels: list[str]
+    key: str
+    label: str
+    from_id: int
+    to_id: int
+
+class SchemaViolationDict(TypedDict):
+    target: SchemaViolationTarget
+    path: str
+    message: str
+
+class SchemaValidationReportDict(TypedDict):
+    checked_records: int
+    violation_count: int
+    violations: list[SchemaViolationDict]
+    truncated: bool
+    scan_limit_hit: bool
+
+class NodeSchemaInfoDict(TypedDict):
+    label: str
+    schema: NodeSchemaOutput
+
+class EdgeSchemaInfoDict(TypedDict):
+    label: str
+    schema: EdgeSchemaOutput
+
+class GraphSchemaNodeEntry(TypedDict):
+    label: str
+    schema: NodeSchema
+
+class GraphSchemaEdgeEntry(TypedDict):
+    label: str
+    schema: EdgeSchema
+
+class GraphSchema(TypedDict, total=False):
+    node_schemas: list[GraphSchemaNodeEntry]
+    edge_schemas: list[GraphSchemaEdgeEntry]
+
+class GraphSchemaSetNodeOperation(TypedDict):
+    kind: Literal["set_node"]
+    label: str
+    schema: NodeSchema
+
+class GraphSchemaSetEdgeOperation(TypedDict):
+    kind: Literal["set_edge"]
+    label: str
+    schema: EdgeSchema
+
+class GraphSchemaDropNodeOperation(TypedDict):
+    kind: Literal["drop_node"]
+    label: str
+
+class GraphSchemaDropEdgeOperation(TypedDict):
+    kind: Literal["drop_edge"]
+    label: str
+
+GraphSchemaOperation = (
+    GraphSchemaSetNodeOperation
+    | GraphSchemaSetEdgeOperation
+    | GraphSchemaDropNodeOperation
+    | GraphSchemaDropEdgeOperation
+)
+GraphSchemaOperationKindName = Literal["add", "set", "drop", "drop_all", "check_add", "check_set"]
+GraphSchemaTargetKindName = Literal["node", "edge"]
+GraphSchemaDropActionName = Literal["dropped", "not_found"]
 
 # ============================================================
 # Data types
@@ -130,6 +380,71 @@ class EdgePropertyIndexInfo:
     kind: str
     state: str
     last_error: str | None
+    def __repr__(self) -> str: ...
+
+class NodeSchemaInfo:
+    label: str
+    @property
+    def schema(self) -> NodeSchemaOutput: ...
+    def __repr__(self) -> str: ...
+
+class EdgeSchemaInfo:
+    label: str
+    @property
+    def schema(self) -> EdgeSchemaOutput: ...
+    def __repr__(self) -> str: ...
+
+class SchemaValidationReport:
+    checked_records: int
+    violation_count: int
+    truncated: bool
+    scan_limit_hit: bool
+    @property
+    def violations(self) -> list[SchemaViolation]: ...
+    def __repr__(self) -> str: ...
+
+class GraphSchemaValidationReportEntry:
+    target_kind: GraphSchemaTargetKindName
+    label: str
+    report: SchemaValidationReport
+    def __repr__(self) -> str: ...
+
+class GraphSchemaCheckReport:
+    operation: GraphSchemaOperationKindName
+    checked_records: int
+    violation_count: int
+    truncated: bool
+    scan_limit_hit: bool
+    @property
+    def entries(self) -> list[GraphSchemaValidationReportEntry]: ...
+    def __repr__(self) -> str: ...
+
+class GraphSchemaDropTargetResult:
+    target_kind: GraphSchemaTargetKindName
+    label: str
+    action: GraphSchemaDropActionName
+    def __repr__(self) -> str: ...
+
+class GraphSchemaPublishResult:
+    operation: GraphSchemaOperationKindName
+    validation: GraphSchemaCheckReport
+    targets_published: int
+    targets_dropped: int
+    node_schemas_dropped: int
+    edge_schemas_dropped: int
+    @property
+    def node_schemas(self) -> list[NodeSchemaInfo]: ...
+    @property
+    def edge_schemas(self) -> list[EdgeSchemaInfo]: ...
+    @property
+    def drop_targets(self) -> list[GraphSchemaDropTargetResult]: ...
+    def __repr__(self) -> str: ...
+
+class SchemaViolation:
+    path: str
+    message: str
+    @property
+    def target(self) -> SchemaViolationTarget: ...
     def __repr__(self) -> str: ...
 
 class PropertyRangeBound:
@@ -440,6 +755,7 @@ class GqlPath(TypedDict, total=False):
     edges: list[GqlEdge]
 
 GqlValue = GqlScalar | list["GqlValue"] | dict[str, "GqlValue"] | GqlNode | GqlEdge | GqlPath
+GqlStatementKind = Literal["query", "mutation", "schema", "index"]
 
 class GqlExecutionStats(TypedDict):
     rows_returned: int
@@ -525,11 +841,50 @@ class GqlMutationExplain(TypedDict):
     replacement_adapters: bool
     atomic_commit: bool
 
+class GqlSchemaExplainTarget(TypedDict):
+    target_kind: str
+    label: str | None
+    action: str | None
+
+class GqlSchemaExplainOptions(TypedDict):
+    max_violations: int | None
+    chunk_size: int | None
+    scan_limit: int | None
+
+class GqlSchemaExplain(TypedDict):
+    operation: str
+    targets: list[GqlSchemaExplainTarget]
+    replaces_entire_catalog: bool
+    publishes_manifest: bool
+    validates_existing_data: bool
+    uses_core_write_queue: bool
+    side_effect_free: bool
+    options: GqlSchemaExplainOptions
+
+class GqlIndexExplainTarget(TypedDict):
+    target_kind: str
+    label: str | None
+    prop_key: str | None
+    kind: str | None
+    action: str | None
+
+class GqlIndexExplain(TypedDict):
+    operation: str
+    targets: list[GqlIndexExplainTarget]
+    uses_core_write_queue: bool
+    publishes_manifest: bool
+    creates_labels: bool
+    schedules_background_build: bool
+    drops_index_data_async: bool
+    side_effect_free: bool
+
 class GqlExecutionExplain(TypedDict):
-    kind: Literal["query", "mutation"]
+    kind: GqlStatementKind
     columns: list[str]
     read: GqlReadExplain | None
     mutation: GqlMutationExplain | None
+    schema: GqlSchemaExplain | None
+    index: GqlIndexExplain | None
     caps: GqlExecutionCapSummary
     warnings: list[str]
     notes: list[str]
@@ -554,13 +909,35 @@ class GqlMutationStats(TypedDict):
     elapsed_us: int | None
     warnings: list[str]
 
+class GqlSchemaStats(TypedDict):
+    operation: str
+    targets_checked: int
+    targets_published: int
+    targets_dropped: int
+    checked_records: int
+    violation_count: int
+    truncated: bool
+    scan_limit_hit: bool
+    elapsed_us: int | None
+    warnings: list[str]
+
+class GqlIndexStats(TypedDict):
+    operation: str
+    indexes_ensured: int
+    indexes_dropped: int
+    indexes_returned: int
+    elapsed_us: int | None
+    warnings: list[str]
+
 class GqlExecutionResult(TypedDict):
-    kind: Literal["query", "mutation"]
+    kind: GqlStatementKind
     columns: list[str]
     rows: list[dict[str, GqlValue]] | list[list[GqlValue]]
     next_cursor: str | None
     stats: GqlExecutionStats
     mutation_stats: GqlMutationStats | None
+    schema_stats: GqlSchemaStats | None
+    index_stats: GqlIndexStats | None
     plan: GqlExecutionExplain | None
 
 # ============================================================
@@ -596,6 +973,23 @@ class OverGraph:
     def get_edge_label(self, label_id: int) -> str | None: ...
     def list_node_labels(self) -> list[NodeLabelInfo]: ...
     def list_edge_labels(self) -> list[EdgeLabelInfo]: ...
+
+    # Schemas
+    def set_node_schema(self, label: str, schema: NodeSchema, *, max_violations: int = 1, chunk_size: int = 4096, scan_limit: int | None = None) -> NodeSchemaInfo: ...
+    def check_node_schema(self, label: str, schema: NodeSchema, *, max_violations: int = 100, chunk_size: int = 4096, scan_limit: int | None = None) -> SchemaValidationReport: ...
+    def drop_node_schema(self, label: str) -> bool: ...
+    def get_node_schema(self, label: str) -> NodeSchemaInfo | None: ...
+    def list_node_schemas(self) -> list[NodeSchemaInfo]: ...
+    def set_edge_schema(self, label: str, schema: EdgeSchema, *, max_violations: int = 1, chunk_size: int = 4096, scan_limit: int | None = None) -> EdgeSchemaInfo: ...
+    def check_edge_schema(self, label: str, schema: EdgeSchema, *, max_violations: int = 100, chunk_size: int = 4096, scan_limit: int | None = None) -> SchemaValidationReport: ...
+    def drop_edge_schema(self, label: str) -> bool: ...
+    def get_edge_schema(self, label: str) -> EdgeSchemaInfo | None: ...
+    def list_edge_schemas(self) -> list[EdgeSchemaInfo]: ...
+    def set_graph_schema(self, schema: GraphSchema, *, max_violations: int = 1, chunk_size: int = 4096, scan_limit: int | None = None) -> GraphSchemaPublishResult: ...
+    def alter_graph_schema(self, operations: list[GraphSchemaOperation] | tuple[GraphSchemaOperation, ...], *, max_violations: int = 1, chunk_size: int = 4096, scan_limit: int | None = None) -> GraphSchemaPublishResult: ...
+    def check_graph_schema_set(self, schema: GraphSchema, *, max_violations: int = 100, chunk_size: int = 4096, scan_limit: int | None = None) -> GraphSchemaCheckReport: ...
+    def check_graph_schema_add(self, schema: GraphSchema, *, max_violations: int = 100, chunk_size: int = 4096, scan_limit: int | None = None) -> GraphSchemaCheckReport: ...
+    def drop_graph_schema(self) -> GraphSchemaPublishResult: ...
 
     # Single CRUD
     def upsert_node(
@@ -1059,6 +1453,23 @@ class AsyncOverGraph:
     async def get_edge_label(self, label_id: int) -> str | None: ...
     async def list_node_labels(self) -> list[NodeLabelInfo]: ...
     async def list_edge_labels(self) -> list[EdgeLabelInfo]: ...
+
+    # Schemas
+    async def set_node_schema(self, label: str, schema: NodeSchema, *, max_violations: int = 1, chunk_size: int = 4096, scan_limit: int | None = None) -> NodeSchemaInfo: ...
+    async def check_node_schema(self, label: str, schema: NodeSchema, *, max_violations: int = 100, chunk_size: int = 4096, scan_limit: int | None = None) -> SchemaValidationReport: ...
+    async def drop_node_schema(self, label: str) -> bool: ...
+    async def get_node_schema(self, label: str) -> NodeSchemaInfo | None: ...
+    async def list_node_schemas(self) -> list[NodeSchemaInfo]: ...
+    async def set_edge_schema(self, label: str, schema: EdgeSchema, *, max_violations: int = 1, chunk_size: int = 4096, scan_limit: int | None = None) -> EdgeSchemaInfo: ...
+    async def check_edge_schema(self, label: str, schema: EdgeSchema, *, max_violations: int = 100, chunk_size: int = 4096, scan_limit: int | None = None) -> SchemaValidationReport: ...
+    async def drop_edge_schema(self, label: str) -> bool: ...
+    async def get_edge_schema(self, label: str) -> EdgeSchemaInfo | None: ...
+    async def list_edge_schemas(self) -> list[EdgeSchemaInfo]: ...
+    async def set_graph_schema(self, schema: GraphSchema, *, max_violations: int = 1, chunk_size: int = 4096, scan_limit: int | None = None) -> GraphSchemaPublishResult: ...
+    async def alter_graph_schema(self, operations: list[GraphSchemaOperation] | tuple[GraphSchemaOperation, ...], *, max_violations: int = 1, chunk_size: int = 4096, scan_limit: int | None = None) -> GraphSchemaPublishResult: ...
+    async def check_graph_schema_set(self, schema: GraphSchema, *, max_violations: int = 100, chunk_size: int = 4096, scan_limit: int | None = None) -> GraphSchemaCheckReport: ...
+    async def check_graph_schema_add(self, schema: GraphSchema, *, max_violations: int = 100, chunk_size: int = 4096, scan_limit: int | None = None) -> GraphSchemaCheckReport: ...
+    async def drop_graph_schema(self) -> GraphSchemaPublishResult: ...
 
     # Single CRUD
     async def upsert_node(self, labels: NodeLabels, key: str, *, props: dict[str, Any] | None = None, weight: float = 1.0, dense_vector: list[float] | None = None, sparse_vector: list[tuple[int, float]] | None = None) -> int: ...

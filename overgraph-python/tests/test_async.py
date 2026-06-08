@@ -170,6 +170,137 @@ class TestAsyncCrud:
         assert result is not None  # returns updated EdgeView
 
 
+@pytest.mark.asyncio
+async def test_async_schema_management_wrapper_parity(async_db):
+    schema = {
+        "properties": {
+            "name": {"required": True, "nullable": False, "types": ["string"]}
+        }
+    }
+
+    info = await async_db.set_node_schema(
+        "AsyncSchemaPerson",
+        schema,
+        max_violations=1,
+        chunk_size=1,
+        scan_limit=None,
+    )
+    assert info.label == "AsyncSchemaPerson"
+    assert info.schema["properties"]["name"]["required"] is True
+
+    report = await async_db.check_node_schema(
+        "AsyncSchemaPerson",
+        schema,
+        max_violations=100,
+        chunk_size=2,
+        scan_limit=None,
+    )
+    assert report.checked_records == 0
+    assert report.violation_count == 0
+
+    with pytest.raises(OverGraphError, match="schema violation"):
+        await async_db.upsert_node("AsyncSchemaPerson", "bad", props={})
+
+    assert (await async_db.get_node_schema("AsyncSchemaPerson")).label == "AsyncSchemaPerson"
+    assert [item.label for item in await async_db.list_node_schemas()] == ["AsyncSchemaPerson"]
+    assert await async_db.drop_node_schema("AsyncSchemaPerson") is True
+    assert await async_db.get_node_schema("AsyncSchemaPerson") is None
+
+    edge_info = await async_db.set_edge_schema(
+        "ASYNC_SCHEMA_EDGE",
+        {"properties": {"role": {"required": True, "nullable": False, "types": ["string"]}}},
+    )
+    assert edge_info.label == "ASYNC_SCHEMA_EDGE"
+    edge_report = await async_db.check_edge_schema(
+        "ASYNC_SCHEMA_EDGE",
+        {"properties": {"role": {"required": True, "nullable": False, "types": ["string"]}}},
+        max_violations=100,
+        chunk_size=2,
+        scan_limit=None,
+    )
+    assert edge_report.checked_records == 0
+    assert edge_report.violation_count == 0
+    assert (await async_db.get_edge_schema("ASYNC_SCHEMA_EDGE")).label == "ASYNC_SCHEMA_EDGE"
+    assert [item.label for item in await async_db.list_edge_schemas()] == ["ASYNC_SCHEMA_EDGE"]
+    assert await async_db.drop_edge_schema("ASYNC_SCHEMA_EDGE") is True
+
+
+@pytest.mark.asyncio
+async def test_async_bulk_graph_schema_management_wrapper_parity(async_db):
+    schema = {
+        "node_schemas": [
+            {
+                "label": "AsyncBulkPerson",
+                "schema": {
+                    "properties": {
+                        "name": {"required": True, "nullable": False, "types": ["string"]}
+                    }
+                },
+            }
+        ],
+        "edge_schemas": [{"label": "ASYNC_BULK_EDGE", "schema": {"properties": {}}}],
+    }
+    published = await async_db.set_graph_schema(schema)
+    assert published.operation == "set"
+    assert published.targets_published == 2
+    assert [item.label for item in await async_db.list_node_schemas()] == ["AsyncBulkPerson"]
+
+    added = await async_db.alter_graph_schema(
+        [
+            {
+                "kind": "set_node",
+                "label": "AsyncBulkCompany",
+                "schema": {"properties": {}},
+            }
+        ]
+    )
+    assert added.operation == "add"
+    assert added.targets_published == 1
+    assert [item.label for item in await async_db.list_node_schemas()] == [
+        "AsyncBulkCompany",
+        "AsyncBulkPerson",
+    ]
+
+    check = await async_db.check_graph_schema_add(
+        {
+            "node_schemas": [
+                {"label": "AsyncBulkDryRun", "schema": {"properties": {}}}
+            ]
+        }
+    )
+    assert check.operation == "check_add"
+    assert check.entries[0].label == "AsyncBulkDryRun"
+    assert await async_db.get_node_schema("AsyncBulkDryRun") is None
+
+    check_set = await async_db.check_graph_schema_set({"node_schemas": []})
+    assert check_set.operation == "check_set"
+    assert check_set.entries == []
+    assert [item.label for item in await async_db.list_node_schemas()] == [
+        "AsyncBulkCompany",
+        "AsyncBulkPerson",
+    ]
+
+    dropped = await async_db.alter_graph_schema(
+        [
+            {"kind": "drop_node", "label": "AsyncBulkCompany"},
+            {"kind": "drop_node", "label": "AsyncBulkPerson"},
+            {"kind": "drop_edge", "label": "ASYNC_BULK_MISSING"},
+        ]
+    )
+    assert [target.action for target in dropped.drop_targets] == [
+        "dropped",
+        "dropped",
+        "not_found",
+    ]
+    assert dropped.targets_dropped == 2
+    assert await async_db.get_node_schema("AsyncBulkCompany") is None
+    assert await async_db.get_node_schema("AsyncBulkPerson") is None
+
+    drop_all = await async_db.drop_graph_schema()
+    assert drop_all.edge_schemas_dropped == 1
+    assert await async_db.list_edge_schemas() == []
+
+
 class TestAsyncBatch:
     @pytest.mark.asyncio
     async def test_batch_upsert_nodes(self, async_db):

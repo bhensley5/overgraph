@@ -137,6 +137,8 @@ def test_execute_gql_params_and_bytes_round_trip(db):
     assert result["kind"] == "query"
     assert result["next_cursor"] is None
     assert result["mutation_stats"] is None
+    assert result["schema_stats"] is None
+    assert result["index_stats"] is None
     assert result["plan"] is None
     assert result["columns"] == ["nil", "flag", "neg", "pos", "float", "text", "blob", "list", "map"]
     row = result["rows"][0]
@@ -149,6 +151,259 @@ def test_execute_gql_params_and_bytes_round_trip(db):
     assert row["blob"] == b"\x01\x02\x03"
     assert row["list"] == [False, 4, "x"]
     assert row["map"]["bytes"] == b"b"
+
+
+def test_gql_schema_execute_explain_and_tagged_rows(tmp_dir):
+    path = os.path.join(tmp_dir, "gql_schema_db")
+    db = OverGraph.open(path)
+    try:
+        alter = db.execute_gql(
+            """
+            ALTER CURRENT GRAPH TYPE SET {
+              NODE Tagged = {
+                properties: {
+                  payload: {
+                    enum_values: [
+                      { type: 'uint', value: '18446744073709551615' },
+                      { type: 'bytes', value: [0, 1, 255] }
+                    ]
+                  }
+                }
+              }
+            }
+            """,
+            include_plan=True,
+        )
+        assert alter["kind"] == "schema"
+        assert alter["mutation_stats"] is None
+        assert alter["index_stats"] is None
+        assert alter["schema_stats"]["operation"] == "alter_graph_type_set"
+        assert alter["schema_stats"]["targets_published"] == 1
+        assert alter["plan"]["kind"] == "schema"
+        assert alter["plan"]["read"] is None
+        assert alter["plan"]["mutation"] is None
+        assert alter["plan"]["index"] is None
+        assert alter["plan"]["schema"]["operation"] == "alter_graph_type_set"
+        assert alter["plan"]["schema"]["uses_core_write_queue"] is True
+
+        show = db.execute_gql("SHOW CURRENT GRAPH TYPE")
+        assert show["kind"] == "schema"
+        assert show["schema_stats"]["operation"] == "show_current_graph_type"
+        assert show["rows"][0]["target_kind"] == "node"
+        enum_values = show["rows"][0]["schema"]["properties"]["payload"]["enum_values"]
+        assert enum_values[0] == {
+            "type": "uint",
+            "value": "18446744073709551615",
+        }
+        assert enum_values[1] == {"type": "bytes", "value": [0, 1, 255]}
+
+        db.upsert_node("PyNeedsName", "missing")
+        check = db.execute_gql(
+            """
+            CHECK CURRENT GRAPH TYPE ADD {
+              NODE PyNeedsName = {
+                properties: {
+                  name: { required: true, nullable: false, types: ['string'] }
+                }
+              }
+            }
+            """
+        )
+        assert check["kind"] == "schema"
+        assert check["schema_stats"]["operation"] == "check_graph_type_add"
+        assert check["schema_stats"]["violation_count"] == 1
+        assert check["rows"][0]["violations"][0]["target"]["id"] == {
+            "type": "uint",
+            "value": "1",
+        }
+        assert db.get_node_schema("PyNeedsName") is None
+
+        explain = db.explain_gql(
+            """
+            CHECK CURRENT GRAPH TYPE SET {
+              NODE Tagged = { properties: {} }
+            }
+            """
+        )
+        assert explain["kind"] == "schema"
+        assert explain["read"] is None
+        assert explain["mutation"] is None
+        assert explain["index"] is None
+        assert explain["schema"]["operation"] == "check_graph_type_set"
+        assert explain["schema"]["side_effect_free"] is True
+
+        read = db.execute_gql("MATCH (n:PyNeedsName) RETURN n.key AS key")
+        assert read["kind"] == "query"
+        assert read["schema_stats"] is None
+        assert read["index_stats"] is None
+
+        mutation = db.execute_gql(
+            "CREATE (n:PyUnconstrained {key: 'one'}) RETURN n.key AS key"
+        )
+        assert mutation["kind"] == "mutation"
+        assert mutation["schema_stats"] is None
+        assert mutation["index_stats"] is None
+    finally:
+        db.close()
+
+
+def test_gql_property_index_connector_payloads(tmp_dir):
+    path = os.path.join(tmp_dir, "gql_index_db")
+    db = OverGraph.open(path)
+    try:
+        person_index = "CREATE PROPERTY INDEX FOR (n:PyIndexPerson) ON (n.status) KIND EQUALITY"
+        edge_index = (
+            "CREATE PROPERTY INDEX FOR ()-[r:PY_INDEX_WORKS_AT]-() ON (r.since) KIND RANGE"
+        )
+        drop_edge = (
+            "DROP PROPERTY INDEX FOR ()-[r:PY_INDEX_WORKS_AT]-() ON (r.since) KIND RANGE"
+        )
+
+        create = db.execute_gql(person_index)
+        assert create["kind"] == "index"
+        assert create["columns"] == [
+            "operation",
+            "target_kind",
+            "label",
+            "prop_key",
+            "kind",
+            "action",
+            "state",
+            "index_id",
+            "last_error",
+        ]
+        assert create["mutation_stats"] is None
+        assert create["schema_stats"] is None
+        assert create["index_stats"]["operation"] == "create_property_index"
+        assert create["index_stats"]["indexes_ensured"] == 1
+        assert create["index_stats"]["indexes_dropped"] == 0
+        assert create["index_stats"]["indexes_returned"] == 0
+        assert create["index_stats"]["elapsed_us"] is None
+        assert create["index_stats"]["warnings"] == []
+        assert create["rows"][0]["operation"] == "create_property_index"
+        assert create["rows"][0]["target_kind"] == "node"
+        assert create["rows"][0]["label"] == "PyIndexPerson"
+        assert create["rows"][0]["prop_key"] == "status"
+        assert create["rows"][0]["kind"] == "equality"
+        assert create["rows"][0]["action"] == "ensured"
+        assert create["rows"][0]["state"] in {"building", "ready", "failed"}
+        assert isinstance(create["rows"][0]["index_id"], int)
+        assert create["rows"][0]["last_error"] is None
+
+        planned = db.execute_gql(person_index, include_plan=True, profile=True)
+        assert isinstance(planned["index_stats"]["elapsed_us"], int)
+        assert planned["plan"]["kind"] == "index"
+        assert planned["plan"]["read"] is None
+        assert planned["plan"]["mutation"] is None
+        assert planned["plan"]["schema"] is None
+        assert planned["plan"]["index"]["operation"] == "create_property_index"
+        assert planned["plan"]["index"]["targets"] == [
+            {
+                "target_kind": "node",
+                "label": "PyIndexPerson",
+                "prop_key": "status",
+                "kind": "equality",
+                "action": "ensure",
+            }
+        ]
+        assert planned["plan"]["index"]["uses_core_write_queue"] is True
+        assert planned["plan"]["index"]["publishes_manifest"] is True
+        assert planned["plan"]["index"]["creates_labels"] is True
+        assert planned["plan"]["index"]["schedules_background_build"] is True
+        assert planned["plan"]["index"]["drops_index_data_async"] is False
+        assert planned["plan"]["index"]["side_effect_free"] is False
+
+        create_explain = db.explain_gql(person_index)
+        assert create_explain["kind"] == "index"
+        assert create_explain["read"] is None
+        assert create_explain["mutation"] is None
+        assert create_explain["schema"] is None
+        assert create_explain["index"]["operation"] == "create_property_index"
+        assert create_explain["index"]["targets"][0] == planned["plan"]["index"]["targets"][0]
+
+        edge_create = db.execute_gql(edge_index)
+        assert edge_create["kind"] == "index"
+        assert edge_create["index_stats"]["operation"] == "create_property_index"
+        assert edge_create["index_stats"]["indexes_ensured"] == 1
+        assert edge_create["mutation_stats"] is None
+        assert edge_create["schema_stats"] is None
+
+        show = db.execute_gql("SHOW PROPERTY INDEXES")
+        assert show["kind"] == "index"
+        assert show["index_stats"]["operation"] == "show_property_indexes"
+        assert show["index_stats"]["indexes_returned"] == 2
+        assert [
+            (row["target_kind"], row["label"], row["prop_key"], row["kind"])
+            for row in show["rows"]
+        ] == [
+            ("node", "PyIndexPerson", "status", "equality"),
+            ("edge", "PY_INDEX_WORKS_AT", "since", "range"),
+        ]
+        assert all(row["state"] in {"building", "ready", "failed"} for row in show["rows"])
+        assert all(row["last_error"] is None for row in show["rows"])
+
+        show_explain = db.explain_gql("SHOW PROPERTY INDEXES")
+        assert show_explain["index"]["operation"] == "show_property_indexes"
+        assert show_explain["index"]["targets"] == [
+            {
+                "target_kind": "property_index_catalog",
+                "label": None,
+                "prop_key": None,
+                "kind": None,
+                "action": "show",
+            }
+        ]
+        assert show_explain["index"]["uses_core_write_queue"] is False
+        assert show_explain["index"]["publishes_manifest"] is False
+        assert show_explain["index"]["creates_labels"] is False
+        assert show_explain["index"]["schedules_background_build"] is False
+        assert show_explain["index"]["drops_index_data_async"] is False
+        assert show_explain["index"]["side_effect_free"] is True
+
+        drop_explain = db.explain_gql(drop_edge)
+        assert drop_explain["index"]["operation"] == "drop_property_index"
+        assert drop_explain["index"]["targets"] == [
+            {
+                "target_kind": "edge",
+                "label": "PY_INDEX_WORKS_AT",
+                "prop_key": "since",
+                "kind": "range",
+                "action": "drop",
+            }
+        ]
+        assert drop_explain["index"]["uses_core_write_queue"] is True
+        assert drop_explain["index"]["publishes_manifest"] is True
+        assert drop_explain["index"]["creates_labels"] is False
+        assert drop_explain["index"]["schedules_background_build"] is False
+        assert drop_explain["index"]["drops_index_data_async"] is True
+        assert drop_explain["index"]["side_effect_free"] is False
+
+        with pytest.raises(Exception, match="GQL index management is not allowed in ReadOnly mode"):
+            db.execute_gql(person_index, mode="read_only")
+        with pytest.raises(Exception, match="GQL index management is not allowed in ReadOnly mode"):
+            db.execute_gql(drop_edge, mode="read_only")
+        read_only_show = db.execute_gql("SHOW PROPERTY INDEXES", mode="read_only")
+        assert len(read_only_show["rows"]) == 2
+        with pytest.raises(Exception, match="GQL index statements do not accept cursors"):
+            db.execute_gql("SHOW PROPERTY INDEXES", cursor="locked")
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_async_gql_property_index_payloads(tmp_dir):
+    async with await AsyncOverGraph.open(os.path.join(tmp_dir, "gql_index_async_db")) as db:
+        await db.execute_gql(
+            "CREATE PROPERTY INDEX FOR (n:PyAsyncIndexPerson) ON (n.status) KIND EQUALITY"
+        )
+        show = await db.execute_gql("SHOW PROPERTY INDEXES")
+        assert show["kind"] == "index"
+        assert show["index_stats"]["operation"] == "show_property_indexes"
+        assert show["index_stats"]["indexes_returned"] == 1
+        explain = await db.explain_gql("SHOW PROPERTY INDEXES")
+        assert explain["kind"] == "index"
+        assert explain["index"]["operation"] == "show_property_indexes"
+        assert explain["index"]["targets"][0]["target_kind"] == "property_index_catalog"
 
 
 @pytest.mark.asyncio
@@ -250,6 +505,7 @@ def test_gql_caps_full_scan_row_ops_and_profile(db):
     assert capped_explain["caps"]["max_subquery_invocations"] == 14
     assert capped_explain["caps"]["max_subquery_depth"] == 1
     assert capped_explain["caps"]["max_shortest_path_pairs"] == 15
+    assert capped_explain["index"] is None
 
     unused_oversized = db.execute_gql(
         "MATCH (n:Person) RETURN id(n) LIMIT 1",
@@ -645,6 +901,28 @@ def test_gql_sync_create_return_mutation_stats_bytes_and_plan(db):
     assert result["plan"]["mutation"]["return_plan"]["columns"] == result["columns"]
 
 
+def test_gql_schema_mutation_failures_are_rejected(db):
+    db.set_node_schema(
+        "PyGqlSchemaPerson",
+        {
+            "properties": {
+                "name": {"required": True, "nullable": False, "types": ["string"]}
+            }
+        },
+    )
+
+    with pytest.raises(Exception, match="schema violation"):
+        db.execute_gql("CREATE (n:PyGqlSchemaPerson {key: 'bad'}) RETURN n")
+    assert db.get_node_by_key("PyGqlSchemaPerson", "bad") is None
+
+    db.upsert_node("PyGqlSchemaPerson", "good", props={"name": "Ada"})
+    with pytest.raises(Exception, match="schema violation"):
+        db.execute_gql(
+            "MATCH (n:PyGqlSchemaPerson) WHERE n.key = 'good' REMOVE n.name"
+        )
+    assert db.get_node_by_key("PyGqlSchemaPerson", "good").props["name"] == "Ada"
+
+
 def test_gql_sync_set_remove_return_row_ops(db):
     db.upsert_node("PySetRemoveReturn", "a", props={"rank": 1, "group": "old", "status": "old"})
     db.upsert_node("PySetRemoveReturn", "b", props={"rank": 2, "group": "old", "status": "old"})
@@ -953,6 +1231,15 @@ def test_gql_stub_and_signature_smoke():
     assert "class GqlExecutionResult" in text
     assert "class GqlExecutionExplain" in text
     assert "class GqlMutationStats" in text
+    assert "class GqlSchemaStats" in text
+    assert "class GqlIndexStats" in text
+    assert "class GqlSchemaExplain" in text
+    assert "class GqlIndexExplain" in text
+    assert "schema_stats: GqlSchemaStats | None" in text
+    assert "index_stats: GqlIndexStats | None" in text
+    assert "schema: GqlSchemaExplain | None" in text
+    assert "index: GqlIndexExplain | None" in text
+    assert "Literal[\"query\", \"mutation\", \"schema\", \"index\"]" in text
     assert "async def execute_gql" in text
     assert "def query_graph_pipeline" in text
     assert "def explain_graph_pipeline" in text
@@ -962,4 +1249,3 @@ def test_gql_stub_and_signature_smoke():
     assert "gql_query" not in text
     assert "explain_gql_query" not in text
     assert "class GqlResult" not in text
-    assert "truncated" not in text

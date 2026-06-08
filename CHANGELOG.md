@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-06-08
+
+### Added
+
+#### Optional Graph Schemas
+- **Manifest-backed optional schemas.** Added open-by-default node and edge schemas that validate required properties, value types, numeric and collection bounds, enum values, closed-property rules, edge metadata, self-loop policy, and endpoint label rules while preserving schemaless behavior for databases without schemas.
+- **Shared schema enforcement.** Schema validation now runs in the Rust core before WAL append, so native writes, transactions, batch ingestion, graph patches, GQL mutations, Node.js, and Python receive the same atomic validation behavior.
+- **Schema management APIs.** Added Rust, Node.js, and Python APIs for setting, dropping, listing, and checking node and edge schemas, plus graph-level bulk schema publication with bounded violation reports and persistence across reopen.
+
+#### GQL Schema And Index DDL
+- **GQL current-graph-type DDL.** Added `ALTER CURRENT GRAPH TYPE`, `CHECK CURRENT GRAPH TYPE`, `DROP CURRENT GRAPH TYPE`, `SHOW CURRENT GRAPH TYPE`, `SHOW NODE SCHEMAS`, and `SHOW EDGE SCHEMAS` over the same schema management substrate as the native APIs.
+- **GQL property-index DDL.** Added target-based `CREATE PROPERTY INDEX`, `DROP PROPERTY INDEX`, and `SHOW PROPERTY INDEXES` for existing node and edge single-property equality and range indexes.
+- **Connector DDL parity.** Node.js and Python now convert schema stats, index stats, schema explain payloads, index explain payloads, schema rows, index rows, and async GQL DDL results with connector-native field naming.
+
+### Changed
+
+#### Validation And Catalogs
+- **Schema publication is atomic.** Bulk schema add, replace, check, and drop operations now publish through one graph-schema management path with stable per-target result details and no partial catalog updates on validation failures.
+- **Label membership scanning is shared.** Schema endpoint validation and query endpoint scans now reuse shared source-list scanning machinery, reducing duplicate cursor logic while preserving visibility and deterministic behavior.
+- **Public docs now cover schemas and DDL.** README, getting-started, API reference, GQL subset docs, and architecture docs now include optional schemas, GQL schema DDL, and GQL property-index DDL.
+
+### Fixed
+
+- **Schema correctness hardening.** Fixed same-plan endpoint-rule rewrites, ID rollback after schema violations, manifest schema validation, canonical schema literal conversion, queued-write release after schema publication outcomes, and dry-run behavior under intervening writes.
+- **Connector schema fidelity.** Fixed Node.js and Python schema literal round trips for tagged unsigned integers, bytes, map markers, enum values, numeric bounds, returned-schema reuse, async dry-run coverage, and stub/type declaration parity.
+- **Index DDL guardrails.** Fixed unsupported GQL property-index syntax handling, side-effect-free `EXPLAIN`, unknown-label `DROP` behavior, cursor rejection, read-only execution behavior, manifest shape preservation, and planner fallback after dropped declarations.
+
 ## [0.11.0] - 2026-06-02
 
 ### Added
@@ -402,6 +429,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.12.0]: https://github.com/bhensley5/overgraph/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/bhensley5/overgraph/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/bhensley5/overgraph/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/bhensley5/overgraph/compare/v0.8.0...v0.9.0

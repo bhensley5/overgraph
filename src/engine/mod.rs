@@ -24,8 +24,19 @@ use crate::row_projection::{
     ProjectionNeedClass, PropertySelection, RowProjectionPlan, VectorSelection, DIRECT_EDGE_ALIAS,
     DIRECT_NODE_ALIAS,
 };
+use crate::schema::{
+    edge_schema_info_from_manifest, edge_schema_manifest_entry_from_public,
+    node_schema_info_from_manifest, node_schema_manifest_entry_from_public,
+    normalize_schema_manifest, validate_node_schema_dense_vector_config, EdgeSchema,
+    EdgeSchemaInfo, GraphSchema, GraphSchemaCheckOptions, GraphSchemaCheckReport,
+    GraphSchemaDropAction, GraphSchemaDropTargetResult, GraphSchemaOperation,
+    GraphSchemaOperationKind, GraphSchemaPublishResult, GraphSchemaSetOptions,
+    GraphSchemaValidationReportEntry, NodeSchema, NodeSchemaInfo, RuntimeSchemaCatalog,
+    SchemaCheckOptions, SchemaSetOptions, SchemaTargetKind, SchemaValidationFailure,
+    SchemaValidationReport, SchemaViolation, SchemaViolationTarget,
+};
 use crate::segment_components::{ComponentAvailability, SegmentComponentKind};
-use crate::segment_reader::{SegmentAdjPostingCursor, SegmentLabelPosting, SegmentReader};
+use crate::segment_reader::{SegmentLabelPosting, SegmentReader};
 use crate::segment_writer::{
     cleanup_orphan_optional_component_files, create_compaction_core_writer,
     finalize_compaction_segment, finish_compaction_core_writer,
@@ -2791,6 +2802,13 @@ struct ReadManifestState {
     dense_vector: Option<DenseVectorConfig>,
 }
 
+#[derive(Clone)]
+struct PublishedSchemaCatalogSnapshot {
+    next_schema_id: u64,
+    node_schemas: Vec<NodeSchemaManifestEntry>,
+    edge_schemas: Vec<EdgeSchemaManifestEntry>,
+}
+
 pub(crate) struct PublishedReadSources {
     manifest: ReadManifestState,
     memtable: Arc<Memtable>,
@@ -2873,6 +2891,7 @@ pub(crate) type ReadViewImmutableEpoch = ImmutableEpoch;
 struct PublishedReadState {
     view: Arc<ReadView>,
     label_catalog: Arc<ReadLabelCatalogSnapshot>,
+    schema_catalog: Arc<PublishedSchemaCatalogSnapshot>,
     edge_uniqueness: bool,
     #[cfg(test)]
     engine_seq: u64,
@@ -3190,6 +3209,31 @@ enum CoreWriteRequest {
     RemovePrunePolicy {
         name: String,
     },
+    SetNodeSchema {
+        label: String,
+        schema: NodeSchema,
+        options: SchemaSetOptions,
+    },
+    DropNodeSchema {
+        label: String,
+    },
+    SetEdgeSchema {
+        label: String,
+        schema: EdgeSchema,
+        options: SchemaSetOptions,
+    },
+    DropEdgeSchema {
+        label: String,
+    },
+    SetGraphSchema {
+        schema: GraphSchema,
+        options: GraphSchemaSetOptions,
+    },
+    AlterGraphSchema {
+        operations: Vec<GraphSchemaOperation>,
+        options: GraphSchemaSetOptions,
+    },
+    DropGraphSchema,
     EnsureNodePropertyIndex {
         label: String,
         prop_key: String,
@@ -3231,6 +3275,9 @@ enum CoreWriteReply {
     TxnCommitResultWithReadView(TxnCommitResult, Arc<ReadView>),
     PruneResult(PruneResult),
     Bool(bool),
+    NodeSchemaInfo(NodeSchemaInfo),
+    EdgeSchemaInfo(EdgeSchemaInfo),
+    GraphSchemaPublishResult(GraphSchemaPublishResult),
     NodePropertyIndexInfo(NodePropertyIndexInfo),
     EdgePropertyIndexInfo(EdgePropertyIndexInfo),
     OptionSegmentInfo(Option<SegmentInfo>),
@@ -3243,6 +3290,19 @@ struct CoreWritePlan {
     auto_flush: bool,
     track_ids: bool,
     label_catalog_changed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct IdCounterSnapshot {
+    next_node_id: u64,
+    next_edge_id: u64,
+    next_node_id_seen: u64,
+    next_edge_id_seen: u64,
+}
+
+struct PlannedCoreWrite {
+    plan: CoreWritePlan,
+    id_counter_snapshot: IdCounterSnapshot,
 }
 
 struct QueuedCoreWrite {
@@ -3949,6 +4009,53 @@ impl DbRuntime {
             }
             CoreWriteRequest::RemovePrunePolicy { name } => match core.remove_prune_policy(name) {
                 Ok((removed, impact)) => (Ok(CoreWriteReply::Bool(removed)), impact),
+                Err(err) => (Err(err), PublishImpact::NoPublish),
+            },
+            CoreWriteRequest::SetNodeSchema {
+                label,
+                schema,
+                options,
+            } => match core.set_node_schema(label, schema.clone(), options.clone()) {
+                Ok((info, impact)) => (Ok(CoreWriteReply::NodeSchemaInfo(info)), impact),
+                Err(err) => (Err(err), PublishImpact::NoPublish),
+            },
+            CoreWriteRequest::DropNodeSchema { label } => match core.drop_node_schema(label) {
+                Ok((removed, impact)) => (Ok(CoreWriteReply::Bool(removed)), impact),
+                Err(err) => (Err(err), PublishImpact::NoPublish),
+            },
+            CoreWriteRequest::SetEdgeSchema {
+                label,
+                schema,
+                options,
+            } => match core.set_edge_schema(label, schema.clone(), options.clone()) {
+                Ok((info, impact)) => (Ok(CoreWriteReply::EdgeSchemaInfo(info)), impact),
+                Err(err) => (Err(err), PublishImpact::NoPublish),
+            },
+            CoreWriteRequest::DropEdgeSchema { label } => match core.drop_edge_schema(label) {
+                Ok((removed, impact)) => (Ok(CoreWriteReply::Bool(removed)), impact),
+                Err(err) => (Err(err), PublishImpact::NoPublish),
+            },
+            CoreWriteRequest::SetGraphSchema { schema, options } => {
+                match core.set_graph_schema(schema.clone(), options.clone()) {
+                    Ok((result, impact)) => {
+                        (Ok(CoreWriteReply::GraphSchemaPublishResult(result)), impact)
+                    }
+                    Err(err) => (Err(err), PublishImpact::NoPublish),
+                }
+            }
+            CoreWriteRequest::AlterGraphSchema {
+                operations,
+                options,
+            } => match core.alter_graph_schema(operations.clone(), options.clone()) {
+                Ok((result, impact)) => {
+                    (Ok(CoreWriteReply::GraphSchemaPublishResult(result)), impact)
+                }
+                Err(err) => (Err(err), PublishImpact::NoPublish),
+            },
+            CoreWriteRequest::DropGraphSchema => match core.drop_graph_schema() {
+                Ok((result, impact)) => {
+                    (Ok(CoreWriteReply::GraphSchemaPublishResult(result)), impact)
+                }
                 Err(err) => (Err(err), PublishImpact::NoPublish),
             },
             CoreWriteRequest::EnsureNodePropertyIndex {
@@ -6115,6 +6222,24 @@ impl DatabaseEngine {
         self.with_core_ref(|core| Ok(core.next_edge_id))
     }
 
+    #[cfg(test)]
+    pub(crate) fn schema_validation_overlay_build_count(&self) -> Result<usize, EngineError> {
+        self.with_core_ref(|core| {
+            Ok(core
+                .schema_validation_overlay_builds
+                .load(Ordering::Acquire))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn schema_validation_incident_scan_chunk_count(&self) -> Result<usize, EngineError> {
+        self.with_core_ref(|core| {
+            Ok(core
+                .schema_validation_incident_scan_chunks
+                .load(Ordering::Acquire))
+        })
+    }
+
     pub fn segment_count(&self) -> Result<usize, EngineError> {
         self.with_core_ref(|core| Ok(core.segments.len()))
     }
@@ -6585,6 +6710,23 @@ impl DatabaseEngine {
             .expect("set secondary index build pause")
     }
 
+    pub(crate) fn set_schema_validation_pause(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.with_core_ref(|core| Ok(core.set_schema_validation_pause()))
+            .expect("set schema validation pause")
+    }
+
+    pub(crate) fn force_next_runtime_manifest_write_error(&self) {
+        let _ = self.with_core_mut(|core| {
+            core.force_next_runtime_manifest_write_error();
+            Ok(())
+        });
+    }
+
     pub(crate) fn set_runtime_publish_pause(
         &self,
     ) -> (
@@ -6824,11 +6966,19 @@ struct EngineCore {
     next_node_id_seen: Arc<AtomicU64>,
     /// Monotonic shared view of the next edge ID.
     next_edge_id_seen: Arc<AtomicU64>,
+    #[cfg(test)]
+    schema_validation_overlay_builds: Arc<AtomicUsize>,
+    #[cfg(test)]
+    schema_validation_incident_scan_chunks: Arc<AtomicUsize>,
     /// Monotonic shared view of the latest durable engine_seq.
     engine_seq_seen: Arc<AtomicU64>,
     /// Shared runtime node-label/edge-label catalog. Manifest writers merge this
     /// before checkpointing so token WAL generations are not retired early.
     label_catalog: Arc<RwLock<RuntimeLabelCatalog>>,
+    /// Compiled schema catalog keyed by numeric label IDs. Schema management stores it but
+    /// does not consume it from write admission yet.
+    #[allow(dead_code)]
+    runtime_schema_catalog: RuntimeSchemaCatalog,
     /// Serialize all manifest writes across engine, flush publisher, and compaction.
     manifest_write_lock: Arc<Mutex<()>>,
     /// Frozen memtable epochs awaiting or undergoing flush, newest-first.
@@ -6878,9 +7028,13 @@ struct EngineCore {
     bg_compact_pause: Arc<Mutex<Option<BgCompactPauseHook>>>,
     #[cfg(test)]
     secondary_index_build_pause: Arc<Mutex<Option<SecondaryIndexBuildPauseHook>>>,
+    #[cfg(test)]
+    schema_validation_pause: Mutex<Option<RuntimeReadPauseHook>>,
     /// One-shot failure injection flag (test only).
     #[cfg(test)]
     flush_force_error: bool,
+    #[cfg(test)]
+    runtime_manifest_write_force_error: bool,
 }
 
 /// Captured pre-mutation edge state for degree cache updates.
@@ -7211,8 +7365,10 @@ impl EngineCore {
             Some(m) => m,
             None => default_manifest(),
         };
-        let manifest_dirty = reconcile_dense_vector_manifest(&mut manifest, options)?
-            || normalize_secondary_index_manifest(&mut manifest)?;
+        let mut manifest_dirty = false;
+        manifest_dirty |= reconcile_dense_vector_manifest(&mut manifest, options)?;
+        manifest_dirty |= normalize_schema_manifest(&mut manifest)?;
+        manifest_dirty |= normalize_secondary_index_manifest(&mut manifest)?;
         if created_manifest || manifest_dirty {
             write_manifest(path, &manifest)?;
         };
@@ -7351,6 +7507,7 @@ impl EngineCore {
             active_wal_durable_len,
         )?;
         runtime_label_catalog.apply_to_manifest(&mut manifest);
+        let runtime_schema_catalog = RuntimeSchemaCatalog::from_manifest(&manifest)?;
 
         // Compute next IDs from active memtable + immutable epochs + manifest.
         let mut max_node_id = manifest
@@ -7468,8 +7625,13 @@ impl EngineCore {
             engine_seq,
             next_node_id_seen,
             next_edge_id_seen,
+            #[cfg(test)]
+            schema_validation_overlay_builds: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            schema_validation_incident_scan_chunks: Arc::new(AtomicUsize::new(0)),
             engine_seq_seen,
             label_catalog,
+            runtime_schema_catalog,
             manifest_write_lock,
             immutable_epochs: immutable_epochs_on_open,
             immutable_bytes_total: immutable_bytes_on_open,
@@ -7495,7 +7657,11 @@ impl EngineCore {
             #[cfg(test)]
             secondary_index_build_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
+            schema_validation_pause: Mutex::new(None),
+            #[cfg(test)]
             flush_force_error: false,
+            #[cfg(test)]
+            runtime_manifest_write_force_error: false,
         };
 
         engine.recover_secondary_index_states_on_open()?;
@@ -7715,6 +7881,11 @@ impl EngineCore {
                 Arc::clone(&label_catalog),
             )),
             label_catalog,
+            schema_catalog: Arc::new(PublishedSchemaCatalogSnapshot {
+                next_schema_id: self.manifest.next_schema_id,
+                node_schemas: self.manifest.node_schemas.clone(),
+                edge_schemas: self.manifest.edge_schemas.clone(),
+            }),
             edge_uniqueness: self.edge_uniqueness,
             #[cfg(test)]
             engine_seq: self.engine_seq,
@@ -8051,6 +8222,13 @@ impl EngineCore {
         let mut manifest = self.load_current_manifest_for_write()?;
         let result = mutate(&mut manifest)?;
         self.merge_checkpointed_runtime_manifest_state(&mut manifest);
+        #[cfg(test)]
+        if self.runtime_manifest_write_force_error {
+            self.runtime_manifest_write_force_error = false;
+            return Err(EngineError::ManifestError(
+                "test forced runtime manifest write failure".to_string(),
+            ));
+        }
         write_manifest(&self.db_dir, &manifest)?;
         self.manifest = manifest;
         Ok(result)
@@ -10315,6 +10493,35 @@ impl EngineCore {
         (ready_rx, release_tx)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_schema_validation_pause(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *self.schema_validation_pause.lock().unwrap() = Some(RuntimeReadPauseHook {
+            ready_tx,
+            release_rx,
+        });
+        (ready_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    fn pause_schema_validation_for_test(&self) {
+        if let Some(hook) = self.schema_validation_pause.lock().unwrap().take() {
+            let _ = hook.ready_tx.send(());
+            let _ = hook.release_rx.recv();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_next_runtime_manifest_write_error(&mut self) {
+        self.runtime_manifest_write_force_error = true;
+    }
+
     /// Enqueue one flush (expose for tests).
     pub(crate) fn enqueue_one_flush(&mut self) -> Result<(), EngineError> {
         self.ensure_bg_flush_worker();
@@ -11522,6 +11729,7 @@ include!("graph_ops.rs");
 include!("txn.rs");
 include!("write.rs");
 include!("read.rs");
+include!("schema_management.rs");
 include!("query_ir.rs");
 include!("query_plan.rs");
 include!("projection.rs");
@@ -11748,6 +11956,151 @@ mod tests {
             valid_to: i64::MAX,
             last_write_seq: 0,
         }
+    }
+
+    fn schema_manifest_for_open_tests() -> ManifestState {
+        let mut manifest = default_manifest();
+        manifest.node_label_tokens.insert("Person".to_string(), 1);
+        manifest.node_label_tokens.insert("Team".to_string(), 2);
+        manifest.next_node_label_id = 3;
+        manifest.edge_label_tokens.insert("KNOWS".to_string(), 1);
+        manifest.next_edge_label_id = 2;
+        manifest
+    }
+
+    fn open_test_node_schema(schema_id: u64, label_id: u32) -> NodeSchemaManifestEntry {
+        NodeSchemaManifestEntry {
+            schema_id,
+            revision: 1,
+            label_id,
+            created_at_ms: 100,
+            updated_at_ms: 100,
+            additional_properties: SchemaAdditionalPropertiesManifest::Allow,
+            properties: BTreeMap::new(),
+            key: None,
+            label_constraints: None,
+            weight: None,
+            dense_vector: None,
+            sparse_vector: None,
+        }
+    }
+
+    fn open_test_edge_schema(schema_id: u64, label_id: u32) -> EdgeSchemaManifestEntry {
+        EdgeSchemaManifestEntry {
+            schema_id,
+            revision: 1,
+            label_id,
+            created_at_ms: 100,
+            updated_at_ms: 100,
+            additional_properties: SchemaAdditionalPropertiesManifest::Allow,
+            properties: BTreeMap::new(),
+            from: None,
+            to: None,
+            allow_self_loops: true,
+            weight: None,
+            validity: None,
+        }
+    }
+
+    #[test]
+    fn open_old_manifest_missing_schema_fields_writes_normalized_fields() {
+        let dir = TempDir::new().unwrap();
+        let legacy_json = r#"{
+  "version": 1,
+  "label_token_schema_version": 1,
+  "node_label_tokens": {},
+  "edge_label_tokens": {},
+  "next_node_label_id": 1,
+  "next_edge_label_id": 1,
+  "segments": [],
+  "next_node_id": 1,
+  "next_edge_id": 1,
+  "prune_policies": {},
+  "next_engine_seq": 0,
+  "next_wal_generation_id": 0,
+  "active_wal_generation_id": 0,
+  "pending_flush_epochs": [],
+  "secondary_indexes": [],
+  "next_secondary_index_id": 1
+}"#;
+        std::fs::write(dir.path().join("manifest.current"), legacy_json).unwrap();
+
+        let engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+        engine
+            .with_core_ref(|core| {
+                assert!(core.runtime_schema_catalog.is_empty());
+                Ok(())
+            })
+            .unwrap();
+        engine.close().unwrap();
+
+        let raw_manifest = std::fs::read_to_string(dir.path().join("manifest.current")).unwrap();
+        assert!(raw_manifest.contains("\"schema_catalog_version\": 1"));
+        assert!(raw_manifest.contains("\"next_schema_id\": 1"));
+        assert!(raw_manifest.contains("\"node_schemas\": []"));
+        assert!(raw_manifest.contains("\"edge_schemas\": []"));
+    }
+
+    #[test]
+    fn open_valid_schema_manifest_compiles_runtime_catalog() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let mut manifest = schema_manifest_for_open_tests();
+        let mut node_schema = open_test_node_schema(1, 1);
+        node_schema.label_constraints = Some(NodeLabelConstraintManifestRule {
+            all_of: vec![2],
+            any_of: Vec::new(),
+            none_of: Vec::new(),
+        });
+        let mut edge_schema = open_test_edge_schema(2, 1);
+        edge_schema.from = Some(EndpointLabelManifestRule {
+            all_of: vec![1],
+            any_of: Vec::new(),
+            none_of: Vec::new(),
+        });
+        manifest.node_schemas.push(node_schema);
+        manifest.edge_schemas.push(edge_schema);
+        manifest.next_schema_id = 3;
+        write_manifest(dir.path(), &manifest).unwrap();
+
+        let engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+        engine
+            .with_core_ref(|core| {
+                let catalog = &core.runtime_schema_catalog;
+                assert!(!catalog.is_empty());
+                assert!(catalog.has_node_schemas);
+                assert!(catalog.has_edge_schemas);
+                assert!(catalog.has_node_label_constraints);
+                assert!(catalog.has_edge_endpoint_constraints);
+                assert!(catalog.node_has_applicable_schema(
+                    &NodeLabelSet::from_canonical_ids(&[1, 2]).unwrap()
+                ));
+                assert!(catalog.edge_has_applicable_schema(1));
+                assert!(catalog.endpoint_relevant_node_label_ids.contains(&1));
+                Ok(())
+            })
+            .unwrap();
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn open_invalid_schema_manifest_fails_with_manifest_error() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let mut manifest = schema_manifest_for_open_tests();
+        manifest.node_schemas.push(open_test_node_schema(1, 1));
+        manifest.node_schemas.push(open_test_node_schema(2, 1));
+        manifest.next_schema_id = 3;
+        write_manifest(dir.path(), &manifest).unwrap();
+
+        let error = match DatabaseEngine::open(dir.path(), &DbOptions::default()) {
+            Ok(_) => panic!("invalid schema manifest unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, EngineError::ManifestError(_)));
+        assert!(error
+            .to_string()
+            .contains("duplicate node schema target label_id 1"));
     }
 
     fn is_atomic_batch_marker(op: &WalOp) -> bool {
@@ -11980,6 +12333,7 @@ mod tests {
     include!("tests/lifecycle.rs");
     include!("tests/txn.rs");
     include!("tests/write.rs");
+    include!("tests/schema_management.rs");
     include!("tests/read.rs");
     include!("tests/graph_ops.rs");
     include!("tests/graph_rows.rs");

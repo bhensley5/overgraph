@@ -1096,6 +1096,42 @@ fn test_nodes_by_labels_paged_basic() {
 }
 
 #[test]
+fn test_nodes_by_labels_paged_active_memtable_uses_bounded_label_cursor() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let total = 64usize;
+    for idx in 0..total {
+        engine
+            .upsert_node("Person", &format!("n{idx}"), UpsertNodeOptions::default())
+            .unwrap();
+    }
+
+    engine.reset_query_execution_counters_for_test();
+    let page = engine
+        .nodes_by_labels_paged("Person",
+            &PageRequest {
+                limit: Some(2),
+                after: None,
+            },
+        )
+        .unwrap();
+    let counters = engine.query_execution_counter_snapshot_for_test();
+
+    assert_eq!(page.items.len(), 2);
+    assert!(page.next_cursor.is_some());
+    assert!(
+        counters.node_visibility_meta_reads > 0,
+        "active-only label page should verify candidates from the cursor path"
+    );
+    assert!(
+        counters.node_visibility_meta_reads < total,
+        "active-only label page should not materialize and verify the full label"
+    );
+}
+
+#[test]
 fn test_nodes_by_labels_paged_multi_label_all() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");

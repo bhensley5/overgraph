@@ -1,11 +1,14 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use overgraph::{
     AllShortestPathsOptions, DatabaseEngine, DbOptions, DegreeOptions, Direction, EdgeInput,
-    ExportOptions, GraphPatch, IsConnectedOptions, LabelMatchMode, NeighborOptions, NodeInput,
-    NodeKeyQuery, NodeLabelFilter, PageRequest, PprAlgorithm, PprOptions, PropValue,
-    PropertyRangeBound, PrunePolicy, SecondaryIndexKind, SecondaryIndexState, ShortestPathOptions,
-    TopKOptions, TraverseOptions, TxnIntent, TxnLocalRef, TxnNodeRef, UpsertEdgeOptions,
-    UpsertNodeOptions, WalSyncMode,
+    EdgeSchema, EndpointLabelSchema, ExportOptions, GraphPatch, GraphSchemaOperation,
+    GraphSchemaSetOptions, IsConnectedOptions, LabelMatchMode, NeighborOptions, NodeInput,
+    NodeKeyQuery, NodeLabelFilter, NodeSchema, NumericFieldSchema, PageRequest, PprAlgorithm,
+    PprOptions, PropValue, PropertyRangeBound, PropertySchema, PrunePolicy,
+    SchemaAdditionalProperties, SchemaCheckOptions, SchemaNumericBound, SchemaSetOptions,
+    SchemaValueType, SecondaryIndexKind, SecondaryIndexState, ShortestPathOptions, TopKOptions,
+    TraverseOptions, TxnIntent, TxnLocalRef, TxnNodeRef, UpsertEdgeOptions, UpsertNodeOptions,
+    WalSyncMode,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -564,6 +567,750 @@ fn bench_batch_upsert_nodes(c: &mut Criterion) {
             batch_num += 1;
         });
     });
+}
+
+fn bench_schema_empty_catalog_write_overhead(c: &mut Criterion) {
+    let mut group = c.benchmark_group("schema_empty_catalog");
+
+    group.bench_function("upsert_node", |b| {
+        let (_dir, engine) = temp_db();
+        let mut i = 0u64;
+        b.iter(|| {
+            let key = format!("schema_empty_node_{i}");
+            black_box(
+                engine
+                    .upsert_node("BenchNode1", &key, UpsertNodeOptions::default())
+                    .unwrap(),
+            );
+            i += 1;
+        });
+    });
+
+    group.bench_function("upsert_edge", |b| {
+        let (_dir, engine) = temp_db();
+        let inputs: Vec<NodeInput> = (0..1000)
+            .map(|i| NodeInput {
+                labels: vec![bench_node_label(1)],
+                key: format!("schema_empty_edge_node_{i}"),
+                props: BTreeMap::new(),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            })
+            .collect();
+        let ids = engine.batch_upsert_nodes(inputs).unwrap();
+        let mut i = 0usize;
+        b.iter(|| {
+            let from = ids[i % ids.len()];
+            let to = ids[(i + 1) % ids.len()];
+            black_box(
+                engine
+                    .upsert_edge(from, to, "BenchEdge1", UpsertEdgeOptions::default())
+                    .unwrap(),
+            );
+            i += 1;
+        });
+    });
+
+    group.bench_function("batch_upsert_nodes_100", |b| {
+        let (_dir, engine) = temp_db();
+        let mut batch_num = 0u64;
+        b.iter(|| {
+            let inputs: Vec<NodeInput> = (0..100)
+                .map(|i| NodeInput {
+                    labels: vec![bench_node_label(1)],
+                    key: format!("schema_empty_batch_node_{batch_num}_{i}"),
+                    props: BTreeMap::new(),
+                    weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
+                })
+                .collect();
+            black_box(engine.batch_upsert_nodes(inputs).unwrap());
+            batch_num += 1;
+        });
+    });
+
+    group.bench_function("batch_upsert_edges_100", |b| {
+        let (_dir, engine) = temp_db();
+        let inputs: Vec<NodeInput> = (0..2000)
+            .map(|i| NodeInput {
+                labels: vec![bench_node_label(1)],
+                key: format!("schema_empty_batch_edge_node_{i}"),
+                props: BTreeMap::new(),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            })
+            .collect();
+        let ids = engine.batch_upsert_nodes(inputs).unwrap();
+        let mut batch_num = 0usize;
+        b.iter(|| {
+            let offset = (batch_num * 100) % (ids.len() - 101);
+            let inputs: Vec<EdgeInput> = (0..100)
+                .map(|i| EdgeInput {
+                    from: ids[offset + i],
+                    to: ids[offset + i + 1],
+                    label: "BenchEdge1".to_string(),
+                    props: BTreeMap::new(),
+                    weight: 1.0,
+                    valid_from: None,
+                    valid_to: None,
+                })
+                .collect();
+            black_box(engine.batch_upsert_edges(inputs).unwrap());
+            batch_num += 1;
+        });
+    });
+
+    group.finish();
+}
+
+fn endpoint_bench_edge_schema() -> EdgeSchema {
+    EdgeSchema {
+        from: Some(EndpointLabelSchema {
+            all_of: vec![bench_node_label(1)],
+            ..Default::default()
+        }),
+        to: Some(EndpointLabelSchema {
+            all_of: vec![bench_node_label(2)],
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn temp_endpoint_schema_db(edge_uniqueness: bool) -> (tempfile::TempDir, DatabaseEngine) {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        edge_uniqueness,
+        ..DbOptions::default()
+    };
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    seed_bench_label_tokens(&engine);
+    engine
+        .set_edge_schema("BenchEdge1", endpoint_bench_edge_schema())
+        .unwrap();
+    (dir, engine)
+}
+
+fn bench_schema_endpoint_validation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("schema_endpoint_validation");
+
+    group.bench_function("batch_upsert_edges_endpoint_hydration_64", |b| {
+        let (_dir, engine) = temp_endpoint_schema_db(false);
+        let from_ids: Vec<u64> = (0..32)
+            .map(|i| {
+                engine
+                    .upsert_node(
+                        "BenchNode1",
+                        &format!("endpoint_from_{i}"),
+                        UpsertNodeOptions::default(),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let to_ids: Vec<u64> = (0..32)
+            .map(|i| {
+                engine
+                    .upsert_node(
+                        "BenchNode2",
+                        &format!("endpoint_to_{i}"),
+                        UpsertNodeOptions::default(),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let mut batch_num = 0usize;
+        b.iter(|| {
+            let inputs: Vec<EdgeInput> = (0..64)
+                .map(|i| EdgeInput {
+                    from: from_ids[i % from_ids.len()],
+                    to: to_ids[(i + batch_num) % to_ids.len()],
+                    label: "BenchEdge1".to_string(),
+                    props: BTreeMap::new(),
+                    weight: 1.0,
+                    valid_from: None,
+                    valid_to: None,
+                })
+                .collect();
+            black_box(engine.batch_upsert_edges(inputs).unwrap());
+            batch_num += 1;
+        });
+    });
+
+    group.bench_function("remove_endpoint_label_high_degree_1000", |b| {
+        b.iter_batched(
+            || {
+                let (dir, engine) = temp_endpoint_schema_db(true);
+                let hub = engine
+                    .upsert_node(
+                        &["BenchNode1", "BenchNode3"],
+                        "endpoint_hub",
+                        UpsertNodeOptions::default(),
+                    )
+                    .unwrap();
+                let edge_inputs: Vec<EdgeInput> = (0..1000)
+                    .map(|i| {
+                        let leaf = engine
+                            .upsert_node(
+                                "BenchNode2",
+                                &format!("endpoint_leaf_{i}"),
+                                UpsertNodeOptions::default(),
+                            )
+                            .unwrap();
+                        EdgeInput {
+                            from: hub,
+                            to: leaf,
+                            label: "BenchEdge1".to_string(),
+                            props: BTreeMap::new(),
+                            weight: 1.0,
+                            valid_from: None,
+                            valid_to: None,
+                        }
+                    })
+                    .collect();
+                engine.batch_upsert_edges(edge_inputs).unwrap();
+                (dir, engine, hub)
+            },
+            |(_dir, engine, hub)| {
+                let rejected = engine.remove_node_label(hub, &bench_node_label(1));
+                black_box(rejected.is_err());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+const SCHEMA_MIXED_SOURCE_SEGMENT_RECORDS: usize = 256;
+const SCHEMA_MIXED_SOURCE_MEMTABLE_RECORDS: usize = 256;
+const SCHEMA_MIXED_SOURCE_TOTAL_RECORDS: u64 =
+    (SCHEMA_MIXED_SOURCE_SEGMENT_RECORDS + SCHEMA_MIXED_SOURCE_MEMTABLE_RECORDS) as u64;
+
+fn required_bench_property(types: Vec<SchemaValueType>) -> PropertySchema {
+    PropertySchema {
+        required: true,
+        nullable: false,
+        types,
+        ..Default::default()
+    }
+}
+
+fn schema_bench_node_schema() -> NodeSchema {
+    let mut name = required_bench_property(vec![SchemaValueType::String]);
+    name.string_min_bytes = Some(3);
+    name.string_max_bytes = Some(64);
+
+    let mut score = required_bench_property(vec![SchemaValueType::Number]);
+    score.numeric_min = Some(SchemaNumericBound {
+        value: PropValue::Int(0),
+        inclusive: true,
+    });
+    score.numeric_max = Some(SchemaNumericBound {
+        value: PropValue::Int(1000),
+        inclusive: true,
+    });
+
+    let mut status = required_bench_property(vec![SchemaValueType::String]);
+    status.enum_values = vec![
+        PropValue::String("active".to_string()),
+        PropValue::String("pending".to_string()),
+    ];
+
+    let mut payload = required_bench_property(vec![SchemaValueType::Bytes]);
+    payload.bytes_min_len = Some(4);
+    payload.bytes_max_len = Some(16);
+
+    NodeSchema {
+        additional_properties: SchemaAdditionalProperties::Reject,
+        properties: BTreeMap::from([
+            ("name".to_string(), name),
+            ("score".to_string(), score),
+            ("status".to_string(), status),
+            ("payload".to_string(), payload),
+        ]),
+        weight: Some(NumericFieldSchema {
+            min: Some(SchemaNumericBound {
+                value: PropValue::Float(0.0),
+                inclusive: true,
+            }),
+            max: Some(SchemaNumericBound {
+                value: PropValue::Float(10.0),
+                inclusive: true,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn schema_bench_node_props(i: u64) -> BTreeMap<String, PropValue> {
+    BTreeMap::from([
+        (
+            "name".to_string(),
+            PropValue::String(format!("schema node {i}")),
+        ),
+        ("score".to_string(), PropValue::Int((i % 1000) as i64)),
+        (
+            "status".to_string(),
+            PropValue::String(if i.is_multiple_of(2) {
+                "active".to_string()
+            } else {
+                "pending".to_string()
+            }),
+        ),
+        (
+            "payload".to_string(),
+            PropValue::Bytes(vec![i as u8, (i >> 8) as u8, 0, 1]),
+        ),
+    ])
+}
+
+fn schema_bench_node_inputs(prefix: &str, start: u64, count: usize) -> Vec<NodeInput> {
+    let label = bench_node_label(10);
+    (0..count as u64)
+        .map(|offset| {
+            let i = start + offset;
+            NodeInput {
+                labels: vec![label.clone()],
+                key: format!("{prefix}_{i}"),
+                props: schema_bench_node_props(i),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            }
+        })
+        .collect()
+}
+
+fn prepare_schema_node_scan_db() -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, engine) = temp_db();
+    engine
+        .batch_upsert_nodes(schema_bench_node_inputs(
+            "schema_segment",
+            0,
+            SCHEMA_MIXED_SOURCE_SEGMENT_RECORDS,
+        ))
+        .unwrap();
+    engine.flush().unwrap();
+    engine
+        .batch_upsert_nodes(schema_bench_node_inputs(
+            "schema_memtable",
+            SCHEMA_MIXED_SOURCE_SEGMENT_RECORDS as u64,
+            SCHEMA_MIXED_SOURCE_MEMTABLE_RECORDS,
+        ))
+        .unwrap();
+    (dir, engine)
+}
+
+fn schema_bench_edge_schema() -> EdgeSchema {
+    let mut since = required_bench_property(vec![SchemaValueType::Int]);
+    since.numeric_min = Some(SchemaNumericBound {
+        value: PropValue::Int(2020),
+        inclusive: true,
+    });
+
+    let mut confidence = required_bench_property(vec![SchemaValueType::Number]);
+    confidence.numeric_min = Some(SchemaNumericBound {
+        value: PropValue::Float(0.0),
+        inclusive: true,
+    });
+    confidence.numeric_max = Some(SchemaNumericBound {
+        value: PropValue::Float(1.0),
+        inclusive: true,
+    });
+
+    EdgeSchema {
+        additional_properties: SchemaAdditionalProperties::Reject,
+        properties: BTreeMap::from([
+            ("since".to_string(), since),
+            ("confidence".to_string(), confidence),
+        ]),
+        from: Some(EndpointLabelSchema {
+            all_of: vec![bench_node_label(11)],
+            ..Default::default()
+        }),
+        to: Some(EndpointLabelSchema {
+            all_of: vec![bench_node_label(12)],
+            ..Default::default()
+        }),
+        allow_self_loops: false,
+        ..Default::default()
+    }
+}
+
+fn schema_bench_edge_props(i: u64) -> BTreeMap<String, PropValue> {
+    BTreeMap::from([
+        ("since".to_string(), PropValue::Int(2020 + (i % 5) as i64)),
+        (
+            "confidence".to_string(),
+            PropValue::Float(0.5 + (i % 50) as f64 / 100.0),
+        ),
+    ])
+}
+
+fn prepare_schema_edge_scan_db() -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, engine) = temp_db();
+    let total = SCHEMA_MIXED_SOURCE_SEGMENT_RECORDS + SCHEMA_MIXED_SOURCE_MEMTABLE_RECORDS;
+    let from_inputs: Vec<NodeInput> = (0..total)
+        .map(|i| NodeInput {
+            labels: vec![bench_node_label(11)],
+            key: format!("schema_from_{i}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect();
+    let to_inputs: Vec<NodeInput> = (0..total)
+        .map(|i| NodeInput {
+            labels: vec![bench_node_label(12)],
+            key: format!("schema_to_{i}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect();
+    let from_ids = engine.batch_upsert_nodes(from_inputs).unwrap();
+    let to_ids = engine.batch_upsert_nodes(to_inputs).unwrap();
+    let make_edges = |range: std::ops::Range<usize>| -> Vec<EdgeInput> {
+        range
+            .map(|i| EdgeInput {
+                from: from_ids[i],
+                to: to_ids[i],
+                label: "BenchEdge10".to_string(),
+                props: schema_bench_edge_props(i as u64),
+                weight: 1.0,
+                valid_from: Some(i as i64),
+                valid_to: Some(i as i64 + 100),
+            })
+            .collect()
+    };
+
+    engine
+        .batch_upsert_edges(make_edges(0..SCHEMA_MIXED_SOURCE_SEGMENT_RECORDS))
+        .unwrap();
+    engine.flush().unwrap();
+    engine
+        .batch_upsert_edges(make_edges(
+            SCHEMA_MIXED_SOURCE_SEGMENT_RECORDS
+                ..SCHEMA_MIXED_SOURCE_SEGMENT_RECORDS + SCHEMA_MIXED_SOURCE_MEMTABLE_RECORDS,
+        ))
+        .unwrap();
+    (dir, engine)
+}
+
+fn graph_schema_bench_operations() -> Vec<GraphSchemaOperation> {
+    vec![
+        GraphSchemaOperation::SetNode {
+            label: bench_node_label(10),
+            schema: schema_bench_node_schema(),
+        },
+        GraphSchemaOperation::SetEdge {
+            label: "BenchEdge10".to_string(),
+            schema: schema_bench_edge_schema(),
+        },
+    ]
+}
+
+fn prepare_graph_schema_bulk_scan_db() -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, engine) = temp_db();
+    let count = SCHEMA_MIXED_SOURCE_SEGMENT_RECORDS + SCHEMA_MIXED_SOURCE_MEMTABLE_RECORDS;
+
+    engine
+        .batch_upsert_nodes(schema_bench_node_inputs("bulk_schema_node", 0, count))
+        .unwrap();
+
+    let from_inputs: Vec<NodeInput> = (0..count)
+        .map(|i| NodeInput {
+            labels: vec![bench_node_label(11)],
+            key: format!("bulk_schema_from_{i}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect();
+    let to_inputs: Vec<NodeInput> = (0..count)
+        .map(|i| NodeInput {
+            labels: vec![bench_node_label(12)],
+            key: format!("bulk_schema_to_{i}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect();
+    let from_ids = engine.batch_upsert_nodes(from_inputs).unwrap();
+    let to_ids = engine.batch_upsert_nodes(to_inputs).unwrap();
+    let edges: Vec<EdgeInput> = (0..count)
+        .map(|i| EdgeInput {
+            from: from_ids[i],
+            to: to_ids[i],
+            label: "BenchEdge10".to_string(),
+            props: schema_bench_edge_props(i as u64),
+            weight: 1.0,
+            valid_from: Some(i as i64),
+            valid_to: Some(i as i64 + 100),
+        })
+        .collect();
+    engine.batch_upsert_edges(edges).unwrap();
+    (dir, engine)
+}
+
+fn temp_active_edge_schema_db(
+    edge_uniqueness: bool,
+    endpoint_count: usize,
+) -> (tempfile::TempDir, DatabaseEngine, Vec<u64>, Vec<u64>) {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        edge_uniqueness,
+        ..DbOptions::default()
+    };
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    seed_bench_label_tokens(&engine);
+    let from_ids: Vec<u64> = (0..endpoint_count)
+        .map(|i| {
+            engine
+                .upsert_node(
+                    &bench_node_label(11),
+                    &format!("active_edge_from_{i}"),
+                    UpsertNodeOptions::default(),
+                )
+                .unwrap()
+        })
+        .collect();
+    let to_ids: Vec<u64> = (0..endpoint_count)
+        .map(|i| {
+            engine
+                .upsert_node(
+                    &bench_node_label(12),
+                    &format!("active_edge_to_{i}"),
+                    UpsertNodeOptions::default(),
+                )
+                .unwrap()
+        })
+        .collect();
+    engine
+        .set_edge_schema("BenchEdge10", schema_bench_edge_schema())
+        .unwrap();
+    (dir, engine, from_ids, to_ids)
+}
+
+fn bench_schema_publication_check(c: &mut Criterion) {
+    let mut group = c.benchmark_group("schema_publication_check");
+
+    group.bench_function("set_node_schema_mixed_segment_memtable_512", |b| {
+        b.iter_batched(
+            prepare_schema_node_scan_db,
+            |(_dir, engine)| {
+                black_box(
+                    engine
+                        .set_node_schema_with_options(
+                            &bench_node_label(10),
+                            schema_bench_node_schema(),
+                            SchemaSetOptions {
+                                max_violations: 1,
+                                chunk_size: 128,
+                                scan_limit: None,
+                            },
+                        )
+                        .unwrap(),
+                );
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("check_node_schema_mixed_segment_memtable_512", |b| {
+        b.iter_batched(
+            prepare_schema_node_scan_db,
+            |(_dir, engine)| {
+                let report = engine
+                    .check_node_schema(
+                        &bench_node_label(10),
+                        schema_bench_node_schema(),
+                        SchemaCheckOptions {
+                            max_violations: 16,
+                            chunk_size: 128,
+                            scan_limit: None,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(report.checked_records, SCHEMA_MIXED_SOURCE_TOTAL_RECORDS);
+                black_box(report);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("set_edge_schema_mixed_segment_memtable_512", |b| {
+        b.iter_batched(
+            prepare_schema_edge_scan_db,
+            |(_dir, engine)| {
+                black_box(
+                    engine
+                        .set_edge_schema_with_options(
+                            "BenchEdge10",
+                            schema_bench_edge_schema(),
+                            SchemaSetOptions {
+                                max_violations: 1,
+                                chunk_size: 128,
+                                scan_limit: None,
+                            },
+                        )
+                        .unwrap(),
+                );
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("check_edge_schema_mixed_segment_memtable_512", |b| {
+        b.iter_batched(
+            prepare_schema_edge_scan_db,
+            |(_dir, engine)| {
+                let report = engine
+                    .check_edge_schema(
+                        "BenchEdge10",
+                        schema_bench_edge_schema(),
+                        SchemaCheckOptions {
+                            max_violations: 16,
+                            chunk_size: 128,
+                            scan_limit: None,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(report.checked_records, SCHEMA_MIXED_SOURCE_TOTAL_RECORDS);
+                black_box(report);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("alter_graph_schema_add_node_edge_existing_data", |b| {
+        b.iter_batched(
+            prepare_graph_schema_bulk_scan_db,
+            |(_dir, engine)| {
+                let result = engine
+                    .alter_graph_schema(
+                        graph_schema_bench_operations(),
+                        GraphSchemaSetOptions {
+                            chunk_size: 128,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(result.targets_published, 2);
+                black_box(result);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+fn bench_schema_active_validation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("schema_active_validation");
+
+    group.bench_function("upsert_node_active_schema_5_rules", |b| {
+        let (_dir, engine) = temp_db();
+        engine
+            .set_node_schema(&bench_node_label(10), schema_bench_node_schema())
+            .unwrap();
+        let mut i = 0u64;
+        b.iter(|| {
+            black_box(
+                engine
+                    .upsert_node(
+                        &bench_node_label(10),
+                        &format!("active_schema_node_{i}"),
+                        UpsertNodeOptions {
+                            props: schema_bench_node_props(i),
+                            weight: 1.0,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+            );
+            i += 1;
+        });
+    });
+
+    group.bench_function("upsert_edge_active_schema_4_rules", |b| {
+        let (_dir, engine, from_ids, to_ids) = temp_active_edge_schema_db(false, 1024);
+        let mut i = 0usize;
+        b.iter(|| {
+            black_box(
+                engine
+                    .upsert_edge(
+                        from_ids[i % from_ids.len()],
+                        to_ids[(i + 1) % to_ids.len()],
+                        "BenchEdge10",
+                        UpsertEdgeOptions {
+                            props: schema_bench_edge_props(i as u64),
+                            weight: 1.0,
+                            valid_from: Some(i as i64),
+                            valid_to: Some(i as i64 + 100),
+                        },
+                    )
+                    .unwrap(),
+            );
+            i += 1;
+        });
+    });
+
+    group.bench_function("batch_upsert_nodes_active_schema_100", |b| {
+        let (_dir, engine) = temp_db();
+        engine
+            .set_node_schema(&bench_node_label(10), schema_bench_node_schema())
+            .unwrap();
+        let mut batch_num = 0u64;
+        b.iter(|| {
+            black_box(
+                engine
+                    .batch_upsert_nodes(schema_bench_node_inputs(
+                        "active_schema_batch_node",
+                        batch_num * 100,
+                        100,
+                    ))
+                    .unwrap(),
+            );
+            batch_num += 1;
+        });
+    });
+
+    group.bench_function("batch_upsert_edges_active_schema_64", |b| {
+        let (_dir, engine, from_ids, to_ids) = temp_active_edge_schema_db(false, 128);
+        let mut batch_num = 0usize;
+        b.iter(|| {
+            let offset = batch_num * 64;
+            let inputs: Vec<EdgeInput> = (0..64)
+                .map(|j| {
+                    let i = offset + j;
+                    EdgeInput {
+                        from: from_ids[i % from_ids.len()],
+                        to: to_ids[(i + 1) % to_ids.len()],
+                        label: "BenchEdge10".to_string(),
+                        props: schema_bench_edge_props(i as u64),
+                        weight: 1.0,
+                        valid_from: Some(i as i64),
+                        valid_to: Some(i as i64 + 100),
+                    }
+                })
+                .collect();
+            black_box(engine.batch_upsert_edges(inputs).unwrap());
+            batch_num += 1;
+        });
+    });
+
+    group.finish();
 }
 
 /// Build properties representative of typical graph nodes.
@@ -3307,6 +4054,10 @@ criterion_group!(
     bench_flush,
     bench_property_indexes,
     bench_batch_upsert_nodes,
+    bench_schema_empty_catalog_write_overhead,
+    bench_schema_endpoint_validation,
+    bench_schema_publication_check,
+    bench_schema_active_validation,
     bench_compact,
     bench_group_commit,
     bench_degree,

@@ -1,12 +1,28 @@
 import type {
   EdgeInput,
   EdgeLabelInfo,
+  EdgeSchema,
+  EdgeSchemaInfo,
+  CanonicalSchemaLiteral,
+  GraphSchema,
+  GraphSchemaCheckReport,
+  GraphSchemaDropTargetResult,
+  GraphSchemaOperation,
+  GraphSchemaOperationKind,
+  GraphSchemaPublishResult,
+  GraphSchemaValidationReportEntry,
   NeighborEntry,
   NeighborsOptions,
   NodeInput,
   NodeLabelFilter,
   NodeLabelInfo,
+  NodeSchema,
+  NodeSchemaInfo,
   OverGraph,
+  SchemaCheckOptions,
+  SchemaLiteral,
+  SchemaSetOptions,
+  SchemaValidationReport,
 } from '../../index.js'
 import type {
   GraphPathValue,
@@ -18,9 +34,12 @@ import type {
   GqlExecutionExplain,
   GqlExecutionOptions,
   GqlExecutionResult,
+  GqlIndexExplain,
+  GqlIndexStats,
   GqlLoweringTarget,
   GqlNode,
   GqlPath,
+  GqlStatementKind,
   GqlValue,
   QueryEdgeRequest,
   QueryPlanNode,
@@ -45,6 +64,114 @@ const nodeInfo: NodeLabelInfo = {
   label: 'Person',
   labelId: 1,
 }
+
+const schemaLiteral: SchemaLiteral = {
+  nested: [
+    { type: 'uint', value: '18446744073709551615' },
+    { type: 'bytes', value: Buffer.from('abc') },
+    { type: 'map', value: { type: 'uint', value: '123' } },
+  ],
+}
+
+const schemaSetOptions: SchemaSetOptions = {
+  maxViolations: 1,
+  chunkSize: 4096,
+  scanLimit: null,
+}
+
+const schemaCheckOptions: SchemaCheckOptions = {
+  maxViolations: 100,
+  chunkSize: 128,
+  scanLimit: 10,
+}
+
+const nodeSchema: NodeSchema = {
+  additionalProperties: 'reject',
+  properties: {
+    name: {
+      required: true,
+      nullable: false,
+      types: ['string'],
+      enumValues: ['Alice', schemaLiteral],
+    },
+    age: {
+      types: ['int', 'uint', 'number'],
+      numericMin: { value: 0 },
+      numericMax: { value: { type: 'uint', value: '120' }, inclusive: true },
+    },
+    payload: {
+      types: ['bytes'],
+      bytesMinLen: 1,
+      bytesMaxLen: 1024,
+      enumValues: [{ type: 'bytes', value: new Uint8Array([1, 2, 3]) }],
+    },
+  },
+  key: { minBytes: 1, maxBytes: 128, enumValues: ['alice'] },
+  labelConstraints: { allOf: ['Entity'], anyOf: ['Person'], noneOf: ['Archived'] },
+  weight: { min: { value: 0 }, max: { value: 1.0 }, finite: true },
+  denseVector: { presence: 'optional', dimension: 3 },
+  sparseVector: { presence: 'forbidden', maxDimensionId: 1024 },
+}
+
+const edgeSchema: EdgeSchema = {
+  additionalProperties: 'allow',
+  properties: {
+    since: { required: true, nullable: false, types: ['int'] },
+  },
+  from: { allOf: ['Person'] },
+  to: { anyOf: ['Company', 'Team'] },
+  allowSelfLoops: false,
+  validity: {
+    requireValidFromBeforeValidTo: true,
+    allowOpenEndedValidTo: false,
+  },
+}
+
+const setNodeSchemaInfo: NodeSchemaInfo = db.setNodeSchema('Person', nodeSchema, schemaSetOptions)
+const checkNodeSchemaReport: SchemaValidationReport = db.checkNodeSchema('Person', nodeSchema, schemaCheckOptions)
+const maybeNodeSchemaInfo: NodeSchemaInfo | null = db.getNodeSchema('Person')
+const listedNodeSchemas: Array<NodeSchemaInfo> = db.listNodeSchemas()
+const setEdgeSchemaInfo: EdgeSchemaInfo = db.setEdgeSchema('WORKS_AT', edgeSchema, schemaSetOptions)
+const checkEdgeSchemaReport: SchemaValidationReport = db.checkEdgeSchema('WORKS_AT', edgeSchema, schemaCheckOptions)
+const maybeEdgeSchemaInfo: EdgeSchemaInfo | null = db.getEdgeSchema('WORKS_AT')
+const listedEdgeSchemas: Array<EdgeSchemaInfo> = db.listEdgeSchemas()
+const droppedNodeSchema: boolean = db.dropNodeSchema('Person')
+const droppedEdgeSchema: boolean = db.dropEdgeSchema('WORKS_AT')
+const asyncNodeSchemaInfo: Promise<NodeSchemaInfo> = db.setNodeSchemaAsync('Person', nodeSchema)
+const asyncNodeSchemaReport: Promise<SchemaValidationReport> = db.checkNodeSchemaAsync('Person', nodeSchema)
+const asyncMaybeNodeSchemaInfo: Promise<NodeSchemaInfo | null> = db.getNodeSchemaAsync('Person')
+const asyncListedNodeSchemas: Promise<Array<NodeSchemaInfo>> = db.listNodeSchemasAsync()
+const asyncEdgeSchemaInfo: Promise<EdgeSchemaInfo> = db.setEdgeSchemaAsync('WORKS_AT', edgeSchema)
+const asyncEdgeSchemaReport: Promise<SchemaValidationReport> = db.checkEdgeSchemaAsync('WORKS_AT', edgeSchema)
+const asyncMaybeEdgeSchemaInfo: Promise<EdgeSchemaInfo | null> = db.getEdgeSchemaAsync('WORKS_AT')
+const asyncListedEdgeSchemas: Promise<Array<EdgeSchemaInfo>> = db.listEdgeSchemasAsync()
+const asyncDroppedNodeSchema: Promise<boolean> = db.dropNodeSchemaAsync('Person')
+const asyncDroppedEdgeSchema: Promise<boolean> = db.dropEdgeSchemaAsync('WORKS_AT')
+const canonicalUIntValue: CanonicalSchemaLiteral | undefined =
+  setNodeSchemaInfo.schema.properties?.age?.numericMax?.value
+const graphSchema: GraphSchema = {
+  nodeSchemas: [{ label: 'Person', schema: nodeSchema }],
+  edgeSchemas: [{ label: 'WORKS_AT', schema: edgeSchema }],
+}
+const graphSchemaOperations: Array<GraphSchemaOperation> = [
+  { kind: 'setNode', label: 'Person', schema: nodeSchema },
+  { kind: 'setEdge', label: 'WORKS_AT', schema: edgeSchema },
+  { kind: 'dropNode', label: 'OldPerson' },
+  { kind: 'dropEdge', label: 'OLD_EDGE' },
+]
+const graphSchemaPublish: GraphSchemaPublishResult = db.setGraphSchema(graphSchema, schemaSetOptions)
+const graphSchemaAlter: GraphSchemaPublishResult = db.alterGraphSchema(graphSchemaOperations, schemaSetOptions)
+const graphSchemaCheckSet: GraphSchemaCheckReport = db.checkGraphSchemaSet(graphSchema, schemaCheckOptions)
+const graphSchemaCheckAdd: GraphSchemaCheckReport = db.checkGraphSchemaAdd(graphSchema, schemaCheckOptions)
+const graphSchemaDrop: GraphSchemaPublishResult = db.dropGraphSchema()
+const graphSchemaValidationEntry: GraphSchemaValidationReportEntry | undefined = graphSchemaCheckSet.entries[0]
+const graphSchemaDropTarget: GraphSchemaDropTargetResult | undefined = graphSchemaAlter.dropTargets[0]
+const graphSchemaOperationKind: GraphSchemaOperationKind = graphSchemaPublish.operation
+const asyncGraphSchemaPublish: Promise<GraphSchemaPublishResult> = db.setGraphSchemaAsync(graphSchema)
+const asyncGraphSchemaAlter: Promise<GraphSchemaPublishResult> = db.alterGraphSchemaAsync(graphSchemaOperations)
+const asyncGraphSchemaCheckSet: Promise<GraphSchemaCheckReport> = db.checkGraphSchemaSetAsync(graphSchema)
+const asyncGraphSchemaCheckAdd: Promise<GraphSchemaCheckReport> = db.checkGraphSchemaAddAsync(graphSchema)
+const asyncGraphSchemaDrop: Promise<GraphSchemaPublishResult> = db.dropGraphSchemaAsync()
 
 const neighbor: NeighborEntry = {
   nodeId: 2,
@@ -191,6 +318,11 @@ const gqlAsyncResult: Promise<GqlExecutionResult> = db.executeGqlAsync(
 )
 const gqlExplain: GqlExecutionExplain = db.explainGql('MATCH (n:Person) RETURN n', null, { allowFullScan: true })
 const gqlReadTarget: GqlLoweringTarget | undefined = gqlExplain.read?.target
+const gqlExplainSchemaOperation: string | undefined = gqlExplain.schema?.operation
+const gqlExplainSchemaTargetLabel: string | null | undefined = gqlExplain.schema?.targets[0]?.label
+const gqlExplainSchemaScanLimit: number | null | undefined = gqlExplain.schema?.options.scanLimit
+const gqlExplainIndexOperation: string | undefined = gqlExplain.index?.operation
+const gqlExplainIndexTargetProp: string | null | undefined = gqlExplain.index?.targets[0]?.propKey
 const gqlPipelineRowCap: number = gqlExplain.caps.maxPipelineRows
 const gqlGroupCap: number = gqlExplain.caps.maxGroups
 const gqlCollectCap: number = gqlExplain.caps.maxCollectItems
@@ -215,6 +347,37 @@ const gqlMutationResult: GqlExecutionResult = db.executeGql(
   { maxMutationRows: 1, maxMutationOps: 1 },
 )
 const compactRows = gqlMutationResult.rows as Array<Array<GqlValue>>
+const gqlSchemaStatsOperation: string | undefined = gqlResult.schemaStats?.operation
+const gqlSchemaStatsWarnings: Array<string> | undefined = gqlResult.schemaStats?.warnings
+const gqlMutationSchemaStats: QueryTypes.GqlSchemaStats | null = gqlMutationResult.schemaStats
+const gqlStatementKindIndex: GqlStatementKind = 'index'
+const gqlIndexStats: GqlIndexStats = {
+  operation: 'create_property_index',
+  indexesEnsured: 1,
+  indexesDropped: 0,
+  indexesReturned: 0,
+  elapsedUs: null,
+  warnings: [],
+}
+const gqlIndexExplain: GqlIndexExplain = {
+  operation: 'show_property_indexes',
+  targets: [
+    {
+      targetKind: 'property_index_catalog',
+      label: null,
+      propKey: null,
+      kind: null,
+      action: 'show',
+    },
+  ],
+  usesCoreWriteQueue: false,
+  publishesManifest: false,
+  createsLabels: false,
+  schedulesBackgroundBuild: false,
+  dropsIndexDataAsync: false,
+  sideEffectFree: true,
+}
+const gqlResultIndexStats: QueryTypes.GqlIndexStats | null = gqlResult.indexStats
 const gqlNodeValue: GqlNode = {
   id: 1,
   labels: ['Person'],
@@ -263,6 +426,47 @@ void db
 void edgeInput
 void edgeInfo
 void nodeInfo
+void schemaLiteral
+void schemaSetOptions
+void schemaCheckOptions
+void nodeSchema
+void edgeSchema
+void setNodeSchemaInfo
+void checkNodeSchemaReport
+void maybeNodeSchemaInfo
+void listedNodeSchemas
+void setEdgeSchemaInfo
+void checkEdgeSchemaReport
+void maybeEdgeSchemaInfo
+void listedEdgeSchemas
+void droppedNodeSchema
+void droppedEdgeSchema
+void asyncNodeSchemaInfo
+void asyncNodeSchemaReport
+void asyncMaybeNodeSchemaInfo
+void asyncListedNodeSchemas
+void asyncEdgeSchemaInfo
+void asyncEdgeSchemaReport
+void asyncMaybeEdgeSchemaInfo
+void asyncListedEdgeSchemas
+void asyncDroppedNodeSchema
+void asyncDroppedEdgeSchema
+void canonicalUIntValue
+void graphSchema
+void graphSchemaOperations
+void graphSchemaPublish
+void graphSchemaAlter
+void graphSchemaCheckSet
+void graphSchemaCheckAdd
+void graphSchemaDrop
+void graphSchemaValidationEntry
+void graphSchemaDropTarget
+void graphSchemaOperationKind
+void asyncGraphSchemaPublish
+void asyncGraphSchemaAlter
+void asyncGraphSchemaCheckSet
+void asyncGraphSchemaCheckAdd
+void asyncGraphSchemaDrop
 void neighbor
 void neighborOptions
 void edgeQuery
@@ -279,11 +483,23 @@ void gqlResult
 void gqlAsyncResult
 void gqlExplain
 void gqlReadTarget
+void gqlExplainSchemaOperation
+void gqlExplainSchemaTargetLabel
+void gqlExplainSchemaScanLimit
 void gqlExplainAsync
 void gqlMutationResult
 void compactRows
+void gqlSchemaStatsOperation
+void gqlSchemaStatsWarnings
+void gqlMutationSchemaStats
 void gqlReadRowCap
 void gqlNestedValue
 void mutationStats
+void gqlStatementKindIndex
+void gqlIndexStats
+void gqlIndexExplain
+void gqlResultIndexStats
+void gqlExplainIndexOperation
+void gqlExplainIndexTargetProp
 void mutationOperation
 void mutationReturnColumns

@@ -3,8 +3,13 @@ use crate::gql::eval::{
     GqlReturnExpr,
 };
 use crate::gql::ast::{
-    BinaryOp, Expr, ExprKind, GqlMutationStatement, GqlQuery, GqlStatementBody, Literal,
-    OrderDirection, UnaryOp,
+    BinaryOp, Expr, ExprKind, GqlGraphTypeAlterMode, GqlGraphTypeCheckMode, GqlIndexStatement,
+    GqlMutationStatement, GqlQuery, GqlSchemaStatement, GqlShowPropertyIndexScope,
+    GqlShowSchemaKind, GqlStatementBody, Literal, OrderDirection, UnaryOp,
+};
+use crate::gql::index::{
+    bind_index_statement, gql_index_target_kind_name, index_statement_is_mutating,
+    GqlBoundPropertyIndexStatement, GqlIndexSemanticPlan, GqlPropertyIndexTargetKind,
 };
 use crate::gql::lower::{
     gql_expr_to_graph_expr, gql_order_direction_to_graph, lower_mutation, lower_semantic_plan,
@@ -14,8 +19,15 @@ use crate::gql::lower::{
     GqlRemoveItemPlan, GqlSetItemPlan,
 };
 use crate::gql::parser::{parse_statement, GqlParseOptions};
-use crate::gql::params::validate_referenced_gql_params;
+use crate::gql::params::{
+    validate_referenced_gql_params, validate_referenced_gql_schema_ast_params,
+};
 use crate::gql::result::graph_value_to_gql_value;
+use crate::gql::schema::{
+    bind_schema_statement, gql_schema_target_kind_name, gql_value_from_edge_schema,
+    gql_value_from_node_schema, gql_value_from_schema_violation, schema_statement_is_mutating,
+    GqlBoundAlterGraphTypeStatement, GqlBoundCheckGraphTypeStatement, GqlSchemaSemanticPlan,
+};
 use crate::gql::semantic::{
     bind_query, gql_semantic_error, GqlAliasKind, GqlAliasOrigin, GqlReturnPlan,
     GqlSemanticPlan,
@@ -48,6 +60,10 @@ impl DatabaseEngine {
             GqlStatementBody::Mutation(mutation) => {
                 self.execute_gql_mutation(mutation, params, options, started_at)
             }
+            GqlStatementBody::Schema(schema) => {
+                self.execute_gql_schema(schema, params, options, started_at)
+            }
+            GqlStatementBody::Index(index) => self.execute_gql_index(index, options, started_at),
         }
     }
 
@@ -68,6 +84,8 @@ impl DatabaseEngine {
             GqlStatementBody::Mutation(mutation) => {
                 explain_gql_mutation(self, mutation, params, options)
             }
+            GqlStatementBody::Schema(schema) => self.explain_gql_schema(schema, params, options),
+            GqlStatementBody::Index(index) => self.explain_gql_index(index, options),
         }
     }
 
@@ -125,6 +143,8 @@ impl DatabaseEngine {
                     warnings,
                 },
                 mutation_stats: None,
+                schema_stats: None,
+                index_stats: None,
                 plan,
             });
         }
@@ -222,6 +242,8 @@ impl DatabaseEngine {
                 warnings,
             },
             mutation_stats: None,
+            schema_stats: None,
+            index_stats: None,
             plan,
         })
     }
@@ -324,6 +346,8 @@ impl DatabaseEngine {
                 warnings,
             },
             mutation_stats: None,
+            schema_stats: None,
+            index_stats: None,
             plan,
         })
     }
@@ -587,6 +611,1363 @@ impl DatabaseEngine {
         ))
     }
 
+}
+
+impl DatabaseEngine {
+    fn execute_gql_index(
+        &self,
+        index: GqlIndexStatement,
+        options: &GqlExecutionOptions,
+        started_at: Instant,
+    ) -> Result<GqlExecutionResult, EngineError> {
+        if options.cursor.is_some() {
+            return Err(EngineError::InvalidCursor {
+                message: "GQL index statements do not accept cursors".into(),
+            });
+        }
+        if options.mode == GqlExecutionMode::ReadOnly && index_statement_is_mutating(&index) {
+            return Err(EngineError::InvalidOperation(
+                "GQL index management is not allowed in ReadOnly mode".to_string(),
+            ));
+        }
+        let bound = bind_index_statement(index)?;
+        let plan = if options.include_plan {
+            Some(build_gql_index_execution_explain(&bound, options))
+        } else {
+            None
+        };
+        match bound {
+            GqlIndexSemanticPlan::Create(create) => {
+                self.execute_bound_gql_index_create(create, options, started_at, plan)
+            }
+            GqlIndexSemanticPlan::Drop(drop) => {
+                self.execute_bound_gql_index_drop(drop, options, started_at, plan)
+            }
+            GqlIndexSemanticPlan::Show { scope, .. } => {
+                self.execute_bound_gql_index_show(scope, options, started_at, plan)
+            }
+        }
+    }
+
+    fn explain_gql_index(
+        &self,
+        index: GqlIndexStatement,
+        options: &GqlExecutionOptions,
+    ) -> Result<GqlExecutionExplain, EngineError> {
+        if options.cursor.is_some() {
+            return Err(EngineError::InvalidCursor {
+                message: "GQL index statements do not accept cursors".into(),
+            });
+        }
+        if options.mode == GqlExecutionMode::ReadOnly && index_statement_is_mutating(&index) {
+            return Err(EngineError::InvalidOperation(
+                "GQL index management is not allowed in ReadOnly mode".to_string(),
+            ));
+        }
+        let bound = bind_index_statement(index)?;
+        Ok(build_gql_index_execution_explain(&bound, options))
+    }
+
+    fn execute_bound_gql_index_create(
+        &self,
+        create: GqlBoundPropertyIndexStatement,
+        options: &GqlExecutionOptions,
+        started_at: Instant,
+        plan: Option<GqlExecutionExplain>,
+    ) -> Result<GqlExecutionResult, EngineError> {
+        let row = match create.target_kind {
+            GqlPropertyIndexTargetKind::Node => {
+                let info = self.ensure_node_property_index(
+                    &create.label,
+                    &create.prop_key,
+                    create.kind.clone(),
+                )?;
+                create_node_property_index_row(&info)
+            }
+            GqlPropertyIndexTargetKind::Edge => {
+                let info = self.ensure_edge_property_index(
+                    &create.label,
+                    &create.prop_key,
+                    create.kind.clone(),
+                )?;
+                create_edge_property_index_row(&info)
+            }
+        };
+        Ok(gql_index_execution_result(
+            create_property_index_operation_name(),
+            create_property_index_columns(),
+            vec![row],
+            GqlIndexStatsCounts {
+                indexes_ensured: 1,
+                indexes_dropped: 0,
+                indexes_returned: 0,
+            },
+            options,
+            started_at,
+            plan,
+        ))
+    }
+
+    fn execute_bound_gql_index_drop(
+        &self,
+        drop: GqlBoundPropertyIndexStatement,
+        options: &GqlExecutionOptions,
+        started_at: Instant,
+        plan: Option<GqlExecutionExplain>,
+    ) -> Result<GqlExecutionResult, EngineError> {
+        let dropped = match drop.target_kind {
+            GqlPropertyIndexTargetKind::Node => {
+                self.drop_node_property_index(&drop.label, &drop.prop_key, drop.kind.clone())?
+            }
+            GqlPropertyIndexTargetKind::Edge => {
+                self.drop_edge_property_index(&drop.label, &drop.prop_key, drop.kind.clone())?
+            }
+        };
+        let row = drop_property_index_row(&drop, dropped);
+        Ok(gql_index_execution_result(
+            drop_property_index_operation_name(),
+            drop_property_index_columns(),
+            vec![row],
+            GqlIndexStatsCounts {
+                indexes_ensured: 0,
+                indexes_dropped: if dropped { 1 } else { 0 },
+                indexes_returned: 0,
+            },
+            options,
+            started_at,
+            plan,
+        ))
+    }
+
+    fn execute_bound_gql_index_show(
+        &self,
+        scope: GqlShowPropertyIndexScope,
+        options: &GqlExecutionOptions,
+        started_at: Instant,
+        plan: Option<GqlExecutionExplain>,
+    ) -> Result<GqlExecutionResult, EngineError> {
+        let operation = show_property_index_operation_name(scope);
+        let catalog_rows = self.show_property_index_catalog_rows(scope)?;
+        if catalog_rows.len() > options.max_rows {
+            return Err(EngineError::InvalidOperation(format!(
+                "GQL index SHOW result has {} rows, exceeding max_rows={}; index SHOW does not support cursors",
+                catalog_rows.len(),
+                options.max_rows
+            )));
+        }
+        let rows = catalog_rows
+            .iter()
+            .map(show_property_index_row)
+            .collect::<Vec<_>>();
+        let indexes_returned = rows.len() as u64;
+        Ok(gql_index_execution_result(
+            operation,
+            show_property_index_columns(),
+            rows,
+            GqlIndexStatsCounts {
+                indexes_ensured: 0,
+                indexes_dropped: 0,
+                indexes_returned,
+            },
+            options,
+            started_at,
+            plan,
+        ))
+    }
+
+    fn show_property_index_catalog_rows(
+        &self,
+        scope: GqlShowPropertyIndexScope,
+    ) -> Result<Vec<GqlPropertyIndexCatalogRow>, EngineError> {
+        let mut rows = {
+            let (_guard, published) = self.runtime.published_snapshot()?;
+            let mut rows = Vec::new();
+            for entry in &published.view.secondary_index_entries {
+                let Some(row) =
+                    gql_property_index_catalog_row(entry, published.label_catalog.as_ref())?
+                else {
+                    continue;
+                };
+                if show_property_index_scope_matches(scope, row.target_kind) {
+                    rows.push(row);
+                }
+            }
+            rows
+        };
+        rows.sort_unstable_by(|left, right| {
+            gql_index_target_kind_rank(left.target_kind)
+                .cmp(&gql_index_target_kind_rank(right.target_kind))
+                .then_with(|| left.label.cmp(&right.label))
+                .then_with(|| left.prop_key.cmp(&right.prop_key))
+                .then_with(|| gql_index_kind_rank(&left.kind).cmp(&gql_index_kind_rank(&right.kind)))
+                .then_with(|| left.index_id.cmp(&right.index_id))
+        });
+        Ok(rows)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GqlPropertyIndexCatalogRow {
+    target_kind: GqlPropertyIndexTargetKind,
+    label: String,
+    prop_key: String,
+    kind: SecondaryIndexKind,
+    state: SecondaryIndexState,
+    index_id: u64,
+    last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GqlIndexStatsCounts {
+    indexes_ensured: u64,
+    indexes_dropped: u64,
+    indexes_returned: u64,
+}
+
+fn gql_property_index_catalog_row(
+    entry: &SecondaryIndexManifestEntry,
+    catalog: &ReadLabelCatalogSnapshot,
+) -> Result<Option<GqlPropertyIndexCatalogRow>, EngineError> {
+    let (target_kind, label, prop_key) = match &entry.target {
+        SecondaryIndexTarget::NodeProperty { label_id, prop_key } => (
+            GqlPropertyIndexTargetKind::Node,
+            catalog
+                .node_label(*label_id)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    EngineError::ManifestError(format!(
+                        "node property index {} references missing node label label_id {}",
+                        entry.index_id, label_id
+                    ))
+                })?,
+            prop_key.clone(),
+        ),
+        SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => (
+            GqlPropertyIndexTargetKind::Edge,
+            catalog
+                .edge_label(*label_id)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    EngineError::ManifestError(format!(
+                        "edge property index {} references missing edge-label label_id {}",
+                        entry.index_id, label_id
+                    ))
+                })?,
+            prop_key.clone(),
+        ),
+    };
+    Ok(Some(GqlPropertyIndexCatalogRow {
+        target_kind,
+        label,
+        prop_key,
+        kind: entry.kind.clone(),
+        state: entry.state,
+        index_id: entry.index_id,
+        last_error: entry.last_error.clone(),
+    }))
+}
+
+fn show_property_index_scope_matches(
+    scope: GqlShowPropertyIndexScope,
+    target_kind: GqlPropertyIndexTargetKind,
+) -> bool {
+    matches!(
+        (scope, target_kind),
+        (GqlShowPropertyIndexScope::All, _)
+            | (GqlShowPropertyIndexScope::Node, GqlPropertyIndexTargetKind::Node)
+            | (GqlShowPropertyIndexScope::Edge, GqlPropertyIndexTargetKind::Edge)
+    )
+}
+
+fn create_property_index_columns() -> Vec<String> {
+    gql_index_columns([
+        "operation",
+        "target_kind",
+        "label",
+        "prop_key",
+        "kind",
+        "action",
+        "state",
+        "index_id",
+        "last_error",
+    ])
+}
+
+fn drop_property_index_columns() -> Vec<String> {
+    gql_index_columns([
+        "operation",
+        "target_kind",
+        "label",
+        "prop_key",
+        "kind",
+        "action",
+    ])
+}
+
+fn show_property_index_columns() -> Vec<String> {
+    gql_index_columns([
+        "target_kind",
+        "label",
+        "prop_key",
+        "kind",
+        "state",
+        "index_id",
+        "last_error",
+    ])
+}
+
+fn gql_index_columns<const N: usize>(columns: [&str; N]) -> Vec<String> {
+    columns.into_iter().map(str::to_string).collect()
+}
+
+fn create_node_property_index_row(info: &NodePropertyIndexInfo) -> GqlRow {
+    create_property_index_row(
+        GqlPropertyIndexTargetKind::Node,
+        &info.label,
+        &info.prop_key,
+        &info.kind,
+        info.state,
+        info.index_id,
+        info.last_error.as_ref(),
+    )
+}
+
+fn create_edge_property_index_row(info: &EdgePropertyIndexInfo) -> GqlRow {
+    create_property_index_row(
+        GqlPropertyIndexTargetKind::Edge,
+        &info.label,
+        &info.prop_key,
+        &info.kind,
+        info.state,
+        info.index_id,
+        info.last_error.as_ref(),
+    )
+}
+
+fn create_property_index_row(
+    target_kind: GqlPropertyIndexTargetKind,
+    label: &str,
+    prop_key: &str,
+    kind: &SecondaryIndexKind,
+    state: SecondaryIndexState,
+    index_id: u64,
+    last_error: Option<&String>,
+) -> GqlRow {
+    GqlRow {
+        values: vec![
+            GqlValue::String(create_property_index_operation_name().to_string()),
+            GqlValue::String(gql_index_target_kind_name(target_kind).to_string()),
+            GqlValue::String(label.to_string()),
+            GqlValue::String(prop_key.to_string()),
+            GqlValue::String(gql_index_kind_name(kind).to_string()),
+            GqlValue::String("ensured".to_string()),
+            GqlValue::String(gql_index_state_name(state).to_string()),
+            GqlValue::UInt(index_id),
+            gql_index_last_error_value(last_error),
+        ],
+    }
+}
+
+fn drop_property_index_row(bound: &GqlBoundPropertyIndexStatement, dropped: bool) -> GqlRow {
+    GqlRow {
+        values: vec![
+            GqlValue::String(drop_property_index_operation_name().to_string()),
+            GqlValue::String(gql_index_target_kind_name(bound.target_kind).to_string()),
+            GqlValue::String(bound.label.clone()),
+            GqlValue::String(bound.prop_key.clone()),
+            GqlValue::String(gql_index_kind_name(&bound.kind).to_string()),
+            GqlValue::String(if dropped { "dropped" } else { "not_found" }.to_string()),
+        ],
+    }
+}
+
+fn show_property_index_row(row: &GqlPropertyIndexCatalogRow) -> GqlRow {
+    GqlRow {
+        values: vec![
+            GqlValue::String(gql_index_target_kind_name(row.target_kind).to_string()),
+            GqlValue::String(row.label.clone()),
+            GqlValue::String(row.prop_key.clone()),
+            GqlValue::String(gql_index_kind_name(&row.kind).to_string()),
+            GqlValue::String(gql_index_state_name(row.state).to_string()),
+            GqlValue::UInt(row.index_id),
+            gql_index_last_error_value(row.last_error.as_ref()),
+        ],
+    }
+}
+
+fn gql_index_last_error_value(last_error: Option<&String>) -> GqlValue {
+    last_error
+        .cloned()
+        .map(GqlValue::String)
+        .unwrap_or(GqlValue::Null)
+}
+
+fn gql_index_execution_result(
+    operation: &str,
+    columns: Vec<String>,
+    rows: Vec<GqlRow>,
+    counts: GqlIndexStatsCounts,
+    options: &GqlExecutionOptions,
+    started_at: Instant,
+    plan: Option<GqlExecutionExplain>,
+) -> GqlExecutionResult {
+    let rows_returned = rows.len();
+    let elapsed_us = index_elapsed(options, started_at);
+    GqlExecutionResult {
+        kind: GqlStatementKind::Index,
+        columns,
+        rows,
+        next_cursor: None,
+        stats: GqlExecutionStats {
+            rows_returned,
+            rows_matched: 0,
+            rows_after_filter: 0,
+            intermediate_bindings: 0,
+            db_hits: 0,
+            elapsed_us,
+            warnings: Vec::new(),
+        },
+        mutation_stats: None,
+        schema_stats: None,
+        index_stats: Some(gql_index_stats(operation, counts, elapsed_us)),
+        plan,
+    }
+}
+
+fn gql_index_stats(
+    operation: &str,
+    counts: GqlIndexStatsCounts,
+    elapsed_us: Option<u64>,
+) -> GqlIndexStats {
+    GqlIndexStats {
+        operation: operation.to_string(),
+        indexes_ensured: counts.indexes_ensured,
+        indexes_dropped: counts.indexes_dropped,
+        indexes_returned: counts.indexes_returned,
+        elapsed_us,
+        warnings: Vec::new(),
+    }
+}
+
+fn index_elapsed(options: &GqlExecutionOptions, started_at: Instant) -> Option<u64> {
+    if options.profile {
+        started_at.elapsed().as_micros().try_into().ok()
+    } else {
+        None
+    }
+}
+
+fn build_gql_index_execution_explain(
+    plan: &GqlIndexSemanticPlan,
+    options: &GqlExecutionOptions,
+) -> GqlExecutionExplain {
+    GqlExecutionExplain {
+        kind: GqlStatementKind::Index,
+        columns: gql_index_explain_columns(plan),
+        read: None,
+        mutation: None,
+        schema: None,
+        index: Some(gql_index_explain(plan)),
+        caps: gql_execution_cap_summary(options),
+        warnings: Vec::new(),
+        notes: vec![
+            "Index explain is side-effect-free and does not create labels, write manifests, enqueue builds, drop declarations, inspect sidecars, or scan graph records".to_string(),
+        ],
+    }
+}
+
+fn gql_index_explain(plan: &GqlIndexSemanticPlan) -> GqlIndexExplain {
+    match plan {
+        GqlIndexSemanticPlan::Create(create) => GqlIndexExplain {
+            operation: create_property_index_operation_name().to_string(),
+            targets: vec![gql_index_explain_property_target(create, "ensure")],
+            uses_core_write_queue: true,
+            publishes_manifest: true,
+            creates_labels: true,
+            schedules_background_build: true,
+            drops_index_data_async: false,
+            side_effect_free: false,
+        },
+        GqlIndexSemanticPlan::Drop(drop) => GqlIndexExplain {
+            operation: drop_property_index_operation_name().to_string(),
+            targets: vec![gql_index_explain_property_target(drop, "drop")],
+            uses_core_write_queue: true,
+            publishes_manifest: true,
+            creates_labels: false,
+            schedules_background_build: false,
+            drops_index_data_async: true,
+            side_effect_free: false,
+        },
+        GqlIndexSemanticPlan::Show { scope, .. } => GqlIndexExplain {
+            operation: show_property_index_operation_name(*scope).to_string(),
+            targets: vec![gql_index_explain_show_target(*scope)],
+            uses_core_write_queue: false,
+            publishes_manifest: false,
+            creates_labels: false,
+            schedules_background_build: false,
+            drops_index_data_async: false,
+            side_effect_free: true,
+        },
+    }
+}
+
+fn gql_index_explain_columns(plan: &GqlIndexSemanticPlan) -> Vec<String> {
+    match plan {
+        GqlIndexSemanticPlan::Create(_) => create_property_index_columns(),
+        GqlIndexSemanticPlan::Drop(_) => drop_property_index_columns(),
+        GqlIndexSemanticPlan::Show { .. } => show_property_index_columns(),
+    }
+}
+
+fn gql_index_explain_property_target(
+    bound: &GqlBoundPropertyIndexStatement,
+    action: &str,
+) -> GqlIndexExplainTarget {
+    GqlIndexExplainTarget {
+        target_kind: gql_index_target_kind_name(bound.target_kind).to_string(),
+        label: Some(bound.label.clone()),
+        prop_key: Some(bound.prop_key.clone()),
+        kind: Some(gql_index_kind_name(&bound.kind).to_string()),
+        action: Some(action.to_string()),
+    }
+}
+
+fn gql_index_explain_show_target(scope: GqlShowPropertyIndexScope) -> GqlIndexExplainTarget {
+    GqlIndexExplainTarget {
+        target_kind: match scope {
+            GqlShowPropertyIndexScope::All => "property_index_catalog",
+            GqlShowPropertyIndexScope::Node => "node",
+            GqlShowPropertyIndexScope::Edge => "edge",
+        }
+        .to_string(),
+        label: None,
+        prop_key: None,
+        kind: None,
+        action: Some("show".to_string()),
+    }
+}
+
+fn create_property_index_operation_name() -> &'static str {
+    "create_property_index"
+}
+
+fn drop_property_index_operation_name() -> &'static str {
+    "drop_property_index"
+}
+
+fn show_property_index_operation_name(scope: GqlShowPropertyIndexScope) -> &'static str {
+    match scope {
+        GqlShowPropertyIndexScope::All => "show_property_indexes",
+        GqlShowPropertyIndexScope::Node => "show_node_property_indexes",
+        GqlShowPropertyIndexScope::Edge => "show_edge_property_indexes",
+    }
+}
+
+fn gql_index_kind_name(kind: &SecondaryIndexKind) -> &'static str {
+    match kind {
+        SecondaryIndexKind::Equality => "equality",
+        SecondaryIndexKind::Range => "range",
+    }
+}
+
+fn gql_index_state_name(state: SecondaryIndexState) -> &'static str {
+    match state {
+        SecondaryIndexState::Building => "building",
+        SecondaryIndexState::Ready => "ready",
+        SecondaryIndexState::Failed => "failed",
+    }
+}
+
+fn gql_index_target_kind_rank(kind: GqlPropertyIndexTargetKind) -> u8 {
+    match kind {
+        GqlPropertyIndexTargetKind::Node => 0,
+        GqlPropertyIndexTargetKind::Edge => 1,
+    }
+}
+
+fn gql_index_kind_rank(kind: &SecondaryIndexKind) -> u8 {
+    match kind {
+        SecondaryIndexKind::Equality => 0,
+        SecondaryIndexKind::Range => 1,
+    }
+}
+
+impl DatabaseEngine {
+    fn execute_gql_schema(
+        &self,
+        schema: GqlSchemaStatement,
+        params: &GqlParams,
+        options: &GqlExecutionOptions,
+        started_at: Instant,
+    ) -> Result<GqlExecutionResult, EngineError> {
+        if options.cursor.is_some() {
+            return Err(EngineError::InvalidCursor {
+                message: "GQL schema statements do not accept cursors".into(),
+            });
+        }
+        if options.mode == GqlExecutionMode::ReadOnly && schema_statement_is_mutating(&schema) {
+            return Err(EngineError::InvalidOperation(
+                "GQL schema publication is not allowed in ReadOnly mode".to_string(),
+            ));
+        }
+        validate_referenced_gql_schema_ast_params(&schema, params, options)?;
+        let bound = bind_schema_statement(schema, params)?;
+        let plan = if options.include_plan {
+            Some(build_gql_schema_execution_explain(&bound, options))
+        } else {
+            None
+        };
+        match bound {
+            GqlSchemaSemanticPlan::Alter(alter) => {
+                self.execute_bound_gql_schema_alter(alter, options, started_at, plan)
+            }
+            GqlSchemaSemanticPlan::DropCurrentGraphType { .. } => {
+                self.execute_bound_gql_schema_drop_current(options, started_at, plan)
+            }
+            GqlSchemaSemanticPlan::Check(check) => {
+                self.execute_bound_gql_schema_check(check, options, started_at, plan)
+            }
+            GqlSchemaSemanticPlan::Show { kind, .. } => {
+                self.execute_bound_gql_schema_show(kind, options, started_at, plan)
+            }
+        }
+    }
+
+    fn explain_gql_schema(
+        &self,
+        schema: GqlSchemaStatement,
+        params: &GqlParams,
+        options: &GqlExecutionOptions,
+    ) -> Result<GqlExecutionExplain, EngineError> {
+        if options.cursor.is_some() {
+            return Err(EngineError::InvalidCursor {
+                message: "GQL schema statements do not accept cursors".into(),
+            });
+        }
+        if options.mode == GqlExecutionMode::ReadOnly && schema_statement_is_mutating(&schema) {
+            return Err(EngineError::InvalidOperation(
+                "GQL schema publication is not allowed in ReadOnly mode".to_string(),
+            ));
+        }
+        validate_referenced_gql_schema_ast_params(&schema, params, options)?;
+        let bound = bind_schema_statement(schema, params)?;
+        Ok(build_gql_schema_execution_explain(&bound, options))
+    }
+
+    fn execute_bound_gql_schema_alter(
+        &self,
+        alter: GqlBoundAlterGraphTypeStatement,
+        options: &GqlExecutionOptions,
+        started_at: Instant,
+        plan: Option<GqlExecutionExplain>,
+    ) -> Result<GqlExecutionResult, EngineError> {
+        let operation = alter_operation_name(alter.mode);
+        match alter.mode {
+            GqlGraphTypeAlterMode::Add => {
+                let result = self.alter_graph_schema(alter.operations, alter.options)?;
+                Ok(gql_schema_execution_result(
+                    operation,
+                    alter_add_set_columns(),
+                    rows_for_gql_schema_publish(&result, false),
+                    gql_schema_stats_from_publish(operation, &result, schema_elapsed(options, started_at)),
+                    options,
+                    started_at,
+                    plan,
+                ))
+            }
+            GqlGraphTypeAlterMode::Set => {
+                let schema = alter.schema.expect("SET plan always carries a schema");
+                let set_empty = schema.node_schemas.is_empty() && schema.edge_schemas.is_empty();
+                let result = self.set_graph_schema(schema, alter.options)?;
+                let rows = if set_empty {
+                    vec![alter_set_empty_row()]
+                } else {
+                    rows_for_gql_schema_publish(&result, false)
+                };
+                Ok(gql_schema_execution_result(
+                    operation,
+                    alter_add_set_columns(),
+                    rows,
+                    gql_schema_stats_from_publish(operation, &result, schema_elapsed(options, started_at)),
+                    options,
+                    started_at,
+                    plan,
+                ))
+            }
+            GqlGraphTypeAlterMode::Drop => {
+                let result = self.alter_graph_schema(alter.operations, alter.options)?;
+                Ok(gql_schema_execution_result(
+                    operation,
+                    alter_drop_columns(),
+                    rows_for_gql_schema_selected_drop(&result),
+                    gql_schema_stats_from_publish(operation, &result, schema_elapsed(options, started_at)),
+                    options,
+                    started_at,
+                    plan,
+                ))
+            }
+        }
+    }
+
+    fn execute_bound_gql_schema_drop_current(
+        &self,
+        options: &GqlExecutionOptions,
+        started_at: Instant,
+        plan: Option<GqlExecutionExplain>,
+    ) -> Result<GqlExecutionResult, EngineError> {
+        let result = self.drop_graph_schema()?;
+        let operation = "drop_current_graph_type";
+        Ok(gql_schema_execution_result(
+            operation,
+            drop_current_columns(),
+            vec![drop_current_row(&result)],
+            gql_schema_stats_from_publish(operation, &result, schema_elapsed(options, started_at)),
+            options,
+            started_at,
+            plan,
+        ))
+    }
+
+    fn execute_bound_gql_schema_check(
+        &self,
+        check: GqlBoundCheckGraphTypeStatement,
+        options: &GqlExecutionOptions,
+        started_at: Instant,
+        plan: Option<GqlExecutionExplain>,
+    ) -> Result<GqlExecutionResult, EngineError> {
+        let operation = check_operation_name(check.mode);
+        let check_empty =
+            check.schema.node_schemas.is_empty() && check.schema.edge_schemas.is_empty();
+        let report = match check.mode {
+            GqlGraphTypeCheckMode::Add => self.check_graph_schema_add(check.schema, check.options)?,
+            GqlGraphTypeCheckMode::Set => self.check_graph_schema_set(check.schema, check.options)?,
+        };
+        let rows = if check.mode == GqlGraphTypeCheckMode::Set && check_empty {
+            vec![check_set_empty_row()]
+        } else {
+            rows_for_gql_schema_check(&report)
+        };
+        Ok(gql_schema_execution_result(
+            operation,
+            check_columns(),
+            rows,
+            gql_schema_stats_from_check(operation, &report, schema_elapsed(options, started_at)),
+            options,
+            started_at,
+            plan,
+        ))
+    }
+
+    fn execute_bound_gql_schema_show(
+        &self,
+        kind: GqlShowSchemaKind,
+        options: &GqlExecutionOptions,
+        started_at: Instant,
+        plan: Option<GqlExecutionExplain>,
+    ) -> Result<GqlExecutionResult, EngineError> {
+        let operation = show_operation_name(&kind);
+        let rows = match kind {
+            GqlShowSchemaKind::CurrentGraphType => {
+                self.show_current_graph_type_rows()?
+            }
+            GqlShowSchemaKind::NodeSchemas => show_node_schema_rows(self.list_node_schemas()?),
+            GqlShowSchemaKind::EdgeSchemas => show_edge_schema_rows(self.list_edge_schemas()?),
+            GqlShowSchemaKind::NodeSchema { label } => self
+                .get_node_schema(&label.name)?
+                .map(|info| show_node_schema_rows(vec![info]))
+                .unwrap_or_default(),
+            GqlShowSchemaKind::EdgeSchema { label } => self
+                .get_edge_schema(&label.name)?
+                .map(|info| show_edge_schema_rows(vec![info]))
+                .unwrap_or_default(),
+        };
+        if rows.len() > options.max_rows {
+            return Err(EngineError::InvalidOperation(format!(
+                "GQL schema SHOW result has {} rows, exceeding max_rows={}; schema SHOW does not support cursors",
+                rows.len(),
+                options.max_rows
+            )));
+        }
+        Ok(gql_schema_execution_result(
+            operation,
+            show_columns(),
+            rows,
+            gql_schema_stats_for_show(operation, schema_elapsed(options, started_at)),
+            options,
+            started_at,
+            plan,
+        ))
+    }
+
+    fn show_current_graph_type_rows(&self) -> Result<Vec<GqlRow>, EngineError> {
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        let mut node_infos = published
+            .schema_catalog
+            .node_schemas
+            .iter()
+            .map(|entry| {
+                node_schema_info_from_entry_with_catalog(entry, published.label_catalog.as_ref())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        node_infos.sort_unstable_by(|left, right| left.label.cmp(&right.label));
+
+        let mut edge_infos = published
+            .schema_catalog
+            .edge_schemas
+            .iter()
+            .map(|entry| {
+                edge_schema_info_from_entry_with_catalog(entry, published.label_catalog.as_ref())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        edge_infos.sort_unstable_by(|left, right| left.label.cmp(&right.label));
+
+        let mut rows = show_node_schema_rows(node_infos);
+        rows.extend(show_edge_schema_rows(edge_infos));
+        Ok(rows)
+    }
+}
+
+fn gql_schema_execution_result(
+    _operation: &str,
+    columns: Vec<String>,
+    rows: Vec<GqlRow>,
+    schema_stats: GqlSchemaStats,
+    options: &GqlExecutionOptions,
+    started_at: Instant,
+    plan: Option<GqlExecutionExplain>,
+) -> GqlExecutionResult {
+    let rows_returned = rows.len();
+    let elapsed_us = schema_elapsed(options, started_at);
+    GqlExecutionResult {
+        kind: GqlStatementKind::Schema,
+        columns,
+        rows,
+        next_cursor: None,
+        stats: GqlExecutionStats {
+            rows_returned,
+            rows_matched: 0,
+            rows_after_filter: 0,
+            intermediate_bindings: 0,
+            db_hits: 0,
+            elapsed_us,
+            warnings: Vec::new(),
+        },
+        mutation_stats: None,
+        schema_stats: Some(schema_stats),
+        index_stats: None,
+        plan,
+    }
+}
+
+fn alter_add_set_columns() -> Vec<String> {
+    gql_schema_columns([
+        "operation",
+        "target_kind",
+        "label",
+        "action",
+        "checked_records",
+        "violation_count",
+        "truncated",
+        "scan_limit_hit",
+    ])
+}
+
+fn alter_drop_columns() -> Vec<String> {
+    gql_schema_columns(["operation", "target_kind", "label", "action"])
+}
+
+fn drop_current_columns() -> Vec<String> {
+    gql_schema_columns([
+        "operation",
+        "target_kind",
+        "label",
+        "action",
+        "node_schemas_dropped",
+        "edge_schemas_dropped",
+    ])
+}
+
+fn check_columns() -> Vec<String> {
+    gql_schema_columns([
+        "operation",
+        "target_kind",
+        "label",
+        "checked_records",
+        "violation_count",
+        "truncated",
+        "scan_limit_hit",
+        "violations",
+    ])
+}
+
+fn show_columns() -> Vec<String> {
+    gql_schema_columns(["target_kind", "label", "schema"])
+}
+
+fn gql_schema_columns<const N: usize>(columns: [&str; N]) -> Vec<String> {
+    columns.into_iter().map(str::to_string).collect()
+}
+
+fn rows_for_gql_schema_publish(
+    result: &GraphSchemaPublishResult,
+    _include_catalog_rows: bool,
+) -> Vec<GqlRow> {
+    let operation = match result.operation {
+        GraphSchemaOperationKind::Add => "alter_graph_type_add",
+        GraphSchemaOperationKind::Set => "alter_graph_type_set",
+        other => panic!("unexpected publish operation for ALTER ADD/SET rows: {other:?}"),
+    };
+    result
+        .validation
+        .entries
+        .iter()
+        .map(|entry| alter_publish_row(operation, entry))
+        .collect()
+}
+
+fn alter_publish_row(operation: &str, entry: &GraphSchemaValidationReportEntry) -> GqlRow {
+    GqlRow {
+        values: vec![
+            GqlValue::String(operation.to_string()),
+            GqlValue::String(gql_schema_target_kind_name(entry.target_kind).to_string()),
+            GqlValue::String(entry.label.clone()),
+            GqlValue::String("published".to_string()),
+            GqlValue::UInt(entry.report.checked_records),
+            GqlValue::UInt(entry.report.violation_count),
+            GqlValue::Bool(entry.report.truncated),
+            GqlValue::Bool(entry.report.scan_limit_hit),
+        ],
+    }
+}
+
+fn alter_set_empty_row() -> GqlRow {
+    GqlRow {
+        values: vec![
+            GqlValue::String("alter_graph_type_set".to_string()),
+            GqlValue::String("graph".to_string()),
+            GqlValue::Null,
+            GqlValue::String("published_empty_graph_type".to_string()),
+            GqlValue::UInt(0),
+            GqlValue::UInt(0),
+            GqlValue::Bool(false),
+            GqlValue::Bool(false),
+        ],
+    }
+}
+
+fn rows_for_gql_schema_selected_drop(result: &GraphSchemaPublishResult) -> Vec<GqlRow> {
+    result
+        .drop_targets
+        .iter()
+        .map(|target| GqlRow {
+            values: vec![
+                GqlValue::String("alter_graph_type_drop".to_string()),
+                GqlValue::String(gql_schema_target_kind_name(target.target_kind).to_string()),
+                GqlValue::String(target.label.clone()),
+                GqlValue::String(drop_action_name(target.action).to_string()),
+            ],
+        })
+        .collect()
+}
+
+fn drop_current_row(result: &GraphSchemaPublishResult) -> GqlRow {
+    GqlRow {
+        values: vec![
+            GqlValue::String("drop_current_graph_type".to_string()),
+            GqlValue::String("graph".to_string()),
+            GqlValue::Null,
+            GqlValue::String("dropped".to_string()),
+            GqlValue::UInt(result.node_schemas_dropped as u64),
+            GqlValue::UInt(result.edge_schemas_dropped as u64),
+        ],
+    }
+}
+
+fn rows_for_gql_schema_check(report: &GraphSchemaCheckReport) -> Vec<GqlRow> {
+    let operation = match report.operation {
+        GraphSchemaOperationKind::CheckAdd => "check_graph_type_add",
+        GraphSchemaOperationKind::CheckSet => "check_graph_type_set",
+        other => panic!("unexpected check operation for CHECK rows: {other:?}"),
+    };
+    report
+        .entries
+        .iter()
+        .map(|entry| check_row(operation, entry))
+        .collect()
+}
+
+fn check_row(operation: &str, entry: &GraphSchemaValidationReportEntry) -> GqlRow {
+    GqlRow {
+        values: vec![
+            GqlValue::String(operation.to_string()),
+            GqlValue::String(gql_schema_target_kind_name(entry.target_kind).to_string()),
+            GqlValue::String(entry.label.clone()),
+            GqlValue::UInt(entry.report.checked_records),
+            GqlValue::UInt(entry.report.violation_count),
+            GqlValue::Bool(entry.report.truncated),
+            GqlValue::Bool(entry.report.scan_limit_hit),
+            GqlValue::List(
+                entry
+                    .report
+                    .violations
+                    .iter()
+                    .map(gql_value_from_schema_violation)
+                    .collect(),
+            ),
+        ],
+    }
+}
+
+fn check_set_empty_row() -> GqlRow {
+    GqlRow {
+        values: vec![
+            GqlValue::String("check_graph_type_set".to_string()),
+            GqlValue::String("graph".to_string()),
+            GqlValue::Null,
+            GqlValue::UInt(0),
+            GqlValue::UInt(0),
+            GqlValue::Bool(false),
+            GqlValue::Bool(false),
+            GqlValue::List(Vec::new()),
+        ],
+    }
+}
+
+fn show_node_schema_rows(infos: Vec<NodeSchemaInfo>) -> Vec<GqlRow> {
+    infos
+        .into_iter()
+        .map(|info| GqlRow {
+            values: vec![
+                GqlValue::String("node".to_string()),
+                GqlValue::String(info.label),
+                gql_value_from_node_schema(&info.schema),
+            ],
+        })
+        .collect()
+}
+
+fn show_edge_schema_rows(infos: Vec<EdgeSchemaInfo>) -> Vec<GqlRow> {
+    infos
+        .into_iter()
+        .map(|info| GqlRow {
+            values: vec![
+                GqlValue::String("edge".to_string()),
+                GqlValue::String(info.label),
+                gql_value_from_edge_schema(&info.schema),
+            ],
+        })
+        .collect()
+}
+
+fn gql_schema_stats_from_publish(
+    operation: &str,
+    result: &GraphSchemaPublishResult,
+    elapsed_us: Option<u64>,
+) -> GqlSchemaStats {
+    gql_schema_stats_from_report(
+        operation,
+        &result.validation,
+        result.targets_published as u64,
+        result.targets_dropped as u64,
+        elapsed_us,
+    )
+}
+
+fn gql_schema_stats_from_check(
+    operation: &str,
+    report: &GraphSchemaCheckReport,
+    elapsed_us: Option<u64>,
+) -> GqlSchemaStats {
+    gql_schema_stats_from_report(operation, report, 0, 0, elapsed_us)
+}
+
+fn gql_schema_stats_from_report(
+    operation: &str,
+    report: &GraphSchemaCheckReport,
+    targets_published: u64,
+    targets_dropped: u64,
+    elapsed_us: Option<u64>,
+) -> GqlSchemaStats {
+    GqlSchemaStats {
+        operation: operation.to_string(),
+        targets_checked: report.entries.len() as u64,
+        targets_published,
+        targets_dropped,
+        checked_records: report.checked_records,
+        violation_count: report.violation_count,
+        truncated: report.truncated,
+        scan_limit_hit: report.scan_limit_hit,
+        elapsed_us,
+        warnings: Vec::new(),
+    }
+}
+
+fn gql_schema_stats_for_show(operation: &str, elapsed_us: Option<u64>) -> GqlSchemaStats {
+    GqlSchemaStats {
+        operation: operation.to_string(),
+        targets_checked: 0,
+        targets_published: 0,
+        targets_dropped: 0,
+        checked_records: 0,
+        violation_count: 0,
+        truncated: false,
+        scan_limit_hit: false,
+        elapsed_us,
+        warnings: Vec::new(),
+    }
+}
+
+fn schema_elapsed(options: &GqlExecutionOptions, started_at: Instant) -> Option<u64> {
+    if options.profile {
+        started_at.elapsed().as_micros().try_into().ok()
+    } else {
+        None
+    }
+}
+
+fn build_gql_schema_execution_explain(
+    plan: &GqlSchemaSemanticPlan,
+    options: &GqlExecutionOptions,
+) -> GqlExecutionExplain {
+    let schema = gql_schema_explain(plan);
+    let columns = gql_schema_explain_columns(plan);
+    let mut notes = vec![
+        "Schema explain is side-effect-free and does not publish schemas, create labels, write manifests, drop schemas, or scan graph data".to_string(),
+    ];
+    if schema.uses_core_write_queue {
+        notes.push(
+            "Schema execution routes catalog publication/drop through the core serialized write queue"
+                .to_string(),
+        );
+    } else {
+        notes.push(
+            "Schema execution uses side-effect-free CHECK or catalog SHOW APIs without the core write queue"
+                .to_string(),
+        );
+    }
+    GqlExecutionExplain {
+        kind: GqlStatementKind::Schema,
+        columns,
+        read: None,
+        mutation: None,
+        schema: Some(schema),
+        index: None,
+        caps: gql_execution_cap_summary(options),
+        warnings: Vec::new(),
+        notes,
+    }
+}
+
+fn gql_schema_explain(plan: &GqlSchemaSemanticPlan) -> GqlSchemaExplain {
+    match plan {
+        GqlSchemaSemanticPlan::Alter(alter) => gql_schema_explain_for_alter(alter),
+        GqlSchemaSemanticPlan::DropCurrentGraphType { .. } => GqlSchemaExplain {
+            operation: "drop_current_graph_type".to_string(),
+            targets: vec![schema_explain_target("graph", None, Some("drop"))],
+            replaces_entire_catalog: true,
+            publishes_manifest: true,
+            validates_existing_data: false,
+            uses_core_write_queue: true,
+            side_effect_free: false,
+            options: empty_schema_explain_options(),
+        },
+        GqlSchemaSemanticPlan::Check(check) => gql_schema_explain_for_check(check),
+        GqlSchemaSemanticPlan::Show { kind, .. } => GqlSchemaExplain {
+            operation: show_operation_name(kind).to_string(),
+            targets: show_schema_explain_targets(kind),
+            replaces_entire_catalog: false,
+            publishes_manifest: false,
+            validates_existing_data: false,
+            uses_core_write_queue: false,
+            side_effect_free: true,
+            options: empty_schema_explain_options(),
+        },
+    }
+}
+
+fn gql_schema_explain_for_alter(alter: &GqlBoundAlterGraphTypeStatement) -> GqlSchemaExplain {
+    let targets = match alter.mode {
+        GqlGraphTypeAlterMode::Add | GqlGraphTypeAlterMode::Set => alter
+            .schema
+            .as_ref()
+            .map(schema_publish_explain_targets)
+            .unwrap_or_default(),
+        GqlGraphTypeAlterMode::Drop => alter_drop_explain_targets(&alter.operations),
+    };
+    GqlSchemaExplain {
+        operation: alter_operation_name(alter.mode).to_string(),
+        targets: if alter.mode == GqlGraphTypeAlterMode::Set && targets.is_empty() {
+            vec![schema_explain_target(
+                "graph",
+                None,
+                Some("publish_empty_graph_type"),
+            )]
+        } else {
+            targets
+        },
+        replaces_entire_catalog: alter.mode == GqlGraphTypeAlterMode::Set,
+        publishes_manifest: true,
+        validates_existing_data: alter.mode != GqlGraphTypeAlterMode::Drop
+            && alter
+                .schema
+                .as_ref()
+                .is_some_and(|schema| !schema.node_schemas.is_empty() || !schema.edge_schemas.is_empty()),
+        uses_core_write_queue: true,
+        side_effect_free: false,
+        options: if alter.mode == GqlGraphTypeAlterMode::Drop {
+            empty_schema_explain_options()
+        } else {
+            GqlSchemaExplainOptions {
+                max_violations: Some(alter.options.max_violations),
+                chunk_size: Some(alter.options.chunk_size),
+                scan_limit: alter.options.scan_limit,
+            }
+        },
+    }
+}
+
+fn gql_schema_explain_for_check(check: &GqlBoundCheckGraphTypeStatement) -> GqlSchemaExplain {
+    let targets = schema_publish_explain_targets(&check.schema);
+    GqlSchemaExplain {
+        operation: check_operation_name(check.mode).to_string(),
+        targets: if check.mode == GqlGraphTypeCheckMode::Set && targets.is_empty() {
+            vec![schema_explain_target(
+                "graph",
+                None,
+                Some("check_empty_graph_type"),
+            )]
+        } else {
+            targets
+        },
+        replaces_entire_catalog: check.mode == GqlGraphTypeCheckMode::Set,
+        publishes_manifest: false,
+        validates_existing_data: !check.schema.node_schemas.is_empty()
+            || !check.schema.edge_schemas.is_empty(),
+        uses_core_write_queue: false,
+        side_effect_free: true,
+        options: GqlSchemaExplainOptions {
+            max_violations: Some(check.options.max_violations),
+            chunk_size: Some(check.options.chunk_size),
+            scan_limit: check.options.scan_limit,
+        },
+    }
+}
+
+fn gql_schema_explain_columns(plan: &GqlSchemaSemanticPlan) -> Vec<String> {
+    match plan {
+        GqlSchemaSemanticPlan::Alter(alter) => match alter.mode {
+            GqlGraphTypeAlterMode::Add | GqlGraphTypeAlterMode::Set => alter_add_set_columns(),
+            GqlGraphTypeAlterMode::Drop => alter_drop_columns(),
+        },
+        GqlSchemaSemanticPlan::DropCurrentGraphType { .. } => drop_current_columns(),
+        GqlSchemaSemanticPlan::Check(_) => check_columns(),
+        GqlSchemaSemanticPlan::Show { .. } => show_columns(),
+    }
+}
+
+fn schema_publish_explain_targets(schema: &GraphSchema) -> Vec<GqlSchemaExplainTarget> {
+    schema
+        .node_schemas
+        .iter()
+        .map(|info| schema_explain_target("node", Some(info.label.clone()), Some("publish")))
+        .chain(
+            schema
+                .edge_schemas
+                .iter()
+                .map(|info| schema_explain_target("edge", Some(info.label.clone()), Some("publish"))),
+        )
+        .collect()
+}
+
+fn alter_drop_explain_targets(
+    operations: &[GraphSchemaOperation],
+) -> Vec<GqlSchemaExplainTarget> {
+    operations
+        .iter()
+        .map(|operation| match operation {
+            GraphSchemaOperation::DropNode { label } => {
+                schema_explain_target("node", Some(label.clone()), Some("drop"))
+            }
+            GraphSchemaOperation::DropEdge { label } => {
+                schema_explain_target("edge", Some(label.clone()), Some("drop"))
+            }
+            GraphSchemaOperation::SetNode { .. } | GraphSchemaOperation::SetEdge { .. } => {
+                unreachable!("ALTER DROP explain only receives drop operations")
+            }
+        })
+        .collect()
+}
+
+fn show_schema_explain_targets(kind: &GqlShowSchemaKind) -> Vec<GqlSchemaExplainTarget> {
+    match kind {
+        GqlShowSchemaKind::CurrentGraphType => {
+            vec![schema_explain_target("graph", None, Some("show"))]
+        }
+        GqlShowSchemaKind::NodeSchemas => {
+            vec![schema_explain_target("node", None, Some("show"))]
+        }
+        GqlShowSchemaKind::EdgeSchemas => {
+            vec![schema_explain_target("edge", None, Some("show"))]
+        }
+        GqlShowSchemaKind::NodeSchema { label } => {
+            vec![schema_explain_target("node", Some(label.name.clone()), Some("show"))]
+        }
+        GqlShowSchemaKind::EdgeSchema { label } => {
+            vec![schema_explain_target("edge", Some(label.name.clone()), Some("show"))]
+        }
+    }
+}
+
+fn schema_explain_target(
+    target_kind: &str,
+    label: Option<String>,
+    action: Option<&str>,
+) -> GqlSchemaExplainTarget {
+    GqlSchemaExplainTarget {
+        target_kind: target_kind.to_string(),
+        label,
+        action: action.map(str::to_string),
+    }
+}
+
+fn empty_schema_explain_options() -> GqlSchemaExplainOptions {
+    GqlSchemaExplainOptions {
+        max_violations: None,
+        chunk_size: None,
+        scan_limit: None,
+    }
+}
+
+fn alter_operation_name(mode: GqlGraphTypeAlterMode) -> &'static str {
+    match mode {
+        GqlGraphTypeAlterMode::Add => "alter_graph_type_add",
+        GqlGraphTypeAlterMode::Set => "alter_graph_type_set",
+        GqlGraphTypeAlterMode::Drop => "alter_graph_type_drop",
+    }
+}
+
+fn check_operation_name(mode: GqlGraphTypeCheckMode) -> &'static str {
+    match mode {
+        GqlGraphTypeCheckMode::Add => "check_graph_type_add",
+        GqlGraphTypeCheckMode::Set => "check_graph_type_set",
+    }
+}
+
+fn show_operation_name(kind: &GqlShowSchemaKind) -> &'static str {
+    match kind {
+        GqlShowSchemaKind::CurrentGraphType => "show_current_graph_type",
+        GqlShowSchemaKind::NodeSchemas => "show_node_schemas",
+        GqlShowSchemaKind::EdgeSchemas => "show_edge_schemas",
+        GqlShowSchemaKind::NodeSchema { .. } => "show_node_schema",
+        GqlShowSchemaKind::EdgeSchema { .. } => "show_edge_schema",
+    }
+}
+
+fn drop_action_name(action: GraphSchemaDropAction) -> &'static str {
+    match action {
+        GraphSchemaDropAction::Dropped => "dropped",
+        GraphSchemaDropAction::NotFound => "not_found",
+    }
 }
 
 fn graph_pipeline_legacy_fast_path_eligible(query: &GraphPipelineQuery) -> bool {
@@ -1442,6 +2823,8 @@ impl DatabaseEngine {
                 elapsed_us,
                 warnings,
             }),
+            schema_stats: None,
+            index_stats: None,
             plan: explain,
         })
     }
@@ -8190,6 +9573,8 @@ fn wrap_read_gql_explain(
         warnings: read.warnings.clone(),
         read: Some(read),
         mutation: None,
+        schema: None,
+        index: None,
         caps: gql_execution_cap_summary(options),
         notes: Vec::new(),
     }
@@ -8321,6 +9706,8 @@ fn build_gql_mutation_explain_with_snapshot(
             replacement_adapters: mutation_uses_replacement_adapters(plan),
             atomic_commit: true,
         }),
+        schema: None,
+        index: None,
         caps: gql_execution_cap_summary(options),
         warnings,
         notes,
@@ -10516,6 +11903,8 @@ fn build_gql_pipeline_execution_explain(
         warnings: read.warnings.clone(),
         read: Some(read),
         mutation: None,
+        schema: None,
+        index: None,
         caps: gql_execution_cap_summary(options),
         notes,
     }

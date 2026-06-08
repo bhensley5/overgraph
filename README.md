@@ -43,7 +43,7 @@ Graph structure and vector similarity can live in the same engine, so you can as
 - **Explicit write transactions.** Stage ordered node and edge mutations locally, read your own staged writes, then commit atomically with optimistic conflict detection. Available in Rust, Node.js, and Python.
 - **Three languages, one engine.** Rust core with native bindings for Node.js (napi-rs) and Python (PyO3). Not a wrapper around a REST API. Actual FFI into the same Rust engine with minimal overhead.
 - **Full queries as functions.** Use regular APIs for everything: `find_nodes` for direct property lookups, `query_node_ids` / `query_nodes` for full boolean node queries, and `query_graph_rows` for row-shaped graph patterns, optional matches, and bounded paths.
-- **GQL Beta.** Write graph reads and writes as GQL/Cypher-style strings when that is easier than building request objects. Use `MATCH`, `WITH`, `DISTINCT`, aggregation, `UNION`, read-only subqueries, constrained shortest paths, `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE r`, `DETACH DELETE n`, and mutation returns.
+- **GQL Beta.** Write graph reads, writes, graph-schema DDL, and property-index DDL as GQL/Cypher-style strings when that is easier than building request objects. Use `MATCH`, `WITH`, `DISTINCT`, aggregation, `UNION`, read-only subqueries, constrained shortest paths, `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE r`, `DETACH DELETE n`, mutation returns, `ALTER` / `CHECK` / `SHOW CURRENT GRAPH TYPE`, and `CREATE` / `DROP` / `SHOW PROPERTY INDEXES`.
 
 ## Performance
 
@@ -197,7 +197,7 @@ Personalized PageRank is available across Rust, Node.js, and Python; this snippe
 
 ## GQL Beta
 
-OverGraph includes **GQL Beta**: a GQL/Cypher-style query language for graph reads and writes. Use it when a graph operation is easier to read as text: create records, match patterns, shape rows with `WITH`, aggregate, combine branches with `UNION`, run read-only subqueries, use constrained shortest paths, and return mutation results.
+OverGraph includes **GQL Beta**: a GQL/Cypher-style query language for graph reads, writes, graph-schema DDL, and property-index DDL. Use it when a graph operation is easier to read as text: create records, match patterns, shape rows with `WITH`, aggregate, combine branches with `UNION`, run read-only subqueries, use constrained shortest paths, return mutation results, manage the current graph type with `ALTER`, `CHECK`, `DROP`, and `SHOW`, or manage property-index declarations with `CREATE`, `DROP`, and `SHOW PROPERTY INDEXES`.
 
 ```python
 db.execute_gql(
@@ -226,7 +226,7 @@ print(result["stats"])
 print(result["plan"]["read"]["row_ops"])
 ```
 
-GQL Beta is available across Rust, Node.js, and Python. It supports params, read cursors, compact rows, vector opt-in for returned node values, explain/profile, read-only execution, mutation stats, async connector calls, and consistent result shapes across languages. See the full [GQL Beta API reference](docs/api-reference.md#gql-beta) for syntax, result shapes, options, and examples.
+GQL Beta is available across Rust, Node.js, and Python. It supports params, read cursors, compact rows, vector opt-in for returned node values, explain/profile, read-only execution, mutation stats, schema stats, index stats, async connector calls, and consistent result shapes across languages. See the full [GQL Beta API reference](docs/api-reference.md#gql-beta) for syntax, result shapes, options, and examples.
 
 ### Async support
 
@@ -263,6 +263,7 @@ Both Python and Node.js connectors include full async variants of every API. Pyt
 - **Degree counts.** Count edges, sum weights, and compute averages without materializing neighbor lists. Batch `degrees` for bulk analysis.
 - **Direct property queries.** `find_nodes` and `find_nodes_paged` do focused equality lookups with semantic numeric equality for finite scalars. `find_nodes_range` and `find_nodes_range_paged` do domainless numeric range scans with exact bound and cursor semantics.
 - **Optional property indexes.** Declare node or edge equality/range indexes only where they pay off. Range indexes cover finite scalar numeric values across signed integers, unsigned integers, and finite floats; non-finite floats and non-numeric values are excluded. Use `ensure_node_property_index` / `ensure_edge_property_index`, list APIs, and drop APIs to manage them. Public query APIs stay index-transparent: when a matching declaration is `Ready`, OverGraph uses the declaration-backed path; otherwise it falls back to the same public API.
+- **Optional schemas and constraints.** Databases stay open by default; label-scoped node and edge schemas can validate required properties, value types, metadata, and endpoint labels through the shared Rust write path across Rust, Node.js, Python, and GQL mutations. Manage them with single-target helpers, atomic graph-level schema APIs, or the supported GQL current-graph-type DDL subset.
 - **Full query APIs.** `query_node_ids`, `query_nodes`, `query_edge_ids`, `query_edges`, `query_graph_rows`, and explain APIs combine IDs, keys, labels, edge labels, endpoint constraints, property equality/IN/range/exists/missing filters, edge metadata filters, updated-at ranges, row-shaped graph patterns, optional groups, and bounded paths without a query string. `execute_gql` / `executeGql` adds GQL Beta for query-string reads and mutations. OverGraph chooses the cheapest legal path with available indexes and planner stats, then verifies results against visible records.
 - **Time-range queries.** Find nodes created or updated within a time window. Sorted timestamp index for efficient range scans.
 

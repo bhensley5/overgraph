@@ -2909,8 +2909,6 @@ impl EngineCore {
 
         self.next_node_id = next_node_id;
         self.next_edge_id = next_edge_id;
-        self.update_next_node_id_seen();
-        self.update_next_edge_id_seen();
 
         Ok(CoreWritePlan {
             ops,

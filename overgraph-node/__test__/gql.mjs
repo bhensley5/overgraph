@@ -81,6 +81,8 @@ describe('GQL connector API', () => {
     assert.equal(result.kind, 'query');
     assert.equal(result.nextCursor, null);
     assert.equal(result.mutationStats, null);
+    assert.equal(result.schemaStats, null);
+    assert.equal(result.indexStats, null);
     assert.equal(result.plan, null);
     assert.deepEqual(result.columns, ['nil', 'flag', 'neg', 'pos', 'float', 'text', 'blob', 'list', 'map']);
     assert.equal(result.rows.length, 1);
@@ -108,6 +110,260 @@ describe('GQL connector API', () => {
     assert.equal(objectRows.stats.rowsReturned, compactRows.stats.rowsReturned);
     assert.equal(objectRows.kind, 'query');
     assert.equal(compactRows.kind, 'query');
+  });
+
+  it('executes and explains GQL schema statements with tagged schema rows', () => {
+    const localTmpDir = mkdtempSync(join(tmpdir(), 'overgraph-gql-node-schema-'));
+    const localDb = OverGraph.open(join(localTmpDir, 'db'), { walSyncMode: 'immediate' });
+    try {
+      const alter = localDb.executeGql(
+        `ALTER CURRENT GRAPH TYPE SET {
+           NODE Tagged = {
+             properties: {
+               payload: {
+                 enum_values: [
+                   { type: 'uint', value: '18446744073709551615' },
+                   { type: 'bytes', value: [0, 1, 255] }
+                 ]
+               }
+             }
+           }
+         }`,
+        null,
+        { includePlan: true }
+      );
+      assert.equal(alter.kind, 'schema');
+      assert.equal(alter.mutationStats, null);
+      assert.equal(alter.indexStats, null);
+      assert.equal(alter.schemaStats.operation, 'alter_graph_type_set');
+      assert.equal(alter.schemaStats.targetsPublished, 1);
+      assert.equal(alter.plan.kind, 'schema');
+      assert.equal(alter.plan.read, null);
+      assert.equal(alter.plan.mutation, null);
+      assert.equal(alter.plan.index, null);
+      assert.equal(alter.plan.schema.operation, 'alter_graph_type_set');
+      assert.equal(alter.plan.schema.usesCoreWriteQueue, true);
+
+      const show = localDb.executeGql('SHOW CURRENT GRAPH TYPE');
+      assert.equal(show.kind, 'schema');
+      assert.equal(show.schemaStats.operation, 'show_current_graph_type');
+      assert.equal(show.rows[0].target_kind, 'node');
+      const enumValues = show.rows[0].schema.properties.payload.enum_values;
+      assert.deepEqual(enumValues[0], {
+        type: 'uint',
+        value: '18446744073709551615',
+      });
+      assert.deepEqual(enumValues[1], {
+        type: 'bytes',
+        value: [0, 1, 255],
+      });
+
+      localDb.upsertNode('NeedsName', 'missing');
+      const check = localDb.executeGql(
+        `CHECK CURRENT GRAPH TYPE ADD {
+           NODE NeedsName = {
+             properties: {
+               name: { required: true, nullable: false, types: ['string'] }
+             }
+           }
+         }`
+      );
+      assert.equal(check.kind, 'schema');
+      assert.equal(check.schemaStats.operation, 'check_graph_type_add');
+      assert.equal(check.schemaStats.violationCount, 1);
+      assert.equal(check.rows[0].violations[0].target.id.type, 'uint');
+      assert.equal(check.rows[0].violations[0].target.id.value, '1');
+      assert.equal(localDb.getNodeSchema('NeedsName'), null);
+
+      const explain = localDb.explainGql(
+        `CHECK CURRENT GRAPH TYPE SET {
+           NODE Tagged = { properties: {} }
+         }`
+      );
+      assert.equal(explain.kind, 'schema');
+      assert.equal(explain.read, null);
+      assert.equal(explain.mutation, null);
+      assert.equal(explain.index, null);
+      assert.equal(explain.schema.operation, 'check_graph_type_set');
+      assert.equal(explain.schema.sideEffectFree, true);
+
+      const read = localDb.executeGql('MATCH (n:NeedsName) RETURN n.key AS key');
+      assert.equal(read.kind, 'query');
+      assert.equal(read.schemaStats, null);
+      assert.equal(read.indexStats, null);
+
+      const mutation = localDb.executeGql(
+        "CREATE (n:Unconstrained {key: 'one'}) RETURN n.key AS key"
+      );
+      assert.equal(mutation.kind, 'mutation');
+      assert.equal(mutation.schemaStats, null);
+      assert.equal(mutation.indexStats, null);
+    } finally {
+      closeDir(localDb, localTmpDir);
+    }
+  });
+
+  it('executes and explains GQL property-index DDL through connectors', async () => {
+    const localTmpDir = mkdtempSync(join(tmpdir(), 'overgraph-gql-node-index-'));
+    const localDb = OverGraph.open(join(localTmpDir, 'db'), { walSyncMode: 'immediate' });
+    try {
+      const personIndex =
+        'CREATE PROPERTY INDEX FOR (n:IndexPerson) ON (n.status) KIND EQUALITY';
+      const edgeIndex =
+        'CREATE PROPERTY INDEX FOR ()-[r:INDEX_WORKS_AT]-() ON (r.since) KIND RANGE';
+      const dropEdge =
+        'DROP PROPERTY INDEX FOR ()-[r:INDEX_WORKS_AT]-() ON (r.since) KIND RANGE';
+
+      const create = localDb.executeGql(personIndex);
+      assert.equal(create.kind, 'index');
+      assert.deepEqual(create.columns, [
+        'operation',
+        'target_kind',
+        'label',
+        'prop_key',
+        'kind',
+        'action',
+        'state',
+        'index_id',
+        'last_error',
+      ]);
+      assert.equal(create.mutationStats, null);
+      assert.equal(create.schemaStats, null);
+      assert.equal(create.indexStats.operation, 'create_property_index');
+      assert.equal(create.indexStats.indexesEnsured, 1);
+      assert.equal(create.indexStats.indexesDropped, 0);
+      assert.equal(create.indexStats.indexesReturned, 0);
+      assert.equal(create.indexStats.elapsedUs, null);
+      assert.deepEqual(create.indexStats.warnings, []);
+      assert.equal(create.rows[0].operation, 'create_property_index');
+      assert.equal(create.rows[0].target_kind, 'node');
+      assert.equal(create.rows[0].label, 'IndexPerson');
+      assert.equal(create.rows[0].prop_key, 'status');
+      assert.equal(create.rows[0].kind, 'equality');
+      assert.equal(create.rows[0].action, 'ensured');
+      assert.ok(['building', 'ready', 'failed'].includes(create.rows[0].state));
+      assert.equal(typeof create.rows[0].index_id, 'number');
+      assert.equal(create.rows[0].last_error, null);
+
+      const planned = localDb.executeGql(personIndex, null, {
+        includePlan: true,
+        profile: true,
+      });
+      assert.equal(typeof planned.indexStats.elapsedUs, 'number');
+      assert.equal(planned.plan.kind, 'index');
+      assert.equal(planned.plan.read, null);
+      assert.equal(planned.plan.mutation, null);
+      assert.equal(planned.plan.schema, null);
+      assert.equal(planned.plan.index.operation, 'create_property_index');
+      assert.deepEqual(planned.plan.index.targets, [
+        {
+          targetKind: 'node',
+          label: 'IndexPerson',
+          propKey: 'status',
+          kind: 'equality',
+          action: 'ensure',
+        },
+      ]);
+      assert.equal(planned.plan.index.usesCoreWriteQueue, true);
+      assert.equal(planned.plan.index.publishesManifest, true);
+      assert.equal(planned.plan.index.createsLabels, true);
+      assert.equal(planned.plan.index.schedulesBackgroundBuild, true);
+      assert.equal(planned.plan.index.dropsIndexDataAsync, false);
+      assert.equal(planned.plan.index.sideEffectFree, false);
+
+      const createExplain = localDb.explainGql(personIndex);
+      assert.equal(createExplain.kind, 'index');
+      assert.equal(createExplain.read, null);
+      assert.equal(createExplain.mutation, null);
+      assert.equal(createExplain.schema, null);
+      assert.equal(createExplain.index.operation, 'create_property_index');
+      assert.deepEqual(createExplain.index.targets[0], planned.plan.index.targets[0]);
+
+      const edgeCreate = localDb.executeGql(edgeIndex);
+      assert.equal(edgeCreate.kind, 'index');
+      assert.equal(edgeCreate.indexStats.operation, 'create_property_index');
+      assert.equal(edgeCreate.indexStats.indexesEnsured, 1);
+      assert.equal(edgeCreate.mutationStats, null);
+      assert.equal(edgeCreate.schemaStats, null);
+
+      const show = localDb.executeGql('SHOW PROPERTY INDEXES');
+      assert.equal(show.kind, 'index');
+      assert.equal(show.indexStats.operation, 'show_property_indexes');
+      assert.equal(show.indexStats.indexesReturned, 2);
+      assert.deepEqual(
+        show.rows.map(row => [row.target_kind, row.label, row.prop_key, row.kind]),
+        [
+          ['node', 'IndexPerson', 'status', 'equality'],
+          ['edge', 'INDEX_WORKS_AT', 'since', 'range'],
+        ]
+      );
+      assert.ok(show.rows.every(row => ['building', 'ready', 'failed'].includes(row.state)));
+      assert.ok(show.rows.every(row => row.last_error === null));
+
+      const showExplain = localDb.explainGql('SHOW PROPERTY INDEXES');
+      assert.equal(showExplain.index.operation, 'show_property_indexes');
+      assert.deepEqual(showExplain.index.targets, [
+        {
+          targetKind: 'property_index_catalog',
+          label: null,
+          propKey: null,
+          kind: null,
+          action: 'show',
+        },
+      ]);
+      assert.equal(showExplain.index.usesCoreWriteQueue, false);
+      assert.equal(showExplain.index.publishesManifest, false);
+      assert.equal(showExplain.index.createsLabels, false);
+      assert.equal(showExplain.index.schedulesBackgroundBuild, false);
+      assert.equal(showExplain.index.dropsIndexDataAsync, false);
+      assert.equal(showExplain.index.sideEffectFree, true);
+
+      const dropExplain = localDb.explainGql(dropEdge);
+      assert.equal(dropExplain.index.operation, 'drop_property_index');
+      assert.deepEqual(dropExplain.index.targets, [
+        {
+          targetKind: 'edge',
+          label: 'INDEX_WORKS_AT',
+          propKey: 'since',
+          kind: 'range',
+          action: 'drop',
+        },
+      ]);
+      assert.equal(dropExplain.index.usesCoreWriteQueue, true);
+      assert.equal(dropExplain.index.publishesManifest, true);
+      assert.equal(dropExplain.index.createsLabels, false);
+      assert.equal(dropExplain.index.schedulesBackgroundBuild, false);
+      assert.equal(dropExplain.index.dropsIndexDataAsync, true);
+      assert.equal(dropExplain.index.sideEffectFree, false);
+
+      assert.throws(
+        () => localDb.executeGql(personIndex, null, { mode: 'readOnly' }),
+        /GQL index management is not allowed in ReadOnly mode/
+      );
+      assert.throws(
+        () => localDb.executeGql(dropEdge, null, { mode: 'readOnly' }),
+        /GQL index management is not allowed in ReadOnly mode/
+      );
+      const readOnlyShow = localDb.executeGql('SHOW PROPERTY INDEXES', null, {
+        mode: 'readOnly',
+      });
+      assert.equal(readOnlyShow.rows.length, 2);
+      assert.throws(
+        () => localDb.executeGql('SHOW PROPERTY INDEXES', null, { cursor: 'locked' }),
+        /GQL index statements do not accept cursors/
+      );
+
+      const asyncShow = await localDb.executeGqlAsync('SHOW PROPERTY INDEXES');
+      assert.equal(asyncShow.kind, 'index');
+      assert.equal(asyncShow.indexStats.operation, 'show_property_indexes');
+      assert.equal(asyncShow.indexStats.indexesReturned, 2);
+      const asyncExplain = await localDb.explainGqlAsync('SHOW PROPERTY INDEXES');
+      assert.equal(asyncExplain.kind, 'index');
+      assert.equal(asyncExplain.index.operation, 'show_property_indexes');
+      assert.equal(asyncExplain.index.targets[0].targetKind, 'property_index_catalog');
+    } finally {
+      closeDir(localDb, localTmpDir);
+    }
   });
 
   it('returns nodes and edges without vectors by default and with vectors on opt-in', () => {
@@ -195,6 +451,7 @@ describe('GQL connector API', () => {
     assert.equal(cappedExplain.caps.maxSubqueryInvocations, 14);
     assert.equal(cappedExplain.caps.maxSubqueryDepth, 1);
     assert.equal(cappedExplain.caps.maxShortestPathPairs, 15);
+    assert.equal(cappedExplain.index, null);
 
     const unusedOversized = db.executeGql(
       'MATCH (n:Person) RETURN id(n) LIMIT 1',

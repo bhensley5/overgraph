@@ -250,6 +250,18 @@
     "S-GQL-006": {
       "status": "comparable"
     },
+    "S-SCHEMA-001": {
+      "status": "comparable"
+    },
+    "S-SCHEMA-002": {
+      "status": "comparable"
+    },
+    "S-SCHEMA-003": {
+      "status": "comparable"
+    },
+    "S-SCHEMA-004": {
+      "status": "comparable"
+    },
     "S-ADV-005": {
       "status": "comparable"
     },

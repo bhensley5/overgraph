@@ -202,10 +202,10 @@ struct MemtableState {
     adj_out: NodeIdMap<NodeIdMap<MembershipSlot<AdjEntry>>>,
     adj_in: NodeIdMap<NodeIdMap<MembershipSlot<AdjEntry>>>,
     ordered_edge_ids: BTreeMap<u64, MembershipSlot<()>>,
+    label_node_index: BTreeMap<(u32, u64), MembershipSlot<()>>,
     ordered_label_edge_index: BTreeMap<(u32, u64), MembershipSlot<()>>,
     ordered_adj_out: NodeIdMap<BTreeMap<u64, MembershipSlot<AdjEntry>>>,
     ordered_adj_in: NodeIdMap<BTreeMap<u64, MembershipSlot<AdjEntry>>>,
-    label_node_index: HashMap<u32, NodeIdMap<MembershipSlot<()>>>,
     label_edge_index: HashMap<u32, NodeIdMap<MembershipSlot<()>>>,
     time_node_index: BTreeMap<(u32, i64, u64), MembershipSlot<()>>,
     secondary_index_declarations: HashMap<u64, SecondaryIndexManifestEntry>,
@@ -559,6 +559,27 @@ impl MemtableState {
         }
     }
 
+    fn set_node_label_membership_slot(
+        &mut self,
+        label_id: u32,
+        node_id: u64,
+        present: bool,
+        write_seq: u64,
+    ) {
+        let value = present.then_some(());
+        let key = (label_id, node_id);
+        if let Some(slot) = self.label_node_index.get_mut(&key) {
+            let before = estimate_membership_slot(slot);
+            slot.replace(write_seq, value);
+            let after = estimate_membership_slot(slot);
+            apply_size_delta(&mut self.estimated_bytes, before, after);
+        } else {
+            let slot = VersionedSlot::new(write_seq, value);
+            self.estimated_bytes += estimate_membership_slot(&slot);
+            self.label_node_index.insert(key, slot);
+        }
+    }
+
     fn set_ordered_edge_label_slot(
         &mut self,
         label_id: u32,
@@ -637,14 +658,7 @@ impl MemtableState {
         present: bool,
         write_seq: u64,
     ) {
-        let (before, after) = Self::set_label_membership_slot(
-            &mut self.label_node_index,
-            label_id,
-            member_id,
-            present,
-            write_seq,
-        );
-        apply_size_delta(&mut self.estimated_bytes, before, after);
+        self.set_node_label_membership_slot(label_id, member_id, present, write_seq);
     }
 
     fn set_edge_label_slot(
@@ -804,6 +818,11 @@ impl MemtableState {
             .map(estimate_membership_slot)
             .sum::<usize>()
             + self
+                .label_node_index
+                .values()
+                .map(estimate_membership_slot)
+                .sum::<usize>()
+            + self
                 .ordered_label_edge_index
                 .values()
                 .map(estimate_membership_slot)
@@ -819,7 +838,7 @@ impl MemtableState {
                 .map(|entries| entries.values().map(estimate_adj_slot).sum::<usize>())
                 .sum::<usize>();
         let label_idx_size: usize = self
-            .label_node_index
+            .label_edge_index
             .values()
             .map(|members| {
                 members
@@ -827,17 +846,7 @@ impl MemtableState {
                     .map(estimate_membership_slot)
                     .sum::<usize>()
             })
-            .sum::<usize>()
-            + self
-                .label_edge_index
-                .values()
-                .map(|members| {
-                    members
-                        .values()
-                        .map(estimate_membership_slot)
-                        .sum::<usize>()
-                })
-                .sum::<usize>();
+            .sum::<usize>();
         let time_idx_size: usize = self
             .time_node_index
             .values()
@@ -2499,14 +2508,14 @@ impl Memtable {
     pub(crate) fn visible_nodes_by_label_id(&self, label_id: u32, snapshot_seq: u64) -> Vec<u64> {
         let state = self.state.read().unwrap();
         let mut ids = Vec::new();
-        if let Some(members) = state.label_node_index.get(&label_id) {
-            for (&node_id, slot) in members {
-                if slot_option_visible(slot, snapshot_seq) {
-                    ids.push(node_id);
-                }
+        for (&(_, node_id), slot) in state
+            .label_node_index
+            .range((label_id, 0)..=(label_id, u64::MAX))
+        {
+            if slot_option_visible(slot, snapshot_seq) {
+                ids.push(node_id);
             }
         }
-        ids.sort_unstable();
         ids
     }
 
@@ -2539,14 +2548,9 @@ impl Memtable {
         let state = self.state.read().unwrap();
         state
             .label_node_index
-            .get(&label_id)
-            .map(|members| {
-                members
-                    .values()
-                    .filter(|slot| slot_option_visible(slot, snapshot_seq))
-                    .count()
-            })
-            .unwrap_or(0)
+            .range((label_id, 0)..=(label_id, u64::MAX))
+            .filter(|(_, slot)| slot_option_visible(slot, snapshot_seq))
+            .count()
     }
 
     pub(crate) fn visible_edges_by_label_id(&self, label_id: u32, snapshot_seq: u64) -> Vec<u64> {
@@ -2599,6 +2603,27 @@ impl Memtable {
         for (&edge_id, slot) in state.ordered_edge_ids.range((start, Bound::Unbounded)) {
             if slot_option_visible(slot, snapshot_seq) {
                 return Some(edge_id);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn next_visible_node_by_label_id_after(
+        &self,
+        label_id: u32,
+        snapshot_seq: u64,
+        after: Option<u64>,
+    ) -> Option<u64> {
+        let state = self.state.read().unwrap();
+        let start_key = (label_id, after.unwrap_or(0));
+        let start = match after {
+            Some(_) => Bound::Excluded(start_key),
+            None => Bound::Included(start_key),
+        };
+        let end = Bound::Included((label_id, u64::MAX));
+        for (&(_, node_id), slot) in state.label_node_index.range((start, end)) {
+            if slot_option_visible(slot, snapshot_seq) {
+                return Some(node_id);
             }
         }
         None
@@ -3127,15 +3152,21 @@ impl Memtable {
     pub(crate) fn visible_node_label_ids(&self, snapshot_seq: u64) -> Vec<u32> {
         let state = self.state.read().unwrap();
         let mut label_ids = Vec::new();
-        for (&label_id, members) in &state.label_node_index {
-            if members
-                .values()
-                .any(|slot| slot_option_visible(slot, snapshot_seq))
-            {
-                label_ids.push(label_id);
+        let mut current_label_id = None;
+        let mut current_label_visible = false;
+        for (&(label_id, _), slot) in &state.label_node_index {
+            if current_label_id != Some(label_id) {
+                if current_label_visible {
+                    label_ids.push(current_label_id.expect("label group is present"));
+                }
+                current_label_id = Some(label_id);
+                current_label_visible = false;
             }
+            current_label_visible |= slot_option_visible(slot, snapshot_seq);
         }
-        label_ids.sort_unstable();
+        if current_label_visible {
+            label_ids.push(current_label_id.expect("label group is present"));
+        }
         label_ids
     }
 
@@ -3552,9 +3583,34 @@ impl Memtable {
         current_adj_map(&state.adj_in)
     }
 
-    pub fn label_node_index(&self) -> HashMap<u32, NodeIdSet> {
+    pub(crate) fn node_label_posting_groups_current(&self) -> Vec<(u32, Vec<u64>)> {
         let state = self.state.read().unwrap();
-        current_label_membership_index(&state.label_node_index)
+        let mut groups = Vec::new();
+        let mut current_label_id = None;
+        let mut current_ids = Vec::new();
+
+        for (&(label_id, node_id), slot) in &state.label_node_index {
+            if current_label_id != Some(label_id) {
+                if !current_ids.is_empty() {
+                    groups.push((
+                        current_label_id.expect("label group is present"),
+                        std::mem::take(&mut current_ids),
+                    ));
+                }
+                current_label_id = Some(label_id);
+            }
+            if slot_option_current(slot).is_some() {
+                current_ids.push(node_id);
+            }
+        }
+
+        if !current_ids.is_empty() {
+            groups.push((
+                current_label_id.expect("label group is present"),
+                current_ids,
+            ));
+        }
+        groups
     }
 
     pub fn label_edge_index(&self) -> HashMap<u32, NodeIdSet> {
@@ -3644,7 +3700,7 @@ impl Memtable {
 #[cfg(test)]
 impl Memtable {
     fn label_node_index_key_count(&self) -> usize {
-        self.label_node_index().len()
+        self.node_label_posting_groups_current().len()
     }
 
     fn node_key_index_key_count(&self) -> usize {
@@ -4054,6 +4110,56 @@ mod tests {
                 .visible_nodes_by_time_range(label_id, 200, 200, 3)
                 .is_empty());
         }
+    }
+
+    #[test]
+    fn ordered_node_label_memberships_drive_visible_cursors_and_flush_groups() {
+        let mt = Memtable::new();
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_labels(1, &[1, 3], "a", 100)),
+            1,
+        );
+        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 2);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 2, "b")), 3);
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_labels(1, &[2, 3], "a", 200)),
+            4,
+        );
+
+        assert_eq!(mt.visible_nodes_by_label_id(1, 2), vec![1, 3]);
+        assert_eq!(mt.next_visible_node_by_label_id_after(1, 2, None), Some(1));
+        assert_eq!(
+            mt.next_visible_node_by_label_id_after(1, 2, Some(1)),
+            Some(3)
+        );
+        assert_eq!(mt.visible_nodes_by_label_id(1, 4), vec![3]);
+        assert_eq!(mt.visible_nodes_by_label_id(2, 4), vec![1, 2]);
+        assert_eq!(mt.visible_node_label_ids(4), vec![1, 2, 3]);
+        assert_eq!(
+            mt.node_label_posting_groups_current(),
+            vec![(1, vec![3]), (2, vec![1, 2]), (3, vec![1])]
+        );
+
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 3,
+                deleted_at: 300,
+            },
+            5,
+        );
+
+        assert!(mt.visible_nodes_by_label_id(1, 5).is_empty());
+        assert_eq!(mt.visible_node_label_ids(5), vec![2, 3]);
+        assert_eq!(
+            mt.node_label_posting_groups_current(),
+            vec![(2, vec![1, 2]), (3, vec![1])]
+        );
+        assert_eq!(mt.next_visible_node_by_label_id_after(2, 5, None), Some(1));
+        assert_eq!(
+            mt.next_visible_node_by_label_id_after(2, 5, Some(1)),
+            Some(2)
+        );
+        assert_eq!(mt.next_visible_node_by_label_id_after(2, 5, Some(2)), None);
     }
 
     #[test]

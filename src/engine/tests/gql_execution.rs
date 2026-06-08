@@ -7,6 +7,8 @@ fn gql_opts() -> GqlExecutionOptions {
 fn gql_read_explain(explain: &GqlExecutionExplain) -> &GqlExplain {
     assert_eq!(explain.kind, GqlStatementKind::Query);
     assert!(explain.mutation.is_none());
+    assert!(explain.schema.is_none());
+    assert!(explain.index.is_none());
     explain.read.as_ref().expect("read explain should be present")
 }
 
@@ -139,6 +141,78 @@ fn gql_string_column(result: &GqlExecutionResult, index: usize) -> Vec<String> {
         .collect()
 }
 
+fn assert_gql_schema_result<'a>(
+    result: &'a GqlExecutionResult,
+    operation: &str,
+) -> &'a GqlSchemaStats {
+    assert_eq!(result.kind, GqlStatementKind::Schema);
+    assert!(result.mutation_stats.is_none());
+    assert!(result.index_stats.is_none());
+    assert!(result.next_cursor.is_none());
+    let stats = result
+        .schema_stats
+        .as_ref()
+        .expect("schema result should include schema_stats");
+    assert_eq!(stats.operation, operation);
+    stats
+}
+
+fn gql_schema_explain(explain: &GqlExecutionExplain) -> &GqlSchemaExplain {
+    assert_eq!(explain.kind, GqlStatementKind::Schema);
+    assert!(explain.read.is_none());
+    assert!(explain.mutation.is_none());
+    assert!(explain.index.is_none());
+    explain
+        .schema
+        .as_ref()
+        .expect("schema explain should be present")
+}
+
+fn gql_map(value: &GqlValue) -> &BTreeMap<String, GqlValue> {
+    match value {
+        GqlValue::Map(map) => map,
+        other => panic!("expected GQL map, got {other:?}"),
+    }
+}
+
+fn gql_list(value: &GqlValue) -> &[GqlValue] {
+    match value {
+        GqlValue::List(values) => values,
+        other => panic!("expected GQL list, got {other:?}"),
+    }
+}
+
+fn gql_str(value: &GqlValue) -> &str {
+    match value {
+        GqlValue::String(value) => value,
+        other => panic!("expected GQL string, got {other:?}"),
+    }
+}
+
+fn gql_tagged_value(value: &GqlValue) -> (&str, &GqlValue) {
+    let map = gql_map(value);
+    (gql_str(&map["type"]), &map["value"])
+}
+
+fn assert_gql_tagged_uint(value: &GqlValue, expected: &str) {
+    let (kind, payload) = gql_tagged_value(value);
+    assert_eq!(kind, "uint");
+    assert_eq!(gql_str(payload), expected);
+}
+
+fn assert_gql_tagged_bytes(value: &GqlValue, expected: &[i64]) {
+    let (kind, payload) = gql_tagged_value(value);
+    assert_eq!(kind, "bytes");
+    let actual = gql_list(payload)
+        .iter()
+        .map(|value| match value {
+            GqlValue::Int(value) => *value,
+            other => panic!("expected byte Int, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
+
 fn gql_u64_or_i64_values(result: &GqlExecutionResult, index: usize) -> Vec<String> {
     result
         .rows
@@ -234,6 +308,8 @@ fn execute_gql_read_uses_unified_result_and_read_plan_wrapper() {
         .unwrap();
     assert_eq!(result.kind, GqlStatementKind::Query);
     assert_eq!(result.mutation_stats, None);
+    assert_eq!(result.schema_stats, None);
+    assert_eq!(result.index_stats, None);
     assert_eq!(result.columns, vec!["id"]);
     assert_eq!(gql_u64_column(&result, 0), vec![active]);
     let plan = result.plan.as_ref().expect("include_plan should return plan");
@@ -241,6 +317,8 @@ fn execute_gql_read_uses_unified_result_and_read_plan_wrapper() {
     assert_eq!(plan.columns, vec!["id"]);
     assert!(plan.read.is_some());
     assert!(plan.mutation.is_none());
+    assert!(plan.schema.is_none());
+    assert!(plan.index.is_none());
 }
 
 #[test]
@@ -289,6 +367,8 @@ fn execute_gql_create_mutation_preserves_cursor_and_readonly_ordering() {
         .execute_gql(source, &GqlParams::new(), &gql_opts())
         .unwrap();
     assert_eq!(result.kind, GqlStatementKind::Mutation);
+    assert!(result.schema_stats.is_none());
+    assert!(result.index_stats.is_none());
     assert_eq!(result.columns, vec!["n"]);
     assert_eq!(result.rows.len(), 1);
     assert_eq!(
@@ -312,6 +392,8 @@ fn execute_gql_create_mutation_preserves_cursor_and_readonly_ordering() {
         .unwrap();
     let plan = planned.plan.expect("mutation include_plan should return a plan");
     assert_eq!(plan.kind, GqlStatementKind::Mutation);
+    assert!(plan.schema.is_none());
+    assert!(plan.index.is_none());
     let mutation = plan.mutation.expect("mutation plan should be present");
     assert!(mutation.uses_write_txn);
     assert!(mutation.atomic_commit);
@@ -375,6 +457,8 @@ fn explain_gql_mutation_plan_is_side_effect_free() {
         .unwrap();
     assert_eq!(explain.kind, GqlStatementKind::Mutation);
     assert!(explain.read.is_none());
+    assert!(explain.schema.is_none());
+    assert!(explain.index.is_none());
     let mutation = explain.mutation.expect("mutation explain should be present");
     assert_eq!(mutation.would_create_node_labels, vec![label.to_string()]);
     assert!(mutation.uses_write_txn);
@@ -7869,10 +7953,10 @@ fn gql_beta_unsupported_features_are_rejected_by_execution_api() {
     let cases = [
         (
             "CREATE INDEX node_status FOR (n:User) ON (n.status)",
-            "schema/DDL",
-            "CREATE",
+            "GQL index DDL",
+            "INDEX",
         ),
-        ("DROP INDEX node_status", "schema/DDL", "DROP"),
+        ("DROP INDEX node_status", "GQL index DDL", "INDEX"),
         (
             "MATCH (n:Person)-[*]->(m) RETURN n",
             "unbounded VLP",
@@ -7902,6 +7986,2242 @@ fn gql_beta_unsupported_features_are_rejected_by_execution_api() {
             other => panic!("expected unsupported {expected_feature} for {source}, got {other:?}"),
         }
     }
+}
+
+fn expected_gql_index_columns<const N: usize>(columns: [&str; N]) -> Vec<String> {
+    columns.into_iter().map(str::to_string).collect()
+}
+
+fn gql_uint(value: &GqlValue) -> u64 {
+    match value {
+        GqlValue::UInt(value) => *value,
+        other => panic!("expected GQL UInt, got {other:?}"),
+    }
+}
+
+fn assert_gql_index_result<'a>(
+    result: &'a GqlExecutionResult,
+    operation: &str,
+) -> &'a GqlIndexStats {
+    assert_eq!(result.kind, GqlStatementKind::Index);
+    assert!(result.mutation_stats.is_none());
+    assert!(result.schema_stats.is_none());
+    assert!(result.next_cursor.is_none());
+    assert_eq!(result.stats.rows_returned, result.rows.len());
+    assert_eq!(result.stats.rows_matched, 0);
+    assert_eq!(result.stats.rows_after_filter, 0);
+    assert_eq!(result.stats.intermediate_bindings, 0);
+    assert_eq!(result.stats.db_hits, 0);
+    assert!(result.stats.warnings.is_empty());
+    let stats = result
+        .index_stats
+        .as_ref()
+        .expect("index result should include index_stats");
+    assert_eq!(stats.operation, operation);
+    assert!(stats.warnings.is_empty());
+    stats
+}
+
+fn assert_create_property_index_row(
+    result: &GqlExecutionResult,
+    target_kind: &str,
+    label: &str,
+    prop_key: &str,
+    kind: &str,
+) -> u64 {
+    assert_eq!(
+        result.columns,
+        expected_gql_index_columns([
+            "operation",
+            "target_kind",
+            "label",
+            "prop_key",
+            "kind",
+            "action",
+            "state",
+            "index_id",
+            "last_error",
+        ])
+    );
+    assert_eq!(result.rows.len(), 1);
+    let values = &result.rows[0].values;
+    assert_eq!(values[0], GqlValue::String("create_property_index".to_string()));
+    assert_eq!(values[1], GqlValue::String(target_kind.to_string()));
+    assert_eq!(values[2], GqlValue::String(label.to_string()));
+    assert_eq!(values[3], GqlValue::String(prop_key.to_string()));
+    assert_eq!(values[4], GqlValue::String(kind.to_string()));
+    assert_eq!(values[5], GqlValue::String("ensured".to_string()));
+    assert!(
+        matches!(
+            &values[6],
+            GqlValue::String(state) if state == "building" || state == "ready" || state == "failed"
+        ),
+        "unexpected index state: {:?}",
+        values[6]
+    );
+    assert_eq!(values[8], GqlValue::Null);
+    gql_uint(&values[7])
+}
+
+fn assert_drop_property_index_row(
+    result: &GqlExecutionResult,
+    target_kind: &str,
+    label: &str,
+    prop_key: &str,
+    kind: &str,
+    action: &str,
+) {
+    assert_eq!(
+        result.columns,
+        expected_gql_index_columns([
+            "operation",
+            "target_kind",
+            "label",
+            "prop_key",
+            "kind",
+            "action",
+        ])
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(
+        result.rows[0].values,
+        vec![
+            GqlValue::String("drop_property_index".to_string()),
+            GqlValue::String(target_kind.to_string()),
+            GqlValue::String(label.to_string()),
+            GqlValue::String(prop_key.to_string()),
+            GqlValue::String(kind.to_string()),
+            GqlValue::String(action.to_string()),
+        ]
+    );
+}
+
+fn native_node_index(
+    engine: &DatabaseEngine,
+    label: &str,
+    prop_key: &str,
+    kind: SecondaryIndexKind,
+) -> Option<NodePropertyIndexInfo> {
+    engine
+        .list_node_property_indexes()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.label == label && info.prop_key == prop_key && info.kind == kind)
+}
+
+fn native_edge_index(
+    engine: &DatabaseEngine,
+    label: &str,
+    prop_key: &str,
+    kind: SecondaryIndexKind,
+) -> Option<EdgePropertyIndexInfo> {
+    engine
+        .list_edge_property_indexes()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.label == label && info.prop_key == prop_key && info.kind == kind)
+}
+
+fn assert_index_cursor_error(err: EngineError) {
+    match err {
+        EngineError::InvalidCursor { message } => {
+            assert_eq!(message, "GQL index statements do not accept cursors");
+        }
+        other => panic!("expected GQL index cursor error, got {other:?}"),
+    }
+}
+
+fn assert_index_read_only_error(err: EngineError) {
+    match err {
+        EngineError::InvalidOperation(message) => {
+            assert_eq!(
+                message,
+                "GQL index management is not allowed in ReadOnly mode"
+            );
+        }
+        other => panic!("expected GQL index ReadOnly error, got {other:?}"),
+    }
+}
+
+fn gql_index_explain_payload(explain: &GqlExecutionExplain) -> &GqlIndexExplain {
+    assert_eq!(explain.kind, GqlStatementKind::Index);
+    assert!(explain.read.is_none());
+    assert!(explain.mutation.is_none());
+    assert!(explain.schema.is_none());
+    assert!(explain.warnings.is_empty());
+    assert!(explain.notes.iter().any(|note| {
+        note.contains("side-effect-free")
+            && note.contains("does not create labels")
+            && note.contains("write manifests")
+            && note.contains("enqueue builds")
+            && note.contains("drop declarations")
+            && note.contains("inspect sidecars")
+            && note.contains("scan graph records")
+    }));
+    explain
+        .index
+        .as_ref()
+        .expect("index explain should be present")
+}
+
+fn gql_index_test_node_query(label: &str, filter: NodeFilterExpr) -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![label.to_string()],
+            mode: LabelMatchMode::All,
+        }),
+        filter: Some(filter),
+        ..Default::default()
+    }
+}
+
+fn gql_index_test_edge_query(label: &str, filter: EdgeFilterExpr) -> EdgeQuery {
+    EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(filter),
+        ..Default::default()
+    }
+}
+
+fn assert_show_property_index_row(
+    result: &GqlExecutionResult,
+    target_kind: &str,
+    label: &str,
+    prop_key: &str,
+    kind: &str,
+    index_id: u64,
+) {
+    assert!(
+        result.rows.iter().any(|row| {
+            row.values[0] == GqlValue::String(target_kind.to_string())
+                && row.values[1] == GqlValue::String(label.to_string())
+                && row.values[2] == GqlValue::String(prop_key.to_string())
+                && row.values[3] == GqlValue::String(kind.to_string())
+                && gql_uint(&row.values[5]) == index_id
+                && row.values[6] == GqlValue::Null
+        }),
+        "SHOW PROPERTY INDEXES did not include {target_kind} {label}.{prop_key} {kind} id {index_id}: {:?}",
+        result.rows
+    );
+}
+
+fn assert_show_property_index_absent(
+    result: &GqlExecutionResult,
+    target_kind: &str,
+    label: &str,
+    prop_key: &str,
+    kind: &str,
+) {
+    assert!(
+        result.rows.iter().all(|row| {
+            !(row.values[0] == GqlValue::String(target_kind.to_string())
+                && row.values[1] == GqlValue::String(label.to_string())
+                && row.values[2] == GqlValue::String(prop_key.to_string())
+                && row.values[3] == GqlValue::String(kind.to_string()))
+        }),
+        "SHOW PROPERTY INDEXES unexpectedly included {target_kind} {label}.{prop_key} {kind}: {:?}",
+        result.rows
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GqlIndexSideEffectSnapshot {
+    node_label_tokens: std::collections::BTreeMap<String, u32>,
+    edge_label_tokens: std::collections::BTreeMap<String, u32>,
+    next_node_label_id: u32,
+    next_edge_label_id: u32,
+    next_secondary_index_id: u64,
+    node_indexes: Vec<NodePropertyIndexInfo>,
+    edge_indexes: Vec<EdgePropertyIndexInfo>,
+    secondary_indexes: Vec<SecondaryIndexManifestEntry>,
+    pending_followups: usize,
+}
+
+fn gql_index_side_effect_snapshot(engine: &DatabaseEngine) -> GqlIndexSideEffectSnapshot {
+    let manifest = engine.manifest().unwrap();
+    GqlIndexSideEffectSnapshot {
+        node_label_tokens: manifest.node_label_tokens,
+        edge_label_tokens: manifest.edge_label_tokens,
+        next_node_label_id: manifest.next_node_label_id,
+        next_edge_label_id: manifest.next_edge_label_id,
+        next_secondary_index_id: manifest.next_secondary_index_id,
+        node_indexes: engine.list_node_property_indexes().unwrap(),
+        edge_indexes: engine.list_edge_property_indexes().unwrap(),
+        secondary_indexes: manifest.secondary_indexes,
+        pending_followups: engine.pending_secondary_index_followup_count_for_test(),
+    }
+}
+
+fn assert_gql_index_no_side_effects(
+    engine: &DatabaseEngine,
+    before: &GqlIndexSideEffectSnapshot,
+    context: &str,
+) {
+    assert_eq!(
+        gql_index_side_effect_snapshot(engine),
+        *before,
+        "{context} mutated labels, property-index declarations, manifest entries, or followups"
+    );
+}
+
+fn gql_index_manifest_json(db_path: &std::path::Path) -> serde_json::Value {
+    let raw = std::fs::read_to_string(db_path.join("manifest.current")).unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
+fn assert_json_object_keys(value: &serde_json::Value, expected: &[&str]) {
+    let object = value.as_object().expect("expected JSON object");
+    let mut actual = object.keys().map(String::as_str).collect::<Vec<_>>();
+    actual.sort_unstable();
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+}
+
+fn assert_gql_index_manifest_secondary_index_shape(db_path: &std::path::Path, expected_len: usize) {
+    let manifest = gql_index_manifest_json(db_path);
+    let secondary_indexes = manifest["secondary_indexes"]
+        .as_array()
+        .expect("secondary_indexes should be an array");
+    assert_eq!(secondary_indexes.len(), expected_len);
+    for entry in secondary_indexes {
+        assert_json_object_keys(
+            entry,
+            &["index_id", "target", "kind", "state", "last_error"],
+        );
+        assert!(entry["index_id"].as_u64().is_some());
+        assert!(matches!(
+            entry["kind"].as_str(),
+            Some("Equality") | Some("Range")
+        ));
+        assert!(matches!(
+            entry["state"].as_str(),
+            Some("Building") | Some("Ready") | Some("Failed")
+        ));
+        assert!(entry.get("last_error").is_some());
+
+        let target = entry["target"].as_object().expect("target should be object");
+        assert_eq!(target.len(), 1);
+        let (target_kind, target_payload) = target.iter().next().unwrap();
+        assert!(
+            target_kind == "NodeProperty" || target_kind == "EdgeProperty",
+            "unexpected secondary-index target kind: {target_kind}"
+        );
+        assert_json_object_keys(target_payload, &["label_id", "prop_key"]);
+        assert!(target_payload["label_id"].as_u64().is_some());
+        assert!(target_payload["prop_key"].as_str().is_some());
+    }
+}
+
+#[test]
+fn gql_index_create_node_rows_idempotence_and_native_visibility() {
+    let (_dir, engine) = query_test_engine();
+    let source = "CREATE PROPERTY INDEX FOR (n:GqlIndexNodeCreate) ON (n.role) KIND EQUALITY";
+    assert_eq!(engine.get_node_label_id("GqlIndexNodeCreate").unwrap(), None);
+
+    let result = execute_gql_ok(&engine, source);
+    let stats = assert_gql_index_result(&result, "create_property_index");
+    assert_eq!(stats.indexes_ensured, 1);
+    assert_eq!(stats.indexes_dropped, 0);
+    assert_eq!(stats.indexes_returned, 0);
+    assert!(result.stats.elapsed_us.is_none());
+    assert!(stats.elapsed_us.is_none());
+    let index_id =
+        assert_create_property_index_row(&result, "node", "GqlIndexNodeCreate", "role", "equality");
+    assert!(engine
+        .get_node_label_id("GqlIndexNodeCreate")
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        native_node_index(
+            &engine,
+            "GqlIndexNodeCreate",
+            "role",
+            SecondaryIndexKind::Equality
+        )
+        .unwrap()
+        .index_id,
+        index_id
+    );
+
+    let rerun = execute_gql_ok(&engine, source);
+    let rerun_id =
+        assert_create_property_index_row(&rerun, "node", "GqlIndexNodeCreate", "role", "equality");
+    assert_eq!(rerun_id, index_id);
+
+    let range = execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexNodeCreate) ON (n.score) KIND RANGE",
+    );
+    assert_create_property_index_row(&range, "node", "GqlIndexNodeCreate", "score", "range");
+    assert!(native_node_index(
+        &engine,
+        "GqlIndexNodeCreate",
+        "score",
+        SecondaryIndexKind::Range
+    )
+    .is_some());
+}
+
+#[test]
+fn gql_index_create_edge_rows_native_visibility_and_missing_label_tokens() {
+    let (_dir, engine) = query_test_engine();
+    assert_eq!(engine.get_edge_label_id("GQL_INDEX_EDGE_CREATE").unwrap(), None);
+
+    let equality = execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR ()-[r:GQL_INDEX_EDGE_CREATE]-() ON (r.role) KIND EQUALITY",
+    );
+    assert_create_property_index_row(
+        &equality,
+        "edge",
+        "GQL_INDEX_EDGE_CREATE",
+        "role",
+        "equality",
+    );
+    assert!(engine
+        .get_edge_label_id("GQL_INDEX_EDGE_CREATE")
+        .unwrap()
+        .is_some());
+    assert!(native_edge_index(
+        &engine,
+        "GQL_INDEX_EDGE_CREATE",
+        "role",
+        SecondaryIndexKind::Equality
+    )
+    .is_some());
+
+    let range = execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR ()-[r:GQL_INDEX_EDGE_CREATE]-() ON (r.score) KIND RANGE",
+    );
+    assert_create_property_index_row(&range, "edge", "GQL_INDEX_EDGE_CREATE", "score", "range");
+    assert!(native_edge_index(
+        &engine,
+        "GQL_INDEX_EDGE_CREATE",
+        "score",
+        SecondaryIndexKind::Range
+    )
+    .is_some());
+
+    assert_eq!(engine.get_node_label_id("GqlIndexMissingNodeLabel").unwrap(), None);
+    execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexMissingNodeLabel) ON (n.status) KIND EQUALITY",
+    );
+    assert!(engine
+        .get_node_label_id("GqlIndexMissingNodeLabel")
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn gql_index_drop_existing_missing_and_unknown_labels() {
+    let (_dir, engine) = query_test_engine();
+    execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexDropNode) ON (n.role) KIND EQUALITY",
+    );
+    execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR ()-[r:GQL_INDEX_DROP_EDGE]-() ON (r.role) KIND EQUALITY",
+    );
+
+    let node_drop = execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR (n:GqlIndexDropNode) ON (n.role) KIND EQUALITY",
+    );
+    let stats = assert_gql_index_result(&node_drop, "drop_property_index");
+    assert_eq!(stats.indexes_ensured, 0);
+    assert_eq!(stats.indexes_dropped, 1);
+    assert_eq!(stats.indexes_returned, 0);
+    assert_drop_property_index_row(
+        &node_drop,
+        "node",
+        "GqlIndexDropNode",
+        "role",
+        "equality",
+        "dropped",
+    );
+    assert!(native_node_index(
+        &engine,
+        "GqlIndexDropNode",
+        "role",
+        SecondaryIndexKind::Equality
+    )
+    .is_none());
+
+    let edge_drop = execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR ()-[r:GQL_INDEX_DROP_EDGE]-() ON (r.role) KIND EQUALITY",
+    );
+    assert_drop_property_index_row(
+        &edge_drop,
+        "edge",
+        "GQL_INDEX_DROP_EDGE",
+        "role",
+        "equality",
+        "dropped",
+    );
+    assert!(native_edge_index(
+        &engine,
+        "GQL_INDEX_DROP_EDGE",
+        "role",
+        SecondaryIndexKind::Equality
+    )
+    .is_none());
+
+    let missing = execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR (n:GqlIndexDropNode) ON (n.missing) KIND EQUALITY",
+    );
+    let stats = assert_gql_index_result(&missing, "drop_property_index");
+    assert_eq!(stats.indexes_dropped, 0);
+    assert_drop_property_index_row(
+        &missing,
+        "node",
+        "GqlIndexDropNode",
+        "missing",
+        "equality",
+        "not_found",
+    );
+
+    assert_eq!(engine.get_node_label_id("GqlIndexDropUnknown").unwrap(), None);
+    let unknown_node = execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR (n:GqlIndexDropUnknown) ON (n.role) KIND EQUALITY",
+    );
+    assert_drop_property_index_row(
+        &unknown_node,
+        "node",
+        "GqlIndexDropUnknown",
+        "role",
+        "equality",
+        "not_found",
+    );
+    assert_eq!(engine.get_node_label_id("GqlIndexDropUnknown").unwrap(), None);
+
+    assert_eq!(engine.get_edge_label_id("GQL_INDEX_DROP_UNKNOWN").unwrap(), None);
+    let unknown_edge = execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR ()-[r:GQL_INDEX_DROP_UNKNOWN]-() ON (r.role) KIND EQUALITY",
+    );
+    assert_drop_property_index_row(
+        &unknown_edge,
+        "edge",
+        "GQL_INDEX_DROP_UNKNOWN",
+        "role",
+        "equality",
+        "not_found",
+    );
+    assert_eq!(engine.get_edge_label_id("GQL_INDEX_DROP_UNKNOWN").unwrap(), None);
+}
+
+#[test]
+fn gql_index_show_rows_order_filters_empty_and_stats() {
+    let (_dir, engine) = query_test_engine();
+    let empty = execute_gql_ok(&engine, "SHOW PROPERTY INDEXES");
+    let stats = assert_gql_index_result(&empty, "show_property_indexes");
+    assert_eq!(
+        empty.columns,
+        expected_gql_index_columns([
+            "target_kind",
+            "label",
+            "prop_key",
+            "kind",
+            "state",
+            "index_id",
+            "last_error",
+        ])
+    );
+    assert_eq!(empty.rows.len(), 0);
+    assert_eq!(stats.indexes_returned, 0);
+
+    engine
+        .ensure_edge_property_index("GQL_INDEX_SHOW_B_EDGE", "z", SecondaryIndexKind::Range)
+        .unwrap();
+    engine
+        .ensure_node_property_index("GqlIndexShowBNode", "z", SecondaryIndexKind::Range)
+        .unwrap();
+    engine
+        .ensure_node_property_index("GqlIndexShowANode", "b", SecondaryIndexKind::Range)
+        .unwrap();
+    engine
+        .ensure_node_property_index("GqlIndexShowANode", "a", SecondaryIndexKind::Range)
+        .unwrap();
+    engine
+        .ensure_node_property_index("GqlIndexShowANode", "a", SecondaryIndexKind::Equality)
+        .unwrap();
+    engine
+        .ensure_edge_property_index("GQL_INDEX_SHOW_A_EDGE", "a", SecondaryIndexKind::Equality)
+        .unwrap();
+
+    let all = execute_gql_ok(&engine, "SHOW PROPERTY INDEXES");
+    let stats = assert_gql_index_result(&all, "show_property_indexes");
+    assert_eq!(stats.indexes_ensured, 0);
+    assert_eq!(stats.indexes_dropped, 0);
+    assert_eq!(stats.indexes_returned, 6);
+    assert_eq!(
+        all.rows
+            .iter()
+            .map(|row| {
+                (
+                    gql_str(&row.values[0]).to_string(),
+                    gql_str(&row.values[1]).to_string(),
+                    gql_str(&row.values[2]).to_string(),
+                    gql_str(&row.values[3]).to_string(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "node".to_string(),
+                "GqlIndexShowANode".to_string(),
+                "a".to_string(),
+                "equality".to_string()
+            ),
+            (
+                "node".to_string(),
+                "GqlIndexShowANode".to_string(),
+                "a".to_string(),
+                "range".to_string()
+            ),
+            (
+                "node".to_string(),
+                "GqlIndexShowANode".to_string(),
+                "b".to_string(),
+                "range".to_string()
+            ),
+            (
+                "node".to_string(),
+                "GqlIndexShowBNode".to_string(),
+                "z".to_string(),
+                "range".to_string()
+            ),
+            (
+                "edge".to_string(),
+                "GQL_INDEX_SHOW_A_EDGE".to_string(),
+                "a".to_string(),
+                "equality".to_string()
+            ),
+            (
+                "edge".to_string(),
+                "GQL_INDEX_SHOW_B_EDGE".to_string(),
+                "z".to_string(),
+                "range".to_string()
+            ),
+        ]
+    );
+    for row in &all.rows {
+        assert!(
+            matches!(&row.values[4], GqlValue::String(state) if state == "building" || state == "ready" || state == "failed")
+        );
+        gql_uint(&row.values[5]);
+        assert_eq!(row.values[6], GqlValue::Null);
+    }
+
+    let node_only = execute_gql_ok(&engine, "SHOW NODE PROPERTY INDEXES");
+    assert_eq!(node_only.rows.len(), 4);
+    assert!(node_only
+        .rows
+        .iter()
+        .all(|row| row.values[0] == GqlValue::String("node".to_string())));
+    assert_eq!(
+        assert_gql_index_result(&node_only, "show_node_property_indexes").indexes_returned,
+        4
+    );
+
+    let edge_only = execute_gql_ok(&engine, "SHOW EDGE PROPERTY INDEX");
+    assert_eq!(edge_only.rows.len(), 2);
+    assert!(edge_only
+        .rows
+        .iter()
+        .all(|row| row.values[0] == GqlValue::String("edge".to_string())));
+    assert_eq!(
+        assert_gql_index_result(&edge_only, "show_edge_property_indexes").indexes_returned,
+        2
+    );
+}
+
+#[test]
+fn gql_index_max_rows_cursor_readonly_profile_and_include_plan() {
+    let (_dir, engine) = query_test_engine();
+    execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexCaps) ON (n.status) KIND EQUALITY",
+    );
+
+    let max_rows = engine
+        .execute_gql(
+            "SHOW PROPERTY INDEXES",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_rows: 0,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    match max_rows {
+        EngineError::InvalidOperation(message) => assert_eq!(
+            message,
+            "GQL index SHOW result has 1 rows, exceeding max_rows=0; index SHOW does not support cursors"
+        ),
+        other => panic!("expected SHOW max_rows error, got {other:?}"),
+    }
+    let exactly_capped = execute_gql_with_options(
+        &engine,
+        "SHOW PROPERTY INDEXES",
+        GqlExecutionOptions {
+            max_rows: 1,
+            ..gql_opts()
+        },
+    );
+    assert_eq!(exactly_capped.rows.len(), 1);
+
+    for source in [
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexCursor) ON (n.status) KIND EQUALITY",
+        "DROP PROPERTY INDEX FOR (n:GqlIndexCursor) ON (n.status) KIND EQUALITY",
+        "SHOW PROPERTY INDEXES",
+    ] {
+        let err = engine
+            .execute_gql(
+                source,
+                &GqlParams::new(),
+                &GqlExecutionOptions {
+                    cursor: Some("not-an-index-cursor".to_string()),
+                    ..gql_opts()
+                },
+            )
+            .unwrap_err();
+        assert_index_cursor_error(err);
+    }
+
+    let read_only_create = engine
+        .execute_gql(
+            "CREATE PROPERTY INDEX FOR (n:GqlIndexReadOnly) ON (n.status) KIND EQUALITY",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                mode: GqlExecutionMode::ReadOnly,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert_index_read_only_error(read_only_create);
+    let read_only_drop = engine
+        .execute_gql(
+            "DROP PROPERTY INDEX FOR (n:GqlIndexCaps) ON (n.status) KIND EQUALITY",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                mode: GqlExecutionMode::ReadOnly,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert_index_read_only_error(read_only_drop);
+    let read_only_show = execute_gql_with_options(
+        &engine,
+        "SHOW PROPERTY INDEXES",
+        GqlExecutionOptions {
+            mode: GqlExecutionMode::ReadOnly,
+            ..gql_opts()
+        },
+    );
+    assert_eq!(read_only_show.rows.len(), 1);
+
+    let profiled = execute_gql_with_options(
+        &engine,
+        "SHOW PROPERTY INDEXES",
+        GqlExecutionOptions {
+            profile: true,
+            ..gql_opts()
+        },
+    );
+    assert!(profiled.stats.elapsed_us.is_some());
+    assert!(profiled.index_stats.as_ref().unwrap().elapsed_us.is_some());
+
+    let profiled_create = execute_gql_with_options(
+        &engine,
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexProfileCreate) ON (n.status) KIND EQUALITY",
+        GqlExecutionOptions {
+            profile: true,
+            ..gql_opts()
+        },
+    );
+    assert!(profiled_create.stats.elapsed_us.is_some());
+    assert!(profiled_create
+        .index_stats
+        .as_ref()
+        .unwrap()
+        .elapsed_us
+        .is_some());
+
+    let planned_source =
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexPlan) ON (n.status) KIND EQUALITY";
+    let planned = execute_gql_with_options(
+        &engine,
+        planned_source,
+        GqlExecutionOptions {
+            include_plan: true,
+            ..gql_opts()
+        },
+    );
+    let plan = planned.plan.as_ref().expect("include_plan should return plan");
+    let index_plan = gql_index_explain_payload(plan);
+    assert_eq!(index_plan.operation, "create_property_index");
+    let explained = engine
+        .explain_gql(planned_source, &GqlParams::new(), &gql_opts())
+        .unwrap();
+    assert_eq!(plan.index, explained.index);
+
+    let planned_show = execute_gql_with_options(
+        &engine,
+        "SHOW NODE PROPERTY INDEXES",
+        GqlExecutionOptions {
+            include_plan: true,
+            ..gql_opts()
+        },
+    );
+    let show_plan = planned_show
+        .plan
+        .as_ref()
+        .expect("SHOW include_plan should return plan");
+    let show_index = gql_index_explain_payload(show_plan);
+    assert_eq!(show_index.operation, "show_node_property_indexes");
+    assert!(show_index.side_effect_free);
+    assert_eq!(show_index.targets[0].target_kind, "node");
+    assert_eq!(show_index.targets[0].action.as_deref(), Some("show"));
+}
+
+#[test]
+fn gql_index_explain_booleans_readonly_and_no_side_effects() {
+    let (_dir, engine) = query_test_engine();
+    let create_source = "CREATE PROPERTY INDEX FOR (n:GqlIndexExplainCreate) ON (n.status) KIND EQUALITY";
+    assert_eq!(engine.get_node_label_id("GqlIndexExplainCreate").unwrap(), None);
+    let create = engine
+        .explain_gql(create_source, &GqlParams::new(), &gql_opts())
+        .unwrap();
+    let create = gql_index_explain_payload(&create);
+    assert_eq!(create.operation, "create_property_index");
+    assert_eq!(create.targets.len(), 1);
+    assert_eq!(create.targets[0].target_kind, "node");
+    assert_eq!(create.targets[0].label.as_deref(), Some("GqlIndexExplainCreate"));
+    assert_eq!(create.targets[0].prop_key.as_deref(), Some("status"));
+    assert_eq!(create.targets[0].kind.as_deref(), Some("equality"));
+    assert_eq!(create.targets[0].action.as_deref(), Some("ensure"));
+    assert!(create.uses_core_write_queue);
+    assert!(create.publishes_manifest);
+    assert!(create.creates_labels);
+    assert!(create.schedules_background_build);
+    assert!(!create.drops_index_data_async);
+    assert!(!create.side_effect_free);
+    assert_eq!(engine.get_node_label_id("GqlIndexExplainCreate").unwrap(), None);
+
+    let drop_source =
+        "DROP PROPERTY INDEX FOR ()-[r:GQL_INDEX_EXPLAIN_DROP]-() ON (r.status) KIND RANGE";
+    let drop = engine
+        .explain_gql(drop_source, &GqlParams::new(), &gql_opts())
+        .unwrap();
+    let drop = gql_index_explain_payload(&drop);
+    assert_eq!(drop.operation, "drop_property_index");
+    assert_eq!(drop.targets[0].target_kind, "edge");
+    assert_eq!(drop.targets[0].label.as_deref(), Some("GQL_INDEX_EXPLAIN_DROP"));
+    assert_eq!(drop.targets[0].prop_key.as_deref(), Some("status"));
+    assert_eq!(drop.targets[0].kind.as_deref(), Some("range"));
+    assert_eq!(drop.targets[0].action.as_deref(), Some("drop"));
+    assert!(drop.uses_core_write_queue);
+    assert!(drop.publishes_manifest);
+    assert!(!drop.creates_labels);
+    assert!(!drop.schedules_background_build);
+    assert!(drop.drops_index_data_async);
+    assert!(!drop.side_effect_free);
+    assert_eq!(engine.get_edge_label_id("GQL_INDEX_EXPLAIN_DROP").unwrap(), None);
+
+    let show = engine
+        .explain_gql(
+            "SHOW EDGE PROPERTY INDEXES",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                mode: GqlExecutionMode::ReadOnly,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    let show = gql_index_explain_payload(&show);
+    assert_eq!(show.operation, "show_edge_property_indexes");
+    assert_eq!(show.targets[0].target_kind, "edge");
+    assert!(show.targets[0].label.is_none());
+    assert!(show.targets[0].prop_key.is_none());
+    assert!(show.targets[0].kind.is_none());
+    assert_eq!(show.targets[0].action.as_deref(), Some("show"));
+    assert!(!show.uses_core_write_queue);
+    assert!(!show.publishes_manifest);
+    assert!(!show.creates_labels);
+    assert!(!show.schedules_background_build);
+    assert!(!show.drops_index_data_async);
+    assert!(show.side_effect_free);
+
+    for source in [create_source, drop_source] {
+        let err = engine
+            .explain_gql(
+                source,
+                &GqlParams::new(),
+                &GqlExecutionOptions {
+                    mode: GqlExecutionMode::ReadOnly,
+                    ..gql_opts()
+                },
+            )
+            .unwrap_err();
+        assert_index_read_only_error(err);
+    }
+    let cursor_err = engine
+        .explain_gql(
+            "SHOW PROPERTY INDEXES",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                cursor: Some("not-an-index-cursor".to_string()),
+                mode: GqlExecutionMode::ReadOnly,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert_index_cursor_error(cursor_err);
+}
+
+#[test]
+fn gql_non_index_results_and_explains_keep_index_payload_absent() {
+    let (_dir, engine) = query_test_engine();
+    insert_query_node(&engine, "Person", "gql-index-non-index", &[], 1.0);
+
+    let read = execute_gql_ok(
+        &engine,
+        "MATCH (n:Person) WHERE n.key = 'gql-index-non-index' RETURN id(n)",
+    );
+    assert_eq!(read.kind, GqlStatementKind::Query);
+    assert!(read.index_stats.is_none());
+
+    let mutation = execute_gql_ok(
+        &engine,
+        "CREATE (n:GqlIndexNonIndexMutation {key: 'created'}) RETURN id(n)",
+    );
+    assert_eq!(mutation.kind, GqlStatementKind::Mutation);
+    assert!(mutation.index_stats.is_none());
+
+    let schema = execute_gql_ok(&engine, "SHOW CURRENT GRAPH TYPE");
+    assert_eq!(schema.kind, GqlStatementKind::Schema);
+    assert!(schema.index_stats.is_none());
+
+    let read_explain = engine
+        .explain_gql(
+            "MATCH (n:Person) WHERE n.key = 'gql-index-non-index' RETURN id(n)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap();
+    assert!(read_explain.index.is_none());
+    let mutation_explain = engine
+        .explain_gql(
+            "CREATE (n:GqlIndexNonIndexExplain {key: 'created'}) RETURN id(n)",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap();
+    assert!(mutation_explain.index.is_none());
+    let schema_explain = engine
+        .explain_gql("SHOW CURRENT GRAPH TYPE", &GqlParams::new(), &gql_opts())
+        .unwrap();
+    assert!(schema_explain.index.is_none());
+}
+
+#[test]
+fn gql_index_show_catalog_smoke_does_not_scan_graph_records() {
+    let (_dir, engine) = query_test_engine();
+    for index in 0..100 {
+        engine
+            .ensure_node_property_index(
+                &format!("GqlIndexSmokeNode{index:03}"),
+                "status",
+                SecondaryIndexKind::Equality,
+            )
+            .unwrap();
+        engine
+            .ensure_edge_property_index(
+                &format!("GQL_INDEX_SMOKE_EDGE_{index:03}"),
+                "status",
+                SecondaryIndexKind::Range,
+            )
+            .unwrap();
+    }
+
+    engine.reset_query_execution_counters_for_test();
+    let show = execute_gql_with_options(
+        &engine,
+        "SHOW PROPERTY INDEXES",
+        GqlExecutionOptions {
+            profile: true,
+            ..gql_opts()
+        },
+    );
+    assert_eq!(show.rows.len(), 200);
+    assert_eq!(show.stats.rows_returned, 200);
+    assert_eq!(show.stats.db_hits, 0);
+    assert_eq!(
+        assert_gql_index_result(&show, "show_property_indexes").indexes_returned,
+        200
+    );
+    assert_eq!(
+        engine.query_execution_counter_snapshot_for_test(),
+        QueryExecutionCounterSnapshot::default()
+    );
+}
+
+#[test]
+fn gql_index_lifecycle_create_persists_across_reopen_and_show() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let node = execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexReopenNode) ON (n.status) KIND EQUALITY",
+    );
+    let node_index_id =
+        assert_create_property_index_row(&node, "node", "GqlIndexReopenNode", "status", "equality");
+    let edge = execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR ()-[r:GQL_INDEX_REOPEN_EDGE]-() ON (r.score) KIND RANGE",
+    );
+    let edge_index_id =
+        assert_create_property_index_row(&edge, "edge", "GQL_INDEX_REOPEN_EDGE", "score", "range");
+
+    engine.close().unwrap();
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let reopened_node = native_node_index(
+        &reopened,
+        "GqlIndexReopenNode",
+        "status",
+        SecondaryIndexKind::Equality,
+    )
+    .unwrap();
+    assert_eq!(reopened_node.index_id, node_index_id);
+    assert_eq!(reopened_node.label, "GqlIndexReopenNode");
+    assert_eq!(reopened_node.prop_key, "status");
+    assert_eq!(reopened_node.kind, SecondaryIndexKind::Equality);
+    assert!(reopened_node.last_error.is_none());
+
+    let reopened_edge = native_edge_index(
+        &reopened,
+        "GQL_INDEX_REOPEN_EDGE",
+        "score",
+        SecondaryIndexKind::Range,
+    )
+    .unwrap();
+    assert_eq!(reopened_edge.index_id, edge_index_id);
+    assert_eq!(reopened_edge.label, "GQL_INDEX_REOPEN_EDGE");
+    assert_eq!(reopened_edge.prop_key, "score");
+    assert_eq!(reopened_edge.kind, SecondaryIndexKind::Range);
+    assert!(reopened_edge.last_error.is_none());
+
+    let show = execute_gql_ok(&reopened, "SHOW PROPERTY INDEXES");
+    assert_show_property_index_row(
+        &show,
+        "node",
+        "GqlIndexReopenNode",
+        "status",
+        "equality",
+        node_index_id,
+    );
+    assert_show_property_index_row(
+        &show,
+        "edge",
+        "GQL_INDEX_REOPEN_EDGE",
+        "score",
+        "range",
+        edge_index_id,
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn gql_index_lifecycle_flush_reopen_queries_remain_correct_while_building() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let active = insert_query_node(
+        &engine,
+        "GqlIndexFlushReopenNode",
+        "active",
+        &[("status", PropValue::String("active".to_string()))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "GqlIndexFlushReopenNode",
+        "inactive",
+        &[("status", PropValue::String("inactive".to_string()))],
+        1.0,
+    );
+    engine.flush().unwrap();
+
+    let (build_ready_rx, build_release_tx) = engine.set_secondary_index_build_pause();
+    let created = execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexFlushReopenNode) ON (n.status) KIND EQUALITY",
+    );
+    let index_id = assert_create_property_index_row(
+        &created,
+        "node",
+        "GqlIndexFlushReopenNode",
+        "status",
+        "equality",
+    );
+    build_ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(
+        native_node_index(
+            &engine,
+            "GqlIndexFlushReopenNode",
+            "status",
+            SecondaryIndexKind::Equality,
+        )
+        .unwrap()
+        .state,
+        SecondaryIndexState::Building
+    );
+    assert_eq!(
+        engine
+            .find_nodes(
+                "GqlIndexFlushReopenNode",
+                "status",
+                &PropValue::String("active".to_string()),
+            )
+            .unwrap(),
+        vec![active]
+    );
+
+    build_release_tx.send(()).unwrap();
+    wait_for_property_index_state(&engine, index_id, SecondaryIndexState::Ready);
+    engine.close().unwrap();
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    wait_for_property_index_state(&reopened, index_id, SecondaryIndexState::Ready);
+    assert_eq!(
+        reopened
+            .find_nodes(
+                "GqlIndexFlushReopenNode",
+                "status",
+                &PropValue::String("active".to_string()),
+            )
+            .unwrap(),
+        vec![active]
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn gql_index_lifecycle_drop_persists_absence_and_fallback_queries() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let node_keep = insert_query_node(
+        &engine,
+        "GqlIndexDropReopenNode",
+        "keep",
+        &[("status", PropValue::String("keep".to_string()))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "GqlIndexDropReopenNode",
+        "skip",
+        &[("status", PropValue::String("skip".to_string()))],
+        1.0,
+    );
+    let from = insert_query_node(&engine, "GqlIndexDropReopenEndpoint", "from", &[], 1.0);
+    let to = insert_query_node(&engine, "GqlIndexDropReopenEndpoint", "to", &[], 1.0);
+    let edge_keep = engine
+        .upsert_edge(
+            from,
+            to,
+            "GQL_INDEX_DROP_REOPEN_EDGE",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("score", PropValue::Int(7))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_edge(
+            to,
+            from,
+            "GQL_INDEX_DROP_REOPEN_EDGE",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("score", PropValue::Int(3))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let node_create = execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexDropReopenNode) ON (n.status) KIND EQUALITY",
+    );
+    let node_index_id = assert_create_property_index_row(
+        &node_create,
+        "node",
+        "GqlIndexDropReopenNode",
+        "status",
+        "equality",
+    );
+    let edge_create = execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR ()-[r:GQL_INDEX_DROP_REOPEN_EDGE]-() ON (r.score) KIND RANGE",
+    );
+    let edge_index_id = assert_create_property_index_row(
+        &edge_create,
+        "edge",
+        "GQL_INDEX_DROP_REOPEN_EDGE",
+        "score",
+        "range",
+    );
+    wait_for_property_index_state(&engine, node_index_id, SecondaryIndexState::Ready);
+    wait_for_edge_property_index_state(&engine, edge_index_id, SecondaryIndexState::Ready);
+
+    execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR (n:GqlIndexDropReopenNode) ON (n.status) KIND EQUALITY",
+    );
+    execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR ()-[r:GQL_INDEX_DROP_REOPEN_EDGE]-() ON (r.score) KIND RANGE",
+    );
+    assert!(native_node_index(
+        &engine,
+        "GqlIndexDropReopenNode",
+        "status",
+        SecondaryIndexKind::Equality
+    )
+    .is_none());
+    assert!(native_edge_index(
+        &engine,
+        "GQL_INDEX_DROP_REOPEN_EDGE",
+        "score",
+        SecondaryIndexKind::Range
+    )
+    .is_none());
+
+    let node_query = gql_index_test_node_query(
+        "GqlIndexDropReopenNode",
+        NodeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("keep".to_string()),
+        },
+    );
+    let edge_query = gql_index_test_edge_query(
+        "GQL_INDEX_DROP_REOPEN_EDGE",
+        EdgeFilterExpr::PropertyRange {
+            key: "score".to_string(),
+            lower: Some(PropertyRangeBound::Included(PropValue::Int(5))),
+            upper: Some(PropertyRangeBound::Included(PropValue::Int(8))),
+        },
+    );
+    assert_eq!(engine.query_node_ids(&node_query).unwrap().items, vec![node_keep]);
+    assert_eq!(
+        engine.query_edge_ids(&edge_query).unwrap().edge_ids,
+        vec![edge_keep]
+    );
+
+    engine.close().unwrap();
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    assert!(native_node_index(
+        &reopened,
+        "GqlIndexDropReopenNode",
+        "status",
+        SecondaryIndexKind::Equality
+    )
+    .is_none());
+    assert!(native_edge_index(
+        &reopened,
+        "GQL_INDEX_DROP_REOPEN_EDGE",
+        "score",
+        SecondaryIndexKind::Range
+    )
+    .is_none());
+    let show = execute_gql_ok(&reopened, "SHOW PROPERTY INDEXES");
+    assert_show_property_index_absent(
+        &show,
+        "node",
+        "GqlIndexDropReopenNode",
+        "status",
+        "equality",
+    );
+    assert_show_property_index_absent(
+        &show,
+        "edge",
+        "GQL_INDEX_DROP_REOPEN_EDGE",
+        "score",
+        "range",
+    );
+    assert_eq!(
+        reopened.query_node_ids(&node_query).unwrap().items,
+        vec![node_keep]
+    );
+    assert_eq!(
+        reopened.query_edge_ids(&edge_query).unwrap().edge_ids,
+        vec![edge_keep]
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn gql_index_lifecycle_retry_failed_declaration_matches_native_ensure() {
+    let (_dir, engine) = query_test_engine();
+    let source = "CREATE PROPERTY INDEX FOR (n:GqlIndexRetryFailedNode) ON (n.status) KIND EQUALITY";
+
+    let created = execute_gql_ok(&engine, source);
+    let index_id = assert_create_property_index_row(
+        &created,
+        "node",
+        "GqlIndexRetryFailedNode",
+        "status",
+        "equality",
+    );
+    engine.shutdown_secondary_index_worker();
+    engine
+        .with_runtime_manifest_write(|manifest| {
+            let entry = manifest
+                .secondary_indexes
+                .iter_mut()
+                .find(|entry| entry.index_id == index_id)
+                .unwrap();
+            entry.state = SecondaryIndexState::Failed;
+            entry.last_error = Some("gql index forced failure".to_string());
+            Ok(())
+        })
+        .unwrap();
+    engine.rebuild_secondary_index_catalog().unwrap();
+    let failed = native_node_index(
+        &engine,
+        "GqlIndexRetryFailedNode",
+        "status",
+        SecondaryIndexKind::Equality,
+    )
+    .unwrap();
+    assert_eq!(failed.index_id, index_id);
+    assert_eq!(failed.state, SecondaryIndexState::Failed);
+    assert_eq!(failed.last_error.as_deref(), Some("gql index forced failure"));
+
+    let retried = execute_gql_ok(&engine, source);
+    let retry_index_id = assert_create_property_index_row(
+        &retried,
+        "node",
+        "GqlIndexRetryFailedNode",
+        "status",
+        "equality",
+    );
+    assert_eq!(retry_index_id, index_id);
+    assert_eq!(
+        retried.rows[0].values[6],
+        GqlValue::String("building".to_string())
+    );
+    assert_eq!(retried.rows[0].values[8], GqlValue::Null);
+    let native = native_node_index(
+        &engine,
+        "GqlIndexRetryFailedNode",
+        "status",
+        SecondaryIndexKind::Equality,
+    )
+    .unwrap();
+    assert_eq!(native.index_id, index_id);
+    assert_eq!(native.state, SecondaryIndexState::Building);
+    assert!(native.last_error.is_none());
+}
+
+#[test]
+fn gql_index_lifecycle_planner_uses_ready_declarations_and_falls_back_after_drop() {
+    let (_dir, engine) = query_test_engine();
+
+    let node_eq_keep = insert_query_node(
+        &engine,
+        "GqlIndexPlanNodeEq",
+        "active",
+        &[("status", PropValue::String("active".to_string()))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "GqlIndexPlanNodeEq",
+        "inactive",
+        &[("status", PropValue::String("inactive".to_string()))],
+        1.0,
+    );
+    let node_range_keep = insert_query_node(
+        &engine,
+        "GqlIndexPlanNodeRange",
+        "mid",
+        &[("score", PropValue::Int(5))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "GqlIndexPlanNodeRange",
+        "low",
+        &[("score", PropValue::Int(1))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "GqlIndexPlanNodeRange",
+        "high",
+        &[("score", PropValue::Int(9))],
+        1.0,
+    );
+
+    let from = insert_query_node(&engine, "GqlIndexPlanEndpoint", "from", &[], 1.0);
+    let to = insert_query_node(&engine, "GqlIndexPlanEndpoint", "to", &[], 1.0);
+    let other = insert_query_node(&engine, "GqlIndexPlanEndpoint", "other", &[], 1.0);
+    let edge_eq_keep = engine
+        .upsert_edge(
+            from,
+            to,
+            "GQL_INDEX_PLAN_EDGE_EQ",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("status", PropValue::String("active".to_string()))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_edge(
+            from,
+            other,
+            "GQL_INDEX_PLAN_EDGE_EQ",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("status", PropValue::String("inactive".to_string()))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let edge_range_keep = engine
+        .upsert_edge(
+            to,
+            other,
+            "GQL_INDEX_PLAN_EDGE_RANGE",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("score", PropValue::Int(5))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_edge(
+            other,
+            to,
+            "GQL_INDEX_PLAN_EDGE_RANGE",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("score", PropValue::Int(10))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let node_eq_index_id = assert_create_property_index_row(
+        &execute_gql_ok(
+            &engine,
+            "CREATE PROPERTY INDEX FOR (n:GqlIndexPlanNodeEq) ON (n.status) KIND EQUALITY",
+        ),
+        "node",
+        "GqlIndexPlanNodeEq",
+        "status",
+        "equality",
+    );
+    let node_range_index_id = assert_create_property_index_row(
+        &execute_gql_ok(
+            &engine,
+            "CREATE PROPERTY INDEX FOR (n:GqlIndexPlanNodeRange) ON (n.score) KIND RANGE",
+        ),
+        "node",
+        "GqlIndexPlanNodeRange",
+        "score",
+        "range",
+    );
+    let edge_eq_index_id = assert_create_property_index_row(
+        &execute_gql_ok(
+            &engine,
+            "CREATE PROPERTY INDEX FOR ()-[r:GQL_INDEX_PLAN_EDGE_EQ]-() ON (r.status) KIND EQUALITY",
+        ),
+        "edge",
+        "GQL_INDEX_PLAN_EDGE_EQ",
+        "status",
+        "equality",
+    );
+    let edge_range_index_id = assert_create_property_index_row(
+        &execute_gql_ok(
+            &engine,
+            "CREATE PROPERTY INDEX FOR ()-[r:GQL_INDEX_PLAN_EDGE_RANGE]-() ON (r.score) KIND RANGE",
+        ),
+        "edge",
+        "GQL_INDEX_PLAN_EDGE_RANGE",
+        "score",
+        "range",
+    );
+
+    wait_for_property_index_state(&engine, node_eq_index_id, SecondaryIndexState::Ready);
+    wait_for_property_index_state(&engine, node_range_index_id, SecondaryIndexState::Ready);
+    wait_for_edge_property_index_state(&engine, edge_eq_index_id, SecondaryIndexState::Ready);
+    wait_for_edge_property_index_state(&engine, edge_range_index_id, SecondaryIndexState::Ready);
+    wait_for_published_property_index_state(&engine, node_eq_index_id, SecondaryIndexState::Ready);
+    wait_for_published_property_index_state(
+        &engine,
+        node_range_index_id,
+        SecondaryIndexState::Ready,
+    );
+    wait_for_published_property_index_state(&engine, edge_eq_index_id, SecondaryIndexState::Ready);
+    wait_for_published_property_index_state(
+        &engine,
+        edge_range_index_id,
+        SecondaryIndexState::Ready,
+    );
+
+    let node_eq_query = gql_index_test_node_query(
+        "GqlIndexPlanNodeEq",
+        NodeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("active".to_string()),
+        },
+    );
+    let node_range_query = gql_index_test_node_query(
+        "GqlIndexPlanNodeRange",
+        NodeFilterExpr::PropertyRange {
+            key: "score".to_string(),
+            lower: Some(PropertyRangeBound::Included(PropValue::Int(4))),
+            upper: Some(PropertyRangeBound::Included(PropValue::Int(6))),
+        },
+    );
+    let edge_eq_query = gql_index_test_edge_query(
+        "GQL_INDEX_PLAN_EDGE_EQ",
+        EdgeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("active".to_string()),
+        },
+    );
+    let edge_range_query = gql_index_test_edge_query(
+        "GQL_INDEX_PLAN_EDGE_RANGE",
+        EdgeFilterExpr::PropertyRange {
+            key: "score".to_string(),
+            lower: Some(PropertyRangeBound::Included(PropValue::Int(4))),
+            upper: Some(PropertyRangeBound::Excluded(PropValue::Int(9))),
+        },
+    );
+
+    let node_eq_ids = engine.query_node_ids(&node_eq_query).unwrap().items;
+    assert_eq!(node_eq_ids, vec![node_eq_keep]);
+    assert_plan_input_nodes(
+        &engine.explain_node_query(&node_eq_query).unwrap(),
+        vec![QueryPlanNode::PropertyEqualityIndex],
+    );
+
+    let node_range_ids = engine.query_node_ids(&node_range_query).unwrap().items;
+    assert_eq!(node_range_ids, vec![node_range_keep]);
+    assert_plan_input_nodes(
+        &engine.explain_node_query(&node_range_query).unwrap(),
+        vec![QueryPlanNode::PropertyRangeIndex],
+    );
+
+    let edge_eq_ids = engine.query_edge_ids(&edge_eq_query).unwrap().edge_ids;
+    assert_eq!(edge_eq_ids, vec![edge_eq_keep]);
+    let edge_eq_plan = engine.explain_edge_query(&edge_eq_query).unwrap();
+    assert!(plan_contains_node(
+        &edge_eq_plan.root,
+        &QueryPlanNode::EdgePropertyEqualityIndex
+    ));
+
+    let edge_range_ids = engine.query_edge_ids(&edge_range_query).unwrap().edge_ids;
+    assert_eq!(edge_range_ids, vec![edge_range_keep]);
+    let edge_range_plan = engine.explain_edge_query(&edge_range_query).unwrap();
+    assert!(plan_contains_node(
+        &edge_range_plan.root,
+        &QueryPlanNode::EdgePropertyRangeIndex
+    ));
+
+    execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR (n:GqlIndexPlanNodeEq) ON (n.status) KIND EQUALITY",
+    );
+    assert_eq!(
+        engine.query_node_ids(&node_eq_query).unwrap().items,
+        node_eq_ids
+    );
+    let node_eq_fallback = engine.explain_node_query(&node_eq_query).unwrap();
+    assert_plan_input_nodes(&node_eq_fallback, vec![QueryPlanNode::FallbackNodeLabelScan]);
+    assert!(!plan_contains_node(
+        &node_eq_fallback.root,
+        &QueryPlanNode::PropertyEqualityIndex
+    ));
+
+    execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR (n:GqlIndexPlanNodeRange) ON (n.score) KIND RANGE",
+    );
+    assert_eq!(
+        engine.query_node_ids(&node_range_query).unwrap().items,
+        node_range_ids
+    );
+    let node_range_fallback = engine.explain_node_query(&node_range_query).unwrap();
+    assert_plan_input_nodes(
+        &node_range_fallback,
+        vec![QueryPlanNode::FallbackNodeLabelScan],
+    );
+    assert!(!plan_contains_node(
+        &node_range_fallback.root,
+        &QueryPlanNode::PropertyRangeIndex
+    ));
+
+    execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR ()-[r:GQL_INDEX_PLAN_EDGE_EQ]-() ON (r.status) KIND EQUALITY",
+    );
+    assert_eq!(
+        engine.query_edge_ids(&edge_eq_query).unwrap().edge_ids,
+        edge_eq_ids
+    );
+    let edge_eq_fallback = engine.explain_edge_query(&edge_eq_query).unwrap();
+    assert!(!plan_contains_node(
+        &edge_eq_fallback.root,
+        &QueryPlanNode::EdgePropertyEqualityIndex
+    ));
+    assert!(edge_eq_fallback
+        .warnings
+        .contains(&QueryPlanWarning::EdgePropertyPostFilter));
+    assert!(edge_eq_fallback
+        .warnings
+        .contains(&QueryPlanWarning::VerifyOnlyFilter));
+
+    execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR ()-[r:GQL_INDEX_PLAN_EDGE_RANGE]-() ON (r.score) KIND RANGE",
+    );
+    assert_eq!(
+        engine.query_edge_ids(&edge_range_query).unwrap().edge_ids,
+        edge_range_ids
+    );
+    let edge_range_fallback = engine.explain_edge_query(&edge_range_query).unwrap();
+    assert!(!plan_contains_node(
+        &edge_range_fallback.root,
+        &QueryPlanNode::EdgePropertyRangeIndex
+    ));
+    assert!(edge_range_fallback
+        .warnings
+        .contains(&QueryPlanWarning::EdgePropertyPostFilter));
+    assert!(edge_range_fallback
+        .warnings
+        .contains(&QueryPlanWarning::VerifyOnlyFilter));
+}
+
+#[test]
+fn gql_index_lifecycle_unsupported_explain_and_unknown_drop_have_no_side_effects() {
+    let (_dir, engine) = query_test_engine();
+    let before = gql_index_side_effect_snapshot(&engine);
+
+    for source in [
+        "CREATE INDEX gql_index_named FOR (n:GqlIndexNoSideNamed) ON (n.status)",
+        "CREATE TEXT INDEX gql_index_text FOR (n:GqlIndexNoSideFamily) ON (n.status)",
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexNoSideKind) ON (n.status) KIND TEXT",
+        "CREATE PROPERTY INDEX FOR ()-[r:GQL_INDEX_NO_SIDE_DIRECTED]->() ON (r.status) KIND EQUALITY",
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexNoSideComposite) ON (n.a, n.b) KIND EQUALITY",
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexNoSideParam) ON (n.$prop) KIND EQUALITY",
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexNoSideMismatch) ON (m.status) KIND EQUALITY",
+    ] {
+        engine
+            .execute_gql(source, &GqlParams::new(), &gql_opts())
+            .unwrap_err();
+        assert_gql_index_no_side_effects(&engine, &before, source);
+    }
+
+    let explain_create =
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexNoSideExplainCreate) ON (n.status) KIND EQUALITY";
+    engine
+        .explain_gql(explain_create, &GqlParams::new(), &gql_opts())
+        .unwrap();
+    assert_gql_index_no_side_effects(&engine, &before, explain_create);
+
+    let explain_drop =
+        "DROP PROPERTY INDEX FOR ()-[r:GQL_INDEX_NO_SIDE_EXPLAIN_DROP]-() ON (r.status) KIND RANGE";
+    engine
+        .explain_gql(explain_drop, &GqlParams::new(), &gql_opts())
+        .unwrap();
+    assert_gql_index_no_side_effects(&engine, &before, explain_drop);
+
+    let drop_unknown_node =
+        "DROP PROPERTY INDEX FOR (n:GqlIndexNoSideUnknownDrop) ON (n.status) KIND EQUALITY";
+    let dropped = execute_gql_ok(&engine, drop_unknown_node);
+    assert_drop_property_index_row(
+        &dropped,
+        "node",
+        "GqlIndexNoSideUnknownDrop",
+        "status",
+        "equality",
+        "not_found",
+    );
+    assert_gql_index_no_side_effects(&engine, &before, drop_unknown_node);
+
+    let drop_unknown_edge =
+        "DROP PROPERTY INDEX FOR ()-[r:GQL_INDEX_NO_SIDE_UNKNOWN_DROP]-() ON (r.status) KIND RANGE";
+    let dropped = execute_gql_ok(&engine, drop_unknown_edge);
+    assert_drop_property_index_row(
+        &dropped,
+        "edge",
+        "GQL_INDEX_NO_SIDE_UNKNOWN_DROP",
+        "status",
+        "range",
+        "not_found",
+    );
+    assert_gql_index_no_side_effects(&engine, &before, drop_unknown_edge);
+}
+
+#[test]
+fn gql_index_lifecycle_manifest_shape_uses_native_secondary_index_entries() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexManifestNode) ON (n.status) KIND EQUALITY",
+    );
+    execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR ()-[r:GQL_INDEX_MANIFEST_EDGE]-() ON (r.score) KIND RANGE",
+    );
+    assert_gql_index_manifest_secondary_index_shape(&db_path, 2);
+
+    let manifest = gql_index_manifest_json(&db_path);
+    let raw_manifest = manifest.to_string();
+    assert!(!raw_manifest.contains("ddl"));
+    assert!(!raw_manifest.contains("index_name"));
+    assert!(!raw_manifest.contains("provider"));
+
+    execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR (n:GqlIndexManifestNode) ON (n.status) KIND EQUALITY",
+    );
+    assert_gql_index_manifest_secondary_index_shape(&db_path, 1);
+
+    execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR ()-[r:GQL_INDEX_MANIFEST_EDGE]-() ON (r.score) KIND RANGE",
+    );
+    assert_gql_index_manifest_secondary_index_shape(&db_path, 0);
+    engine.close().unwrap();
+}
+
+#[test]
+fn gql_schema_alter_add_publishes_multi_target_and_show_sees_catalog() {
+    let (_dir, engine) = query_test_engine();
+    engine.set_node_schema("Keep", NodeSchema::default()).unwrap();
+
+    let result = execute_gql_with_options(
+        &engine,
+        "ALTER CURRENT GRAPH TYPE ADD { NODE Person = {}, EDGE KNOWS = {} }",
+        GqlExecutionOptions {
+            include_plan: true,
+            ..gql_opts()
+        },
+    );
+
+    assert_eq!(result.columns, alter_add_set_columns());
+    assert_eq!(result.rows.len(), 2);
+    let stats = assert_gql_schema_result(&result, "alter_graph_type_add");
+    assert_eq!(stats.targets_checked, 2);
+    assert_eq!(stats.targets_published, 2);
+    assert_eq!(stats.targets_dropped, 0);
+    assert_eq!(stats.checked_records, 0);
+    assert_eq!(gql_string_column(&result, 0), vec!["alter_graph_type_add"; 2]);
+    assert_eq!(gql_string_column(&result, 1), vec!["node", "edge"]);
+    assert_eq!(gql_string_column(&result, 2), vec!["Person", "KNOWS"]);
+    assert_eq!(gql_string_column(&result, 3), vec!["published", "published"]);
+    let plan = gql_schema_explain(result.plan.as_ref().expect("include_plan should exist"));
+    assert_eq!(plan.operation, "alter_graph_type_add");
+    assert!(plan.publishes_manifest);
+    assert!(plan.uses_core_write_queue);
+    assert!(!plan.side_effect_free);
+
+    let show = execute_gql_ok(&engine, "SHOW CURRENT GRAPH TYPE");
+    assert_eq!(show.columns, show_columns());
+    assert_gql_schema_result(&show, "show_current_graph_type");
+    assert_eq!(show.rows.len(), 3);
+    assert_eq!(gql_string_column(&show, 1), vec!["Keep", "Person", "KNOWS"]);
+}
+
+#[test]
+fn gql_schema_alter_set_replaces_catalog_and_empty_set_publishes_summary() {
+    let (_dir, engine) = query_test_engine();
+    execute_gql_ok(
+        &engine,
+        "ALTER CURRENT GRAPH TYPE ADD { NODE Keep = {}, EDGE OLD_EDGE = {} }",
+    );
+
+    let set = execute_gql_ok(&engine, "ALTER CURRENT GRAPH TYPE SET { NODE Person = {} }");
+    let stats = assert_gql_schema_result(&set, "alter_graph_type_set");
+    assert_eq!(stats.targets_published, 1);
+    assert_eq!(stats.targets_dropped, 2);
+    assert_eq!(set.rows.len(), 1);
+    assert_eq!(gql_string_column(&set, 2), vec!["Person"]);
+    let show = execute_gql_ok(&engine, "SHOW CURRENT GRAPH TYPE");
+    assert_eq!(gql_string_column(&show, 1), vec!["Person"]);
+
+    let empty = execute_gql_ok(&engine, "ALTER CURRENT GRAPH TYPE SET {}");
+    assert_eq!(empty.columns, alter_add_set_columns());
+    let stats = assert_gql_schema_result(&empty, "alter_graph_type_set");
+    assert_eq!(stats.targets_published, 0);
+    assert_eq!(stats.targets_dropped, 1);
+    assert_eq!(
+        empty.rows,
+        vec![GqlRow {
+            values: vec![
+                GqlValue::String("alter_graph_type_set".to_string()),
+                GqlValue::String("graph".to_string()),
+                GqlValue::Null,
+                GqlValue::String("published_empty_graph_type".to_string()),
+                GqlValue::UInt(0),
+                GqlValue::UInt(0),
+                GqlValue::Bool(false),
+                GqlValue::Bool(false),
+            ],
+        }]
+    );
+    assert!(execute_gql_ok(&engine, "SHOW CURRENT GRAPH TYPE")
+        .rows
+        .is_empty());
+}
+
+#[test]
+fn gql_schema_selected_drop_and_drop_current_return_authoritative_counts() {
+    let (_dir, engine) = query_test_engine();
+    execute_gql_ok(
+        &engine,
+        "ALTER CURRENT GRAPH TYPE ADD { NODE Person = {}, NODE Company = {}, EDGE KNOWS = {} }",
+    );
+
+    let selected = execute_gql_ok(
+        &engine,
+        "ALTER CURRENT GRAPH TYPE DROP { NODE Person, EDGE MissingEdge, EDGE KNOWS, NODE MissingNode }",
+    );
+    assert_eq!(selected.columns, alter_drop_columns());
+    let stats = assert_gql_schema_result(&selected, "alter_graph_type_drop");
+    assert_eq!(stats.targets_dropped, 2);
+    assert_eq!(gql_string_column(&selected, 1), vec!["node", "edge", "edge", "node"]);
+    assert_eq!(
+        gql_string_column(&selected, 2),
+        vec!["Person", "MissingEdge", "KNOWS", "MissingNode"]
+    );
+    assert_eq!(
+        gql_string_column(&selected, 3),
+        vec!["dropped", "not_found", "dropped", "not_found"]
+    );
+    let show = execute_gql_ok(&engine, "SHOW CURRENT GRAPH TYPE");
+    assert_eq!(gql_string_column(&show, 1), vec!["Company"]);
+
+    execute_gql_ok(&engine, "ALTER CURRENT GRAPH TYPE ADD { EDGE WORKS_AT = {} }");
+    let dropped = execute_gql_ok(&engine, "DROP CURRENT GRAPH TYPE");
+    assert_eq!(dropped.columns, drop_current_columns());
+    let stats = assert_gql_schema_result(&dropped, "drop_current_graph_type");
+    assert_eq!(stats.targets_dropped, 2);
+    assert_eq!(
+        dropped.rows[0].values,
+        vec![
+            GqlValue::String("drop_current_graph_type".to_string()),
+            GqlValue::String("graph".to_string()),
+            GqlValue::Null,
+            GqlValue::String("dropped".to_string()),
+            GqlValue::UInt(1),
+            GqlValue::UInt(1),
+        ]
+    );
+}
+
+#[test]
+fn gql_schema_check_rows_are_side_effect_free_and_readonly_allowed() {
+    let (_dir, engine) = query_test_engine();
+    engine
+        .upsert_node("DryRun", "missing-name", UpsertNodeOptions::default())
+        .unwrap();
+
+    let check = engine
+        .execute_gql(
+            "CHECK CURRENT GRAPH TYPE ADD { NODE DryRun = { properties: { name: { required: true, nullable: false, types: ['string'] } } } } OPTIONS { max_violations: 5, scan_limit: null }",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                mode: GqlExecutionMode::ReadOnly,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(check.columns, check_columns());
+    let stats = assert_gql_schema_result(&check, "check_graph_type_add");
+    assert_eq!(stats.targets_checked, 1);
+    assert_eq!(stats.targets_published, 0);
+    assert_eq!(stats.violation_count, 1);
+    assert_eq!(check.rows.len(), 1);
+    assert_eq!(check.rows[0].values[3], GqlValue::UInt(1));
+    assert_eq!(check.rows[0].values[4], GqlValue::UInt(1));
+    let violations = gql_list(&check.rows[0].values[7]);
+    assert_eq!(violations.len(), 1);
+    let violation = gql_map(&violations[0]);
+    let target = gql_map(&violation["target"]);
+    assert_eq!(gql_str(&target["kind"]), "node");
+    assert_gql_tagged_uint(&target["id"], "1");
+    assert!(engine.get_node_schema("DryRun").unwrap().is_none());
+
+    let no_token = engine.get_node_label_id("FutureCheckOnly").unwrap();
+    assert!(no_token.is_none());
+    let future = engine
+        .execute_gql(
+            "CHECK CURRENT GRAPH TYPE ADD { NODE FutureCheckOnly = {} }",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                mode: GqlExecutionMode::ReadOnly,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_gql_schema_result(&future, "check_graph_type_add");
+    assert!(engine.get_node_schema("FutureCheckOnly").unwrap().is_none());
+    assert!(engine.get_node_label_id("FutureCheckOnly").unwrap().is_none());
+
+    let empty = engine
+        .execute_gql(
+            "CHECK CURRENT GRAPH TYPE SET {}",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                mode: GqlExecutionMode::ReadOnly,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(empty.columns, check_columns());
+    assert_gql_schema_result(&empty, "check_graph_type_set");
+    assert_eq!(
+        empty.rows[0].values,
+        vec![
+            GqlValue::String("check_graph_type_set".to_string()),
+            GqlValue::String("graph".to_string()),
+            GqlValue::Null,
+            GqlValue::UInt(0),
+            GqlValue::UInt(0),
+            GqlValue::Bool(false),
+            GqlValue::Bool(false),
+            GqlValue::List(Vec::new()),
+        ]
+    );
+}
+
+#[test]
+fn gql_schema_failed_alter_and_scan_limit_publish_nothing() {
+    let (_dir, engine) = query_test_engine();
+    engine
+        .upsert_node("Violating", "missing-name", UpsertNodeOptions::default())
+        .unwrap();
+
+    let err = engine
+        .execute_gql(
+            "ALTER CURRENT GRAPH TYPE ADD { NODE FutureClean = {}, NODE Violating = { properties: { name: { required: true, nullable: false, types: ['string'] } } } }",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("schema publication rejected"));
+    assert!(engine.get_node_schema("FutureClean").unwrap().is_none());
+    assert!(engine.get_node_schema("Violating").unwrap().is_none());
+    assert!(engine.get_node_label_id("FutureClean").unwrap().is_none());
+
+    let err = engine
+        .execute_gql(
+            "ALTER CURRENT GRAPH TYPE ADD { NODE Violating = {} } OPTIONS { scan_limit: 0 }",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("scan limit"));
+    assert!(engine.get_node_schema("Violating").unwrap().is_none());
+}
+
+#[test]
+fn gql_schema_show_variants_and_max_rows_are_stable() {
+    let (_dir, engine) = query_test_engine();
+    execute_gql_ok(
+        &engine,
+        "ALTER CURRENT GRAPH TYPE ADD { NODE Alpha = {}, NODE Beta = {}, EDGE REL = {} }",
+    );
+
+    let current = execute_gql_ok(&engine, "SHOW CURRENT GRAPH TYPE");
+    assert_eq!(current.columns, show_columns());
+    assert_eq!(gql_string_column(&current, 0), vec!["node", "node", "edge"]);
+    assert_eq!(gql_string_column(&current, 1), vec!["Alpha", "Beta", "REL"]);
+    assert!(matches!(current.rows[0].values[2], GqlValue::Map(_)));
+
+    let nodes = execute_gql_ok(&engine, "SHOW NODE SCHEMAS");
+    assert_eq!(gql_string_column(&nodes, 1), vec!["Alpha", "Beta"]);
+    assert_gql_schema_result(&nodes, "show_node_schemas");
+    let edges = execute_gql_ok(&engine, "SHOW EDGE SCHEMAS");
+    assert_eq!(gql_string_column(&edges, 1), vec!["REL"]);
+    assert_gql_schema_result(&edges, "show_edge_schemas");
+
+    let one_node = execute_gql_ok(&engine, "SHOW NODE SCHEMA Alpha");
+    assert_eq!(one_node.rows.len(), 1);
+    assert_gql_schema_result(&one_node, "show_node_schema");
+    let missing_node = execute_gql_ok(&engine, "SHOW NODE SCHEMA Missing");
+    assert!(missing_node.rows.is_empty());
+    let one_edge = execute_gql_ok(&engine, "SHOW EDGE SCHEMA REL");
+    assert_eq!(one_edge.rows.len(), 1);
+    assert_gql_schema_result(&one_edge, "show_edge_schema");
+    let missing_edge = execute_gql_ok(&engine, "SHOW EDGE SCHEMA MissingRel");
+    assert!(missing_edge.rows.is_empty());
+
+    let err = engine
+        .execute_gql(
+            "SHOW CURRENT GRAPH TYPE",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_rows: 2,
+                ..gql_opts()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngineError::InvalidOperation(ref message) if message.contains("exceeding max_rows=2")));
+    assert_eq!(execute_gql_ok(&engine, "SHOW CURRENT GRAPH TYPE").rows.len(), 3);
+}
+
+#[test]
+fn gql_schema_cursor_readonly_and_explain_side_effect_rules() {
+    let (_dir, engine) = query_test_engine();
+    for source in [
+        "ALTER CURRENT GRAPH TYPE ADD { NODE Person = {} }",
+        "CHECK CURRENT GRAPH TYPE SET {}",
+        "SHOW NODE SCHEMAS",
+        "DROP CURRENT GRAPH TYPE",
+    ] {
+        let err = engine
+            .execute_gql(
+                source,
+                &GqlParams::new(),
+                &GqlExecutionOptions {
+                    cursor: Some("schema-cursor".to_string()),
+                    ..gql_opts()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::InvalidCursor { .. }));
+        let err = engine
+            .explain_gql(
+                source,
+                &GqlParams::new(),
+                &GqlExecutionOptions {
+                    cursor: Some("schema-cursor".to_string()),
+                    ..gql_opts()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::InvalidCursor { .. }));
+    }
+
+    for source in [
+        "ALTER CURRENT GRAPH TYPE SET {}",
+        "DROP CURRENT GRAPH TYPE",
+    ] {
+        let err = engine
+            .execute_gql(
+                source,
+                &GqlParams::new(),
+                &GqlExecutionOptions {
+                    mode: GqlExecutionMode::ReadOnly,
+                    ..gql_opts()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidOperation(ref message) if message.contains("ReadOnly")),
+            "unexpected ReadOnly error for {source}: {err:?}"
+        );
+        let err = engine
+            .explain_gql(
+                source,
+                &GqlParams::new(),
+                &GqlExecutionOptions {
+                    mode: GqlExecutionMode::ReadOnly,
+                    ..gql_opts()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidOperation(ref message) if message.contains("ReadOnly")),
+            "unexpected ReadOnly explain error for {source}: {err:?}"
+        );
+    }
+
+    for source in ["CHECK CURRENT GRAPH TYPE SET {}", "SHOW EDGE SCHEMAS"] {
+        engine
+            .execute_gql(
+                source,
+                &GqlParams::new(),
+                &GqlExecutionOptions {
+                    mode: GqlExecutionMode::ReadOnly,
+                    ..gql_opts()
+                },
+            )
+            .unwrap();
+        engine
+            .explain_gql(
+                source,
+                &GqlParams::new(),
+                &GqlExecutionOptions {
+                    mode: GqlExecutionMode::ReadOnly,
+                    ..gql_opts()
+                },
+            )
+            .unwrap();
+    }
+
+    let explain = engine
+        .explain_gql(
+            "ALTER CURRENT GRAPH TYPE ADD { NODE FutureExplain = {} }",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap();
+    let schema = gql_schema_explain(&explain);
+    assert_eq!(schema.operation, "alter_graph_type_add");
+    assert!(schema.publishes_manifest);
+    assert!(schema.uses_core_write_queue);
+    assert!(!schema.side_effect_free);
+    assert!(engine.get_node_schema("FutureExplain").unwrap().is_none());
+    assert!(engine.get_node_label_id("FutureExplain").unwrap().is_none());
+}
+
+#[test]
+fn gql_schema_publication_enforces_later_writes_through_shared_write_path() {
+    let (_dir, engine) = query_test_engine();
+    execute_gql_ok(
+        &engine,
+        "ALTER CURRENT GRAPH TYPE ADD { NODE Strict = { additional_properties: 'reject', properties: { name: { required: true, nullable: false, types: ['string'] } } } }",
+    );
+
+    let err = engine
+        .execute_gql(
+            "CREATE (n:Strict {key: 'bad', extra: 'x'}) RETURN n",
+            &GqlParams::new(),
+            &gql_opts(),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("schema violation"));
+    assert!(engine.get_node_by_key("Strict", "bad").unwrap().is_none());
+
+    let native_err = engine
+        .upsert_node("Strict", "native_bad", UpsertNodeOptions::default())
+        .unwrap_err();
+    assert!(native_err.to_string().contains("schema violation"));
+    assert!(engine
+        .get_node_by_key("Strict", "native_bad")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn gql_schema_show_and_check_use_tagged_uint_and_bytes_values() {
+    let (_dir, engine) = query_test_engine();
+    execute_gql_ok(
+        &engine,
+        "ALTER CURRENT GRAPH TYPE ADD { NODE Tagged = { properties: { payload: { enum_values: [{ type: 'uint', value: '18446744073709551615' }, { type: 'bytes', value: [0, 1, 255] }] } } } }",
+    );
+    let show = execute_gql_ok(&engine, "SHOW NODE SCHEMA Tagged");
+    let schema = gql_map(&show.rows[0].values[2]);
+    let properties = gql_map(&schema["properties"]);
+    let payload = gql_map(&properties["payload"]);
+    let enum_values = gql_list(&payload["enum_values"]);
+    assert_gql_tagged_uint(&enum_values[0], "18446744073709551615");
+    assert_gql_tagged_bytes(&enum_values[1], &[0, 1, 255]);
+
+    engine
+        .upsert_node("NeedsName", "missing", UpsertNodeOptions::default())
+        .unwrap();
+    let check = execute_gql_ok(
+        &engine,
+        "CHECK CURRENT GRAPH TYPE ADD { NODE NeedsName = { properties: { name: { required: true, nullable: false, types: ['string'] } } } }",
+    );
+    let violations = gql_list(&check.rows[0].values[7]);
+    let violation = gql_map(&violations[0]);
+    let target = gql_map(&violation["target"]);
+    assert_gql_tagged_uint(&target["id"], "1");
+}
+
+#[test]
+fn gql_schema_params_are_resource_capped_before_binding() {
+    let (_dir, engine) = query_test_engine();
+    let schema_with_long_key = GqlParamValue::Map(BTreeMap::from([(
+        "additional_properties".to_string(),
+        GqlParamValue::String("allow".to_string()),
+    )]));
+    let err = engine
+        .execute_gql(
+            "CHECK CURRENT GRAPH TYPE SET { NODE Person = $schema }",
+            &GqlParams::from([("schema".to_string(), schema_with_long_key)]),
+            &gql_param_cap_options(64, 8, 4),
+        )
+        .unwrap_err();
+    assert_gql_param_error(err, "schema", "exceeding max_param_bytes");
+
+    let deeply_nested_schema = GqlParamValue::Map(BTreeMap::from([(
+        "properties".to_string(),
+        GqlParamValue::Map(BTreeMap::from([(
+            "name".to_string(),
+            GqlParamValue::Map(BTreeMap::from([(
+                "types".to_string(),
+                GqlParamValue::List(vec![GqlParamValue::String("string".to_string())]),
+            )])),
+        )])),
+    )]));
+    let err = engine
+        .explain_gql(
+            "CHECK CURRENT GRAPH TYPE SET { NODE Person = $schema }",
+            &GqlParams::from([("schema".to_string(), deeply_nested_schema)]),
+            &gql_param_cap_options(64, 1, 1024),
+        )
+        .unwrap_err();
+    assert_gql_param_error(err, "schema", "max_ast_depth");
+
+    let options_with_long_key = GqlParamValue::Map(BTreeMap::from([(
+        "max_violations".to_string(),
+        GqlParamValue::Int(1),
+    )]));
+    let err = engine
+        .execute_gql(
+            "CHECK CURRENT GRAPH TYPE SET {} OPTIONS $options",
+            &GqlParams::from([("options".to_string(), options_with_long_key)]),
+            &gql_param_cap_options(64, 8, 4),
+        )
+        .unwrap_err();
+    assert_gql_param_error(err, "options", "exceeding max_param_bytes");
+
+    let deeply_nested_options = GqlParamValue::Map(BTreeMap::from([(
+        "chunk_size".to_string(),
+        GqlParamValue::Map(BTreeMap::from([(
+            "nested".to_string(),
+            GqlParamValue::Null,
+        )])),
+    )]));
+    let err = engine
+        .explain_gql(
+            "CHECK CURRENT GRAPH TYPE SET {} OPTIONS $options",
+            &GqlParams::from([("options".to_string(), deeply_nested_options)]),
+            &gql_param_cap_options(64, 1, 1024),
+        )
+        .unwrap_err();
+    assert_gql_param_error(err, "options", "max_ast_depth");
 }
 
 #[test]

@@ -1,11 +1,12 @@
 {
   "name": "overgraph",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "An absurdly fast embedded graph database for Node.js. Sub-microsecond reads, pure Rust core.",
   "main": "index.js",
   "types": "index.d.ts",
   "napi": {
     "binaryName": "overgraph",
+    "dtsHeaderFile": "dts-header.d.ts",
     "targets": [
       "aarch64-apple-darwin",
       "x86_64-apple-darwin",
@@ -46,6 +47,7 @@
     "index.js",
     "index.d.ts",
     "query-types.d.ts",
+    "schema-types.d.ts",
     "helpers/pack-binary.mjs",
     "*.node",
     "README.md"

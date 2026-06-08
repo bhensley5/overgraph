@@ -366,6 +366,20 @@ class TestBatchUpsertNodesBinary:
         with pytest.raises(ValueError, match="version 2|version 1"):
             db.batch_upsert_nodes_binary(buf)
 
+    def test_schema_rejects_binary_node_batch(self, db):
+        db.set_node_schema(
+            "BinarySchemaPerson",
+            {
+                "properties": {
+                    "name": {"required": True, "nullable": False, "types": ["string"]}
+                }
+            },
+        )
+        buf = pack_node_batch([{"labels": ["BinarySchemaPerson"], "key": "bad"}])
+        with pytest.raises(OverGraphError, match="schema violation"):
+            db.batch_upsert_nodes_binary(buf)
+        assert db.count_nodes_by_labels("BinarySchemaPerson") == 0
+
 
 class TestBatchUpsertEdgesBinary:
     def test_basic(self, db):
@@ -428,3 +442,19 @@ class TestBatchUpsertEdgesBinary:
         buf += struct.pack("<qqI", 0, 0, 0)
         with pytest.raises(ValueError):
             db.batch_upsert_edges_binary(buf)
+
+    def test_schema_rejects_binary_edge_batch(self, db):
+        n1 = db.upsert_node("Person", "a")
+        n2 = db.upsert_node("Person", "b")
+        db.set_edge_schema(
+            "BINARY_SCHEMA_EDGE",
+            {
+                "properties": {
+                    "role": {"required": True, "nullable": False, "types": ["string"]}
+                }
+            },
+        )
+        buf = pack_edge_batch([{"from_id": n1, "to_id": n2, "label": "BINARY_SCHEMA_EDGE"}])
+        with pytest.raises(OverGraphError, match="schema violation"):
+            db.batch_upsert_edges_binary(buf)
+        assert db.count_edges_by_label("BINARY_SCHEMA_EDGE") == 0

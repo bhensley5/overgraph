@@ -21,6 +21,8 @@ Supported at a glance:
 - bounded paths, path values, path helper functions, and constrained shortest paths
 - `CREATE`, keyed node `MERGE`, unique relationship `MERGE`, `ON CREATE SET`, `ON MATCH SET`,
   `SET`, `REMOVE`, `DELETE r`, `DETACH DELETE n`, and mutation returns
+- graph-schema DDL with `ALTER CURRENT GRAPH TYPE`, `CHECK CURRENT GRAPH TYPE`,
+  `DROP CURRENT GRAPH TYPE`, and schema `SHOW`
 - params, read cursors, compact rows, explain/profile, ReadOnly mode, mutation stats, and vector
   opt-in for returned node values
 
@@ -178,6 +180,95 @@ ON MATCH SET a.status = 'matched', a.count = coalesce(a.count, 0) + 1
 RETURN DISTINCT a.key AS key, a.status AS status, a.count AS count
 ```
 
+## Schema DDL Syntax
+
+GQL Beta manages OverGraph's current graph type, which is the active node/edge schema catalog.
+These statements call the same Rust core schema-management APIs as the Rust, Node.js, and Python
+bulk graph-schema methods.
+
+Supported forms:
+
+```gql
+ALTER CURRENT GRAPH TYPE ADD { NODE <label> = <node-schema>, EDGE <label> = <edge-schema> } [OPTIONS <options>]
+ALTER CURRENT GRAPH TYPE SET { NODE <label> = <node-schema>, EDGE <label> = <edge-schema> } [OPTIONS <options>]
+ALTER CURRENT GRAPH TYPE DROP { NODE <label>, EDGE <label> }
+DROP CURRENT GRAPH TYPE
+CHECK CURRENT GRAPH TYPE ADD { NODE <label> = <node-schema>, EDGE <label> = <edge-schema> } [OPTIONS <options>]
+CHECK CURRENT GRAPH TYPE SET { NODE <label> = <node-schema>, EDGE <label> = <edge-schema> } [OPTIONS <options>]
+SHOW CURRENT GRAPH TYPE
+SHOW NODE SCHEMAS
+SHOW EDGE SCHEMAS
+SHOW NODE SCHEMA <label>
+SHOW EDGE SCHEMA <label>
+```
+
+`ADD` publishes listed schemas while preserving unlisted targets. `SET` replaces the whole schema
+catalog; `SET {}` clears it. Selected `DROP` reports one row for each requested target, including
+`not_found` rows. `DROP CURRENT GRAPH TYPE` removes every node and edge schema. `CHECK` validates
+the proposed `ADD` or `SET` without publishing. `OPTIONS` applies to `ADD`, `SET`, and `CHECK`;
+selected and full-catalog `DROP` statements do not accept options.
+
+Schema maps use snake_case fields:
+
+```gql
+ALTER CURRENT GRAPH TYPE ADD {
+  NODE Person = {
+    additional_properties: 'reject',
+    properties: {
+      name: { required: true, nullable: false, types: ['string'] },
+      account_id: {
+        required: true,
+        nullable: false,
+        types: ['uint'],
+        numeric_min: { value: { type: 'uint', value: '1' } }
+      },
+      token: {
+        enum_values: [{ type: 'bytes', value: [0, 1, 255] }]
+      }
+    }
+  },
+  EDGE WORKS_AT = {
+    from: { all_of: ['Person'] },
+    to: { all_of: ['Company'] },
+    properties: {
+      since: { required: true, nullable: false, types: ['int'] }
+    },
+    allow_self_loops: false
+  }
+} OPTIONS { max_violations: 1, chunk_size: 4096, scan_limit: null }
+```
+
+Dry-run, show, and selected drop examples:
+
+```gql
+CHECK CURRENT GRAPH TYPE ADD {
+  NODE Person = { properties: { name: { required: true, nullable: false, types: ['string'] } } }
+} OPTIONS { max_violations: 10 }
+
+SHOW CURRENT GRAPH TYPE
+SHOW NODE SCHEMA Person
+ALTER CURRENT GRAPH TYPE DROP { NODE ArchivedPerson, EDGE OLD_EDGE }
+```
+
+Schema result row columns:
+
+| Statement | Columns |
+|---|---|
+| `ALTER ... ADD` / `ALTER ... SET` | `operation`, `target_kind`, `label`, `action`, `checked_records`, `violation_count`, `truncated`, `scan_limit_hit` |
+| `ALTER ... DROP` | `operation`, `target_kind`, `label`, `action` |
+| `DROP CURRENT GRAPH TYPE` | `operation`, `target_kind`, `label`, `action`, `node_schemas_dropped`, `edge_schemas_dropped` |
+| `CHECK ... ADD` / `CHECK ... SET` | `operation`, `target_kind`, `label`, `checked_records`, `violation_count`, `truncated`, `scan_limit_hit`, `violations` |
+| `SHOW ...` | `target_kind`, `label`, `schema` |
+
+Schema statement results use `kind = "schema"`, no cursor, no mutation stats, and populated
+`schemaStats` / `schema_stats`. `SHOW` returns canonical schema maps. Tagged schema literals keep
+their exact type, for example `{ type: 'uint', value: '18446744073709551615' }` and
+`{ type: 'bytes', value: [0, 1, 255] }`.
+
+`CHECK` and `SHOW` are allowed in ReadOnly mode. `ALTER` and `DROP` are rejected in ReadOnly.
+All schema statements reject `cursor`. `SHOW` does not silently truncate: if the catalog would
+return more rows than `maxRows` / `max_rows`, the statement errors instead.
+
 ## Options
 
 Rust uses `GqlExecutionOptions`. Node and Python expose connector-native option names:
@@ -213,6 +304,10 @@ Rust uses `GqlExecutionOptions`. Node and Python expose connector-native option 
 | `compact_rows` | `compactRows` | `compact_rows` | `false` |
 | `include_vectors` | `includeVectors` | `include_vectors` | `false` |
 
+For reads, `cursor` carries the next page token. Data mutations and schema statements reject
+`cursor`. For schema `SHOW`, `maxRows` / `max_rows` is a hard cap that returns an error when the
+catalog row count is larger.
+
 `compactRows` / `compact_rows` switches connector row serialization from objects to arrays.
 `includeVectors` / `include_vectors` includes dense and sparse vectors in returned node values.
 
@@ -231,6 +326,7 @@ Node.js result shape:
   nextCursor: null,
   stats: { rowsReturned: 1, rowsMatched: 3, rowsAfterFilter: 1, ... },
   mutationStats: null,
+  schemaStats: null,
   plan: null
 }
 ```
@@ -245,9 +341,13 @@ Python result shape:
     "next_cursor": None,
     "stats": {"rows_returned": 1, "rows_matched": 1, "rows_after_filter": 1, ...},
     "mutation_stats": {"nodes_created": 1, "mutation_ops": 1, ...},
+    "schema_stats": None,
     "plan": None,
 }
 ```
+
+For schema statements, `kind` is `"schema"`, `mutationStats` / `mutation_stats` is null, and
+`schemaStats` / `schema_stats` contains operation, target, validation, drop, and timing counters.
 
 ## Path Values
 
@@ -295,6 +395,7 @@ Only referenced params are resource-validated; extra unused params are ignored.
 - `columns`
 - `read` for read-plan details or mutation read-prefix details
 - `mutation` for mutation operation and return-plan details
+- `schema` for schema DDL/check/show details
 - `caps`
 - `warnings`
 - `notes`

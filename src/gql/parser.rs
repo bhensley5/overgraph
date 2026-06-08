@@ -119,6 +119,24 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_statement(&mut self) -> Result<GqlStatement, EngineError> {
+        if self.at_index_statement_start() {
+            let index = self.parse_index_statement()?;
+            return Ok(GqlStatement {
+                kind: GqlStatementKind::Index,
+                span: gql_index_statement_span(&index).clone(),
+                body: GqlStatementBody::Index(index),
+            });
+        }
+
+        if self.at_schema_statement_start() {
+            let schema = self.parse_schema_statement()?;
+            return Ok(GqlStatement {
+                kind: GqlStatementKind::Schema,
+                span: gql_schema_statement_span(&schema).clone(),
+                body: GqlStatementBody::Schema(schema),
+            });
+        }
+
         if self.at_mutation_clause_start() {
             return self.parse_mutation_statement(Vec::new(), None);
         }
@@ -288,6 +306,694 @@ impl<'a> Parser<'a> {
             limit,
             span,
         })
+    }
+
+    fn parse_index_statement(&mut self) -> Result<GqlIndexStatement, EngineError> {
+        let statement = if self.at_keyword(Keyword::Create) {
+            GqlIndexStatement::Create(self.parse_create_property_index_statement()?)
+        } else if self.at_keyword(Keyword::Drop) {
+            GqlIndexStatement::Drop(self.parse_drop_property_index_statement()?)
+        } else if self.at_keyword(Keyword::Show) {
+            GqlIndexStatement::Show(self.parse_show_property_index_statement()?)
+        } else {
+            return Err(self.parse_error_current("expected index statement"));
+        };
+
+        if let Some(semicolon) = self.consume_if(|kind| matches!(kind, TokenKind::Semicolon)) {
+            if !self.at_eof() {
+                return Err(EngineError::GqlParse {
+                    message: "multiple statements are not supported".to_string(),
+                    span: semicolon.span,
+                });
+            }
+        }
+        if !self.at_eof() {
+            return Err(self.parse_error_current("unexpected token after index statement"));
+        }
+        Ok(statement)
+    }
+
+    fn parse_create_property_index_statement(
+        &mut self,
+    ) -> Result<GqlCreatePropertyIndexStatement, EngineError> {
+        let start = self.expect_keyword(Keyword::Create, "expected CREATE")?;
+        self.expect_word("property", "expected PROPERTY after CREATE")?;
+        self.expect_word("index", "expected INDEX after PROPERTY")?;
+        let target = self.parse_property_index_target()?;
+        self.expect_word("kind", "expected KIND after index target")?;
+        let (kind, kind_span) = self.parse_property_index_kind()?;
+        Ok(GqlCreatePropertyIndexStatement {
+            span: self.span_between(&start.span, &kind_span),
+            target,
+            kind,
+            kind_span,
+        })
+    }
+
+    fn parse_drop_property_index_statement(
+        &mut self,
+    ) -> Result<GqlDropPropertyIndexStatement, EngineError> {
+        let start = self.expect_keyword(Keyword::Drop, "expected DROP")?;
+        self.expect_word("property", "expected PROPERTY after DROP")?;
+        self.expect_word("index", "expected INDEX after PROPERTY")?;
+        let target = self.parse_property_index_target()?;
+        self.expect_word("kind", "expected KIND after index target")?;
+        let (kind, kind_span) = self.parse_property_index_kind()?;
+        Ok(GqlDropPropertyIndexStatement {
+            span: self.span_between(&start.span, &kind_span),
+            target,
+            kind,
+            kind_span,
+        })
+    }
+
+    fn parse_show_property_index_statement(
+        &mut self,
+    ) -> Result<GqlShowPropertyIndexStatement, EngineError> {
+        let start = self.expect_keyword(Keyword::Show, "expected SHOW")?;
+        let scope = if self.consume_word("node").is_some() {
+            self.expect_word("property", "expected PROPERTY after NODE")?;
+            GqlShowPropertyIndexScope::Node
+        } else if self.consume_word("edge").is_some() {
+            self.expect_word("property", "expected PROPERTY after EDGE")?;
+            GqlShowPropertyIndexScope::Edge
+        } else {
+            self.expect_word("property", "expected PROPERTY after SHOW")?;
+            GqlShowPropertyIndexScope::All
+        };
+        let end = self.expect_index_or_indexes()?;
+        Ok(GqlShowPropertyIndexStatement {
+            scope,
+            span: self.span_between(&start.span, &end.span),
+        })
+    }
+
+    fn parse_property_index_target(&mut self) -> Result<GqlPropertyIndexTarget, EngineError> {
+        self.expect_word("for", "expected FOR after PROPERTY INDEX")?;
+        if self.index_target_starts_with_nonempty_edge_endpoint() {
+            return Err(EngineError::GqlParse {
+                message: "edge property index target endpoints must be empty anonymous nodes"
+                    .to_string(),
+                span: self.current().span.clone(),
+            });
+        }
+        let start = self.expect_kind(
+            |kind| matches!(kind, TokenKind::LParen),
+            "expected index target pattern after FOR",
+        )?;
+        if let Some(first_endpoint_close) =
+            self.consume_if(|kind| matches!(kind, TokenKind::RParen))
+        {
+            return self.parse_edge_property_index_target(start, first_endpoint_close);
+        }
+        self.parse_node_property_index_target(start)
+    }
+
+    fn parse_node_property_index_target(
+        &mut self,
+        start: Token,
+    ) -> Result<GqlPropertyIndexTarget, EngineError> {
+        self.reject_index_parameter_here()?;
+        let variable = self.parse_ident("node property index target requires a variable")?;
+        if self.at_kind(|kind| matches!(kind, TokenKind::LBrace)) {
+            return Err(EngineError::GqlParse {
+                message: "node property index target must not include a property map".to_string(),
+                span: self.current().span.clone(),
+            });
+        }
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::Colon),
+            "node property index target requires exactly one label",
+        )?;
+        self.reject_index_parameter_here()?;
+        let label = self.parse_index_name("expected node property index label")?;
+        if self.at_kind(|kind| matches!(kind, TokenKind::Colon)) {
+            return Err(
+                self.parse_error_current("node property index target supports exactly one label")
+            );
+        }
+        if self.at_kind(|kind| matches!(kind, TokenKind::LBrace)) {
+            return Err(EngineError::GqlParse {
+                message: "node property index target must not include a property map".to_string(),
+                span: self.current().span.clone(),
+            });
+        }
+        if self.at_keyword(Keyword::Where) {
+            return Err(self.unsupported_current(
+                "node property index target predicates",
+                "node property index target predicates are not supported",
+            ));
+        }
+        let close = self.expect_kind(
+            |kind| matches!(kind, TokenKind::RParen),
+            "expected ')' after node property index target",
+        )?;
+        self.expect_keyword(Keyword::On, "expected ON after index target")?;
+        let (on_variable, prop_key, property_ref_span) =
+            self.parse_property_index_property_ref()?;
+        let span = self.span_between(&start.span, &property_ref_span);
+        let _target_pattern_span = self.span_between(&start.span, &close.span);
+        Ok(GqlPropertyIndexTarget::Node {
+            variable,
+            label,
+            on_variable,
+            prop_key,
+            property_ref_span,
+            span,
+        })
+    }
+
+    fn parse_edge_property_index_target(
+        &mut self,
+        start: Token,
+        first_endpoint_close: Token,
+    ) -> Result<GqlPropertyIndexTarget, EngineError> {
+        let _first_endpoint_span = self.span_between(&start.span, &first_endpoint_close.span);
+        if self.at_kind(|kind| matches!(kind, TokenKind::LeftArrow | TokenKind::RightArrow)) {
+            return Err(self.unsupported_current(
+                "directed edge property index target",
+                "edge property index target must be undirected: use ()-[r:Label]-()",
+            ));
+        }
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::Dash),
+            "expected '-' after edge property index endpoint",
+        )?;
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::LBracket),
+            "expected '[' to start edge property index relationship target",
+        )?;
+        self.reject_index_parameter_here()?;
+        let variable =
+            self.parse_ident("edge property index target requires a relationship variable")?;
+        if self.at_kind(|kind| matches!(kind, TokenKind::LBrace)) {
+            return Err(EngineError::GqlParse {
+                message: "edge property index target must not include a property map".to_string(),
+                span: self.current().span.clone(),
+            });
+        }
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::Colon),
+            "edge property index target requires exactly one relationship label",
+        )?;
+        self.reject_index_parameter_here()?;
+        let label = self.parse_index_name("expected edge property index label")?;
+        if self.at_kind(|kind| matches!(kind, TokenKind::Pipe | TokenKind::Colon)) {
+            return Err(self.parse_error_current(
+                "edge property index target supports exactly one relationship label",
+            ));
+        }
+        if self.at_kind(|kind| matches!(kind, TokenKind::Star)) {
+            return Err(self.unsupported_current(
+                "variable-length edge property index target",
+                "variable-length edge property index targets are not supported",
+            ));
+        }
+        if self.at_kind(|kind| matches!(kind, TokenKind::LBrace)) {
+            return Err(EngineError::GqlParse {
+                message: "edge property index target must not include a property map".to_string(),
+                span: self.current().span.clone(),
+            });
+        }
+        if self.at_keyword(Keyword::Where) {
+            return Err(self.unsupported_current(
+                "edge property index target predicates",
+                "edge property index target predicates are not supported",
+            ));
+        }
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::RBracket),
+            "expected ']' after edge property index relationship target",
+        )?;
+        if self.at_kind(|kind| matches!(kind, TokenKind::LeftArrow | TokenKind::RightArrow)) {
+            return Err(self.unsupported_current(
+                "directed edge property index target",
+                "edge property index target must be undirected: use ()-[r:Label]-()",
+            ));
+        }
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::Dash),
+            "expected '-' after edge property index relationship target",
+        )?;
+        self.parse_empty_property_index_edge_endpoint()?;
+        self.expect_keyword(Keyword::On, "expected ON after index target")?;
+        let (on_variable, prop_key, property_ref_span) =
+            self.parse_property_index_property_ref()?;
+        Ok(GqlPropertyIndexTarget::Edge {
+            variable,
+            label,
+            on_variable,
+            prop_key,
+            property_ref_span: property_ref_span.clone(),
+            span: self.span_between(&start.span, &property_ref_span),
+        })
+    }
+
+    fn parse_empty_property_index_edge_endpoint(&mut self) -> Result<(), EngineError> {
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::LParen),
+            "expected empty endpoint node in edge property index target",
+        )?;
+        if !self.at_kind(|kind| matches!(kind, TokenKind::RParen)) {
+            return Err(EngineError::GqlParse {
+                message: "edge property index target endpoints must be empty anonymous nodes"
+                    .to_string(),
+                span: self.current().span.clone(),
+            });
+        }
+        self.advance();
+        Ok(())
+    }
+
+    fn parse_property_index_property_ref(
+        &mut self,
+    ) -> Result<(Ident, GqlIndexName, SourceSpan), EngineError> {
+        let open = self.expect_kind(
+            |kind| matches!(kind, TokenKind::LParen),
+            "expected '(' after ON",
+        )?;
+        self.reject_index_parameter_here()?;
+        if self.at_kind(|kind| matches!(kind, TokenKind::LParen | TokenKind::LBracket)) {
+            return Err(self.unsupported_current(
+                "compound property indexes",
+                "compound property indexes are not supported",
+            ));
+        }
+        let variable = self.parse_ident("expected variable in index ON property reference")?;
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::Dot),
+            "expected '.' in index ON property reference",
+        )?;
+        self.reject_index_parameter_here()?;
+        let prop_key = self.parse_index_name("expected property key after '.'")?;
+        if self.at_kind(|kind| matches!(kind, TokenKind::Comma)) {
+            return Err(self.unsupported_current(
+                "compound property indexes",
+                "compound property indexes are not supported",
+            ));
+        }
+        let close = self.expect_kind(
+            |kind| matches!(kind, TokenKind::RParen),
+            "expected ')' after index ON property reference",
+        )?;
+        Ok((
+            variable,
+            prop_key,
+            self.span_between(&open.span, &close.span),
+        ))
+    }
+
+    fn parse_index_name(&mut self, message: &str) -> Result<GqlIndexName, EngineError> {
+        self.reject_index_parameter_here()?;
+        let token = self.current().clone();
+        match token.kind {
+            TokenKind::Ident(name) | TokenKind::String(name) => {
+                self.advance();
+                Ok(GqlIndexName {
+                    name,
+                    span: token.span,
+                })
+            }
+            _ => Err(self.parse_error_current(message)),
+        }
+    }
+
+    fn parse_property_index_kind(
+        &mut self,
+    ) -> Result<(GqlPropertyIndexKind, SourceSpan), EngineError> {
+        self.reject_index_parameter_here()?;
+        if self.token_word_eq(self.pos, "equality") {
+            let token = self.advance();
+            return Ok((GqlPropertyIndexKind::Equality, token.span));
+        }
+        if self.token_word_eq(self.pos, "range") {
+            let token = self.advance();
+            return Ok((GqlPropertyIndexKind::Range, token.span));
+        }
+        match &self.current().kind {
+            TokenKind::Ident(_) | TokenKind::Keyword(_) => Err(EngineError::GqlParse {
+                message: format!(
+                    "unsupported property index kind '{}'; supported kinds are equality and range",
+                    self.source_for_span(&self.current().span)
+                ),
+                span: self.current().span.clone(),
+            }),
+            _ => Err(self.parse_error_current("expected property index kind")),
+        }
+    }
+
+    fn expect_index_or_indexes(&mut self) -> Result<Token, EngineError> {
+        if self.token_word_eq(self.pos, "index") || self.token_word_eq(self.pos, "indexes") {
+            Ok(self.advance())
+        } else {
+            Err(self.parse_error_current("expected INDEX or INDEXES after PROPERTY"))
+        }
+    }
+
+    fn reject_index_parameter_here(&self) -> Result<(), EngineError> {
+        if self.at_kind(|kind| matches!(kind, TokenKind::Dollar)) {
+            return Err(EngineError::GqlParse {
+                message: "parameters are not allowed in GQL index DDL".to_string(),
+                span: self.current().span.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn index_target_starts_with_nonempty_edge_endpoint(&self) -> bool {
+        if !matches!(self.current().kind, TokenKind::LParen) {
+            return false;
+        }
+        if self
+            .tokens
+            .get(self.pos + 1)
+            .is_some_and(|token| matches!(token.kind, TokenKind::RParen))
+        {
+            return false;
+        }
+        let mut depth = 0usize;
+        for (index, token) in self.tokens.iter().enumerate().skip(self.pos) {
+            match token.kind {
+                TokenKind::LParen => depth = depth.saturating_add(1),
+                TokenKind::RParen => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return self.tokens.get(index + 1).is_some_and(|next| {
+                            matches!(
+                                next.kind,
+                                TokenKind::Dash | TokenKind::LeftArrow | TokenKind::RightArrow
+                            )
+                        });
+                    }
+                }
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn parse_schema_statement(&mut self) -> Result<GqlSchemaStatement, EngineError> {
+        let statement = if self.at_keyword(Keyword::Alter) {
+            GqlSchemaStatement::AlterGraphType(self.parse_alter_graph_type_statement()?)
+        } else if self.at_keyword(Keyword::Drop) {
+            self.parse_drop_current_graph_type_statement()?
+        } else if self.token_word_eq(self.pos, "check") {
+            GqlSchemaStatement::CheckGraphType(self.parse_check_graph_type_statement()?)
+        } else if self.at_keyword(Keyword::Show) {
+            GqlSchemaStatement::Show(self.parse_show_schema_statement()?)
+        } else {
+            return Err(self.parse_error_current("expected schema statement"));
+        };
+
+        if let Some(semicolon) = self.consume_if(|kind| matches!(kind, TokenKind::Semicolon)) {
+            if !self.at_eof() {
+                return Err(EngineError::GqlParse {
+                    message: "multiple statements are not supported".to_string(),
+                    span: semicolon.span,
+                });
+            }
+        }
+        if !self.at_eof() {
+            return Err(self.parse_error_current("unexpected token after schema statement"));
+        }
+        Ok(statement)
+    }
+
+    fn parse_alter_graph_type_statement(
+        &mut self,
+    ) -> Result<GqlAlterGraphTypeStatement, EngineError> {
+        let start = self.expect_keyword(Keyword::Alter, "expected ALTER")?;
+        self.expect_word("current", "expected CURRENT after ALTER")?;
+        self.expect_keyword(Keyword::Graph, "expected GRAPH after CURRENT")?;
+        self.expect_word("type", "expected TYPE after GRAPH")?;
+        let (mode, items, drop_items, options, end_span) = if self.consume_word("add").is_some() {
+            let items = self.parse_schema_block()?;
+            let end = items
+                .last()
+                .map(gql_schema_item_span)
+                .cloned()
+                .unwrap_or_else(|| self.previous_non_eof_span());
+            let options = self.parse_optional_schema_options()?;
+            let end = options
+                .as_ref()
+                .map(gql_schema_literal_span)
+                .cloned()
+                .unwrap_or(end);
+            (GqlGraphTypeAlterMode::Add, items, Vec::new(), options, end)
+        } else if self.consume_keyword(Keyword::Set).is_some() {
+            let items = self.parse_schema_block()?;
+            let end = items
+                .last()
+                .map(gql_schema_item_span)
+                .cloned()
+                .unwrap_or_else(|| self.previous_non_eof_span());
+            let options = self.parse_optional_schema_options()?;
+            let end = options
+                .as_ref()
+                .map(gql_schema_literal_span)
+                .cloned()
+                .unwrap_or(end);
+            (GqlGraphTypeAlterMode::Set, items, Vec::new(), options, end)
+        } else if self.consume_keyword(Keyword::Drop).is_some() {
+            let drop_items = self.parse_schema_drop_block()?;
+            let end = drop_items
+                .last()
+                .map(gql_schema_drop_item_span)
+                .cloned()
+                .unwrap_or_else(|| self.previous_non_eof_span());
+            (
+                GqlGraphTypeAlterMode::Drop,
+                Vec::new(),
+                drop_items,
+                None,
+                end,
+            )
+        } else {
+            return Err(self.parse_error_current("expected ADD, SET, or DROP after GRAPH TYPE"));
+        };
+        Ok(GqlAlterGraphTypeStatement {
+            mode,
+            items,
+            drop_items,
+            options,
+            span: self.span_between(&start.span, &end_span),
+        })
+    }
+
+    fn parse_drop_current_graph_type_statement(
+        &mut self,
+    ) -> Result<GqlSchemaStatement, EngineError> {
+        let start = self.expect_keyword(Keyword::Drop, "expected DROP")?;
+        self.expect_word("current", "expected CURRENT after DROP")?;
+        self.expect_keyword(Keyword::Graph, "expected GRAPH after CURRENT")?;
+        let end = self.expect_word("type", "expected TYPE after GRAPH")?;
+        Ok(GqlSchemaStatement::DropCurrentGraphType {
+            span: self.span_between(&start.span, &end.span),
+        })
+    }
+
+    fn parse_check_graph_type_statement(
+        &mut self,
+    ) -> Result<GqlCheckGraphTypeStatement, EngineError> {
+        let start = self.expect_word("check", "expected CHECK")?;
+        self.expect_word("current", "expected CURRENT after CHECK")?;
+        self.expect_keyword(Keyword::Graph, "expected GRAPH after CURRENT")?;
+        self.expect_word("type", "expected TYPE after GRAPH")?;
+        let mode = if self.consume_word("add").is_some() {
+            GqlGraphTypeCheckMode::Add
+        } else if self.consume_keyword(Keyword::Set).is_some() {
+            GqlGraphTypeCheckMode::Set
+        } else {
+            return Err(self.parse_error_current("expected ADD or SET after GRAPH TYPE"));
+        };
+        let items = self.parse_schema_block()?;
+        let end = items
+            .last()
+            .map(gql_schema_item_span)
+            .cloned()
+            .unwrap_or_else(|| self.previous_non_eof_span());
+        let options = self.parse_optional_schema_options()?;
+        let end = options
+            .as_ref()
+            .map(gql_schema_literal_span)
+            .cloned()
+            .unwrap_or(end);
+        Ok(GqlCheckGraphTypeStatement {
+            mode,
+            items,
+            options,
+            span: self.span_between(&start.span, &end),
+        })
+    }
+
+    fn parse_show_schema_statement(&mut self) -> Result<GqlShowSchemaStatement, EngineError> {
+        let start = self.expect_keyword(Keyword::Show, "expected SHOW")?;
+        let (kind, end_span) = if self.consume_word("current").is_some() {
+            self.expect_keyword(Keyword::Graph, "expected GRAPH after CURRENT")?;
+            let end = self.expect_word("type", "expected TYPE after GRAPH")?;
+            (GqlShowSchemaKind::CurrentGraphType, end.span)
+        } else if self.consume_word("node").is_some() {
+            if let Some(end) = self.consume_word("schemas") {
+                (GqlShowSchemaKind::NodeSchemas, end.span)
+            } else {
+                self.expect_word("schema", "expected SCHEMA or SCHEMAS after NODE")?;
+                let label = self.parse_schema_label("expected node schema label")?;
+                let end = label.span.clone();
+                (GqlShowSchemaKind::NodeSchema { label }, end)
+            }
+        } else if self.consume_word("edge").is_some() {
+            if let Some(end) = self.consume_word("schemas") {
+                (GqlShowSchemaKind::EdgeSchemas, end.span)
+            } else {
+                self.expect_word("schema", "expected SCHEMA or SCHEMAS after EDGE")?;
+                let label = self.parse_schema_label("expected edge schema label")?;
+                let end = label.span.clone();
+                (GqlShowSchemaKind::EdgeSchema { label }, end)
+            }
+        } else {
+            return Err(self.parse_error_current("expected CURRENT, NODE, or EDGE after SHOW"));
+        };
+        Ok(GqlShowSchemaStatement {
+            kind,
+            span: self.span_between(&start.span, &end_span),
+        })
+    }
+
+    fn parse_schema_block(&mut self) -> Result<Vec<GqlSchemaItem>, EngineError> {
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::LBrace),
+            "expected '{' to start schema block",
+        )?;
+        let mut items = Vec::new();
+        if !self.at_kind(|kind| matches!(kind, TokenKind::RBrace)) {
+            loop {
+                items.push(self.parse_schema_item()?);
+                if self
+                    .consume_if(|kind| matches!(kind, TokenKind::Comma))
+                    .is_none()
+                {
+                    break;
+                }
+            }
+        }
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::RBrace),
+            "expected '}' to close schema block",
+        )?;
+        Ok(items)
+    }
+
+    fn parse_schema_item(&mut self) -> Result<GqlSchemaItem, EngineError> {
+        if self.consume_word("node").is_some() {
+            let label = self.parse_schema_label("expected node schema label")?;
+            self.expect_kind(
+                |kind| matches!(kind, TokenKind::Equals),
+                "expected '=' after node schema label",
+            )?;
+            let schema = self.parse_schema_literal("expected node schema map or parameter")?;
+            let span = self.span_between(&label.span, gql_schema_literal_span(&schema));
+            return Ok(GqlSchemaItem::Node {
+                label,
+                schema,
+                span,
+            });
+        }
+        if self.consume_word("edge").is_some() {
+            let label = self.parse_schema_label("expected edge schema label")?;
+            self.expect_kind(
+                |kind| matches!(kind, TokenKind::Equals),
+                "expected '=' after edge schema label",
+            )?;
+            let schema = self.parse_schema_literal("expected edge schema map or parameter")?;
+            let span = self.span_between(&label.span, gql_schema_literal_span(&schema));
+            return Ok(GqlSchemaItem::Edge {
+                label,
+                schema,
+                span,
+            });
+        }
+        Err(self.parse_error_current("expected NODE or EDGE schema item"))
+    }
+
+    fn parse_schema_drop_block(&mut self) -> Result<Vec<GqlSchemaDropItem>, EngineError> {
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::LBrace),
+            "expected '{' to start schema drop block",
+        )?;
+        let mut items = Vec::new();
+        if !self.at_kind(|kind| matches!(kind, TokenKind::RBrace)) {
+            loop {
+                items.push(self.parse_schema_drop_item()?);
+                if self
+                    .consume_if(|kind| matches!(kind, TokenKind::Comma))
+                    .is_none()
+                {
+                    break;
+                }
+            }
+        }
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::RBrace),
+            "expected '}' to close schema drop block",
+        )?;
+        Ok(items)
+    }
+
+    fn parse_schema_drop_item(&mut self) -> Result<GqlSchemaDropItem, EngineError> {
+        if self.consume_word("node").is_some() {
+            let label = self.parse_schema_label("expected node schema label")?;
+            let span = label.span.clone();
+            return Ok(GqlSchemaDropItem::Node { label, span });
+        }
+        if self.consume_word("edge").is_some() {
+            let label = self.parse_schema_label("expected edge schema label")?;
+            let span = label.span.clone();
+            return Ok(GqlSchemaDropItem::Edge { label, span });
+        }
+        Err(self.parse_error_current("expected NODE or EDGE schema drop item"))
+    }
+
+    fn parse_optional_schema_options(&mut self) -> Result<Option<GqlSchemaLiteral>, EngineError> {
+        if self.consume_word("options").is_some() {
+            return self
+                .parse_schema_literal("expected OPTIONS map or parameter")
+                .map(Some);
+        }
+        Ok(None)
+    }
+
+    fn parse_schema_literal(&mut self, message: &str) -> Result<GqlSchemaLiteral, EngineError> {
+        if self.at_kind(|kind| matches!(kind, TokenKind::LBrace)) {
+            return self
+                .parse_map_literal(0)
+                .map(|literal| GqlSchemaLiteral::Map(literal.literal));
+        }
+        if self.at_kind(|kind| matches!(kind, TokenKind::Dollar)) {
+            let expr = self.parse_parameter()?.expr;
+            let ExprKind::Parameter(name) = expr.kind else {
+                unreachable!("parse_parameter must produce a parameter expression");
+            };
+            return Ok(GqlSchemaLiteral::Parameter {
+                name,
+                span: expr.span,
+            });
+        }
+        Err(self.parse_error_current(message))
+    }
+
+    fn parse_schema_label(&mut self, message: &str) -> Result<GqlSchemaLabel, EngineError> {
+        let token = self.current().clone();
+        match token.kind {
+            TokenKind::Ident(name) | TokenKind::String(name) => {
+                self.advance();
+                Ok(GqlSchemaLabel {
+                    name,
+                    span: token.span,
+                })
+            }
+            _ => Err(self.parse_error_current(message)),
+        }
     }
 
     fn parse_read_stage_sequence(
@@ -2050,22 +2756,34 @@ impl<'a> Parser<'a> {
     }
 
     fn reject_unsupported_clause(&self) -> Result<(), EngineError> {
+        if let Some(error) = self.unsupported_index_ddl_error() {
+            return Err(error);
+        }
+
         if self.token_word_eq(self.pos, "graph")
             || self.token_word_eq(self.pos, "use")
             || (self.token_word_eq(self.pos, "from") && self.token_word_eq(self.pos + 1, "graph"))
         {
             return Err(self.unsupported_current(
                 "graph catalog/session selection syntax",
-                "graph catalog and session selection syntax is not supported in Phase 31",
+                "graph catalog and session selection syntax is not supported in the current GQL subset",
+            ));
+        }
+
+        if self.pos == 0 && self.token_word_eq(self.pos, "require") {
+            return Err(self.unsupported_current(
+                "schema/DDL",
+                "schema and DDL statements are not supported in the current GQL subset",
             ));
         }
 
         if let TokenKind::Keyword(keyword) = self.current().kind {
             match keyword {
                 Keyword::With => {
-                    return Err(
-                        self.unsupported_current("WITH", "WITH is not supported in Phase 31")
-                    );
+                    return Err(self.unsupported_current(
+                        "WITH",
+                        "WITH is not supported in the current GQL subset",
+                    ));
                 }
                 Keyword::Call => {
                     if self.next_is(|kind| matches!(kind, TokenKind::LBrace)) {
@@ -2073,22 +2791,28 @@ impl<'a> Parser<'a> {
                     }
                     let (feature, message) =
                         if self.next_is(|kind| matches!(kind, TokenKind::LBrace)) {
-                            ("subqueries", "subqueries are not supported in Phase 31")
+                            (
+                                "subqueries",
+                                "subqueries are not supported in the current GQL subset",
+                            )
                         } else {
-                            ("CALL", "CALL/procedure syntax is not supported in Phase 31")
+                            (
+                                "CALL",
+                                "CALL/procedure syntax is not supported in the current GQL subset",
+                            )
                         };
                     return Err(self.unsupported_current(feature, message));
                 }
                 Keyword::Create if self.create_clause_is_schema_ddl() => {
                     return Err(self.unsupported_current(
                         "schema/DDL",
-                        "schema and DDL statements are not supported in Phase 31",
+                        "schema and DDL statements are not supported in the current GQL subset",
                     ));
                 }
                 Keyword::Drop | Keyword::Alter | Keyword::Show => {
                     return Err(self.unsupported_current(
                         "schema/DDL",
-                        "schema and catalog statements are not supported in Phase 31",
+                        "schema and catalog statements are not supported in the current GQL subset",
                     ));
                 }
                 Keyword::Create
@@ -2105,9 +2829,10 @@ impl<'a> Parser<'a> {
                     ));
                 }
                 Keyword::Unwind => {
-                    return Err(
-                        self.unsupported_current("UNWIND", "UNWIND is not supported in Phase 31")
-                    );
+                    return Err(self.unsupported_current(
+                        "UNWIND",
+                        "UNWIND is not supported in the current GQL subset",
+                    ));
                 }
                 _ => {}
             }
@@ -2118,9 +2843,10 @@ impl<'a> Parser<'a> {
     fn reject_expression_unsupported(&self) -> Result<(), EngineError> {
         self.reject_unsupported_clause()?;
         if self.at_keyword(Keyword::Distinct) {
-            return Err(
-                self.unsupported_current("DISTINCT", "DISTINCT is not supported in Phase 31")
-            );
+            return Err(self.unsupported_current(
+                "DISTINCT",
+                "DISTINCT is not supported in the current GQL subset",
+            ));
         }
         if self.at_keyword(Keyword::Exists)
             && self.next_is(|kind| matches!(kind, TokenKind::LBrace))
@@ -2181,6 +2907,19 @@ impl<'a> Parser<'a> {
 
     fn consume_keyword(&mut self, keyword: Keyword) -> Option<Token> {
         self.at_keyword(keyword).then(|| self.advance())
+    }
+
+    fn expect_word(&mut self, expected: &str, message: &str) -> Result<Token, EngineError> {
+        if self.token_word_eq(self.pos, expected) {
+            Ok(self.advance())
+        } else {
+            Err(self.parse_error_current(message))
+        }
+    }
+
+    fn consume_word(&mut self, expected: &str) -> Option<Token> {
+        self.token_word_eq(self.pos, expected)
+            .then(|| self.advance())
     }
 
     fn consume_if(&mut self, predicate: impl Fn(&TokenKind) -> bool) -> Option<Token> {
@@ -2292,6 +3031,50 @@ impl<'a> Parser<'a> {
             || self.at_keyword(Keyword::Union)
     }
 
+    fn at_schema_statement_start(&self) -> bool {
+        (self.at_keyword(Keyword::Alter)
+            && self.token_word_eq(self.pos + 1, "current")
+            && self.token_word_eq(self.pos + 2, "graph")
+            && self.token_word_eq(self.pos + 3, "type"))
+            || (self.at_keyword(Keyword::Drop)
+                && self.token_word_eq(self.pos + 1, "current")
+                && self.token_word_eq(self.pos + 2, "graph")
+                && self.token_word_eq(self.pos + 3, "type"))
+            || (self.token_word_eq(self.pos, "check")
+                && self.token_word_eq(self.pos + 1, "current")
+                && self.token_word_eq(self.pos + 2, "graph")
+                && self.token_word_eq(self.pos + 3, "type"))
+            || (self.at_keyword(Keyword::Show) && self.token_word_eq(self.pos + 1, "current"))
+            || (self.at_keyword(Keyword::Show)
+                && self.token_word_eq(self.pos + 1, "node")
+                && (self.token_word_eq(self.pos + 2, "schema")
+                    || self.token_word_eq(self.pos + 2, "schemas")))
+            || (self.at_keyword(Keyword::Show)
+                && self.token_word_eq(self.pos + 1, "edge")
+                && (self.token_word_eq(self.pos + 2, "schema")
+                    || self.token_word_eq(self.pos + 2, "schemas")))
+    }
+
+    fn at_index_statement_start(&self) -> bool {
+        (self.at_keyword(Keyword::Create)
+            && self.token_word_eq(self.pos + 1, "property")
+            && self.token_word_eq(self.pos + 2, "index"))
+            || (self.at_keyword(Keyword::Drop)
+                && self.token_word_eq(self.pos + 1, "property")
+                && self.token_word_eq(self.pos + 2, "index"))
+            || (self.at_keyword(Keyword::Show)
+                && self.token_word_eq(self.pos + 1, "property")
+                && self.token_is_index_or_indexes(self.pos + 2))
+            || (self.at_keyword(Keyword::Show)
+                && self.token_word_eq(self.pos + 1, "node")
+                && self.token_word_eq(self.pos + 2, "property")
+                && self.token_is_index_or_indexes(self.pos + 3))
+            || (self.at_keyword(Keyword::Show)
+                && self.token_word_eq(self.pos + 1, "edge")
+                && self.token_word_eq(self.pos + 2, "property")
+                && self.token_is_index_or_indexes(self.pos + 3))
+    }
+
     fn has_top_level_mutation_before_return(&self) -> bool {
         let mut depth = 0usize;
         for token in self.tokens.iter().skip(self.pos) {
@@ -2350,6 +3133,100 @@ impl<'a> Parser<'a> {
             }
         }
         false
+    }
+
+    fn unsupported_index_ddl_error(&self) -> Option<EngineError> {
+        if self.at_index_statement_start() {
+            return None;
+        }
+        if self.at_keyword(Keyword::Create) {
+            if self.token_word_eq(self.pos + 1, "index") {
+                return Some(self.unsupported_at(
+                    self.pos + 1,
+                    "GQL index DDL",
+                    "named GQL index declarations are not supported",
+                ));
+            }
+            if let Some(family) = self.unsupported_index_family_at(self.pos + 1) {
+                if self.token_word_eq(self.pos + 2, "index") {
+                    return Some(self.unsupported_index_family_error(self.pos + 1, family));
+                }
+            }
+        }
+        if self.at_keyword(Keyword::Drop) {
+            if self.token_word_eq(self.pos + 1, "index") {
+                return Some(self.unsupported_at(
+                    self.pos + 1,
+                    "GQL index DDL",
+                    "named GQL index declarations are not supported",
+                ));
+            }
+            if let Some(family) = self.unsupported_index_family_at(self.pos + 1) {
+                if self.token_word_eq(self.pos + 2, "index") {
+                    return Some(self.unsupported_index_family_error(self.pos + 1, family));
+                }
+            }
+        }
+        if self.at_keyword(Keyword::Show) {
+            if self.token_is_index_or_indexes(self.pos + 1) {
+                return Some(self.unsupported_at(
+                    self.pos + 1,
+                    "GQL index DDL",
+                    "SHOW INDEXES is not supported; use SHOW PROPERTY INDEXES, SHOW NODE PROPERTY INDEXES, or SHOW EDGE PROPERTY INDEXES",
+                ));
+            }
+            if let Some(family) = self.unsupported_index_family_at(self.pos + 1) {
+                if self.token_is_index_or_indexes(self.pos + 2) {
+                    return Some(self.unsupported_index_family_error(self.pos + 1, family));
+                }
+            }
+        }
+        None
+    }
+
+    fn unsupported_index_family_at(&self, index: usize) -> Option<&'static str> {
+        if self.token_word_eq(index, "range") {
+            Some("range")
+        } else if self.token_word_eq(index, "text") {
+            Some("text")
+        } else if self.token_word_eq(index, "fulltext") {
+            Some("fulltext")
+        } else if self.token_word_eq(index, "vector") {
+            Some("vector")
+        } else if self.token_word_eq(index, "lookup") {
+            Some("lookup")
+        } else if self.token_word_eq(index, "point") {
+            Some("point")
+        } else {
+            None
+        }
+    }
+
+    fn unsupported_index_family_error(&self, index: usize, family: &str) -> EngineError {
+        self.unsupported_at(
+            index,
+            "GQL index DDL",
+            &format!(
+                "{family} index declarations are not supported; supported kinds are equality and range through CREATE PROPERTY INDEX ... KIND ..."
+            ),
+        )
+    }
+
+    fn token_is_index_or_indexes(&self, index: usize) -> bool {
+        self.token_word_eq(index, "index") || self.token_word_eq(index, "indexes")
+    }
+
+    fn unsupported_at(&self, index: usize, feature: &str, message: &str) -> EngineError {
+        let span = self
+            .tokens
+            .get(index)
+            .map(|token| token.span.clone())
+            .unwrap_or_else(|| self.current().span.clone());
+        EngineError::GqlUnsupported {
+            feature: feature.to_string(),
+            message: message.to_string(),
+            span,
+        }
     }
 
     fn at_kind(&self, predicate: impl Fn(&TokenKind) -> bool) -> bool {
@@ -2457,6 +3334,42 @@ fn set_item_span(item: &SetItem) -> &SourceSpan {
 fn remove_item_span(item: &RemoveItem) -> &SourceSpan {
     match item {
         RemoveItem::Property { span, .. } | RemoveItem::NodeLabel { span, .. } => span,
+    }
+}
+
+fn gql_schema_statement_span(statement: &GqlSchemaStatement) -> &SourceSpan {
+    match statement {
+        GqlSchemaStatement::AlterGraphType(statement) => &statement.span,
+        GqlSchemaStatement::DropCurrentGraphType { span } => span,
+        GqlSchemaStatement::CheckGraphType(statement) => &statement.span,
+        GqlSchemaStatement::Show(statement) => &statement.span,
+    }
+}
+
+fn gql_index_statement_span(statement: &GqlIndexStatement) -> &SourceSpan {
+    match statement {
+        GqlIndexStatement::Create(statement) => &statement.span,
+        GqlIndexStatement::Drop(statement) => &statement.span,
+        GqlIndexStatement::Show(statement) => &statement.span,
+    }
+}
+
+fn gql_schema_item_span(item: &GqlSchemaItem) -> &SourceSpan {
+    match item {
+        GqlSchemaItem::Node { span, .. } | GqlSchemaItem::Edge { span, .. } => span,
+    }
+}
+
+fn gql_schema_drop_item_span(item: &GqlSchemaDropItem) -> &SourceSpan {
+    match item {
+        GqlSchemaDropItem::Node { span, .. } | GqlSchemaDropItem::Edge { span, .. } => span,
+    }
+}
+
+fn gql_schema_literal_span(literal: &GqlSchemaLiteral) -> &SourceSpan {
+    match literal {
+        GqlSchemaLiteral::Map(map) => &map.span,
+        GqlSchemaLiteral::Parameter { span, .. } => span,
     }
 }
 
@@ -3427,11 +4340,11 @@ mod tests {
             ("CREATE (n) RETURN n", "write clauses"),
             (
                 "CREATE INDEX node_status FOR (n:User) ON (n.status)",
-                "schema/DDL",
+                "GQL index DDL",
             ),
             (
                 "CREATE TEXT INDEX node_status FOR (n:User) ON (n.status)",
-                "schema/DDL",
+                "GQL index DDL",
             ),
             ("CREATE DATABASE overgraph", "schema/DDL"),
             (
@@ -3489,9 +4402,9 @@ mod tests {
         let cases = [
             (
                 "CREATE TEXT INDEX node_status FOR (n:User) ON (n.status)",
-                "schema/DDL",
-                "CREATE",
-                "CREATE".len(),
+                "GQL index DDL",
+                "TEXT",
+                "TEXT".len(),
             ),
             (
                 "MATCH (n)-[r:A|$(rel_label)]->(m) RETURN r",
@@ -3833,7 +4746,7 @@ mod tests {
             ("CALL db.labels()", "CALL"),
             (
                 "CREATE TEXT INDEX node_status FOR (n:User) ON (n.status)",
-                "schema/DDL",
+                "GQL index DDL",
             ),
         ] {
             match parse_statement_err(source) {
@@ -3843,6 +4756,430 @@ mod tests {
                 }
                 err => panic!("expected unsupported error for {source}, got {err:?}"),
             }
+        }
+    }
+
+    fn parse_index_statement_ok(source: &str) -> GqlIndexStatement {
+        let statement = parse_statement_ok(source);
+        assert_eq!(statement.kind, GqlStatementKind::Index, "source: {source}");
+        let GqlStatementBody::Index(index) = statement.body else {
+            panic!("expected index statement for {source}");
+        };
+        index
+    }
+
+    #[test]
+    fn parse_statement_accepts_gql_property_index_v1_syntax() {
+        for source in [
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (n.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (n.score) KIND RANGE",
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_AT]-() ON (r.role) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_AT]-() ON (r.score) KIND RANGE",
+            "DROP PROPERTY INDEX FOR (n:Person) ON (n.status) KIND EQUALITY",
+            "DROP PROPERTY INDEX FOR ()-[r:WORKS_AT]-() ON (r.role) KIND RANGE",
+            "CREATE PROPERTY INDEX FOR (n:\"Display Label\") ON (n.\"external-id\") KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[r:\"WORKED WITH\"]-() ON (r.\"since-ms\") KIND RANGE",
+            "CREATE PROPERTY INDEX FOR (n:\"MATCH\") ON (n.\"RETURN\") KIND EQUALITY",
+            "SHOW PROPERTY INDEX",
+            "SHOW PROPERTY INDEXES",
+            "SHOW NODE PROPERTY INDEX",
+            "SHOW NODE PROPERTY INDEXES",
+            "SHOW EDGE PROPERTY INDEX",
+            "SHOW EDGE PROPERTY INDEXES",
+        ] {
+            parse_index_statement_ok(source);
+        }
+    }
+
+    #[test]
+    fn parse_statement_requires_identifier_or_quoted_index_names() {
+        for source in [
+            "CREATE PROPERTY INDEX FOR (n:MATCH) ON (n.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (n.RETURN) KIND EQUALITY",
+        ] {
+            assert!(
+                matches!(parse_statement_err(source), EngineError::GqlParse { .. }),
+                "source: {source}"
+            );
+        }
+        parse_index_statement_ok(
+            "CREATE PROPERTY INDEX FOR (n:\"MATCH\") ON (n.\"RETURN\") KIND EQUALITY",
+        );
+    }
+
+    #[test]
+    fn parse_statement_parses_gql_property_index_ast_details() {
+        let node = parse_index_statement_ok(
+            "CREATE PROPERTY INDEX FOR (n:\"Display\\nLabel\") ON (m.\"external-id\") KIND EQUALITY",
+        );
+        let GqlIndexStatement::Create(create) = node else {
+            panic!("expected create index statement");
+        };
+        assert_eq!(create.kind, GqlPropertyIndexKind::Equality);
+        match create.target {
+            GqlPropertyIndexTarget::Node {
+                variable,
+                label,
+                on_variable,
+                prop_key,
+                ..
+            } => {
+                assert_eq!(variable.name, "n");
+                assert_eq!(label.name, "Display\nLabel");
+                assert_eq!(on_variable.name, "m");
+                assert_eq!(prop_key.name, "external-id");
+            }
+            other => panic!("expected node target, got {other:?}"),
+        }
+
+        let edge = parse_index_statement_ok(
+            "DROP PROPERTY INDEX FOR ()-[r:\"WORKED WITH\"]-() ON (r.\"since-ms\") KIND RANGE",
+        );
+        let GqlIndexStatement::Drop(drop) = edge else {
+            panic!("expected drop index statement");
+        };
+        assert_eq!(drop.kind, GqlPropertyIndexKind::Range);
+        match drop.target {
+            GqlPropertyIndexTarget::Edge {
+                variable,
+                label,
+                on_variable,
+                prop_key,
+                ..
+            } => {
+                assert_eq!(variable.name, "r");
+                assert_eq!(label.name, "WORKED WITH");
+                assert_eq!(on_variable.name, "r");
+                assert_eq!(prop_key.name, "since-ms");
+            }
+            other => panic!("expected edge target, got {other:?}"),
+        }
+
+        for (source, scope) in [
+            ("SHOW PROPERTY INDEXES", GqlShowPropertyIndexScope::All),
+            ("SHOW NODE PROPERTY INDEX", GqlShowPropertyIndexScope::Node),
+            (
+                "SHOW EDGE PROPERTY INDEXES",
+                GqlShowPropertyIndexScope::Edge,
+            ),
+        ] {
+            let GqlIndexStatement::Show(show) = parse_index_statement_ok(source) else {
+                panic!("expected show index statement");
+            };
+            assert_eq!(show.scope, scope);
+        }
+    }
+
+    #[test]
+    fn parse_statement_classifies_index_ddl_without_stealing_schema_show() {
+        for source in [
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (n.status) KIND EQUALITY",
+            "DROP PROPERTY INDEX FOR ()-[r:WORKS_AT]-() ON (r.role) KIND RANGE",
+            "SHOW PROPERTY INDEXES",
+            "SHOW NODE PROPERTY INDEXES",
+            "SHOW EDGE PROPERTY INDEXES",
+        ] {
+            let statement = parse_statement_ok(source);
+            assert_eq!(statement.kind, GqlStatementKind::Index, "source: {source}");
+            assert!(matches!(statement.body, GqlStatementBody::Index(_)));
+        }
+
+        for source in [
+            "SHOW NODE SCHEMAS",
+            "SHOW EDGE SCHEMAS",
+            "SHOW NODE SCHEMA Person",
+            "SHOW EDGE SCHEMA WORKS_ON",
+        ] {
+            let statement = parse_statement_ok(source);
+            assert_eq!(statement.kind, GqlStatementKind::Schema, "source: {source}");
+            assert!(matches!(statement.body, GqlStatementBody::Schema(_)));
+        }
+    }
+
+    #[test]
+    fn parse_statement_rejects_gql_property_index_missing_required_parts() {
+        for source in [
+            "CREATE PROPERTY INDEX (n:Person) ON (n.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (n.status) EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (n.status) KIND",
+            "DROP PROPERTY INDEX FOR (n:Person) ON (n.status)",
+        ] {
+            assert!(
+                matches!(parse_statement_err(source), EngineError::GqlParse { .. }),
+                "source: {source}"
+            );
+        }
+        assert!(matches!(
+            parse_statement_err("CREATE INDEX node_status FOR (n:User) ON (n.status)"),
+            EngineError::GqlUnsupported { feature, .. } if feature == "GQL index DDL"
+        ));
+    }
+
+    #[test]
+    fn parse_statement_rejects_gql_property_index_params_and_bad_kinds() {
+        for source in [
+            "CREATE PROPERTY INDEX FOR (n:$label) ON (n.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (n.$prop) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (n.status) KIND $kind",
+        ] {
+            match parse_statement_err(source) {
+                EngineError::GqlParse { message, .. } => {
+                    assert!(message.contains("parameters are not allowed in GQL index DDL"));
+                }
+                err => panic!("expected index parameter parse error for {source}, got {err:?}"),
+            }
+        }
+
+        for kind in ["TEXT", "FULLTEXT", "VECTOR", "LOOKUP", "POINT", "HASH"] {
+            let source = format!("CREATE PROPERTY INDEX FOR (n:Person) ON (n.status) KIND {kind}");
+            match parse_statement_err(&source) {
+                EngineError::GqlParse { message, .. } => {
+                    assert_eq!(
+                        message,
+                        format!(
+                            "unsupported property index kind '{kind}'; supported kinds are equality and range"
+                        )
+                    );
+                }
+                err => panic!("expected unsupported kind parse error for {source}, got {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_statement_rejects_unsupported_gql_property_index_targets() {
+        for source in [
+            "CREATE PROPERTY INDEX FOR (:Person) ON (n.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n) ON (n.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person:User) ON (n.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person {status: 'active'}) ON (n.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person WHERE n.active) ON (n.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[r]->() ON (r.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[:WORKS_AT]-() ON (r.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_AT|LIKES]-() ON (r.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_AT*1..2]-() ON (r.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_AT WHERE r.active]-() ON (r.status) KIND EQUALITY",
+        ] {
+            let err = parse_statement_err(source);
+            assert!(
+                matches!(
+                    err,
+                    EngineError::GqlParse { .. } | EngineError::GqlUnsupported { .. }
+                ),
+                "source: {source}, err: {err:?}"
+            );
+        }
+
+        for source in [
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (n.a, n.b) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person) ON ([n.a]) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person) ON ((n.a)) KIND EQUALITY",
+        ] {
+            match parse_statement_err(source) {
+                EngineError::GqlUnsupported { message, .. } => {
+                    assert!(message.contains("compound property indexes are not supported"))
+                }
+                err => {
+                    panic!("expected compound index unsupported error for {source}, got {err:?}")
+                }
+            }
+        }
+
+        for source in [
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_AT]->() ON (r.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()<-[r:WORKS_AT]-() ON (r.status) KIND EQUALITY",
+        ] {
+            match parse_statement_err(source) {
+                EngineError::GqlUnsupported { message, .. } => {
+                    assert!(message.contains("edge property index target must be undirected"))
+                }
+                err => panic!("expected directed edge unsupported error for {source}, got {err:?}"),
+            }
+        }
+
+        for source in [
+            "CREATE PROPERTY INDEX FOR (a)-[r:WORKS_AT]-() ON (r.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (:Person)-[r:WORKS_AT]-() ON (r.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_AT]-(b) ON (r.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_AT]-(:Company) ON (r.status) KIND EQUALITY",
+        ] {
+            match parse_statement_err(source) {
+                EngineError::GqlParse { message, .. } => assert!(message.contains(
+                    "edge property index target endpoints must be empty anonymous nodes"
+                )),
+                err => panic!("expected endpoint parse error for {source}, got {err:?}"),
+            }
+        }
+
+        for source in [
+            "CREATE PROPERTY INDEX FOR (n:Person {status: 'active'}) ON (n.status) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_AT {since: 1}]-() ON (r.status) KIND EQUALITY",
+        ] {
+            match parse_statement_err(source) {
+                EngineError::GqlParse { message, .. } => {
+                    assert!(
+                        message.contains("property index target must not include a property map")
+                    )
+                }
+                err => panic!("expected property-map parse error for {source}, got {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_statement_rejects_unsupported_gql_index_families_and_scripts() {
+        for source in [
+            "CREATE INDEX node_status FOR (n:User) ON (n.status)",
+            "DROP INDEX node_status",
+            "SHOW INDEXES",
+        ] {
+            match parse_statement_err(source) {
+                EngineError::GqlUnsupported {
+                    feature, message, ..
+                } => {
+                    assert_eq!(feature, "GQL index DDL");
+                    assert!(
+                        message.contains("named GQL index declarations")
+                            || message.contains("SHOW INDEXES is not supported")
+                    );
+                }
+                err => panic!("expected named index unsupported error for {source}, got {err:?}"),
+            }
+        }
+
+        for source in [
+            "CREATE RANGE INDEX node_status FOR (n:User) ON (n.status)",
+            "CREATE TEXT INDEX node_status FOR (n:User) ON (n.status)",
+            "CREATE FULLTEXT INDEX node_status FOR (n:User) ON (n.status)",
+            "CREATE VECTOR INDEX node_status FOR (n:User) ON (n.status)",
+            "CREATE LOOKUP INDEX node_status FOR (n:User) ON (n.status)",
+            "CREATE POINT INDEX node_status FOR (n:User) ON (n.status)",
+            "SHOW RANGE INDEXES",
+            "SHOW TEXT INDEXES",
+        ] {
+            match parse_statement_err(source) {
+                EngineError::GqlUnsupported {
+                    feature, message, ..
+                } => {
+                    assert_eq!(feature, "GQL index DDL");
+                    assert!(message.contains("supported kinds are equality and range"));
+                }
+                err => panic!("expected index-family unsupported error for {source}, got {err:?}"),
+            }
+        }
+
+        match parse_statement_err(
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (n.status) KIND EQUALITY; SHOW PROPERTY INDEXES",
+        ) {
+            EngineError::GqlParse { message, .. } => {
+                assert_eq!(message, "multiple statements are not supported");
+            }
+            err => panic!("expected index multistatement parse error, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_accepts_gql_schema_v1_syntax() {
+        let cases = [
+            "ALTER CURRENT GRAPH TYPE ADD { NODE Person = {additional_properties: 'allow'}, EDGE WORKS_ON = {allow_self_loops: false} } OPTIONS { max_violations: 1, chunk_size: 4096, scan_limit: null }",
+            "ALTER CURRENT GRAPH TYPE SET {} OPTIONS $options",
+            "ALTER CURRENT GRAPH TYPE DROP { NODE Person, EDGE WORKS_ON }",
+            "DROP CURRENT GRAPH TYPE",
+            "CHECK CURRENT GRAPH TYPE ADD { NODE Person = $person_schema } OPTIONS $options",
+            "CHECK CURRENT GRAPH TYPE SET {}",
+            "SHOW CURRENT GRAPH TYPE",
+            "SHOW NODE SCHEMAS",
+            "SHOW EDGE SCHEMAS",
+            "SHOW NODE SCHEMA Person",
+            "SHOW EDGE SCHEMA WORKS_ON",
+        ];
+        for source in cases {
+            let statement = parse_statement_ok(source);
+            assert_eq!(statement.kind, GqlStatementKind::Schema, "source: {source}");
+            assert!(
+                matches!(statement.body, GqlStatementBody::Schema(_)),
+                "source: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_statement_parses_gql_schema_labels_literals_and_options() {
+        let statement = parse_statement_ok(
+            "ALTER CURRENT GRAPH TYPE ADD { NODE Person = $person, EDGE 'WORKS ON' = {from: {all_of: ['Person']}} } OPTIONS $options",
+        );
+        let GqlStatementBody::Schema(GqlSchemaStatement::AlterGraphType(alter)) = statement.body
+        else {
+            panic!("expected alter graph type schema statement");
+        };
+        assert_eq!(alter.mode, GqlGraphTypeAlterMode::Add);
+        assert_eq!(alter.items.len(), 2);
+        let GqlSchemaItem::Node { label, schema, .. } = &alter.items[0] else {
+            panic!("expected node schema item");
+        };
+        assert_eq!(label.name, "Person");
+        assert!(matches!(
+            schema,
+            GqlSchemaLiteral::Parameter { name, .. } if name == "person"
+        ));
+        let GqlSchemaItem::Edge { label, schema, .. } = &alter.items[1] else {
+            panic!("expected edge schema item");
+        };
+        assert_eq!(label.name, "WORKS ON");
+        assert!(matches!(schema, GqlSchemaLiteral::Map(_)));
+        assert!(matches!(
+            alter.options,
+            Some(GqlSchemaLiteral::Parameter { ref name, .. }) if name == "options"
+        ));
+
+        let show = parse_statement_ok("SHOW NODE SCHEMA 'Display Label'");
+        let GqlStatementBody::Schema(GqlSchemaStatement::Show(show)) = show.body else {
+            panic!("expected show schema statement");
+        };
+        assert!(matches!(
+            show.kind,
+            GqlShowSchemaKind::NodeSchema { ref label } if label.name == "Display Label"
+        ));
+    }
+
+    #[test]
+    fn parse_statement_rejects_gql_schema_multiple_statements() {
+        match parse_statement_err("SHOW NODE SCHEMAS; SHOW EDGE SCHEMAS") {
+            EngineError::GqlParse { message, span } => {
+                assert_eq!(message, "multiple statements are not supported");
+                assert!(span.length > 0);
+            }
+            err => panic!("expected schema multistatement parse error, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_keeps_unsupported_schema_ddl_rejected() {
+        for source in [
+            "CREATE GRAPH TYPE social",
+            "CREATE GRAPH social",
+            "CREATE GRAPH social FROM GRAPH TYPE social_type",
+            "ALTER GRAPH TYPE social ADD NODE Person",
+            "CREATE CONSTRAINT person_name FOR (n:Person) REQUIRE n.name IS UNIQUE",
+            "DROP CONSTRAINT person_name",
+            "REQUIRE n.prop IS UNIQUE",
+            "REQUIRE (n.prop, n.other) IS NODE KEY",
+        ] {
+            match parse_statement_err(source) {
+                EngineError::GqlUnsupported { feature, span, .. } => {
+                    assert_eq!(feature, "schema/DDL", "source: {source}");
+                    assert!(span.length > 0, "source: {source}");
+                }
+                err => panic!("expected unsupported schema/DDL for {source}, got {err:?}"),
+            }
+        }
+        match parse_statement_err("USE GRAPH social") {
+            EngineError::GqlUnsupported { feature, span, .. } => {
+                assert_eq!(feature, "graph catalog/session selection syntax");
+                assert!(span.length > 0);
+            }
+            err => panic!("expected unsupported USE GRAPH, got {err:?}"),
         }
     }
 

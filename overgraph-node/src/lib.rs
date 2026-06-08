@@ -10,16 +10,19 @@ use overgraph::{
     AllShortestPathsOptions as CoreAllShortestPathsOptions, CompactionPhase,
     CompactionStats as CoreCompactionStats, ComponentOptions, DatabaseEngine,
     DbOptions as CoreDbOptions, DbStats as CoreDbStats, DegreeOptions as CoreDegreeOptions,
-    DenseMetric, DenseVectorConfig as CoreDenseVectorConfig, Direction, EdgeFilterExpr,
+    DenseMetric, DenseVectorConfig as CoreDenseVectorConfig,
+    DenseVectorSchema as CoreDenseVectorSchema, Direction, EdgeFilterExpr,
     EdgeInput as CoreEdgeInput, EdgeLabelInfo as CoreEdgeLabelInfo,
     EdgePropertyIndexInfo as CoreEdgePropertyIndexInfo, EdgeQuery, EdgeQueryOrder,
-    EdgeView as CoreEdgeView, EngineError, ExportOptions as CoreExportOptions, FusionMode,
-    GqlCapSummary, GqlEdge, GqlExecutionCapSummary, GqlExecutionExplain, GqlExecutionMode,
-    GqlExecutionOptions, GqlExecutionResult, GqlExecutionStats, GqlExplain, GqlLoweringTarget,
-    GqlNode, GqlParamValue, GqlParams, GqlRow, GqlRowOperation, GqlStatementKind, GqlValue,
-    GraphBinaryOp, GraphCapExplain, GraphCaseBranch, GraphCursorExplain, GraphEdgeField,
-    GraphEdgePattern as CoreGraphEdgePattern, GraphEdgeValue, GraphElementProjection,
-    GraphExplainNode, GraphExpr, GraphFunction, GraphNodeField,
+    EdgeSchema as CoreEdgeSchema, EdgeSchemaInfo as CoreEdgeSchemaInfo,
+    EdgeValiditySchema as CoreEdgeValiditySchema, EdgeView as CoreEdgeView,
+    EndpointLabelSchema as CoreEndpointLabelSchema, EngineError,
+    ExportOptions as CoreExportOptions, FusionMode, GqlCapSummary, GqlEdge, GqlExecutionCapSummary,
+    GqlExecutionExplain, GqlExecutionMode, GqlExecutionOptions, GqlExecutionResult,
+    GqlExecutionStats, GqlExplain, GqlLoweringTarget, GqlNode, GqlParamValue, GqlParams, GqlRow,
+    GqlRowOperation, GqlStatementKind, GqlValue, GraphBinaryOp, GraphCapExplain, GraphCaseBranch,
+    GraphCursorExplain, GraphEdgeField, GraphEdgePattern as CoreGraphEdgePattern, GraphEdgeValue,
+    GraphElementProjection, GraphExplainNode, GraphExpr, GraphFunction, GraphNodeField,
     GraphNodePattern as CoreGraphNodePattern, GraphNodeValue, GraphOptionalGroup,
     GraphOrderDirection, GraphOrderExplain, GraphOrderItem, GraphOutputMode, GraphOutputOptions,
     GraphPageRequest, GraphParamValue, GraphPatch as CoreGraphPatch, GraphPathField,
@@ -29,31 +32,51 @@ use overgraph::{
     GraphProjectKind, GraphProjectStage, GraphProjectionExplain, GraphProjectionItems,
     GraphPropertySelection, GraphQueryOptions, GraphReturnItem, GraphReturnProjection, GraphRow,
     GraphRowExplain, GraphRowOperationExplain, GraphRowQuery, GraphRowResult, GraphRowStats,
+    GraphSchema as CoreGraphSchema, GraphSchemaCheckOptions as CoreGraphSchemaCheckOptions,
+    GraphSchemaCheckReport as CoreGraphSchemaCheckReport,
+    GraphSchemaDropAction as CoreGraphSchemaDropAction,
+    GraphSchemaDropTargetResult as CoreGraphSchemaDropTargetResult,
+    GraphSchemaOperation as CoreGraphSchemaOperation,
+    GraphSchemaOperationKind as CoreGraphSchemaOperationKind,
+    GraphSchemaPublishResult as CoreGraphSchemaPublishResult,
+    GraphSchemaSetOptions as CoreGraphSchemaSetOptions,
+    GraphSchemaValidationReportEntry as CoreGraphSchemaValidationReportEntry,
     GraphSelectedEdgeProjection, GraphSelectedNodeProjection, GraphSelectedPathProjection,
     GraphSelectedProjection, GraphShortestPathEndpoint, GraphShortestPathMode,
     GraphShortestPathStage, GraphSubqueryStage, GraphUnaryOp, GraphUnionStage, GraphValue,
     GraphVariableLengthPattern, GraphVectorSelection, HnswConfig,
     IsConnectedOptions as CoreIsConnectedOptions, LabelMatchMode as CoreLabelMatchMode,
     NeighborEntry as CoreNeighborEntry, NeighborOptions, NodeFilterExpr, NodeIdMap,
-    NodeInput as CoreNodeInput, NodeKeyQuery, NodeLabelFilter as CoreNodeLabelFilter,
-    NodeLabelInfo as CoreNodeLabelInfo, NodePropertyIndexInfo as CoreNodePropertyIndexInfo,
-    NodeQuery, NodeQueryOrder, NodeView as CoreNodeView, PageRequest, PageResult, PprAlgorithm,
+    NodeInput as CoreNodeInput, NodeKeyQuery,
+    NodeLabelConstraintSchema as CoreNodeLabelConstraintSchema,
+    NodeLabelFilter as CoreNodeLabelFilter, NodeLabelInfo as CoreNodeLabelInfo,
+    NodePropertyIndexInfo as CoreNodePropertyIndexInfo, NodeQuery, NodeQueryOrder,
+    NodeSchema as CoreNodeSchema, NodeSchemaInfo as CoreNodeSchemaInfo, NodeView as CoreNodeView,
+    NumericFieldSchema as CoreNumericFieldSchema, PageRequest, PageResult, PprAlgorithm,
     PprOptions, PprResult as CorePprResult, PropValue,
     PropertyRangeBound as CorePropertyRangeBound, PropertyRangeCursor as CorePropertyRangeCursor,
     PropertyRangePageRequest, PropertyRangePageResult as CorePropertyRangePageResult,
-    PrunePolicy as CorePrunePolicy, PrunePolicyInfo, PruneResult as CorePruneResult,
-    QueryEdgeIdsResult, QueryEdgesResult, QueryNodeIdsResult, QueryNodesResult, QueryPlan,
-    QueryPlanKind, QueryPlanNode, QueryPlanWarning, ScoringMode, ScrubReport as CoreScrubReport,
-    SecondaryIndexKind as CoreSecondaryIndexKind, SecondaryIndexState,
-    ShortestPath as CoreShortestPath, ShortestPathOptions as CoreShortestPathOptions, Subgraph,
-    SubgraphOptions, TopKOptions, TraversalCursor as CoreTraversalCursor,
-    TraversalHit as CoreTraversalHit, TraversalPageResult as CoreTraversalPageResult,
-    TraverseOptions as CoreTraverseOptions, TxnCommitResult as CoreTxnCommitResult,
-    TxnEdgeRef as CoreTxnEdgeRef, TxnEdgeView as CoreTxnEdgeView, TxnIntent, TxnLocalRef,
-    TxnNodeRef as CoreTxnNodeRef, TxnNodeView as CoreTxnNodeView,
-    UpsertEdgeOptions as CoreUpsertEdgeOptions, UpsertNodeOptions as CoreUpsertNodeOptions,
-    VectorHit as CoreVectorHit, VectorSearchMode, VectorSearchRequest,
-    VectorSearchScope as CoreVectorSearchScope, WalSyncMode, WriteTxn as CoreWriteTxn,
+    PropertySchema as CorePropertySchema, PrunePolicy as CorePrunePolicy, PrunePolicyInfo,
+    PruneResult as CorePruneResult, QueryEdgeIdsResult, QueryEdgesResult, QueryNodeIdsResult,
+    QueryNodesResult, QueryPlan, QueryPlanKind, QueryPlanNode, QueryPlanWarning,
+    SchemaAdditionalProperties as CoreSchemaAdditionalProperties,
+    SchemaCheckOptions as CoreSchemaCheckOptions, SchemaNumericBound as CoreSchemaNumericBound,
+    SchemaSetOptions as CoreSchemaSetOptions, SchemaTargetKind as CoreSchemaTargetKind,
+    SchemaValidationReport as CoreSchemaValidationReport, SchemaValueType as CoreSchemaValueType,
+    SchemaVectorPresence as CoreSchemaVectorPresence, SchemaViolation as CoreSchemaViolation,
+    SchemaViolationTarget as CoreSchemaViolationTarget, ScoringMode,
+    ScrubReport as CoreScrubReport, SecondaryIndexKind as CoreSecondaryIndexKind,
+    SecondaryIndexState, ShortestPath as CoreShortestPath,
+    ShortestPathOptions as CoreShortestPathOptions, SparseVectorSchema as CoreSparseVectorSchema,
+    StringFieldSchema as CoreStringFieldSchema, Subgraph, SubgraphOptions, TopKOptions,
+    TraversalCursor as CoreTraversalCursor, TraversalHit as CoreTraversalHit,
+    TraversalPageResult as CoreTraversalPageResult, TraverseOptions as CoreTraverseOptions,
+    TxnCommitResult as CoreTxnCommitResult, TxnEdgeRef as CoreTxnEdgeRef,
+    TxnEdgeView as CoreTxnEdgeView, TxnIntent, TxnLocalRef, TxnNodeRef as CoreTxnNodeRef,
+    TxnNodeView as CoreTxnNodeView, UpsertEdgeOptions as CoreUpsertEdgeOptions,
+    UpsertNodeOptions as CoreUpsertNodeOptions, VectorHit as CoreVectorHit, VectorSearchMode,
+    VectorSearchRequest, VectorSearchScope as CoreVectorSearchScope, WalSyncMode,
+    WriteTxn as CoreWriteTxn,
 };
 
 /// ThreadsafeFunction with `CalleeHandled = false` so the JS callback
@@ -157,6 +180,16 @@ impl ToNapiValue for GqlExecutionResultPayload {
             )?,
             None => object.set("mutationStats", Option::<serde_json::Value>::None)?,
         }
+        match val.result.schema_stats {
+            Some(stats) => {
+                object.set("schemaStats", GqlJsValue(gql_schema_stats_to_value(stats)))?
+            }
+            None => object.set("schemaStats", Option::<serde_json::Value>::None)?,
+        }
+        match val.result.index_stats {
+            Some(stats) => object.set("indexStats", GqlJsValue(gql_index_stats_to_value(stats)))?,
+            None => object.set("indexStats", Option::<serde_json::Value>::None)?,
+        }
         match val.result.plan {
             Some(plan) => object.set("plan", GqlJsExplain(plan))?,
             None => object.set("plan", Option::<serde_json::Value>::None)?,
@@ -178,6 +211,14 @@ impl ToNapiValue for GqlJsExplain {
         match val.0.mutation {
             Some(mutation) => object.set("mutation", gql_mutation_explain_to_json(mutation))?,
             None => object.set("mutation", Option::<serde_json::Value>::None)?,
+        }
+        match val.0.schema {
+            Some(schema) => object.set("schema", gql_schema_explain_to_json(schema))?,
+            None => object.set("schema", Option::<serde_json::Value>::None)?,
+        }
+        match val.0.index {
+            Some(index) => object.set("index", gql_index_explain_to_json(index))?,
+            None => object.set("index", Option::<serde_json::Value>::None)?,
         }
         object.set("caps", GqlJsValue(gql_execution_caps_to_value(val.0.caps)))?;
         object.set("warnings", val.0.warnings)?;
@@ -419,6 +460,177 @@ impl OverGraph {
     pub fn list_edge_labels(&self) -> Result<Vec<EdgeLabelInfo>> {
         let infos = with_engine_ref(self, |eng| eng.list_edge_labels())?;
         Ok(infos.into_iter().map(Into::into).collect())
+    }
+
+    // --- Schema management ---
+
+    #[napi(
+        ts_args_type = "label: string, schema: import('./schema-types').NodeSchema, options?: SchemaSetOptions | null",
+        ts_return_type = "import('./schema-types').NodeSchemaInfo"
+    )]
+    pub fn set_node_schema(
+        &self,
+        label: String,
+        schema: Unknown<'_>,
+        options: Option<SchemaSetOptions>,
+    ) -> Result<NodeSchemaInfoPayload> {
+        let schema = parse_js_node_schema(schema, "setNodeSchema schema")?;
+        let options = schema_set_options_to_core(options)?;
+        let info = with_engine(self, |eng| {
+            eng.set_node_schema_with_options(&label, schema, options)
+        })?;
+        Ok(NodeSchemaInfoPayload(info))
+    }
+
+    #[napi(
+        ts_args_type = "label: string, schema: import('./schema-types').NodeSchema, options?: SchemaCheckOptions | null",
+        ts_return_type = "import('./schema-types').SchemaValidationReport"
+    )]
+    pub fn check_node_schema(
+        &self,
+        label: String,
+        schema: Unknown<'_>,
+        options: Option<SchemaCheckOptions>,
+    ) -> Result<SchemaValidationReportPayload> {
+        let schema = parse_js_node_schema(schema, "checkNodeSchema schema")?;
+        let options = schema_check_options_to_core(options)?;
+        let report = with_engine_ref(self, |eng| eng.check_node_schema(&label, schema, options))?;
+        Ok(SchemaValidationReportPayload(report))
+    }
+
+    #[napi]
+    pub fn drop_node_schema(&self, label: String) -> Result<bool> {
+        with_engine(self, |eng| eng.drop_node_schema(&label))
+    }
+
+    #[napi(ts_return_type = "import('./schema-types').NodeSchemaInfo | null")]
+    pub fn get_node_schema(&self, label: String) -> Result<Option<NodeSchemaInfoPayload>> {
+        let info = with_engine_ref(self, |eng| eng.get_node_schema(&label))?;
+        Ok(info.map(NodeSchemaInfoPayload))
+    }
+
+    #[napi(ts_return_type = "Array<import('./schema-types').NodeSchemaInfo>")]
+    pub fn list_node_schemas(&self) -> Result<Vec<NodeSchemaInfoPayload>> {
+        let infos = with_engine_ref(self, |eng| eng.list_node_schemas())?;
+        Ok(infos.into_iter().map(NodeSchemaInfoPayload).collect())
+    }
+
+    #[napi(
+        ts_args_type = "label: string, schema: import('./schema-types').EdgeSchema, options?: SchemaSetOptions | null",
+        ts_return_type = "import('./schema-types').EdgeSchemaInfo"
+    )]
+    pub fn set_edge_schema(
+        &self,
+        label: String,
+        schema: Unknown<'_>,
+        options: Option<SchemaSetOptions>,
+    ) -> Result<EdgeSchemaInfoPayload> {
+        let schema = parse_js_edge_schema(schema, "setEdgeSchema schema")?;
+        let options = schema_set_options_to_core(options)?;
+        let info = with_engine(self, |eng| {
+            eng.set_edge_schema_with_options(&label, schema, options)
+        })?;
+        Ok(EdgeSchemaInfoPayload(info))
+    }
+
+    #[napi(
+        ts_args_type = "label: string, schema: import('./schema-types').EdgeSchema, options?: SchemaCheckOptions | null",
+        ts_return_type = "import('./schema-types').SchemaValidationReport"
+    )]
+    pub fn check_edge_schema(
+        &self,
+        label: String,
+        schema: Unknown<'_>,
+        options: Option<SchemaCheckOptions>,
+    ) -> Result<SchemaValidationReportPayload> {
+        let schema = parse_js_edge_schema(schema, "checkEdgeSchema schema")?;
+        let options = schema_check_options_to_core(options)?;
+        let report = with_engine_ref(self, |eng| eng.check_edge_schema(&label, schema, options))?;
+        Ok(SchemaValidationReportPayload(report))
+    }
+
+    #[napi]
+    pub fn drop_edge_schema(&self, label: String) -> Result<bool> {
+        with_engine(self, |eng| eng.drop_edge_schema(&label))
+    }
+
+    #[napi(ts_return_type = "import('./schema-types').EdgeSchemaInfo | null")]
+    pub fn get_edge_schema(&self, label: String) -> Result<Option<EdgeSchemaInfoPayload>> {
+        let info = with_engine_ref(self, |eng| eng.get_edge_schema(&label))?;
+        Ok(info.map(EdgeSchemaInfoPayload))
+    }
+
+    #[napi(ts_return_type = "Array<import('./schema-types').EdgeSchemaInfo>")]
+    pub fn list_edge_schemas(&self) -> Result<Vec<EdgeSchemaInfoPayload>> {
+        let infos = with_engine_ref(self, |eng| eng.list_edge_schemas())?;
+        Ok(infos.into_iter().map(EdgeSchemaInfoPayload).collect())
+    }
+
+    #[napi(
+        ts_args_type = "schema: import('./schema-types').GraphSchema, options?: SchemaSetOptions | null",
+        ts_return_type = "import('./schema-types').GraphSchemaPublishResult"
+    )]
+    pub fn set_graph_schema(
+        &self,
+        schema: Unknown<'_>,
+        options: Option<SchemaSetOptions>,
+    ) -> Result<GraphSchemaPublishResultPayload> {
+        let schema = parse_js_graph_schema(schema, "setGraphSchema schema")?;
+        let options = graph_schema_set_options_to_core(options)?;
+        let result = with_engine(self, |eng| eng.set_graph_schema(schema, options))?;
+        Ok(GraphSchemaPublishResultPayload(result))
+    }
+
+    #[napi(
+        ts_args_type = "operations: Array<import('./schema-types').GraphSchemaOperation>, options?: SchemaSetOptions | null",
+        ts_return_type = "import('./schema-types').GraphSchemaPublishResult"
+    )]
+    pub fn alter_graph_schema(
+        &self,
+        operations: Unknown<'_>,
+        options: Option<SchemaSetOptions>,
+    ) -> Result<GraphSchemaPublishResultPayload> {
+        let operations =
+            parse_js_graph_schema_operations(operations, "alterGraphSchema operations")?;
+        let options = graph_schema_set_options_to_core(options)?;
+        let result = with_engine(self, |eng| eng.alter_graph_schema(operations, options))?;
+        Ok(GraphSchemaPublishResultPayload(result))
+    }
+
+    #[napi(
+        ts_args_type = "schema: import('./schema-types').GraphSchema, options?: SchemaCheckOptions | null",
+        ts_return_type = "import('./schema-types').GraphSchemaCheckReport"
+    )]
+    pub fn check_graph_schema_set(
+        &self,
+        schema: Unknown<'_>,
+        options: Option<SchemaCheckOptions>,
+    ) -> Result<GraphSchemaCheckReportPayload> {
+        let schema = parse_js_graph_schema(schema, "checkGraphSchemaSet schema")?;
+        let options = graph_schema_check_options_to_core(options)?;
+        let report = with_engine_ref(self, |eng| eng.check_graph_schema_set(schema, options))?;
+        Ok(GraphSchemaCheckReportPayload(report))
+    }
+
+    #[napi(
+        ts_args_type = "schema: import('./schema-types').GraphSchema, options?: SchemaCheckOptions | null",
+        ts_return_type = "import('./schema-types').GraphSchemaCheckReport"
+    )]
+    pub fn check_graph_schema_add(
+        &self,
+        schema: Unknown<'_>,
+        options: Option<SchemaCheckOptions>,
+    ) -> Result<GraphSchemaCheckReportPayload> {
+        let schema = parse_js_graph_schema(schema, "checkGraphSchemaAdd schema")?;
+        let options = graph_schema_check_options_to_core(options)?;
+        let report = with_engine_ref(self, |eng| eng.check_graph_schema_add(schema, options))?;
+        Ok(GraphSchemaCheckReportPayload(report))
+    }
+
+    #[napi(ts_return_type = "import('./schema-types').GraphSchemaPublishResult")]
+    pub fn drop_graph_schema(&self) -> Result<GraphSchemaPublishResultPayload> {
+        let result = with_engine(self, |eng| eng.drop_graph_schema())?;
+        Ok(GraphSchemaPublishResultPayload(result))
     }
 
     // --- Single upserts ---
@@ -1975,6 +2187,236 @@ impl OverGraph {
             self.inner.clone(),
             |eng| eng.list_edge_labels(),
             |infos| Ok(infos.into_iter().map(Into::into).collect()),
+        ))
+    }
+
+    #[napi(
+        ts_args_type = "label: string, schema: import('./schema-types').NodeSchema, options?: SchemaSetOptions | null",
+        ts_return_type = "Promise<import('./schema-types').NodeSchemaInfo>"
+    )]
+    pub fn set_node_schema_async(
+        &self,
+        label: String,
+        schema: Unknown<'_>,
+        options: Option<SchemaSetOptions>,
+    ) -> Result<AsyncTask<EngineOp<CoreNodeSchemaInfo, NodeSchemaInfoPayload>>> {
+        let schema = parse_js_node_schema(schema, "setNodeSchemaAsync schema")?;
+        let options = schema_set_options_to_core(options)?;
+        Ok(AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            move |eng| eng.set_node_schema_with_options(&label, schema, options),
+            |info| Ok(NodeSchemaInfoPayload(info)),
+        )))
+    }
+
+    #[napi(
+        ts_args_type = "label: string, schema: import('./schema-types').NodeSchema, options?: SchemaCheckOptions | null",
+        ts_return_type = "Promise<import('./schema-types').SchemaValidationReport>"
+    )]
+    pub fn check_node_schema_async(
+        &self,
+        label: String,
+        schema: Unknown<'_>,
+        options: Option<SchemaCheckOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<CoreSchemaValidationReport, SchemaValidationReportPayload>>>
+    {
+        let schema = parse_js_node_schema(schema, "checkNodeSchemaAsync schema")?;
+        let options = schema_check_options_to_core(options)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.check_node_schema(&label, schema, options),
+            |report| Ok(SchemaValidationReportPayload(report)),
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<boolean>")]
+    pub fn drop_node_schema_async(&self, label: String) -> AsyncTask<EngineOp<bool, bool>> {
+        AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            move |eng| eng.drop_node_schema(&label),
+            Ok,
+        ))
+    }
+
+    #[napi(ts_return_type = "Promise<import('./schema-types').NodeSchemaInfo | null>")]
+    pub fn get_node_schema_async(
+        &self,
+        label: String,
+    ) -> AsyncTask<EngineReadOp<Option<CoreNodeSchemaInfo>, Option<NodeSchemaInfoPayload>>> {
+        AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.get_node_schema(&label),
+            |info| Ok(info.map(NodeSchemaInfoPayload)),
+        ))
+    }
+
+    #[napi(ts_return_type = "Promise<Array<import('./schema-types').NodeSchemaInfo>>")]
+    pub fn list_node_schemas_async(
+        &self,
+    ) -> AsyncTask<EngineReadOp<Vec<CoreNodeSchemaInfo>, Vec<NodeSchemaInfoPayload>>> {
+        AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            |eng| eng.list_node_schemas(),
+            |infos| Ok(infos.into_iter().map(NodeSchemaInfoPayload).collect()),
+        ))
+    }
+
+    #[napi(
+        ts_args_type = "label: string, schema: import('./schema-types').EdgeSchema, options?: SchemaSetOptions | null",
+        ts_return_type = "Promise<import('./schema-types').EdgeSchemaInfo>"
+    )]
+    pub fn set_edge_schema_async(
+        &self,
+        label: String,
+        schema: Unknown<'_>,
+        options: Option<SchemaSetOptions>,
+    ) -> Result<AsyncTask<EngineOp<CoreEdgeSchemaInfo, EdgeSchemaInfoPayload>>> {
+        let schema = parse_js_edge_schema(schema, "setEdgeSchemaAsync schema")?;
+        let options = schema_set_options_to_core(options)?;
+        Ok(AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            move |eng| eng.set_edge_schema_with_options(&label, schema, options),
+            |info| Ok(EdgeSchemaInfoPayload(info)),
+        )))
+    }
+
+    #[napi(
+        ts_args_type = "label: string, schema: import('./schema-types').EdgeSchema, options?: SchemaCheckOptions | null",
+        ts_return_type = "Promise<import('./schema-types').SchemaValidationReport>"
+    )]
+    pub fn check_edge_schema_async(
+        &self,
+        label: String,
+        schema: Unknown<'_>,
+        options: Option<SchemaCheckOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<CoreSchemaValidationReport, SchemaValidationReportPayload>>>
+    {
+        let schema = parse_js_edge_schema(schema, "checkEdgeSchemaAsync schema")?;
+        let options = schema_check_options_to_core(options)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.check_edge_schema(&label, schema, options),
+            |report| Ok(SchemaValidationReportPayload(report)),
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<boolean>")]
+    pub fn drop_edge_schema_async(&self, label: String) -> AsyncTask<EngineOp<bool, bool>> {
+        AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            move |eng| eng.drop_edge_schema(&label),
+            Ok,
+        ))
+    }
+
+    #[napi(ts_return_type = "Promise<import('./schema-types').EdgeSchemaInfo | null>")]
+    pub fn get_edge_schema_async(
+        &self,
+        label: String,
+    ) -> AsyncTask<EngineReadOp<Option<CoreEdgeSchemaInfo>, Option<EdgeSchemaInfoPayload>>> {
+        AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.get_edge_schema(&label),
+            |info| Ok(info.map(EdgeSchemaInfoPayload)),
+        ))
+    }
+
+    #[napi(ts_return_type = "Promise<Array<import('./schema-types').EdgeSchemaInfo>>")]
+    pub fn list_edge_schemas_async(
+        &self,
+    ) -> AsyncTask<EngineReadOp<Vec<CoreEdgeSchemaInfo>, Vec<EdgeSchemaInfoPayload>>> {
+        AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            |eng| eng.list_edge_schemas(),
+            |infos| Ok(infos.into_iter().map(EdgeSchemaInfoPayload).collect()),
+        ))
+    }
+
+    #[napi(
+        ts_args_type = "schema: import('./schema-types').GraphSchema, options?: SchemaSetOptions | null",
+        ts_return_type = "Promise<import('./schema-types').GraphSchemaPublishResult>"
+    )]
+    pub fn set_graph_schema_async(
+        &self,
+        schema: Unknown<'_>,
+        options: Option<SchemaSetOptions>,
+    ) -> Result<AsyncTask<EngineOp<CoreGraphSchemaPublishResult, GraphSchemaPublishResultPayload>>>
+    {
+        let schema = parse_js_graph_schema(schema, "setGraphSchemaAsync schema")?;
+        let options = graph_schema_set_options_to_core(options)?;
+        Ok(AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            move |eng| eng.set_graph_schema(schema, options),
+            |result| Ok(GraphSchemaPublishResultPayload(result)),
+        )))
+    }
+
+    #[napi(
+        ts_args_type = "operations: Array<import('./schema-types').GraphSchemaOperation>, options?: SchemaSetOptions | null",
+        ts_return_type = "Promise<import('./schema-types').GraphSchemaPublishResult>"
+    )]
+    pub fn alter_graph_schema_async(
+        &self,
+        operations: Unknown<'_>,
+        options: Option<SchemaSetOptions>,
+    ) -> Result<AsyncTask<EngineOp<CoreGraphSchemaPublishResult, GraphSchemaPublishResultPayload>>>
+    {
+        let operations =
+            parse_js_graph_schema_operations(operations, "alterGraphSchemaAsync operations")?;
+        let options = graph_schema_set_options_to_core(options)?;
+        Ok(AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            move |eng| eng.alter_graph_schema(operations, options),
+            |result| Ok(GraphSchemaPublishResultPayload(result)),
+        )))
+    }
+
+    #[napi(
+        ts_args_type = "schema: import('./schema-types').GraphSchema, options?: SchemaCheckOptions | null",
+        ts_return_type = "Promise<import('./schema-types').GraphSchemaCheckReport>"
+    )]
+    pub fn check_graph_schema_set_async(
+        &self,
+        schema: Unknown<'_>,
+        options: Option<SchemaCheckOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<CoreGraphSchemaCheckReport, GraphSchemaCheckReportPayload>>>
+    {
+        let schema = parse_js_graph_schema(schema, "checkGraphSchemaSetAsync schema")?;
+        let options = graph_schema_check_options_to_core(options)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.check_graph_schema_set(schema, options),
+            |report| Ok(GraphSchemaCheckReportPayload(report)),
+        )))
+    }
+
+    #[napi(
+        ts_args_type = "schema: import('./schema-types').GraphSchema, options?: SchemaCheckOptions | null",
+        ts_return_type = "Promise<import('./schema-types').GraphSchemaCheckReport>"
+    )]
+    pub fn check_graph_schema_add_async(
+        &self,
+        schema: Unknown<'_>,
+        options: Option<SchemaCheckOptions>,
+    ) -> Result<AsyncTask<EngineReadOp<CoreGraphSchemaCheckReport, GraphSchemaCheckReportPayload>>>
+    {
+        let schema = parse_js_graph_schema(schema, "checkGraphSchemaAddAsync schema")?;
+        let options = graph_schema_check_options_to_core(options)?;
+        Ok(AsyncTask::new(EngineReadOp::new(
+            self.inner.clone(),
+            move |eng| eng.check_graph_schema_add(schema, options),
+            |report| Ok(GraphSchemaCheckReportPayload(report)),
+        )))
+    }
+
+    #[napi(ts_return_type = "Promise<import('./schema-types').GraphSchemaPublishResult>")]
+    pub fn drop_graph_schema_async(
+        &self,
+    ) -> AsyncTask<EngineOp<CoreGraphSchemaPublishResult, GraphSchemaPublishResultPayload>> {
+        AsyncTask::new(EngineOp::new(
+            self.inner.clone(),
+            |eng| eng.drop_graph_schema(),
+            |result| Ok(GraphSchemaPublishResultPayload(result)),
         ))
     }
 
@@ -4346,6 +4788,29 @@ pub struct EdgePropertyIndexInfo {
 }
 
 #[napi(object)]
+pub struct SchemaSetOptions {
+    pub max_violations: Option<f64>,
+    pub chunk_size: Option<f64>,
+    #[napi(ts_type = "number | null")]
+    pub scan_limit: Option<serde_json::Value>,
+}
+
+#[napi(object)]
+pub struct SchemaCheckOptions {
+    pub max_violations: Option<f64>,
+    pub chunk_size: Option<f64>,
+    #[napi(ts_type = "number | null")]
+    pub scan_limit: Option<serde_json::Value>,
+}
+
+pub struct NodeSchemaInfoPayload(CoreNodeSchemaInfo);
+pub struct EdgeSchemaInfoPayload(CoreEdgeSchemaInfo);
+pub struct SchemaValidationReportPayload(CoreSchemaValidationReport);
+pub struct GraphSchemaCheckReportPayload(CoreGraphSchemaCheckReport);
+pub struct GraphSchemaPublishResultPayload(CoreGraphSchemaPublishResult);
+struct SchemaLiteralPayload(PropValue);
+
+#[napi(object)]
 pub struct NodeLabelInfo {
     pub label: String,
     pub label_id: u32,
@@ -5227,6 +5692,654 @@ fn neighbor_page_to_js(page: PageResult<CoreNeighborEntry>) -> Result<NeighborPa
         items_vec: neighbor_entries_to_js(page.items)?,
         cursor: page.next_cursor,
     })
+}
+
+impl TypeName for NodeSchemaInfoPayload {
+    fn type_name() -> &'static str {
+        "Object"
+    }
+
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::Object
+    }
+}
+
+impl ToNapiValue for NodeSchemaInfoPayload {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        let env = Env::from_raw(env);
+        let object = node_schema_info_to_js_object(&env, val.0)?;
+        unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env.raw(), &object) }
+    }
+}
+
+impl TypeName for EdgeSchemaInfoPayload {
+    fn type_name() -> &'static str {
+        "Object"
+    }
+
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::Object
+    }
+}
+
+impl ToNapiValue for EdgeSchemaInfoPayload {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        let env = Env::from_raw(env);
+        let object = edge_schema_info_to_js_object(&env, val.0)?;
+        unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env.raw(), &object) }
+    }
+}
+
+impl TypeName for SchemaValidationReportPayload {
+    fn type_name() -> &'static str {
+        "Object"
+    }
+
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::Object
+    }
+}
+
+impl ToNapiValue for SchemaValidationReportPayload {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        let env = Env::from_raw(env);
+        let object = schema_validation_report_to_js_object(&env, val.0)?;
+        unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env.raw(), &object) }
+    }
+}
+
+impl TypeName for GraphSchemaCheckReportPayload {
+    fn type_name() -> &'static str {
+        "Object"
+    }
+
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::Object
+    }
+}
+
+impl ToNapiValue for GraphSchemaCheckReportPayload {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        let env = Env::from_raw(env);
+        let object = graph_schema_check_report_to_js_object(&env, val.0)?;
+        unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env.raw(), &object) }
+    }
+}
+
+impl TypeName for GraphSchemaPublishResultPayload {
+    fn type_name() -> &'static str {
+        "Object"
+    }
+
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::Object
+    }
+}
+
+impl ToNapiValue for GraphSchemaPublishResultPayload {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        let env = Env::from_raw(env);
+        let object = graph_schema_publish_result_to_js_object(&env, val.0)?;
+        unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env.raw(), &object) }
+    }
+}
+
+impl TypeName for SchemaLiteralPayload {
+    fn type_name() -> &'static str {
+        "any"
+    }
+
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::Unknown
+    }
+}
+
+impl ToNapiValue for SchemaLiteralPayload {
+    unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+        unsafe { schema_literal_to_napi(env, val.0) }
+    }
+}
+
+fn node_schema_info_to_js_object<'env>(
+    env: &'env Env,
+    info: CoreNodeSchemaInfo,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set("label", info.label)?;
+    object.set("schema", node_schema_to_js_object(env, info.schema)?)?;
+    Ok(object)
+}
+
+fn edge_schema_info_to_js_object<'env>(
+    env: &'env Env,
+    info: CoreEdgeSchemaInfo,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set("label", info.label)?;
+    object.set("schema", edge_schema_to_js_object(env, info.schema)?)?;
+    Ok(object)
+}
+
+fn node_schema_to_js_object<'env>(env: &'env Env, schema: CoreNodeSchema) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set(
+        "additionalProperties",
+        schema_additional_properties_to_js(schema.additional_properties),
+    )?;
+    object.set(
+        "properties",
+        property_schema_map_to_js_object(env, schema.properties)?,
+    )?;
+    if let Some(key) = schema.key {
+        object.set("key", string_field_schema_to_js_object(env, key)?)?;
+    }
+    if let Some(label_constraints) = schema.label_constraints {
+        object.set(
+            "labelConstraints",
+            node_label_constraints_to_js_object(env, label_constraints)?,
+        )?;
+    }
+    if let Some(weight) = schema.weight {
+        object.set("weight", numeric_field_schema_to_js_object(env, weight)?)?;
+    }
+    if let Some(dense_vector) = schema.dense_vector {
+        object.set(
+            "denseVector",
+            dense_vector_schema_to_js_object(env, dense_vector)?,
+        )?;
+    }
+    if let Some(sparse_vector) = schema.sparse_vector {
+        object.set(
+            "sparseVector",
+            sparse_vector_schema_to_js_object(env, sparse_vector)?,
+        )?;
+    }
+    Ok(object)
+}
+
+fn edge_schema_to_js_object<'env>(env: &'env Env, schema: CoreEdgeSchema) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set(
+        "additionalProperties",
+        schema_additional_properties_to_js(schema.additional_properties),
+    )?;
+    object.set(
+        "properties",
+        property_schema_map_to_js_object(env, schema.properties)?,
+    )?;
+    if let Some(from) = schema.from {
+        object.set("from", endpoint_label_schema_to_js_object(env, from)?)?;
+    }
+    if let Some(to) = schema.to {
+        object.set("to", endpoint_label_schema_to_js_object(env, to)?)?;
+    }
+    object.set("allowSelfLoops", schema.allow_self_loops)?;
+    if let Some(weight) = schema.weight {
+        object.set("weight", numeric_field_schema_to_js_object(env, weight)?)?;
+    }
+    if let Some(validity) = schema.validity {
+        object.set(
+            "validity",
+            edge_validity_schema_to_js_object(env, validity)?,
+        )?;
+    }
+    Ok(object)
+}
+
+fn property_schema_map_to_js_object<'env>(
+    env: &'env Env,
+    properties: BTreeMap<String, CorePropertySchema>,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    for (key, schema) in properties {
+        object.set(&key, property_schema_to_js_object(env, schema)?)?;
+    }
+    Ok(object)
+}
+
+fn property_schema_to_js_object<'env>(
+    env: &'env Env,
+    schema: CorePropertySchema,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set("required", schema.required)?;
+    object.set("nullable", schema.nullable)?;
+    object.set(
+        "types",
+        schema
+            .types
+            .into_iter()
+            .map(schema_value_type_to_js)
+            .collect::<Vec<_>>(),
+    )?;
+    if let Some(bound) = schema.numeric_min {
+        object.set("numericMin", schema_numeric_bound_to_js_object(env, bound)?)?;
+    }
+    if let Some(bound) = schema.numeric_max {
+        object.set("numericMax", schema_numeric_bound_to_js_object(env, bound)?)?;
+    }
+    if let Some(value) = schema.string_min_bytes {
+        object.set("stringMinBytes", value as f64)?;
+    }
+    if let Some(value) = schema.string_max_bytes {
+        object.set("stringMaxBytes", value as f64)?;
+    }
+    if let Some(value) = schema.bytes_min_len {
+        object.set("bytesMinLen", value as f64)?;
+    }
+    if let Some(value) = schema.bytes_max_len {
+        object.set("bytesMaxLen", value as f64)?;
+    }
+    if let Some(value) = schema.array_min_items {
+        object.set("arrayMinItems", value as f64)?;
+    }
+    if let Some(value) = schema.array_max_items {
+        object.set("arrayMaxItems", value as f64)?;
+    }
+    if let Some(value) = schema.map_min_entries {
+        object.set("mapMinEntries", value as f64)?;
+    }
+    if let Some(value) = schema.map_max_entries {
+        object.set("mapMaxEntries", value as f64)?;
+    }
+    let mut enum_values = env.create_array(schema.enum_values.len() as u32)?;
+    for (index, value) in schema.enum_values.into_iter().enumerate() {
+        enum_values.set(index as u32, SchemaLiteralPayload(value))?;
+    }
+    object.set("enumValues", enum_values)?;
+    Ok(object)
+}
+
+fn schema_numeric_bound_to_js_object<'env>(
+    env: &'env Env,
+    bound: CoreSchemaNumericBound,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set("value", SchemaLiteralPayload(bound.value))?;
+    object.set("inclusive", bound.inclusive)?;
+    Ok(object)
+}
+
+fn string_field_schema_to_js_object<'env>(
+    env: &'env Env,
+    schema: CoreStringFieldSchema,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    if let Some(value) = schema.min_bytes {
+        object.set("minBytes", value as f64)?;
+    }
+    if let Some(value) = schema.max_bytes {
+        object.set("maxBytes", value as f64)?;
+    }
+    object.set("enumValues", schema.enum_values)?;
+    Ok(object)
+}
+
+fn numeric_field_schema_to_js_object<'env>(
+    env: &'env Env,
+    schema: CoreNumericFieldSchema,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    if let Some(bound) = schema.min {
+        object.set("min", schema_numeric_bound_to_js_object(env, bound)?)?;
+    }
+    if let Some(bound) = schema.max {
+        object.set("max", schema_numeric_bound_to_js_object(env, bound)?)?;
+    }
+    object.set("finite", schema.finite)?;
+    Ok(object)
+}
+
+fn node_label_constraints_to_js_object<'env>(
+    env: &'env Env,
+    schema: CoreNodeLabelConstraintSchema,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set("allOf", schema.all_of)?;
+    object.set("anyOf", schema.any_of)?;
+    object.set("noneOf", schema.none_of)?;
+    Ok(object)
+}
+
+fn endpoint_label_schema_to_js_object<'env>(
+    env: &'env Env,
+    schema: CoreEndpointLabelSchema,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set("allOf", schema.all_of)?;
+    object.set("anyOf", schema.any_of)?;
+    object.set("noneOf", schema.none_of)?;
+    Ok(object)
+}
+
+fn dense_vector_schema_to_js_object<'env>(
+    env: &'env Env,
+    schema: CoreDenseVectorSchema,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set("presence", schema_vector_presence_to_js(schema.presence))?;
+    if let Some(value) = schema.dimension {
+        object.set("dimension", value as f64)?;
+    }
+    Ok(object)
+}
+
+fn sparse_vector_schema_to_js_object<'env>(
+    env: &'env Env,
+    schema: CoreSparseVectorSchema,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set("presence", schema_vector_presence_to_js(schema.presence))?;
+    if let Some(value) = schema.min_entries {
+        object.set("minEntries", value as f64)?;
+    }
+    if let Some(value) = schema.max_entries {
+        object.set("maxEntries", value as f64)?;
+    }
+    if let Some(value) = schema.max_dimension_id {
+        object.set("maxDimensionId", value)?;
+    }
+    Ok(object)
+}
+
+fn edge_validity_schema_to_js_object<'env>(
+    env: &'env Env,
+    schema: CoreEdgeValiditySchema,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set(
+        "requireValidFromBeforeValidTo",
+        schema.require_valid_from_before_valid_to,
+    )?;
+    if let Some(value) = schema.valid_from_min {
+        object.set("validFromMin", value)?;
+    }
+    if let Some(value) = schema.valid_from_max {
+        object.set("validFromMax", value)?;
+    }
+    if let Some(value) = schema.valid_to_min {
+        object.set("validToMin", value)?;
+    }
+    if let Some(value) = schema.valid_to_max {
+        object.set("validToMax", value)?;
+    }
+    object.set("allowOpenEndedValidTo", schema.allow_open_ended_valid_to)?;
+    Ok(object)
+}
+
+fn schema_validation_report_to_js_object<'env>(
+    env: &'env Env,
+    report: CoreSchemaValidationReport,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set("checkedRecords", report.checked_records as f64)?;
+    object.set("violationCount", report.violation_count as f64)?;
+    let mut violations = env.create_array(report.violations.len() as u32)?;
+    for (index, violation) in report.violations.into_iter().enumerate() {
+        violations.set(index as u32, schema_violation_to_js_object(env, violation)?)?;
+    }
+    object.set("violations", violations)?;
+    object.set("truncated", report.truncated)?;
+    object.set("scanLimitHit", report.scan_limit_hit)?;
+    Ok(object)
+}
+
+fn graph_schema_check_report_to_js_object<'env>(
+    env: &'env Env,
+    report: CoreGraphSchemaCheckReport,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set(
+        "operation",
+        graph_schema_operation_kind_to_js(report.operation),
+    )?;
+    let mut entries = env.create_array(report.entries.len() as u32)?;
+    for (index, entry) in report.entries.into_iter().enumerate() {
+        entries.set(
+            index as u32,
+            graph_schema_validation_entry_to_js_object(env, entry)?,
+        )?;
+    }
+    object.set("entries", entries)?;
+    object.set("checkedRecords", report.checked_records as f64)?;
+    object.set("violationCount", report.violation_count as f64)?;
+    object.set("truncated", report.truncated)?;
+    object.set("scanLimitHit", report.scan_limit_hit)?;
+    Ok(object)
+}
+
+fn graph_schema_validation_entry_to_js_object<'env>(
+    env: &'env Env,
+    entry: CoreGraphSchemaValidationReportEntry,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set("targetKind", schema_target_kind_to_js(entry.target_kind))?;
+    object.set("label", entry.label)?;
+    object.set(
+        "report",
+        schema_validation_report_to_js_object(env, entry.report)?,
+    )?;
+    Ok(object)
+}
+
+fn graph_schema_publish_result_to_js_object<'env>(
+    env: &'env Env,
+    result: CoreGraphSchemaPublishResult,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set(
+        "operation",
+        graph_schema_operation_kind_to_js(result.operation),
+    )?;
+
+    let mut node_schemas = env.create_array(result.node_schemas.len() as u32)?;
+    for (index, info) in result.node_schemas.into_iter().enumerate() {
+        node_schemas.set(index as u32, node_schema_info_to_js_object(env, info)?)?;
+    }
+    object.set("nodeSchemas", node_schemas)?;
+
+    let mut edge_schemas = env.create_array(result.edge_schemas.len() as u32)?;
+    for (index, info) in result.edge_schemas.into_iter().enumerate() {
+        edge_schemas.set(index as u32, edge_schema_info_to_js_object(env, info)?)?;
+    }
+    object.set("edgeSchemas", edge_schemas)?;
+
+    object.set(
+        "validation",
+        graph_schema_check_report_to_js_object(env, result.validation)?,
+    )?;
+    object.set("targetsPublished", result.targets_published as f64)?;
+    object.set("targetsDropped", result.targets_dropped as f64)?;
+
+    let mut drop_targets = env.create_array(result.drop_targets.len() as u32)?;
+    for (index, target) in result.drop_targets.into_iter().enumerate() {
+        drop_targets.set(
+            index as u32,
+            graph_schema_drop_target_to_js_object(env, target)?,
+        )?;
+    }
+    object.set("dropTargets", drop_targets)?;
+    object.set("nodeSchemasDropped", result.node_schemas_dropped as f64)?;
+    object.set("edgeSchemasDropped", result.edge_schemas_dropped as f64)?;
+    Ok(object)
+}
+
+fn graph_schema_drop_target_to_js_object<'env>(
+    env: &'env Env,
+    target: CoreGraphSchemaDropTargetResult,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set("targetKind", schema_target_kind_to_js(target.target_kind))?;
+    object.set("label", target.label)?;
+    object.set("action", graph_schema_drop_action_to_js(target.action))?;
+    Ok(object)
+}
+
+fn schema_violation_to_js_object<'env>(
+    env: &'env Env,
+    violation: CoreSchemaViolation,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    object.set(
+        "target",
+        schema_violation_target_to_js_object(env, violation.target)?,
+    )?;
+    object.set("path", violation.path)?;
+    object.set("message", violation.message)?;
+    Ok(object)
+}
+
+fn schema_violation_target_to_js_object<'env>(
+    env: &'env Env,
+    target: CoreSchemaViolationTarget,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    match target {
+        CoreSchemaViolationTarget::Node { id, labels, key } => {
+            object.set("kind", "node")?;
+            object.set("id", u64_to_f64(id)?)?;
+            object.set("labels", labels)?;
+            object.set("key", key)?;
+        }
+        CoreSchemaViolationTarget::Edge {
+            id,
+            label,
+            from,
+            to,
+        } => {
+            object.set("kind", "edge")?;
+            object.set("id", u64_to_f64(id)?)?;
+            object.set("label", label)?;
+            object.set("from", u64_to_f64(from)?)?;
+            object.set("to", u64_to_f64(to)?)?;
+        }
+    }
+    Ok(object)
+}
+
+unsafe fn schema_literal_to_napi(
+    env: napi::sys::napi_env,
+    value: PropValue,
+) -> Result<napi::sys::napi_value> {
+    match value {
+        PropValue::Null => unsafe {
+            <Option<serde_json::Value> as ToNapiValue>::to_napi_value(env, None)
+        },
+        PropValue::Bool(value) => unsafe { bool::to_napi_value(env, value) },
+        PropValue::Int(value) => unsafe { i64::to_napi_value(env, value) },
+        PropValue::UInt(value) => {
+            let env_ref = Env::from_raw(env);
+            let mut object = Object::new(&env_ref)?;
+            object.set("type", "uint")?;
+            object.set("value", value.to_string())?;
+            unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env_ref.raw(), &object) }
+        }
+        PropValue::Float(value) => unsafe { f64::to_napi_value(env, value) },
+        PropValue::String(value) => unsafe { String::to_napi_value(env, value) },
+        PropValue::Bytes(value) => {
+            let env_ref = Env::from_raw(env);
+            let mut object = Object::new(&env_ref)?;
+            object.set("type", "bytes")?;
+            object.set("value", Buffer::from(value))?;
+            unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env_ref.raw(), &object) }
+        }
+        PropValue::Array(values) => {
+            let env_ref = Env::from_raw(env);
+            let mut array = env_ref.create_array(values.len() as u32)?;
+            for (index, value) in values.into_iter().enumerate() {
+                array.set(index as u32, SchemaLiteralPayload(value))?;
+            }
+            unsafe { <Array<'_> as ToNapiValue>::to_napi_value(env_ref.raw(), array) }
+        }
+        PropValue::Map(values) => {
+            let env_ref = Env::from_raw(env);
+            if schema_map_literal_needs_escape(&values) {
+                let mut object = Object::new(&env_ref)?;
+                object.set("type", "map")?;
+                object.set("value", schema_map_to_js_object(&env_ref, values)?)?;
+                unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env_ref.raw(), &object) }
+            } else {
+                let object = schema_map_to_js_object(&env_ref, values)?;
+                unsafe { <&Object<'_> as ToNapiValue>::to_napi_value(env_ref.raw(), &object) }
+            }
+        }
+    }
+}
+
+fn schema_map_to_js_object<'env>(
+    env: &'env Env,
+    values: BTreeMap<String, PropValue>,
+) -> Result<Object<'env>> {
+    let mut object = Object::new(env)?;
+    for (key, value) in values {
+        object.set(&key, SchemaLiteralPayload(value))?;
+    }
+    Ok(object)
+}
+
+fn schema_map_literal_needs_escape(values: &BTreeMap<String, PropValue>) -> bool {
+    if values.len() != 2 || !values.contains_key("value") {
+        return false;
+    }
+    matches!(
+        values.get("type"),
+        Some(PropValue::String(marker))
+            if matches!(marker.as_str(), "uint" | "bytes" | "map")
+    )
+}
+
+fn schema_target_kind_to_js(kind: CoreSchemaTargetKind) -> &'static str {
+    match kind {
+        CoreSchemaTargetKind::Node => "node",
+        CoreSchemaTargetKind::Edge => "edge",
+    }
+}
+
+fn graph_schema_operation_kind_to_js(kind: CoreGraphSchemaOperationKind) -> &'static str {
+    match kind {
+        CoreGraphSchemaOperationKind::Add => "add",
+        CoreGraphSchemaOperationKind::Set => "set",
+        CoreGraphSchemaOperationKind::Drop => "drop",
+        CoreGraphSchemaOperationKind::DropAll => "dropAll",
+        CoreGraphSchemaOperationKind::CheckAdd => "checkAdd",
+        CoreGraphSchemaOperationKind::CheckSet => "checkSet",
+    }
+}
+
+fn graph_schema_drop_action_to_js(action: CoreGraphSchemaDropAction) -> &'static str {
+    match action {
+        CoreGraphSchemaDropAction::Dropped => "dropped",
+        CoreGraphSchemaDropAction::NotFound => "notFound",
+    }
+}
+
+fn schema_additional_properties_to_js(value: CoreSchemaAdditionalProperties) -> &'static str {
+    match value {
+        CoreSchemaAdditionalProperties::Allow => "allow",
+        CoreSchemaAdditionalProperties::Reject => "reject",
+    }
+}
+
+fn schema_value_type_to_js(value: CoreSchemaValueType) -> &'static str {
+    match value {
+        CoreSchemaValueType::Bool => "bool",
+        CoreSchemaValueType::Int => "int",
+        CoreSchemaValueType::UInt => "uint",
+        CoreSchemaValueType::Float => "float",
+        CoreSchemaValueType::Number => "number",
+        CoreSchemaValueType::String => "string",
+        CoreSchemaValueType::Bytes => "bytes",
+        CoreSchemaValueType::Array => "array",
+        CoreSchemaValueType::Map => "map",
+    }
+}
+
+fn schema_vector_presence_to_js(value: CoreSchemaVectorPresence) -> &'static str {
+    match value {
+        CoreSchemaVectorPresence::Optional => "optional",
+        CoreSchemaVectorPresence::Required => "required",
+        CoreSchemaVectorPresence::Forbidden => "forbidden",
+    }
 }
 
 #[napi(object)]
@@ -6117,10 +7230,83 @@ fn gql_mutation_stats_to_value(stats: overgraph::GqlMutationStats) -> GqlValue {
     ]))
 }
 
+fn gql_schema_stats_to_value(stats: overgraph::GqlSchemaStats) -> GqlValue {
+    GqlValue::Map(BTreeMap::from([
+        ("operation".to_string(), GqlValue::String(stats.operation)),
+        (
+            "targetsChecked".to_string(),
+            GqlValue::UInt(stats.targets_checked),
+        ),
+        (
+            "targetsPublished".to_string(),
+            GqlValue::UInt(stats.targets_published),
+        ),
+        (
+            "targetsDropped".to_string(),
+            GqlValue::UInt(stats.targets_dropped),
+        ),
+        (
+            "checkedRecords".to_string(),
+            GqlValue::UInt(stats.checked_records),
+        ),
+        (
+            "violationCount".to_string(),
+            GqlValue::UInt(stats.violation_count),
+        ),
+        ("truncated".to_string(), GqlValue::Bool(stats.truncated)),
+        (
+            "scanLimitHit".to_string(),
+            GqlValue::Bool(stats.scan_limit_hit),
+        ),
+        (
+            "elapsedUs".to_string(),
+            stats
+                .elapsed_us
+                .map(GqlValue::UInt)
+                .unwrap_or(GqlValue::Null),
+        ),
+        (
+            "warnings".to_string(),
+            GqlValue::List(stats.warnings.into_iter().map(GqlValue::String).collect()),
+        ),
+    ]))
+}
+
+fn gql_index_stats_to_value(stats: overgraph::GqlIndexStats) -> GqlValue {
+    GqlValue::Map(BTreeMap::from([
+        ("operation".to_string(), GqlValue::String(stats.operation)),
+        (
+            "indexesEnsured".to_string(),
+            GqlValue::UInt(stats.indexes_ensured),
+        ),
+        (
+            "indexesDropped".to_string(),
+            GqlValue::UInt(stats.indexes_dropped),
+        ),
+        (
+            "indexesReturned".to_string(),
+            GqlValue::UInt(stats.indexes_returned),
+        ),
+        (
+            "elapsedUs".to_string(),
+            stats
+                .elapsed_us
+                .map(GqlValue::UInt)
+                .unwrap_or(GqlValue::Null),
+        ),
+        (
+            "warnings".to_string(),
+            GqlValue::List(stats.warnings.into_iter().map(GqlValue::String).collect()),
+        ),
+    ]))
+}
+
 fn gql_statement_kind_to_js(kind: GqlStatementKind) -> &'static str {
     match kind {
         GqlStatementKind::Query => "query",
         GqlStatementKind::Mutation => "mutation",
+        GqlStatementKind::Schema => "schema",
+        GqlStatementKind::Index => "index",
     }
 }
 
@@ -6238,6 +7424,46 @@ fn gql_mutation_explain_to_json(explain: overgraph::GqlMutationExplain) -> serde
         "usesWriteTxn": explain.uses_write_txn,
         "replacementAdapters": explain.replacement_adapters,
         "atomicCommit": explain.atomic_commit,
+    })
+}
+
+fn gql_schema_explain_to_json(explain: overgraph::GqlSchemaExplain) -> serde_json::Value {
+    serde_json::json!({
+        "operation": explain.operation,
+        "targets": explain.targets.into_iter().map(|target| serde_json::json!({
+            "targetKind": target.target_kind,
+            "label": target.label,
+            "action": target.action,
+        })).collect::<Vec<_>>(),
+        "replacesEntireCatalog": explain.replaces_entire_catalog,
+        "publishesManifest": explain.publishes_manifest,
+        "validatesExistingData": explain.validates_existing_data,
+        "usesCoreWriteQueue": explain.uses_core_write_queue,
+        "sideEffectFree": explain.side_effect_free,
+        "options": {
+            "maxViolations": explain.options.max_violations,
+            "chunkSize": explain.options.chunk_size,
+            "scanLimit": explain.options.scan_limit,
+        },
+    })
+}
+
+fn gql_index_explain_to_json(explain: overgraph::GqlIndexExplain) -> serde_json::Value {
+    serde_json::json!({
+        "operation": explain.operation,
+        "targets": explain.targets.into_iter().map(|target| serde_json::json!({
+            "targetKind": target.target_kind,
+            "label": target.label,
+            "propKey": target.prop_key,
+            "kind": target.kind,
+            "action": target.action,
+        })).collect::<Vec<_>>(),
+        "usesCoreWriteQueue": explain.uses_core_write_queue,
+        "publishesManifest": explain.publishes_manifest,
+        "createsLabels": explain.creates_labels,
+        "schedulesBackgroundBuild": explain.schedules_background_build,
+        "dropsIndexDataAsync": explain.drops_index_data_async,
+        "sideEffectFree": explain.side_effect_free,
     })
 }
 
@@ -11029,6 +12255,1082 @@ fn js_property_range_bound_to_rust(bound: &PropertyRangeBound) -> Result<CorePro
     } else {
         Ok(CorePropertyRangeBound::Excluded(value))
     }
+}
+
+fn schema_set_options_to_core(options: Option<SchemaSetOptions>) -> Result<CoreSchemaSetOptions> {
+    let mut core = CoreSchemaSetOptions::default();
+    if let Some(options) = options {
+        if let Some(value) = options.max_violations {
+            core.max_violations = f64_to_usize(value, "schema options maxViolations")?;
+        }
+        if let Some(value) = options.chunk_size {
+            core.chunk_size = f64_to_usize(value, "schema options chunkSize")?;
+        }
+        core.scan_limit = parse_schema_scan_limit_option(options.scan_limit)?;
+    }
+    Ok(core)
+}
+
+fn schema_check_options_to_core(
+    options: Option<SchemaCheckOptions>,
+) -> Result<CoreSchemaCheckOptions> {
+    let mut core = CoreSchemaCheckOptions::default();
+    if let Some(options) = options {
+        if let Some(value) = options.max_violations {
+            core.max_violations = f64_to_usize(value, "schema options maxViolations")?;
+        }
+        if let Some(value) = options.chunk_size {
+            core.chunk_size = f64_to_usize(value, "schema options chunkSize")?;
+        }
+        core.scan_limit = parse_schema_scan_limit_option(options.scan_limit)?;
+    }
+    Ok(core)
+}
+
+fn graph_schema_set_options_to_core(
+    options: Option<SchemaSetOptions>,
+) -> Result<CoreGraphSchemaSetOptions> {
+    let mut core = CoreGraphSchemaSetOptions::default();
+    if let Some(options) = options {
+        if let Some(value) = options.max_violations {
+            core.max_violations = f64_to_usize(value, "schema options maxViolations")?;
+        }
+        if let Some(value) = options.chunk_size {
+            core.chunk_size = f64_to_usize(value, "schema options chunkSize")?;
+        }
+        core.scan_limit = parse_schema_scan_limit_option(options.scan_limit)?;
+    }
+    Ok(core)
+}
+
+fn graph_schema_check_options_to_core(
+    options: Option<SchemaCheckOptions>,
+) -> Result<CoreGraphSchemaCheckOptions> {
+    let mut core = CoreGraphSchemaCheckOptions::default();
+    if let Some(options) = options {
+        if let Some(value) = options.max_violations {
+            core.max_violations = f64_to_usize(value, "schema options maxViolations")?;
+        }
+        if let Some(value) = options.chunk_size {
+            core.chunk_size = f64_to_usize(value, "schema options chunkSize")?;
+        }
+        core.scan_limit = parse_schema_scan_limit_option(options.scan_limit)?;
+    }
+    Ok(core)
+}
+
+fn parse_schema_scan_limit_option(value: Option<serde_json::Value>) -> Result<Option<u64>> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(number)) => {
+            let number = number.as_f64().ok_or_else(|| {
+                napi::Error::from_reason(
+                    "schema options scanLimit must be a number or null".to_string(),
+                )
+            })?;
+            f64_to_u64_for_context(number, "schema options scanLimit").map(Some)
+        }
+        Some(_) => Err(napi::Error::from_reason(
+            "schema options scanLimit must be a number or null".to_string(),
+        )),
+    }
+}
+
+fn parse_js_graph_schema(value: Unknown<'_>, context: &str) -> Result<CoreGraphSchema> {
+    let object = cast_js_plain_object(value, context)?;
+    ensure_only_js_object_fields(&object, &["nodeSchemas", "edgeSchemas"], context)?;
+    Ok(CoreGraphSchema {
+        node_schemas: parse_js_optional_object_field(&object, "nodeSchemas")?
+            .map(|value| parse_js_node_schema_infos(value, &format!("{context} nodeSchemas")))
+            .transpose()?
+            .unwrap_or_default(),
+        edge_schemas: parse_js_optional_object_field(&object, "edgeSchemas")?
+            .map(|value| parse_js_edge_schema_infos(value, &format!("{context} edgeSchemas")))
+            .transpose()?
+            .unwrap_or_default(),
+    })
+}
+
+fn parse_js_node_schema_infos(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<Vec<CoreNodeSchemaInfo>> {
+    if !value.is_array()? {
+        return Err(napi::Error::from_reason(format!(
+            "{context} must be an array"
+        )));
+    }
+    let array = unsafe { value.cast::<Array<'_>>()? };
+    let mut infos = Vec::with_capacity(array.len() as usize);
+    for index in 0..array.len() {
+        let value = array
+            .get::<Unknown<'_>>(index)?
+            .ok_or_else(|| napi::Error::from_reason(format!("{context}[{index}] is missing")))?;
+        let item_context = format!("{context}[{index}]");
+        let object = cast_js_plain_object(value, &item_context)?;
+        ensure_only_js_object_fields(&object, &["label", "schema"], &item_context)?;
+        let label = parse_js_string_unknown(
+            parse_js_required_object_field(&object, "label", &format!("{item_context} label"))?,
+            &format!("{item_context} label"),
+        )?;
+        let schema = parse_js_node_schema(
+            parse_js_required_object_field(&object, "schema", &format!("{item_context} schema"))?,
+            &format!("{item_context} schema"),
+        )?;
+        infos.push(CoreNodeSchemaInfo { label, schema });
+    }
+    Ok(infos)
+}
+
+fn parse_js_edge_schema_infos(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<Vec<CoreEdgeSchemaInfo>> {
+    if !value.is_array()? {
+        return Err(napi::Error::from_reason(format!(
+            "{context} must be an array"
+        )));
+    }
+    let array = unsafe { value.cast::<Array<'_>>()? };
+    let mut infos = Vec::with_capacity(array.len() as usize);
+    for index in 0..array.len() {
+        let value = array
+            .get::<Unknown<'_>>(index)?
+            .ok_or_else(|| napi::Error::from_reason(format!("{context}[{index}] is missing")))?;
+        let item_context = format!("{context}[{index}]");
+        let object = cast_js_plain_object(value, &item_context)?;
+        ensure_only_js_object_fields(&object, &["label", "schema"], &item_context)?;
+        let label = parse_js_string_unknown(
+            parse_js_required_object_field(&object, "label", &format!("{item_context} label"))?,
+            &format!("{item_context} label"),
+        )?;
+        let schema = parse_js_edge_schema(
+            parse_js_required_object_field(&object, "schema", &format!("{item_context} schema"))?,
+            &format!("{item_context} schema"),
+        )?;
+        infos.push(CoreEdgeSchemaInfo { label, schema });
+    }
+    Ok(infos)
+}
+
+fn parse_js_graph_schema_operations(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<Vec<CoreGraphSchemaOperation>> {
+    if !value.is_array()? {
+        return Err(napi::Error::from_reason(format!(
+            "{context} must be an array"
+        )));
+    }
+    let array = unsafe { value.cast::<Array<'_>>()? };
+    let mut operations = Vec::with_capacity(array.len() as usize);
+    for index in 0..array.len() {
+        let value = array
+            .get::<Unknown<'_>>(index)?
+            .ok_or_else(|| napi::Error::from_reason(format!("{context}[{index}] is missing")))?;
+        operations.push(parse_js_graph_schema_operation(
+            value,
+            &format!("{context}[{index}]"),
+        )?);
+    }
+    Ok(operations)
+}
+
+fn parse_js_graph_schema_operation(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<CoreGraphSchemaOperation> {
+    let object = cast_js_plain_object(value, context)?;
+    ensure_only_js_object_fields(&object, &["kind", "label", "schema"], context)?;
+    let kind = parse_js_string_unknown(
+        parse_js_required_object_field(&object, "kind", &format!("{context} kind"))?,
+        &format!("{context} kind"),
+    )?;
+    let label = parse_js_string_unknown(
+        parse_js_required_object_field(&object, "label", &format!("{context} label"))?,
+        &format!("{context} label"),
+    )?;
+    match kind.as_str() {
+        "setNode" => {
+            let schema = parse_js_node_schema(
+                parse_js_required_object_field(&object, "schema", &format!("{context} schema"))?,
+                &format!("{context} schema"),
+            )?;
+            Ok(CoreGraphSchemaOperation::SetNode { label, schema })
+        }
+        "setEdge" => {
+            let schema = parse_js_edge_schema(
+                parse_js_required_object_field(&object, "schema", &format!("{context} schema"))?,
+                &format!("{context} schema"),
+            )?;
+            Ok(CoreGraphSchemaOperation::SetEdge { label, schema })
+        }
+        "dropNode" => {
+            reject_js_graph_schema_operation_schema(&object, context)?;
+            Ok(CoreGraphSchemaOperation::DropNode { label })
+        }
+        "dropEdge" => {
+            reject_js_graph_schema_operation_schema(&object, context)?;
+            Ok(CoreGraphSchemaOperation::DropEdge { label })
+        }
+        other => Err(napi::Error::from_reason(format!(
+            "{context} kind must be setNode, setEdge, dropNode, or dropEdge, got '{other}'"
+        ))),
+    }
+}
+
+fn reject_js_graph_schema_operation_schema(object: &Object<'_>, context: &str) -> Result<()> {
+    if parse_js_optional_object_field(object, "schema")?.is_some() {
+        return Err(napi::Error::from_reason(format!(
+            "{context} schema is only accepted for setNode and setEdge operations"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_js_node_schema(value: Unknown<'_>, context: &str) -> Result<CoreNodeSchema> {
+    let object = cast_js_plain_object(value, context)?;
+    ensure_only_js_object_fields(
+        &object,
+        &[
+            "additionalProperties",
+            "properties",
+            "key",
+            "labelConstraints",
+            "weight",
+            "denseVector",
+            "sparseVector",
+        ],
+        context,
+    )?;
+    let mut schema = CoreNodeSchema::default();
+    if let Some(value) = parse_js_optional_object_field(&object, "additionalProperties")? {
+        schema.additional_properties = parse_js_schema_additional_properties(
+            value,
+            &format!("{context} additionalProperties"),
+        )?;
+    }
+    if let Some(value) = parse_js_optional_object_field(&object, "properties")? {
+        schema.properties = parse_js_property_schema_map(value, &format!("{context} properties"))?;
+    }
+    schema.key = parse_js_optional_object_field(&object, "key")?
+        .map(|value| parse_js_string_field_schema(value, &format!("{context} key")))
+        .transpose()?;
+    schema.label_constraints = parse_js_optional_object_field(&object, "labelConstraints")?
+        .map(|value| parse_js_node_label_constraints(value, &format!("{context} labelConstraints")))
+        .transpose()?;
+    schema.weight = parse_js_optional_object_field(&object, "weight")?
+        .map(|value| parse_js_numeric_field_schema(value, &format!("{context} weight")))
+        .transpose()?;
+    schema.dense_vector = parse_js_optional_object_field(&object, "denseVector")?
+        .map(|value| parse_js_dense_vector_schema(value, &format!("{context} denseVector")))
+        .transpose()?;
+    schema.sparse_vector = parse_js_optional_object_field(&object, "sparseVector")?
+        .map(|value| parse_js_sparse_vector_schema(value, &format!("{context} sparseVector")))
+        .transpose()?;
+    Ok(schema)
+}
+
+fn parse_js_edge_schema(value: Unknown<'_>, context: &str) -> Result<CoreEdgeSchema> {
+    let object = cast_js_plain_object(value, context)?;
+    ensure_only_js_object_fields(
+        &object,
+        &[
+            "additionalProperties",
+            "properties",
+            "from",
+            "to",
+            "allowSelfLoops",
+            "weight",
+            "validity",
+        ],
+        context,
+    )?;
+    let mut schema = CoreEdgeSchema::default();
+    if let Some(value) = parse_js_optional_object_field(&object, "additionalProperties")? {
+        schema.additional_properties = parse_js_schema_additional_properties(
+            value,
+            &format!("{context} additionalProperties"),
+        )?;
+    }
+    if let Some(value) = parse_js_optional_object_field(&object, "properties")? {
+        schema.properties = parse_js_property_schema_map(value, &format!("{context} properties"))?;
+    }
+    schema.from = parse_js_optional_object_field(&object, "from")?
+        .map(|value| parse_js_endpoint_label_schema(value, &format!("{context} from")))
+        .transpose()?;
+    schema.to = parse_js_optional_object_field(&object, "to")?
+        .map(|value| parse_js_endpoint_label_schema(value, &format!("{context} to")))
+        .transpose()?;
+    if let Some(value) = parse_js_optional_object_field(&object, "allowSelfLoops")? {
+        schema.allow_self_loops =
+            parse_js_bool_unknown(value, &format!("{context} allowSelfLoops"))?;
+    }
+    schema.weight = parse_js_optional_object_field(&object, "weight")?
+        .map(|value| parse_js_numeric_field_schema(value, &format!("{context} weight")))
+        .transpose()?;
+    schema.validity = parse_js_optional_object_field(&object, "validity")?
+        .map(|value| parse_js_edge_validity_schema(value, &format!("{context} validity")))
+        .transpose()?;
+    Ok(schema)
+}
+
+fn parse_js_property_schema_map(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<BTreeMap<String, CorePropertySchema>> {
+    let object = cast_js_plain_object(value, context)?;
+    let keys = js_object_property_names_array(&object)?;
+    let mut properties = BTreeMap::new();
+    for index in 0..keys.len() {
+        let key = keys
+            .get::<JsString<'_>>(index)?
+            .ok_or_else(|| napi::Error::from_reason(format!("{context} key {index} is missing")))?
+            .into_utf8()?
+            .into_owned()?;
+        let value = object.get::<Unknown<'_>>(&key)?.ok_or_else(|| {
+            napi::Error::from_reason(format!("{context}.{key} property schema is missing"))
+        })?;
+        if is_js_null_or_undefined(&value)? {
+            return Err(napi::Error::from_reason(format!(
+                "{context}.{key} property schema must be an object"
+            )));
+        }
+        properties.insert(
+            key.clone(),
+            parse_js_property_schema(value, &format!("{context}.{key}"))?,
+        );
+    }
+    Ok(properties)
+}
+
+fn parse_js_property_schema(value: Unknown<'_>, context: &str) -> Result<CorePropertySchema> {
+    let object = cast_js_plain_object(value, context)?;
+    ensure_only_js_object_fields(
+        &object,
+        &[
+            "required",
+            "nullable",
+            "types",
+            "numericMin",
+            "numericMax",
+            "stringMinBytes",
+            "stringMaxBytes",
+            "bytesMinLen",
+            "bytesMaxLen",
+            "arrayMinItems",
+            "arrayMaxItems",
+            "mapMinEntries",
+            "mapMaxEntries",
+            "enumValues",
+        ],
+        context,
+    )?;
+    let mut schema = CorePropertySchema::default();
+    if let Some(value) = parse_js_optional_object_field(&object, "required")? {
+        schema.required = parse_js_bool_unknown(value, &format!("{context} required"))?;
+    }
+    if let Some(value) = parse_js_optional_object_field(&object, "nullable")? {
+        schema.nullable = parse_js_bool_unknown(value, &format!("{context} nullable"))?;
+    }
+    if let Some(value) = parse_js_optional_object_field(&object, "types")? {
+        schema.types = parse_js_schema_value_types(value, &format!("{context} types"))?;
+    }
+    schema.numeric_min = parse_js_optional_object_field(&object, "numericMin")?
+        .map(|value| parse_js_schema_numeric_bound(value, &format!("{context} numericMin")))
+        .transpose()?;
+    schema.numeric_max = parse_js_optional_object_field(&object, "numericMax")?
+        .map(|value| parse_js_schema_numeric_bound(value, &format!("{context} numericMax")))
+        .transpose()?;
+    schema.string_min_bytes = parse_js_optional_usize_field(
+        &object,
+        "stringMinBytes",
+        &format!("{context} stringMinBytes"),
+    )?;
+    schema.string_max_bytes = parse_js_optional_usize_field(
+        &object,
+        "stringMaxBytes",
+        &format!("{context} stringMaxBytes"),
+    )?;
+    schema.bytes_min_len =
+        parse_js_optional_usize_field(&object, "bytesMinLen", &format!("{context} bytesMinLen"))?;
+    schema.bytes_max_len =
+        parse_js_optional_usize_field(&object, "bytesMaxLen", &format!("{context} bytesMaxLen"))?;
+    schema.array_min_items = parse_js_optional_usize_field(
+        &object,
+        "arrayMinItems",
+        &format!("{context} arrayMinItems"),
+    )?;
+    schema.array_max_items = parse_js_optional_usize_field(
+        &object,
+        "arrayMaxItems",
+        &format!("{context} arrayMaxItems"),
+    )?;
+    schema.map_min_entries = parse_js_optional_usize_field(
+        &object,
+        "mapMinEntries",
+        &format!("{context} mapMinEntries"),
+    )?;
+    schema.map_max_entries = parse_js_optional_usize_field(
+        &object,
+        "mapMaxEntries",
+        &format!("{context} mapMaxEntries"),
+    )?;
+    if let Some(value) = parse_js_optional_object_field(&object, "enumValues")? {
+        schema.enum_values =
+            parse_js_schema_literal_array(value, &format!("{context} enumValues"))?;
+    }
+    Ok(schema)
+}
+
+fn parse_js_schema_numeric_bound(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<CoreSchemaNumericBound> {
+    let object = cast_js_plain_object(value, context)?;
+    ensure_only_js_object_fields(&object, &["value", "inclusive"], context)?;
+    let value = parse_js_required_object_field(&object, "value", &format!("{context} value"))?;
+    let inclusive = parse_js_optional_object_field(&object, "inclusive")?
+        .map(|value| parse_js_bool_unknown(value, &format!("{context} inclusive")))
+        .transpose()?
+        .unwrap_or(true);
+    Ok(CoreSchemaNumericBound {
+        value: parse_js_schema_literal(value, &format!("{context} value"))?,
+        inclusive,
+    })
+}
+
+fn parse_js_string_field_schema(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<CoreStringFieldSchema> {
+    let object = cast_js_plain_object(value, context)?;
+    ensure_only_js_object_fields(&object, &["minBytes", "maxBytes", "enumValues"], context)?;
+    Ok(CoreStringFieldSchema {
+        min_bytes: parse_js_optional_usize_field(
+            &object,
+            "minBytes",
+            &format!("{context} minBytes"),
+        )?,
+        max_bytes: parse_js_optional_usize_field(
+            &object,
+            "maxBytes",
+            &format!("{context} maxBytes"),
+        )?,
+        enum_values: parse_js_optional_object_field(&object, "enumValues")?
+            .map(|value| parse_js_string_array_unknown(value, &format!("{context} enumValues")))
+            .transpose()?
+            .unwrap_or_default(),
+    })
+}
+
+fn parse_js_numeric_field_schema(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<CoreNumericFieldSchema> {
+    let object = cast_js_plain_object(value, context)?;
+    ensure_only_js_object_fields(&object, &["min", "max", "finite"], context)?;
+    let mut schema = CoreNumericFieldSchema::default();
+    schema.min = parse_js_optional_object_field(&object, "min")?
+        .map(|value| parse_js_schema_numeric_bound(value, &format!("{context} min")))
+        .transpose()?;
+    schema.max = parse_js_optional_object_field(&object, "max")?
+        .map(|value| parse_js_schema_numeric_bound(value, &format!("{context} max")))
+        .transpose()?;
+    if let Some(value) = parse_js_optional_object_field(&object, "finite")? {
+        schema.finite = parse_js_bool_unknown(value, &format!("{context} finite"))?;
+    }
+    Ok(schema)
+}
+
+fn parse_js_node_label_constraints(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<CoreNodeLabelConstraintSchema> {
+    let object = cast_js_plain_object(value, context)?;
+    ensure_only_js_object_fields(&object, &["allOf", "anyOf", "noneOf"], context)?;
+    Ok(CoreNodeLabelConstraintSchema {
+        all_of: parse_js_optional_string_array_object_field(
+            &object,
+            "allOf",
+            &format!("{context} allOf"),
+        )?,
+        any_of: parse_js_optional_string_array_object_field(
+            &object,
+            "anyOf",
+            &format!("{context} anyOf"),
+        )?,
+        none_of: parse_js_optional_string_array_object_field(
+            &object,
+            "noneOf",
+            &format!("{context} noneOf"),
+        )?,
+    })
+}
+
+fn parse_js_endpoint_label_schema(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<CoreEndpointLabelSchema> {
+    let object = cast_js_plain_object(value, context)?;
+    ensure_only_js_object_fields(&object, &["allOf", "anyOf", "noneOf"], context)?;
+    Ok(CoreEndpointLabelSchema {
+        all_of: parse_js_optional_string_array_object_field(
+            &object,
+            "allOf",
+            &format!("{context} allOf"),
+        )?,
+        any_of: parse_js_optional_string_array_object_field(
+            &object,
+            "anyOf",
+            &format!("{context} anyOf"),
+        )?,
+        none_of: parse_js_optional_string_array_object_field(
+            &object,
+            "noneOf",
+            &format!("{context} noneOf"),
+        )?,
+    })
+}
+
+fn parse_js_dense_vector_schema(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<CoreDenseVectorSchema> {
+    let object = cast_js_plain_object(value, context)?;
+    ensure_only_js_object_fields(&object, &["presence", "dimension"], context)?;
+    let mut schema = CoreDenseVectorSchema::default();
+    if let Some(value) = parse_js_optional_object_field(&object, "presence")? {
+        schema.presence = parse_js_schema_vector_presence(value, &format!("{context} presence"))?;
+    }
+    schema.dimension =
+        parse_js_optional_usize_field(&object, "dimension", &format!("{context} dimension"))?;
+    Ok(schema)
+}
+
+fn parse_js_sparse_vector_schema(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<CoreSparseVectorSchema> {
+    let object = cast_js_plain_object(value, context)?;
+    ensure_only_js_object_fields(
+        &object,
+        &["presence", "minEntries", "maxEntries", "maxDimensionId"],
+        context,
+    )?;
+    let mut schema = CoreSparseVectorSchema::default();
+    if let Some(value) = parse_js_optional_object_field(&object, "presence")? {
+        schema.presence = parse_js_schema_vector_presence(value, &format!("{context} presence"))?;
+    }
+    schema.min_entries =
+        parse_js_optional_usize_field(&object, "minEntries", &format!("{context} minEntries"))?;
+    schema.max_entries =
+        parse_js_optional_usize_field(&object, "maxEntries", &format!("{context} maxEntries"))?;
+    schema.max_dimension_id = parse_js_optional_u32_field(
+        &object,
+        "maxDimensionId",
+        &format!("{context} maxDimensionId"),
+    )?;
+    Ok(schema)
+}
+
+fn parse_js_edge_validity_schema(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<CoreEdgeValiditySchema> {
+    let object = cast_js_plain_object(value, context)?;
+    ensure_only_js_object_fields(
+        &object,
+        &[
+            "requireValidFromBeforeValidTo",
+            "validFromMin",
+            "validFromMax",
+            "validToMin",
+            "validToMax",
+            "allowOpenEndedValidTo",
+        ],
+        context,
+    )?;
+    let mut schema = CoreEdgeValiditySchema::default();
+    if let Some(value) = parse_js_optional_object_field(&object, "requireValidFromBeforeValidTo")? {
+        schema.require_valid_from_before_valid_to =
+            parse_js_bool_unknown(value, &format!("{context} requireValidFromBeforeValidTo"))?;
+    }
+    schema.valid_from_min = parse_js_optional_i64_object_field(
+        &object,
+        "validFromMin",
+        &format!("{context} validFromMin"),
+    )?;
+    schema.valid_from_max = parse_js_optional_i64_object_field(
+        &object,
+        "validFromMax",
+        &format!("{context} validFromMax"),
+    )?;
+    schema.valid_to_min = parse_js_optional_i64_object_field(
+        &object,
+        "validToMin",
+        &format!("{context} validToMin"),
+    )?;
+    schema.valid_to_max = parse_js_optional_i64_object_field(
+        &object,
+        "validToMax",
+        &format!("{context} validToMax"),
+    )?;
+    if let Some(value) = parse_js_optional_object_field(&object, "allowOpenEndedValidTo")? {
+        schema.allow_open_ended_valid_to =
+            parse_js_bool_unknown(value, &format!("{context} allowOpenEndedValidTo"))?;
+    }
+    Ok(schema)
+}
+
+fn parse_js_schema_literal_array(value: Unknown<'_>, context: &str) -> Result<Vec<PropValue>> {
+    if !value.is_array()? {
+        return Err(napi::Error::from_reason(format!(
+            "{context} must be an array"
+        )));
+    }
+    let array = unsafe { value.cast::<Array<'_>>()? };
+    let mut values = Vec::with_capacity(array.len() as usize);
+    for index in 0..array.len() {
+        match array.get::<Unknown<'_>>(index)? {
+            Some(value) => values.push(parse_js_schema_literal(
+                value,
+                &format!("{context}[{index}]"),
+            )?),
+            None => values.push(PropValue::Null),
+        }
+    }
+    Ok(values)
+}
+
+fn parse_js_schema_literal(value: Unknown<'_>, context: &str) -> Result<PropValue> {
+    match value.get_type()? {
+        napi::ValueType::Null | napi::ValueType::Undefined => Ok(PropValue::Null),
+        napi::ValueType::Boolean => Ok(PropValue::Bool(unsafe { value.cast::<bool>()? })),
+        napi::ValueType::Number => {
+            let number = unsafe { value.cast::<f64>()? };
+            if !number.is_finite() {
+                return Err(napi::Error::from_reason(format!(
+                    "{context} number must be finite"
+                )));
+            }
+            if number.fract() == 0.0 && number.abs() <= MAX_SAFE_INTEGER {
+                Ok(PropValue::Int(number as i64))
+            } else {
+                Ok(PropValue::Float(number))
+            }
+        }
+        napi::ValueType::String => Ok(PropValue::String(parse_js_string_unknown(value, context)?)),
+        napi::ValueType::Object if value.is_array()? => {
+            let array = unsafe { value.cast::<Array<'_>>()? };
+            let mut values = Vec::with_capacity(array.len() as usize);
+            for index in 0..array.len() {
+                match array.get::<Unknown<'_>>(index)? {
+                    Some(value) => values.push(parse_js_schema_literal(
+                        value,
+                        &format!("{context}[{index}]"),
+                    )?),
+                    None => values.push(PropValue::Null),
+                }
+            }
+            Ok(PropValue::Array(values))
+        }
+        napi::ValueType::Object
+            if value.is_buffer()? || value.is_arraybuffer()? || value.is_typedarray()? =>
+        {
+            Err(napi::Error::from_reason(format!(
+                "{context} bytes literal must use {{ type: 'bytes', value }}"
+            )))
+        }
+        napi::ValueType::Object => parse_js_schema_literal_object(value, context),
+        _ => Err(napi::Error::from_reason(format!(
+            "{context} must be a schema literal value"
+        ))),
+    }
+}
+
+fn parse_js_schema_literal_object(value: Unknown<'_>, context: &str) -> Result<PropValue> {
+    let object = unsafe { value.cast::<Object<'_>>()? };
+    if let Some(type_value) = object.get::<Unknown<'_>>("type")? {
+        if type_value.get_type()? == napi::ValueType::String {
+            let marker = parse_js_string_unknown(type_value, &format!("{context} type"))?;
+            if matches!(marker.as_str(), "bytes" | "uint" | "map")
+                && js_object_has_exact_fields(&object, &["type", "value"])?
+            {
+                let value =
+                    parse_js_required_object_field(&object, "value", &format!("{context} value"))?;
+                return match marker.as_str() {
+                    "bytes" => Ok(PropValue::Bytes(parse_js_schema_bytes_value(
+                        value,
+                        &format!("{context} value"),
+                    )?)),
+                    "uint" => Ok(PropValue::UInt(parse_js_schema_uint_value(
+                        value,
+                        &format!("{context} value"),
+                    )?)),
+                    "map" => Ok(parse_js_schema_literal_raw_map(
+                        value,
+                        &format!("{context} value"),
+                    )?),
+                    _ => unreachable!("schema literal marker checked above"),
+                };
+            }
+        }
+    }
+    parse_js_schema_literal_map_object(&object, context)
+}
+
+fn parse_js_schema_literal_raw_map(value: Unknown<'_>, context: &str) -> Result<PropValue> {
+    let object = cast_js_plain_object(value, context)?;
+    parse_js_schema_literal_map_object(&object, context)
+}
+
+fn parse_js_schema_literal_map_object(object: &Object<'_>, context: &str) -> Result<PropValue> {
+    let keys = js_object_property_names_array(object)?;
+    let mut map = BTreeMap::new();
+    for index in 0..keys.len() {
+        let key = keys
+            .get::<JsString<'_>>(index)?
+            .ok_or_else(|| {
+                napi::Error::from_reason(format!("{context} map key {index} is missing"))
+            })?
+            .into_utf8()?
+            .into_owned()?;
+        let value = object
+            .get::<Unknown<'_>>(&key)?
+            .ok_or_else(|| napi::Error::from_reason(format!("{context}.{key} is missing")))?;
+        map.insert(
+            key.clone(),
+            parse_js_schema_literal(value, &format!("{context}.{key}"))?,
+        );
+    }
+    Ok(PropValue::Map(map))
+}
+
+fn parse_js_schema_bytes_value(value: Unknown<'_>, context: &str) -> Result<Vec<u8>> {
+    match value.get_type()? {
+        napi::ValueType::Object if value.is_buffer()? => {
+            let buffer = unsafe { value.cast::<BufferSlice<'_>>()? };
+            Ok(buffer.as_ref().to_vec())
+        }
+        napi::ValueType::Object if value.is_typedarray()? => {
+            let array = unsafe { value.cast::<Uint8ArraySlice<'_>>()? };
+            Ok(array.as_ref().to_vec())
+        }
+        napi::ValueType::Object if value.is_array()? => parse_js_byte_array_unknown(value, context),
+        _ => Err(napi::Error::from_reason(format!(
+            "{context} must be a number array, Uint8Array, or Buffer"
+        ))),
+    }
+}
+
+fn parse_js_schema_uint_value(value: Unknown<'_>, context: &str) -> Result<u64> {
+    match value.get_type()? {
+        napi::ValueType::Number => {
+            let number = unsafe { value.cast::<f64>()? };
+            f64_to_u64_for_context(number, context)
+        }
+        napi::ValueType::String => {
+            let string = parse_js_string_unknown(value, context)?;
+            parse_decimal_u64(&string, context)
+        }
+        _ => Err(napi::Error::from_reason(format!(
+            "{context} must be a number or decimal string"
+        ))),
+    }
+}
+
+fn parse_js_schema_additional_properties(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<CoreSchemaAdditionalProperties> {
+    match parse_js_string_unknown(value, context)?.as_str() {
+        "allow" => Ok(CoreSchemaAdditionalProperties::Allow),
+        "reject" => Ok(CoreSchemaAdditionalProperties::Reject),
+        other => Err(napi::Error::from_reason(format!(
+            "{context} must be 'allow' or 'reject', got '{other}'"
+        ))),
+    }
+}
+
+fn parse_js_schema_value_types(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<Vec<CoreSchemaValueType>> {
+    let strings = parse_js_string_array_unknown(value, context)?;
+    strings
+        .into_iter()
+        .map(|value| match value.as_str() {
+            "bool" => Ok(CoreSchemaValueType::Bool),
+            "int" => Ok(CoreSchemaValueType::Int),
+            "uint" => Ok(CoreSchemaValueType::UInt),
+            "float" => Ok(CoreSchemaValueType::Float),
+            "number" => Ok(CoreSchemaValueType::Number),
+            "string" => Ok(CoreSchemaValueType::String),
+            "bytes" => Ok(CoreSchemaValueType::Bytes),
+            "array" => Ok(CoreSchemaValueType::Array),
+            "map" => Ok(CoreSchemaValueType::Map),
+            other => Err(napi::Error::from_reason(format!(
+                "{context} contains invalid value type '{other}'"
+            ))),
+        })
+        .collect()
+}
+
+fn parse_js_schema_vector_presence(
+    value: Unknown<'_>,
+    context: &str,
+) -> Result<CoreSchemaVectorPresence> {
+    match parse_js_string_unknown(value, context)?.as_str() {
+        "optional" => Ok(CoreSchemaVectorPresence::Optional),
+        "required" => Ok(CoreSchemaVectorPresence::Required),
+        "forbidden" => Ok(CoreSchemaVectorPresence::Forbidden),
+        other => Err(napi::Error::from_reason(format!(
+            "{context} must be 'optional', 'required', or 'forbidden', got '{other}'"
+        ))),
+    }
+}
+
+fn cast_js_plain_object<'env>(value: Unknown<'env>, context: &str) -> Result<Object<'env>> {
+    match value.get_type()? {
+        napi::ValueType::Object
+            if !value.is_array()?
+                && !value.is_buffer()?
+                && !value.is_arraybuffer()?
+                && !value.is_typedarray()? =>
+        unsafe { value.cast::<Object<'env>>() },
+        _ => Err(napi::Error::from_reason(format!(
+            "{context} must be an object"
+        ))),
+    }
+}
+
+fn ensure_only_js_object_fields(
+    object: &Object<'_>,
+    allowed: &[&str],
+    context: &str,
+) -> Result<()> {
+    let keys = js_object_property_names_array(object)?;
+    for index in 0..keys.len() {
+        let key = keys
+            .get::<JsString<'_>>(index)?
+            .ok_or_else(|| napi::Error::from_reason(format!("{context} key {index} is missing")))?
+            .into_utf8()?
+            .into_owned()?;
+        if !allowed.iter().any(|allowed| *allowed == key) {
+            return Err(napi::Error::from_reason(format!(
+                "{context} does not accept field '{key}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn js_object_has_exact_fields(object: &Object<'_>, expected: &[&str]) -> Result<bool> {
+    let keys = js_object_property_names_array(object)?;
+    if keys.len() as usize != expected.len() {
+        return Ok(false);
+    }
+    for index in 0..keys.len() {
+        let key = keys
+            .get::<JsString<'_>>(index)?
+            .ok_or_else(|| napi::Error::from_reason(format!("object key {index} is missing")))?
+            .into_utf8()?
+            .into_owned()?;
+        if !expected.iter().any(|expected| *expected == key) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn parse_js_optional_object_field<'env>(
+    object: &Object<'env>,
+    key: &str,
+) -> Result<Option<Unknown<'env>>> {
+    if !object.has_own_property(key)? {
+        return Ok(None);
+    }
+    match object.get::<Unknown<'env>>(key)? {
+        Some(value) if !is_js_null_or_undefined(&value)? => Ok(Some(value)),
+        _ => Ok(None),
+    }
+}
+
+fn parse_js_required_object_field<'env>(
+    object: &Object<'env>,
+    key: &str,
+    context: &str,
+) -> Result<Unknown<'env>> {
+    match object.get::<Unknown<'env>>(key)? {
+        Some(value) if !is_js_null_or_undefined(&value)? => Ok(value),
+        _ => Err(napi::Error::from_reason(format!("{context} is required"))),
+    }
+}
+
+fn parse_js_optional_usize_field(
+    object: &Object<'_>,
+    key: &str,
+    context: &str,
+) -> Result<Option<usize>> {
+    parse_js_optional_object_field(object, key)?
+        .map(|value| parse_js_usize_unknown(value, context))
+        .transpose()
+}
+
+fn parse_js_optional_u32_field(
+    object: &Object<'_>,
+    key: &str,
+    context: &str,
+) -> Result<Option<u32>> {
+    parse_js_optional_object_field(object, key)?
+        .map(|value| {
+            let parsed = parse_js_u64_unknown(value, context)?;
+            u32::try_from(parsed)
+                .map_err(|_| napi::Error::from_reason(format!("{context} is too large")))
+        })
+        .transpose()
+}
+
+fn parse_js_optional_i64_object_field(
+    object: &Object<'_>,
+    key: &str,
+    context: &str,
+) -> Result<Option<i64>> {
+    parse_js_optional_object_field(object, key)?
+        .map(|value| parse_js_i64_unknown(value, context))
+        .transpose()
+}
+
+fn parse_js_optional_string_array_object_field(
+    object: &Object<'_>,
+    key: &str,
+    context: &str,
+) -> Result<Vec<String>> {
+    parse_js_optional_object_field(object, key)?
+        .map(|value| parse_js_string_array_unknown(value, context))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn parse_js_string_array_unknown(value: Unknown<'_>, context: &str) -> Result<Vec<String>> {
+    if !value.is_array()? {
+        return Err(napi::Error::from_reason(format!(
+            "{context} must be an array"
+        )));
+    }
+    let array = unsafe { value.cast::<Array<'_>>()? };
+    let mut values = Vec::with_capacity(array.len() as usize);
+    for index in 0..array.len() {
+        let value = array
+            .get::<Unknown<'_>>(index)?
+            .ok_or_else(|| napi::Error::from_reason(format!("{context}[{index}] is missing")))?;
+        values.push(parse_js_string_unknown(
+            value,
+            &format!("{context}[{index}]"),
+        )?);
+    }
+    Ok(values)
+}
+
+fn parse_js_byte_array_unknown(value: Unknown<'_>, context: &str) -> Result<Vec<u8>> {
+    if !value.is_array()? {
+        return Err(napi::Error::from_reason(format!(
+            "{context} must be an array"
+        )));
+    }
+    let array = unsafe { value.cast::<Array<'_>>()? };
+    let mut values = Vec::with_capacity(array.len() as usize);
+    for index in 0..array.len() {
+        let value = array
+            .get::<Unknown<'_>>(index)?
+            .ok_or_else(|| napi::Error::from_reason(format!("{context}[{index}] is missing")))?;
+        let parsed = parse_js_u64_unknown(value, &format!("{context}[{index}]"))?;
+        values.push(u8::try_from(parsed).map_err(|_| {
+            napi::Error::from_reason(format!("{context}[{index}] must be between 0 and 255"))
+        })?);
+    }
+    Ok(values)
+}
+
+fn parse_js_bool_unknown(value: Unknown<'_>, context: &str) -> Result<bool> {
+    if value.get_type()? != napi::ValueType::Boolean {
+        return Err(napi::Error::from_reason(format!(
+            "{context} must be a boolean"
+        )));
+    }
+    unsafe { value.cast::<bool>() }
+}
+
+fn parse_js_string_unknown(value: Unknown<'_>, context: &str) -> Result<String> {
+    if value.get_type()? != napi::ValueType::String {
+        return Err(napi::Error::from_reason(format!(
+            "{context} must be a string"
+        )));
+    }
+    unsafe { value.cast::<JsString<'_>>()?.into_utf8()?.into_owned() }
+}
+
+fn parse_js_usize_unknown(value: Unknown<'_>, context: &str) -> Result<usize> {
+    let number = parse_js_number_unknown(value, context)?;
+    f64_to_usize(number, context)
+}
+
+fn parse_js_u64_unknown(value: Unknown<'_>, context: &str) -> Result<u64> {
+    let number = parse_js_number_unknown(value, context)?;
+    f64_to_u64_for_context(number, context)
+}
+
+fn parse_js_i64_unknown(value: Unknown<'_>, context: &str) -> Result<i64> {
+    let number = parse_js_number_unknown(value, context)?;
+    if !number.is_finite()
+        || number.fract() != 0.0
+        || number < i64::MIN as f64
+        || number > i64::MAX as f64
+    {
+        return Err(napi::Error::from_reason(format!(
+            "{context} must be a finite integer"
+        )));
+    }
+    Ok(number as i64)
+}
+
+fn parse_js_number_unknown(value: Unknown<'_>, context: &str) -> Result<f64> {
+    if value.get_type()? != napi::ValueType::Number {
+        return Err(napi::Error::from_reason(format!(
+            "{context} must be a number"
+        )));
+    }
+    Ok(unsafe { value.cast::<f64>()? })
+}
+
+fn is_js_null_or_undefined(value: &Unknown<'_>) -> Result<bool> {
+    Ok(matches!(
+        value.get_type()?,
+        napi::ValueType::Null | napi::ValueType::Undefined
+    ))
+}
+
+fn f64_to_u64_for_context(value: f64, context: &str) -> Result<u64> {
+    if !(0.0..=MAX_SAFE_INTEGER).contains(&value) || value.fract() != 0.0 {
+        return Err(napi::Error::from_reason(format!(
+            "{context} must be a safe non-negative integer"
+        )));
+    }
+    Ok(value as u64)
+}
+
+fn parse_decimal_u64(value: &str, context: &str) -> Result<u64> {
+    if value.is_empty() || value.starts_with('+') || value.starts_with('-') {
+        return Err(napi::Error::from_reason(format!(
+            "{context} must be an unsigned decimal string"
+        )));
+    }
+    value.parse::<u64>().map_err(|_| {
+        napi::Error::from_reason(format!(
+            "{context} must be an unsigned decimal string in the u64 range"
+        ))
+    })
 }
 
 fn convert_js_props(

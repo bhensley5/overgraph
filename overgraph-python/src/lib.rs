@@ -6,40 +6,58 @@ use eg::{
     CompactionPhase, CompactionProgress as CoreCompactionProgress,
     CompactionStats as CoreCompactionStats, ComponentOptions,
     ComponentScrubFinding as CoreComponentScrubFinding, DatabaseEngine, DbOptions,
-    DbStats as CoreDbStats, DegreeOptions, DenseMetric, DenseVectorConfig, Direction,
-    EdgeFilterExpr, EdgeInput, EdgeLabelInfo as CoreEdgeLabelInfo,
-    EdgePropertyIndexInfo as CoreEdgePropertyIndexInfo, EdgeQuery, EdgeQueryOrder,
-    EdgeView as CoreEdgeView, EngineError, ExportOptions, FusionMode, GqlCapSummary, GqlEdge,
-    GqlExecutionCapSummary, GqlExecutionExplain, GqlExecutionMode, GqlExecutionOptions,
-    GqlExecutionResult, GqlExecutionStats, GqlExplain, GqlLoweringTarget, GqlNode, GqlParamValue,
-    GqlParams, GqlRowOperation, GqlStatementKind, GqlValue, GraphBinaryOp, GraphCapExplain,
-    GraphCaseBranch, GraphCursorExplain, GraphEdgePattern, GraphEdgeValue, GraphElementProjection,
-    GraphExecutionSummaries, GraphExplainNode, GraphExpr, GraphFunction, GraphNodeField,
-    GraphNodePattern, GraphNodeValue, GraphOrderDirection, GraphOrderExplain, GraphOrderItem,
-    GraphOutputMode, GraphOutputOptions, GraphPageRequest, GraphParamValue, GraphPatch,
-    GraphPathField, GraphPathValue, GraphPatternPiece, GraphPipelineCapExplain,
+    DbStats as CoreDbStats, DegreeOptions, DenseMetric, DenseVectorConfig,
+    DenseVectorSchema as CoreDenseVectorSchema, Direction, EdgeFilterExpr, EdgeInput,
+    EdgeLabelInfo as CoreEdgeLabelInfo, EdgePropertyIndexInfo as CoreEdgePropertyIndexInfo,
+    EdgeQuery, EdgeQueryOrder, EdgeSchema as CoreEdgeSchema, EdgeSchemaInfo as CoreEdgeSchemaInfo,
+    EdgeValiditySchema as CoreEdgeValiditySchema, EdgeView as CoreEdgeView,
+    EndpointLabelSchema as CoreEndpointLabelSchema, EngineError, ExportOptions, FusionMode,
+    GqlCapSummary, GqlEdge, GqlExecutionCapSummary, GqlExecutionExplain, GqlExecutionMode,
+    GqlExecutionOptions, GqlExecutionResult, GqlExecutionStats, GqlExplain, GqlLoweringTarget,
+    GqlNode, GqlParamValue, GqlParams, GqlRowOperation, GqlStatementKind, GqlValue, GraphBinaryOp,
+    GraphCapExplain, GraphCaseBranch, GraphCursorExplain, GraphEdgePattern, GraphEdgeValue,
+    GraphElementProjection, GraphExecutionSummaries, GraphExplainNode, GraphExpr, GraphFunction,
+    GraphNodeField, GraphNodePattern, GraphNodeValue, GraphOrderDirection, GraphOrderExplain,
+    GraphOrderItem, GraphOutputMode, GraphOutputOptions, GraphPageRequest, GraphParamValue,
+    GraphPatch, GraphPathField, GraphPathValue, GraphPatternPiece, GraphPipelineCapExplain,
     GraphPipelineExplain, GraphPipelineMatchStage, GraphPipelineOptions, GraphPipelineQuery,
     GraphPipelineResult, GraphPipelineStage, GraphPipelineStageExplain, GraphPipelineStats,
     GraphProjectItem, GraphProjectKind, GraphProjectStage, GraphProjectionExplain,
     GraphProjectionItems, GraphQueryOptions, GraphReturnItem, GraphReturnProjection,
     GraphRowExplain, GraphRowOperationExplain, GraphRowQuery, GraphRowResult, GraphRowStats,
+    GraphSchema as CoreGraphSchema, GraphSchemaCheckOptions as CoreGraphSchemaCheckOptions,
+    GraphSchemaCheckReport as CoreGraphSchemaCheckReport,
+    GraphSchemaDropAction as CoreGraphSchemaDropAction,
+    GraphSchemaDropTargetResult as CoreGraphSchemaDropTargetResult,
+    GraphSchemaOperation as CoreGraphSchemaOperation,
+    GraphSchemaOperationKind as CoreGraphSchemaOperationKind,
+    GraphSchemaPublishResult as CoreGraphSchemaPublishResult,
+    GraphSchemaSetOptions as CoreGraphSchemaSetOptions,
+    GraphSchemaValidationReportEntry as CoreGraphSchemaValidationReportEntry,
     GraphSelectedEdgeProjection, GraphSelectedNodeProjection, GraphSelectedPathProjection,
     GraphSelectedProjection, GraphShortestPathEndpoint, GraphShortestPathMode,
     GraphShortestPathStage, GraphSubqueryStage, GraphUnaryOp, GraphUnionStage, GraphValue,
     GraphVectorSelection, HnswConfig, IsConnectedOptions, LabelMatchMode,
     NeighborEntry as CoreNeighborEntry, NeighborOptions, NodeFilterExpr, NodeIdMap, NodeInput,
-    NodeKeyQuery, NodeLabelFilter, NodeLabelInfo as CoreNodeLabelInfo,
-    NodePropertyIndexInfo as CoreNodePropertyIndexInfo, NodeQuery, NodeQueryOrder,
-    NodeView as CoreNodeView, PageRequest, PprAlgorithm, PprOptions, PprResult as CorePprResult,
-    PropValue, PropertyRangeBound as CorePropertyRangeBound,
-    PropertyRangeCursor as CorePropertyRangeCursor, PropertyRangePageRequest,
-    PropertyRangePageResult as CorePropertyRangePageResult, PrunePolicy, PrunePolicyInfo,
+    NodeKeyQuery, NodeLabelConstraintSchema as CoreNodeLabelConstraintSchema, NodeLabelFilter,
+    NodeLabelInfo as CoreNodeLabelInfo, NodePropertyIndexInfo as CoreNodePropertyIndexInfo,
+    NodeQuery, NodeQueryOrder, NodeSchema as CoreNodeSchema, NodeSchemaInfo as CoreNodeSchemaInfo,
+    NodeView as CoreNodeView, NumericFieldSchema as CoreNumericFieldSchema, PageRequest,
+    PprAlgorithm, PprOptions, PprResult as CorePprResult, PropValue,
+    PropertyRangeBound as CorePropertyRangeBound, PropertyRangeCursor as CorePropertyRangeCursor,
+    PropertyRangePageRequest, PropertyRangePageResult as CorePropertyRangePageResult,
+    PropertySchema as CorePropertySchema, PrunePolicy, PrunePolicyInfo,
     PruneResult as CorePruneResult, QueryPlan, QueryPlanKind, QueryPlanNode, QueryPlanNote,
-    QueryPlanPublicInputs, QueryPlanPublicName, QueryPlanWarning, ScoringMode,
+    QueryPlanPublicInputs, QueryPlanPublicName, QueryPlanWarning, SchemaAdditionalProperties,
+    SchemaCheckOptions, SchemaNumericBound as CoreSchemaNumericBound, SchemaSetOptions,
+    SchemaTargetKind as CoreSchemaTargetKind, SchemaValidationReport as CoreSchemaValidationReport,
+    SchemaValueType, SchemaVectorPresence, SchemaViolation as CoreSchemaViolation,
+    SchemaViolationTarget as CoreSchemaViolationTarget, ScoringMode,
     ScrubReport as CoreScrubReport, SecondaryIndexKind, SecondaryIndexState,
     SegmentScrubResult as CoreSegmentScrubResult, ShortestPath as CoreShortestPath,
-    ShortestPathOptions, Subgraph as CoreSubgraph, SubgraphOptions, TopKOptions,
-    TraversalCursor as CoreTraversalCursor, TraversalHit as CoreTraversalHit,
+    ShortestPathOptions, SparseVectorSchema as CoreSparseVectorSchema,
+    StringFieldSchema as CoreStringFieldSchema, Subgraph as CoreSubgraph, SubgraphOptions,
+    TopKOptions, TraversalCursor as CoreTraversalCursor, TraversalHit as CoreTraversalHit,
     TraversalPageResult as CoreTraversalPageResult, TraverseOptions,
     TxnCommitResult as CoreTxnCommitResult, TxnEdgeRef, TxnEdgeView, TxnIntent, TxnLocalRef,
     TxnNodeRef, TxnNodeView, UpsertEdgeOptions, UpsertNodeOptions, VectorSearchMode,
@@ -47,7 +65,9 @@ use eg::{
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyList, PyString, PyStringMethods, PyTuple};
+use pyo3::types::{
+    PyAny, PyBool, PyByteArray, PyBytes, PyDict, PyList, PyString, PyStringMethods, PyTuple,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -212,6 +232,234 @@ impl OverGraph {
                 .into_iter()
                 .map(EdgeLabelInfo::from)
                 .collect())
+        })
+    }
+
+    // --- Schemas ---
+
+    #[pyo3(signature = (label, schema, *, max_violations=1, chunk_size=4096, scan_limit=None))]
+    fn set_node_schema(
+        &self,
+        py: Python<'_>,
+        label: String,
+        schema: &Bound<'_, PyDict>,
+        max_violations: usize,
+        chunk_size: usize,
+        scan_limit: Option<u64>,
+    ) -> PyResult<NodeSchemaInfo> {
+        let schema = parse_py_node_schema(py, schema)?;
+        let options = SchemaSetOptions {
+            max_violations,
+            chunk_size,
+            scan_limit,
+        };
+        with_engine(self, py, move |eng| {
+            Ok(NodeSchemaInfo::from(
+                eng.set_node_schema_with_options(&label, schema, options)?,
+            ))
+        })
+    }
+
+    #[pyo3(signature = (label, schema, *, max_violations=100, chunk_size=4096, scan_limit=None))]
+    fn check_node_schema(
+        &self,
+        py: Python<'_>,
+        label: String,
+        schema: &Bound<'_, PyDict>,
+        max_violations: usize,
+        chunk_size: usize,
+        scan_limit: Option<u64>,
+    ) -> PyResult<SchemaValidationReport> {
+        let schema = parse_py_node_schema(py, schema)?;
+        let options = SchemaCheckOptions {
+            max_violations,
+            chunk_size,
+            scan_limit,
+        };
+        with_engine_ref(self, py, move |eng| {
+            Ok(SchemaValidationReport::from(
+                eng.check_node_schema(&label, schema, options)?,
+            ))
+        })
+    }
+
+    fn drop_node_schema(&self, py: Python<'_>, label: String) -> PyResult<bool> {
+        with_engine(self, py, move |eng| eng.drop_node_schema(&label))
+    }
+
+    fn get_node_schema(&self, py: Python<'_>, label: String) -> PyResult<Option<NodeSchemaInfo>> {
+        with_engine_ref(self, py, move |eng| {
+            Ok(eng.get_node_schema(&label)?.map(NodeSchemaInfo::from))
+        })
+    }
+
+    fn list_node_schemas(&self, py: Python<'_>) -> PyResult<Vec<NodeSchemaInfo>> {
+        with_engine_ref(self, py, |eng| {
+            Ok(eng
+                .list_node_schemas()?
+                .into_iter()
+                .map(NodeSchemaInfo::from)
+                .collect())
+        })
+    }
+
+    #[pyo3(signature = (label, schema, *, max_violations=1, chunk_size=4096, scan_limit=None))]
+    fn set_edge_schema(
+        &self,
+        py: Python<'_>,
+        label: String,
+        schema: &Bound<'_, PyDict>,
+        max_violations: usize,
+        chunk_size: usize,
+        scan_limit: Option<u64>,
+    ) -> PyResult<EdgeSchemaInfo> {
+        let schema = parse_py_edge_schema(py, schema)?;
+        let options = SchemaSetOptions {
+            max_violations,
+            chunk_size,
+            scan_limit,
+        };
+        with_engine(self, py, move |eng| {
+            Ok(EdgeSchemaInfo::from(
+                eng.set_edge_schema_with_options(&label, schema, options)?,
+            ))
+        })
+    }
+
+    #[pyo3(signature = (label, schema, *, max_violations=100, chunk_size=4096, scan_limit=None))]
+    fn check_edge_schema(
+        &self,
+        py: Python<'_>,
+        label: String,
+        schema: &Bound<'_, PyDict>,
+        max_violations: usize,
+        chunk_size: usize,
+        scan_limit: Option<u64>,
+    ) -> PyResult<SchemaValidationReport> {
+        let schema = parse_py_edge_schema(py, schema)?;
+        let options = SchemaCheckOptions {
+            max_violations,
+            chunk_size,
+            scan_limit,
+        };
+        with_engine_ref(self, py, move |eng| {
+            Ok(SchemaValidationReport::from(
+                eng.check_edge_schema(&label, schema, options)?,
+            ))
+        })
+    }
+
+    fn drop_edge_schema(&self, py: Python<'_>, label: String) -> PyResult<bool> {
+        with_engine(self, py, move |eng| eng.drop_edge_schema(&label))
+    }
+
+    fn get_edge_schema(&self, py: Python<'_>, label: String) -> PyResult<Option<EdgeSchemaInfo>> {
+        with_engine_ref(self, py, move |eng| {
+            Ok(eng.get_edge_schema(&label)?.map(EdgeSchemaInfo::from))
+        })
+    }
+
+    fn list_edge_schemas(&self, py: Python<'_>) -> PyResult<Vec<EdgeSchemaInfo>> {
+        with_engine_ref(self, py, |eng| {
+            Ok(eng
+                .list_edge_schemas()?
+                .into_iter()
+                .map(EdgeSchemaInfo::from)
+                .collect())
+        })
+    }
+
+    #[pyo3(signature = (schema, *, max_violations=1, chunk_size=4096, scan_limit=None))]
+    fn set_graph_schema(
+        &self,
+        py: Python<'_>,
+        schema: &Bound<'_, PyDict>,
+        max_violations: usize,
+        chunk_size: usize,
+        scan_limit: Option<u64>,
+    ) -> PyResult<GraphSchemaPublishResult> {
+        let schema = parse_py_graph_schema(py, schema)?;
+        let options = CoreGraphSchemaSetOptions {
+            max_violations,
+            chunk_size,
+            scan_limit,
+        };
+        with_engine(self, py, move |eng| {
+            Ok(GraphSchemaPublishResult::from(
+                eng.set_graph_schema(schema, options)?,
+            ))
+        })
+    }
+
+    #[pyo3(signature = (operations, *, max_violations=1, chunk_size=4096, scan_limit=None))]
+    fn alter_graph_schema(
+        &self,
+        py: Python<'_>,
+        operations: &Bound<'_, PyAny>,
+        max_violations: usize,
+        chunk_size: usize,
+        scan_limit: Option<u64>,
+    ) -> PyResult<GraphSchemaPublishResult> {
+        let operations = parse_py_graph_schema_operations(py, operations)?;
+        let options = CoreGraphSchemaSetOptions {
+            max_violations,
+            chunk_size,
+            scan_limit,
+        };
+        with_engine(self, py, move |eng| {
+            Ok(GraphSchemaPublishResult::from(
+                eng.alter_graph_schema(operations, options)?,
+            ))
+        })
+    }
+
+    #[pyo3(signature = (schema, *, max_violations=100, chunk_size=4096, scan_limit=None))]
+    fn check_graph_schema_set(
+        &self,
+        py: Python<'_>,
+        schema: &Bound<'_, PyDict>,
+        max_violations: usize,
+        chunk_size: usize,
+        scan_limit: Option<u64>,
+    ) -> PyResult<GraphSchemaCheckReport> {
+        let schema = parse_py_graph_schema(py, schema)?;
+        let options = CoreGraphSchemaCheckOptions {
+            max_violations,
+            chunk_size,
+            scan_limit,
+        };
+        with_engine_ref(self, py, move |eng| {
+            Ok(GraphSchemaCheckReport::from(
+                eng.check_graph_schema_set(schema, options)?,
+            ))
+        })
+    }
+
+    #[pyo3(signature = (schema, *, max_violations=100, chunk_size=4096, scan_limit=None))]
+    fn check_graph_schema_add(
+        &self,
+        py: Python<'_>,
+        schema: &Bound<'_, PyDict>,
+        max_violations: usize,
+        chunk_size: usize,
+        scan_limit: Option<u64>,
+    ) -> PyResult<GraphSchemaCheckReport> {
+        let schema = parse_py_graph_schema(py, schema)?;
+        let options = CoreGraphSchemaCheckOptions {
+            max_violations,
+            chunk_size,
+            scan_limit,
+        };
+        with_engine_ref(self, py, move |eng| {
+            Ok(GraphSchemaCheckReport::from(
+                eng.check_graph_schema_add(schema, options)?,
+            ))
+        })
+    }
+
+    fn drop_graph_schema(&self, py: Python<'_>) -> PyResult<GraphSchemaPublishResult> {
+        with_engine(self, py, move |eng| {
+            Ok(GraphSchemaPublishResult::from(eng.drop_graph_schema()?))
         })
     }
 
@@ -2487,6 +2735,330 @@ impl EdgePropertyIndexInfo {
 
 #[pyclass]
 #[derive(Clone)]
+pub struct NodeSchemaInfo {
+    #[pyo3(get)]
+    pub label: String,
+    schema_internal: CoreNodeSchema,
+}
+
+impl From<CoreNodeSchemaInfo> for NodeSchemaInfo {
+    fn from(info: CoreNodeSchemaInfo) -> Self {
+        NodeSchemaInfo {
+            label: info.label,
+            schema_internal: info.schema,
+        }
+    }
+}
+
+#[pymethods]
+impl NodeSchemaInfo {
+    #[getter]
+    fn schema(&self, py: Python<'_>) -> PyResult<PyObject> {
+        node_schema_to_py(py, &self.schema_internal)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("NodeSchemaInfo(label='{}')", self.label)
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct EdgeSchemaInfo {
+    #[pyo3(get)]
+    pub label: String,
+    schema_internal: CoreEdgeSchema,
+}
+
+impl From<CoreEdgeSchemaInfo> for EdgeSchemaInfo {
+    fn from(info: CoreEdgeSchemaInfo) -> Self {
+        EdgeSchemaInfo {
+            label: info.label,
+            schema_internal: info.schema,
+        }
+    }
+}
+
+#[pymethods]
+impl EdgeSchemaInfo {
+    #[getter]
+    fn schema(&self, py: Python<'_>) -> PyResult<PyObject> {
+        edge_schema_to_py(py, &self.schema_internal)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("EdgeSchemaInfo(label='{}')", self.label)
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct SchemaValidationReport {
+    #[pyo3(get)]
+    pub checked_records: u64,
+    #[pyo3(get)]
+    pub violation_count: u64,
+    #[pyo3(get)]
+    pub truncated: bool,
+    #[pyo3(get)]
+    pub scan_limit_hit: bool,
+    violations_internal: Vec<SchemaViolation>,
+}
+
+impl From<CoreSchemaValidationReport> for SchemaValidationReport {
+    fn from(report: CoreSchemaValidationReport) -> Self {
+        SchemaValidationReport {
+            checked_records: report.checked_records,
+            violation_count: report.violation_count,
+            truncated: report.truncated,
+            scan_limit_hit: report.scan_limit_hit,
+            violations_internal: report
+                .violations
+                .into_iter()
+                .map(SchemaViolation::from)
+                .collect(),
+        }
+    }
+}
+
+#[pymethods]
+impl SchemaValidationReport {
+    #[getter]
+    fn violations(&self) -> Vec<SchemaViolation> {
+        self.violations_internal.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SchemaValidationReport(checked_records={}, violation_count={}, truncated={}, scan_limit_hit={})",
+            self.checked_records, self.violation_count, self.truncated, self.scan_limit_hit
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct GraphSchemaValidationReportEntry {
+    #[pyo3(get)]
+    pub target_kind: String,
+    #[pyo3(get)]
+    pub label: String,
+    #[pyo3(get)]
+    pub report: SchemaValidationReport,
+}
+
+impl From<CoreGraphSchemaValidationReportEntry> for GraphSchemaValidationReportEntry {
+    fn from(entry: CoreGraphSchemaValidationReportEntry) -> Self {
+        GraphSchemaValidationReportEntry {
+            target_kind: schema_target_kind_to_py(entry.target_kind).to_string(),
+            label: entry.label,
+            report: SchemaValidationReport::from(entry.report),
+        }
+    }
+}
+
+#[pymethods]
+impl GraphSchemaValidationReportEntry {
+    fn __repr__(&self) -> String {
+        format!(
+            "GraphSchemaValidationReportEntry(target_kind='{}', label='{}')",
+            self.target_kind, self.label
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct GraphSchemaCheckReport {
+    #[pyo3(get)]
+    pub operation: String,
+    #[pyo3(get)]
+    pub checked_records: u64,
+    #[pyo3(get)]
+    pub violation_count: u64,
+    #[pyo3(get)]
+    pub truncated: bool,
+    #[pyo3(get)]
+    pub scan_limit_hit: bool,
+    entries_internal: Vec<GraphSchemaValidationReportEntry>,
+}
+
+impl From<CoreGraphSchemaCheckReport> for GraphSchemaCheckReport {
+    fn from(report: CoreGraphSchemaCheckReport) -> Self {
+        GraphSchemaCheckReport {
+            operation: graph_schema_operation_kind_to_py(report.operation).to_string(),
+            checked_records: report.checked_records,
+            violation_count: report.violation_count,
+            truncated: report.truncated,
+            scan_limit_hit: report.scan_limit_hit,
+            entries_internal: report
+                .entries
+                .into_iter()
+                .map(GraphSchemaValidationReportEntry::from)
+                .collect(),
+        }
+    }
+}
+
+#[pymethods]
+impl GraphSchemaCheckReport {
+    #[getter]
+    fn entries(&self) -> Vec<GraphSchemaValidationReportEntry> {
+        self.entries_internal.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "GraphSchemaCheckReport(operation='{}', entries={}, checked_records={}, violation_count={})",
+            self.operation,
+            self.entries_internal.len(),
+            self.checked_records,
+            self.violation_count
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct GraphSchemaDropTargetResult {
+    #[pyo3(get)]
+    pub target_kind: String,
+    #[pyo3(get)]
+    pub label: String,
+    #[pyo3(get)]
+    pub action: String,
+}
+
+impl From<CoreGraphSchemaDropTargetResult> for GraphSchemaDropTargetResult {
+    fn from(target: CoreGraphSchemaDropTargetResult) -> Self {
+        GraphSchemaDropTargetResult {
+            target_kind: schema_target_kind_to_py(target.target_kind).to_string(),
+            label: target.label,
+            action: graph_schema_drop_action_to_py(target.action).to_string(),
+        }
+    }
+}
+
+#[pymethods]
+impl GraphSchemaDropTargetResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "GraphSchemaDropTargetResult(target_kind='{}', label='{}', action='{}')",
+            self.target_kind, self.label, self.action
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct GraphSchemaPublishResult {
+    #[pyo3(get)]
+    pub operation: String,
+    #[pyo3(get)]
+    pub validation: GraphSchemaCheckReport,
+    #[pyo3(get)]
+    pub targets_published: u64,
+    #[pyo3(get)]
+    pub targets_dropped: u64,
+    #[pyo3(get)]
+    pub node_schemas_dropped: u64,
+    #[pyo3(get)]
+    pub edge_schemas_dropped: u64,
+    node_schemas_internal: Vec<NodeSchemaInfo>,
+    edge_schemas_internal: Vec<EdgeSchemaInfo>,
+    drop_targets_internal: Vec<GraphSchemaDropTargetResult>,
+}
+
+impl From<CoreGraphSchemaPublishResult> for GraphSchemaPublishResult {
+    fn from(result: CoreGraphSchemaPublishResult) -> Self {
+        GraphSchemaPublishResult {
+            operation: graph_schema_operation_kind_to_py(result.operation).to_string(),
+            node_schemas_internal: result
+                .node_schemas
+                .into_iter()
+                .map(NodeSchemaInfo::from)
+                .collect(),
+            edge_schemas_internal: result
+                .edge_schemas
+                .into_iter()
+                .map(EdgeSchemaInfo::from)
+                .collect(),
+            validation: GraphSchemaCheckReport::from(result.validation),
+            targets_published: result.targets_published as u64,
+            targets_dropped: result.targets_dropped as u64,
+            drop_targets_internal: result
+                .drop_targets
+                .into_iter()
+                .map(GraphSchemaDropTargetResult::from)
+                .collect(),
+            node_schemas_dropped: result.node_schemas_dropped as u64,
+            edge_schemas_dropped: result.edge_schemas_dropped as u64,
+        }
+    }
+}
+
+#[pymethods]
+impl GraphSchemaPublishResult {
+    #[getter]
+    fn node_schemas(&self) -> Vec<NodeSchemaInfo> {
+        self.node_schemas_internal.clone()
+    }
+
+    #[getter]
+    fn edge_schemas(&self) -> Vec<EdgeSchemaInfo> {
+        self.edge_schemas_internal.clone()
+    }
+
+    #[getter]
+    fn drop_targets(&self) -> Vec<GraphSchemaDropTargetResult> {
+        self.drop_targets_internal.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "GraphSchemaPublishResult(operation='{}', targets_published={}, targets_dropped={})",
+            self.operation, self.targets_published, self.targets_dropped
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct SchemaViolation {
+    target_internal: CoreSchemaViolationTarget,
+    #[pyo3(get)]
+    pub path: String,
+    #[pyo3(get)]
+    pub message: String,
+}
+
+impl From<CoreSchemaViolation> for SchemaViolation {
+    fn from(violation: CoreSchemaViolation) -> Self {
+        SchemaViolation {
+            target_internal: violation.target,
+            path: violation.path,
+            message: violation.message,
+        }
+    }
+}
+
+#[pymethods]
+impl SchemaViolation {
+    #[getter]
+    fn target(&self, py: Python<'_>) -> PyResult<PyObject> {
+        schema_violation_target_to_py(py, &self.target_internal)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SchemaViolation(path='{}', message='{}')",
+            self.path, self.message
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
 pub struct PropertyRangeBound {
     value_internal: PropValue,
     #[pyo3(get)]
@@ -3373,6 +3945,1092 @@ impl AdjacencyExport {
 // Property conversion: Python <-> Rust PropValue
 // ============================================================
 
+fn parse_py_graph_schema(py: Python<'_>, dict: &Bound<'_, PyDict>) -> PyResult<CoreGraphSchema> {
+    ensure_only_py_fields(dict, &["node_schemas", "edge_schemas"], "graph schema")?;
+    Ok(CoreGraphSchema {
+        node_schemas: match py_non_none_item(dict, "node_schemas")? {
+            Some(value) => parse_py_node_schema_infos(py, &value, "graph schema node_schemas")?,
+            None => Vec::new(),
+        },
+        edge_schemas: match py_non_none_item(dict, "edge_schemas")? {
+            Some(value) => parse_py_edge_schema_infos(py, &value, "graph schema edge_schemas")?,
+            None => Vec::new(),
+        },
+    })
+}
+
+fn parse_py_node_schema_infos(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    context: &str,
+) -> PyResult<Vec<CoreNodeSchemaInfo>> {
+    if let Ok(list) = value.downcast::<PyList>() {
+        let mut infos = Vec::with_capacity(list.len());
+        for (index, item) in list.iter().enumerate() {
+            infos.push(parse_py_node_schema_info(
+                py,
+                &item,
+                &format!("{context}[{index}]"),
+            )?);
+        }
+        return Ok(infos);
+    }
+    if let Ok(tuple) = value.downcast::<PyTuple>() {
+        let mut infos = Vec::with_capacity(tuple.len());
+        for (index, item) in tuple.iter().enumerate() {
+            infos.push(parse_py_node_schema_info(
+                py,
+                &item,
+                &format!("{context}[{index}]"),
+            )?);
+        }
+        return Ok(infos);
+    }
+    Err(PyTypeError::new_err(format!(
+        "{context} must be a list or tuple"
+    )))
+}
+
+fn parse_py_node_schema_info(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    context: &str,
+) -> PyResult<CoreNodeSchemaInfo> {
+    let dict = value.downcast::<PyDict>().map_err(|_| {
+        PyTypeError::new_err(format!("{context} must be a mapping with label and schema"))
+    })?;
+    ensure_only_py_fields(dict, &["label", "schema"], context)?;
+    let label: String = py_required_extract(dict, "label")?;
+    let schema_value = py_non_none_item(dict, "schema")?
+        .ok_or_else(|| PyValueError::new_err(format!("{context} schema is required")))?;
+    let schema = parse_py_node_schema(
+        py,
+        schema_value
+            .downcast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err(format!("{context} schema must be a mapping")))?,
+    )?;
+    Ok(CoreNodeSchemaInfo { label, schema })
+}
+
+fn parse_py_edge_schema_infos(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    context: &str,
+) -> PyResult<Vec<CoreEdgeSchemaInfo>> {
+    if let Ok(list) = value.downcast::<PyList>() {
+        let mut infos = Vec::with_capacity(list.len());
+        for (index, item) in list.iter().enumerate() {
+            infos.push(parse_py_edge_schema_info(
+                py,
+                &item,
+                &format!("{context}[{index}]"),
+            )?);
+        }
+        return Ok(infos);
+    }
+    if let Ok(tuple) = value.downcast::<PyTuple>() {
+        let mut infos = Vec::with_capacity(tuple.len());
+        for (index, item) in tuple.iter().enumerate() {
+            infos.push(parse_py_edge_schema_info(
+                py,
+                &item,
+                &format!("{context}[{index}]"),
+            )?);
+        }
+        return Ok(infos);
+    }
+    Err(PyTypeError::new_err(format!(
+        "{context} must be a list or tuple"
+    )))
+}
+
+fn parse_py_edge_schema_info(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    context: &str,
+) -> PyResult<CoreEdgeSchemaInfo> {
+    let dict = value.downcast::<PyDict>().map_err(|_| {
+        PyTypeError::new_err(format!("{context} must be a mapping with label and schema"))
+    })?;
+    ensure_only_py_fields(dict, &["label", "schema"], context)?;
+    let label: String = py_required_extract(dict, "label")?;
+    let schema_value = py_non_none_item(dict, "schema")?
+        .ok_or_else(|| PyValueError::new_err(format!("{context} schema is required")))?;
+    let schema = parse_py_edge_schema(
+        py,
+        schema_value
+            .downcast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err(format!("{context} schema must be a mapping")))?,
+    )?;
+    Ok(CoreEdgeSchemaInfo { label, schema })
+}
+
+fn parse_py_graph_schema_operations(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<Vec<CoreGraphSchemaOperation>> {
+    if let Ok(list) = value.downcast::<PyList>() {
+        let mut operations = Vec::with_capacity(list.len());
+        for (index, item) in list.iter().enumerate() {
+            operations.push(parse_py_graph_schema_operation(
+                py,
+                &item,
+                &format!("graph schema operations[{index}]"),
+            )?);
+        }
+        return Ok(operations);
+    }
+    if let Ok(tuple) = value.downcast::<PyTuple>() {
+        let mut operations = Vec::with_capacity(tuple.len());
+        for (index, item) in tuple.iter().enumerate() {
+            operations.push(parse_py_graph_schema_operation(
+                py,
+                &item,
+                &format!("graph schema operations[{index}]"),
+            )?);
+        }
+        return Ok(operations);
+    }
+    Err(PyTypeError::new_err(
+        "graph schema operations must be a list or tuple",
+    ))
+}
+
+fn parse_py_graph_schema_operation(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    context: &str,
+) -> PyResult<CoreGraphSchemaOperation> {
+    let dict = value
+        .downcast::<PyDict>()
+        .map_err(|_| PyTypeError::new_err(format!("{context} must be a mapping")))?;
+    ensure_only_py_fields(dict, &["kind", "label", "schema"], context)?;
+    let kind: String = py_required_extract(dict, "kind")?;
+    let label: String = py_required_extract(dict, "label")?;
+    match kind.as_str() {
+        "set_node" => {
+            let schema_value = py_non_none_item(dict, "schema")?
+                .ok_or_else(|| PyValueError::new_err(format!("{context} schema is required")))?;
+            let schema = parse_py_node_schema(
+                py,
+                schema_value.downcast::<PyDict>().map_err(|_| {
+                    PyTypeError::new_err(format!("{context} schema must be a mapping"))
+                })?,
+            )?;
+            Ok(CoreGraphSchemaOperation::SetNode { label, schema })
+        }
+        "set_edge" => {
+            let schema_value = py_non_none_item(dict, "schema")?
+                .ok_or_else(|| PyValueError::new_err(format!("{context} schema is required")))?;
+            let schema = parse_py_edge_schema(
+                py,
+                schema_value.downcast::<PyDict>().map_err(|_| {
+                    PyTypeError::new_err(format!("{context} schema must be a mapping"))
+                })?,
+            )?;
+            Ok(CoreGraphSchemaOperation::SetEdge { label, schema })
+        }
+        "drop_node" => {
+            reject_py_graph_schema_operation_schema(dict, context)?;
+            Ok(CoreGraphSchemaOperation::DropNode { label })
+        }
+        "drop_edge" => {
+            reject_py_graph_schema_operation_schema(dict, context)?;
+            Ok(CoreGraphSchemaOperation::DropEdge { label })
+        }
+        other => Err(PyValueError::new_err(format!(
+            "{context} kind must be set_node, set_edge, drop_node, or drop_edge, got '{other}'"
+        ))),
+    }
+}
+
+fn reject_py_graph_schema_operation_schema(
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<()> {
+    if py_non_none_item(dict, "schema")?.is_some() {
+        return Err(PyValueError::new_err(format!(
+            "{context} schema is only accepted for set_node and set_edge operations"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_py_node_schema(py: Python<'_>, dict: &Bound<'_, PyDict>) -> PyResult<CoreNodeSchema> {
+    ensure_only_py_fields(
+        dict,
+        &[
+            "additional_properties",
+            "properties",
+            "key",
+            "label_constraints",
+            "weight",
+            "dense_vector",
+            "sparse_vector",
+        ],
+        "node schema",
+    )?;
+    Ok(CoreNodeSchema {
+        additional_properties: parse_py_additional_properties(
+            py_optional_extract::<String>(dict, "additional_properties")?
+                .as_deref()
+                .unwrap_or("allow"),
+        )?,
+        properties: parse_py_schema_properties(py, dict, "node schema")?,
+        key: parse_optional_py_schema_dict(dict, "key", "node schema key", |value| {
+            parse_py_string_field_schema(value, "node schema key")
+        })?,
+        label_constraints: parse_optional_py_schema_dict(
+            dict,
+            "label_constraints",
+            "node schema label_constraints",
+            |value| parse_py_node_label_constraints(value, "node schema label_constraints"),
+        )?,
+        weight: parse_optional_py_schema_dict(dict, "weight", "node schema weight", |value| {
+            parse_py_numeric_field_schema(py, value, "node schema weight")
+        })?,
+        dense_vector: parse_optional_py_schema_dict(
+            dict,
+            "dense_vector",
+            "node schema dense_vector",
+            |value| parse_py_dense_vector_schema(value, "node schema dense_vector"),
+        )?,
+        sparse_vector: parse_optional_py_schema_dict(
+            dict,
+            "sparse_vector",
+            "node schema sparse_vector",
+            |value| parse_py_sparse_vector_schema(value, "node schema sparse_vector"),
+        )?,
+    })
+}
+
+fn parse_py_edge_schema(py: Python<'_>, dict: &Bound<'_, PyDict>) -> PyResult<CoreEdgeSchema> {
+    ensure_only_py_fields(
+        dict,
+        &[
+            "additional_properties",
+            "properties",
+            "from",
+            "to",
+            "allow_self_loops",
+            "weight",
+            "validity",
+        ],
+        "edge schema",
+    )?;
+    Ok(CoreEdgeSchema {
+        additional_properties: parse_py_additional_properties(
+            py_optional_extract::<String>(dict, "additional_properties")?
+                .as_deref()
+                .unwrap_or("allow"),
+        )?,
+        properties: parse_py_schema_properties(py, dict, "edge schema")?,
+        from: parse_optional_py_schema_dict(dict, "from", "edge schema from", |value| {
+            parse_py_endpoint_label_schema(value, "edge schema from")
+        })?,
+        to: parse_optional_py_schema_dict(dict, "to", "edge schema to", |value| {
+            parse_py_endpoint_label_schema(value, "edge schema to")
+        })?,
+        allow_self_loops: py_optional_extract::<bool>(dict, "allow_self_loops")?.unwrap_or(true),
+        weight: parse_optional_py_schema_dict(dict, "weight", "edge schema weight", |value| {
+            parse_py_numeric_field_schema(py, value, "edge schema weight")
+        })?,
+        validity: parse_optional_py_schema_dict(
+            dict,
+            "validity",
+            "edge schema validity",
+            |value| parse_py_edge_validity_schema(value, "edge schema validity"),
+        )?,
+    })
+}
+
+fn parse_py_schema_properties(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<BTreeMap<String, CorePropertySchema>> {
+    let Some(value) = py_non_none_item(dict, "properties")? else {
+        return Ok(BTreeMap::new());
+    };
+    let props = value.downcast::<PyDict>().map_err(|_| {
+        PyTypeError::new_err(format!(
+            "{context} properties must be a mapping of property schemas"
+        ))
+    })?;
+    let mut parsed = BTreeMap::new();
+    for (key, value) in props.iter() {
+        let prop_key: String = key.extract()?;
+        let schema = value.downcast::<PyDict>().map_err(|_| {
+            PyTypeError::new_err(format!(
+                "{context} properties['{prop_key}'] must be a mapping"
+            ))
+        })?;
+        parsed.insert(
+            prop_key.clone(),
+            parse_py_property_schema(py, schema, &format!("{context} properties['{prop_key}']"))?,
+        );
+    }
+    Ok(parsed)
+}
+
+fn parse_py_property_schema(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<CorePropertySchema> {
+    ensure_only_py_fields(
+        dict,
+        &[
+            "required",
+            "nullable",
+            "types",
+            "numeric_min",
+            "numeric_max",
+            "string_min_bytes",
+            "string_max_bytes",
+            "bytes_min_len",
+            "bytes_max_len",
+            "array_min_items",
+            "array_max_items",
+            "map_min_entries",
+            "map_max_entries",
+            "enum_values",
+        ],
+        context,
+    )?;
+    let enum_values = match py_non_none_item(dict, "enum_values")? {
+        Some(value) => {
+            let values = value.downcast::<PyList>().map_err(|_| {
+                PyTypeError::new_err(format!("{context} enum_values must be a list"))
+            })?;
+            values
+                .iter()
+                .map(|item| py_to_schema_literal_value(py, &item))
+                .collect::<PyResult<Vec<_>>>()?
+        }
+        None => Vec::new(),
+    };
+    Ok(CorePropertySchema {
+        required: py_optional_extract::<bool>(dict, "required")?.unwrap_or(false),
+        nullable: py_optional_extract::<bool>(dict, "nullable")?.unwrap_or(true),
+        types: parse_py_schema_value_types(dict, "types", context)?,
+        numeric_min: parse_optional_py_schema_dict(
+            dict,
+            "numeric_min",
+            &format!("{context} numeric_min"),
+            |value| parse_py_schema_numeric_bound(py, value, &format!("{context} numeric_min")),
+        )?,
+        numeric_max: parse_optional_py_schema_dict(
+            dict,
+            "numeric_max",
+            &format!("{context} numeric_max"),
+            |value| parse_py_schema_numeric_bound(py, value, &format!("{context} numeric_max")),
+        )?,
+        string_min_bytes: py_optional_extract(dict, "string_min_bytes")?,
+        string_max_bytes: py_optional_extract(dict, "string_max_bytes")?,
+        bytes_min_len: py_optional_extract(dict, "bytes_min_len")?,
+        bytes_max_len: py_optional_extract(dict, "bytes_max_len")?,
+        array_min_items: py_optional_extract(dict, "array_min_items")?,
+        array_max_items: py_optional_extract(dict, "array_max_items")?,
+        map_min_entries: py_optional_extract(dict, "map_min_entries")?,
+        map_max_entries: py_optional_extract(dict, "map_max_entries")?,
+        enum_values,
+    })
+}
+
+fn parse_py_string_field_schema(
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<CoreStringFieldSchema> {
+    ensure_only_py_fields(dict, &["min_bytes", "max_bytes", "enum_values"], context)?;
+    Ok(CoreStringFieldSchema {
+        min_bytes: py_optional_extract(dict, "min_bytes")?,
+        max_bytes: py_optional_extract(dict, "max_bytes")?,
+        enum_values: py_optional_extract::<Vec<String>>(dict, "enum_values")?.unwrap_or_default(),
+    })
+}
+
+fn parse_py_numeric_field_schema(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<CoreNumericFieldSchema> {
+    ensure_only_py_fields(dict, &["min", "max", "finite"], context)?;
+    Ok(CoreNumericFieldSchema {
+        min: parse_optional_py_schema_dict(dict, "min", &format!("{context} min"), |value| {
+            parse_py_schema_numeric_bound(py, value, &format!("{context} min"))
+        })?,
+        max: parse_optional_py_schema_dict(dict, "max", &format!("{context} max"), |value| {
+            parse_py_schema_numeric_bound(py, value, &format!("{context} max"))
+        })?,
+        finite: py_optional_extract::<bool>(dict, "finite")?.unwrap_or(true),
+    })
+}
+
+fn parse_py_node_label_constraints(
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<CoreNodeLabelConstraintSchema> {
+    ensure_only_py_fields(dict, &["all_of", "any_of", "none_of"], context)?;
+    Ok(CoreNodeLabelConstraintSchema {
+        all_of: py_optional_extract::<Vec<String>>(dict, "all_of")?.unwrap_or_default(),
+        any_of: py_optional_extract::<Vec<String>>(dict, "any_of")?.unwrap_or_default(),
+        none_of: py_optional_extract::<Vec<String>>(dict, "none_of")?.unwrap_or_default(),
+    })
+}
+
+fn parse_py_endpoint_label_schema(
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<CoreEndpointLabelSchema> {
+    ensure_only_py_fields(dict, &["all_of", "any_of", "none_of"], context)?;
+    Ok(CoreEndpointLabelSchema {
+        all_of: py_optional_extract::<Vec<String>>(dict, "all_of")?.unwrap_or_default(),
+        any_of: py_optional_extract::<Vec<String>>(dict, "any_of")?.unwrap_or_default(),
+        none_of: py_optional_extract::<Vec<String>>(dict, "none_of")?.unwrap_or_default(),
+    })
+}
+
+fn parse_py_dense_vector_schema(
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<CoreDenseVectorSchema> {
+    ensure_only_py_fields(dict, &["presence", "dimension"], context)?;
+    Ok(CoreDenseVectorSchema {
+        presence: parse_py_schema_vector_presence(
+            py_optional_extract::<String>(dict, "presence")?
+                .as_deref()
+                .unwrap_or("optional"),
+        )?,
+        dimension: py_optional_extract(dict, "dimension")?,
+    })
+}
+
+fn parse_py_sparse_vector_schema(
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<CoreSparseVectorSchema> {
+    ensure_only_py_fields(
+        dict,
+        &["presence", "min_entries", "max_entries", "max_dimension_id"],
+        context,
+    )?;
+    Ok(CoreSparseVectorSchema {
+        presence: parse_py_schema_vector_presence(
+            py_optional_extract::<String>(dict, "presence")?
+                .as_deref()
+                .unwrap_or("optional"),
+        )?,
+        min_entries: py_optional_extract(dict, "min_entries")?,
+        max_entries: py_optional_extract(dict, "max_entries")?,
+        max_dimension_id: py_optional_extract(dict, "max_dimension_id")?,
+    })
+}
+
+fn parse_py_edge_validity_schema(
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<CoreEdgeValiditySchema> {
+    ensure_only_py_fields(
+        dict,
+        &[
+            "require_valid_from_before_valid_to",
+            "valid_from_min",
+            "valid_from_max",
+            "valid_to_min",
+            "valid_to_max",
+            "allow_open_ended_valid_to",
+        ],
+        context,
+    )?;
+    Ok(CoreEdgeValiditySchema {
+        require_valid_from_before_valid_to: py_optional_extract::<bool>(
+            dict,
+            "require_valid_from_before_valid_to",
+        )?
+        .unwrap_or(false),
+        valid_from_min: py_optional_extract(dict, "valid_from_min")?,
+        valid_from_max: py_optional_extract(dict, "valid_from_max")?,
+        valid_to_min: py_optional_extract(dict, "valid_to_min")?,
+        valid_to_max: py_optional_extract(dict, "valid_to_max")?,
+        allow_open_ended_valid_to: py_optional_extract::<bool>(dict, "allow_open_ended_valid_to")?
+            .unwrap_or(true),
+    })
+}
+
+fn parse_optional_py_schema_dict<T, F>(
+    dict: &Bound<'_, PyDict>,
+    key: &str,
+    context: &str,
+    parse: F,
+) -> PyResult<Option<T>>
+where
+    F: FnOnce(&Bound<'_, PyDict>) -> PyResult<T>,
+{
+    py_non_none_item(dict, key)?
+        .map(|value| {
+            value
+                .downcast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err(format!("{context} must be a mapping")))
+                .and_then(parse)
+        })
+        .transpose()
+}
+
+fn parse_py_schema_numeric_bound(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    context: &str,
+) -> PyResult<CoreSchemaNumericBound> {
+    ensure_only_py_fields(dict, &["value", "inclusive"], context)?;
+    let value = dict
+        .get_item("value")?
+        .ok_or_else(|| PyValueError::new_err(format!("{context} value is required")))?;
+    Ok(CoreSchemaNumericBound {
+        value: py_to_schema_literal_value(py, &value)?,
+        inclusive: py_optional_extract::<bool>(dict, "inclusive")?.unwrap_or(true),
+    })
+}
+
+fn parse_py_additional_properties(value: &str) -> PyResult<SchemaAdditionalProperties> {
+    match value {
+        "allow" => Ok(SchemaAdditionalProperties::Allow),
+        "reject" => Ok(SchemaAdditionalProperties::Reject),
+        other => Err(PyValueError::new_err(format!(
+            "additional_properties must be 'allow' or 'reject', got '{other}'"
+        ))),
+    }
+}
+
+fn additional_properties_to_py(value: SchemaAdditionalProperties) -> &'static str {
+    match value {
+        SchemaAdditionalProperties::Allow => "allow",
+        SchemaAdditionalProperties::Reject => "reject",
+    }
+}
+
+fn parse_py_schema_value_types(
+    dict: &Bound<'_, PyDict>,
+    key: &str,
+    context: &str,
+) -> PyResult<Vec<SchemaValueType>> {
+    let Some(value) = py_non_none_item(dict, key)? else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .downcast::<PyList>()
+        .map_err(|_| PyTypeError::new_err(format!("{context} {key} must be a list")))?;
+    values
+        .iter()
+        .map(|item| parse_py_schema_value_type(&item.extract::<String>()?))
+        .collect()
+}
+
+fn parse_py_schema_value_type(value: &str) -> PyResult<SchemaValueType> {
+    match value {
+        "bool" => Ok(SchemaValueType::Bool),
+        "int" => Ok(SchemaValueType::Int),
+        "uint" => Ok(SchemaValueType::UInt),
+        "float" => Ok(SchemaValueType::Float),
+        "number" => Ok(SchemaValueType::Number),
+        "string" => Ok(SchemaValueType::String),
+        "bytes" => Ok(SchemaValueType::Bytes),
+        "array" => Ok(SchemaValueType::Array),
+        "map" => Ok(SchemaValueType::Map),
+        other => Err(PyValueError::new_err(format!(
+            "schema value type must be one of bool, int, uint, float, number, string, bytes, array, map; got '{other}'"
+        ))),
+    }
+}
+
+fn schema_value_type_to_py(value: SchemaValueType) -> &'static str {
+    match value {
+        SchemaValueType::Bool => "bool",
+        SchemaValueType::Int => "int",
+        SchemaValueType::UInt => "uint",
+        SchemaValueType::Float => "float",
+        SchemaValueType::Number => "number",
+        SchemaValueType::String => "string",
+        SchemaValueType::Bytes => "bytes",
+        SchemaValueType::Array => "array",
+        SchemaValueType::Map => "map",
+    }
+}
+
+fn parse_py_schema_vector_presence(value: &str) -> PyResult<SchemaVectorPresence> {
+    match value {
+        "optional" => Ok(SchemaVectorPresence::Optional),
+        "required" => Ok(SchemaVectorPresence::Required),
+        "forbidden" => Ok(SchemaVectorPresence::Forbidden),
+        other => Err(PyValueError::new_err(format!(
+            "vector presence must be 'optional', 'required', or 'forbidden', got '{other}'"
+        ))),
+    }
+}
+
+fn schema_vector_presence_to_py(value: SchemaVectorPresence) -> &'static str {
+    match value {
+        SchemaVectorPresence::Optional => "optional",
+        SchemaVectorPresence::Required => "required",
+        SchemaVectorPresence::Forbidden => "forbidden",
+    }
+}
+
+#[allow(clippy::only_used_in_recursion)]
+fn py_to_schema_literal_value(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<PropValue> {
+    if obj.is_none() {
+        Ok(PropValue::Null)
+    } else if obj.is_instance_of::<PyBool>() {
+        Ok(PropValue::Bool(obj.extract::<bool>()?))
+    } else if let Ok(i) = obj.extract::<i64>() {
+        Ok(PropValue::Int(i))
+    } else if obj.get_type().name()? == "int" {
+        Err(PyValueError::new_err(
+            "schema integer literals must fit signed i64; use {'type': 'uint', 'value': ...} for unsigned u64 values",
+        ))
+    } else if let Ok(f) = obj.extract::<f64>() {
+        if !f.is_finite() {
+            return Err(PyValueError::new_err(
+                "schema numeric literals must be finite",
+            ));
+        }
+        Ok(PropValue::Float(f))
+    } else if let Ok(s) = obj.extract::<String>() {
+        Ok(PropValue::String(s))
+    } else if let Ok(b) = obj.downcast::<PyBytes>() {
+        Ok(PropValue::Bytes(b.as_bytes().to_vec()))
+    } else if obj.is_instance_of::<PyByteArray>() {
+        Ok(PropValue::Bytes(obj.extract::<Vec<u8>>()?))
+    } else if let Ok(list) = obj.downcast::<PyList>() {
+        let items: PyResult<Vec<PropValue>> = list
+            .iter()
+            .map(|item| py_to_schema_literal_value(py, &item))
+            .collect();
+        Ok(PropValue::Array(items?))
+    } else if let Ok(tuple) = obj.downcast::<PyTuple>() {
+        let items: PyResult<Vec<PropValue>> = tuple
+            .iter()
+            .map(|item| py_to_schema_literal_value(py, &item))
+            .collect();
+        Ok(PropValue::Array(items?))
+    } else if let Ok(dict) = obj.downcast::<PyDict>() {
+        if let Some(value) = parse_py_schema_uint_literal_marker(dict)? {
+            return Ok(value);
+        }
+        let mut map = BTreeMap::new();
+        for (k, v) in dict.iter() {
+            let key: String = k.extract()?;
+            map.insert(key, py_to_schema_literal_value(py, &v)?);
+        }
+        Ok(PropValue::Map(map))
+    } else {
+        Err(PyTypeError::new_err(format!(
+            "Unsupported schema literal type: {}",
+            obj.get_type().name()?
+        )))
+    }
+}
+
+fn parse_py_schema_uint_literal_marker(dict: &Bound<'_, PyDict>) -> PyResult<Option<PropValue>> {
+    let Some(type_value) = dict.get_item("type")? else {
+        return Ok(None);
+    };
+    let Ok(type_name) = type_value.extract::<String>() else {
+        return Ok(None);
+    };
+    if type_name != "uint" {
+        return Ok(None);
+    }
+    ensure_only_py_fields(dict, &["type", "value"], "schema uint literal")?;
+    let value = dict
+        .get_item("value")?
+        .ok_or_else(|| PyValueError::new_err("schema uint literal value is required"))?;
+    if value.is_instance_of::<PyBool>() {
+        return Err(PyTypeError::new_err(
+            "schema uint literal value must be int or str, not bool",
+        ));
+    }
+    if let Ok(text) = value.extract::<String>() {
+        return text
+            .parse::<u64>()
+            .map(PropValue::UInt)
+            .map(Some)
+            .map_err(|_| {
+                PyValueError::new_err("schema uint literal string value must be a valid u64")
+            });
+    }
+    value.extract::<u64>().map(PropValue::UInt).map(Some)
+}
+
+fn node_schema_to_py(py: Python<'_>, schema: &CoreNodeSchema) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "additional_properties",
+        additional_properties_to_py(schema.additional_properties),
+    )?;
+    dict.set_item(
+        "properties",
+        schema_properties_to_py(py, &schema.properties)?,
+    )?;
+    set_optional_py_object(
+        py,
+        &dict,
+        "key",
+        schema
+            .key
+            .as_ref()
+            .map(|value| string_field_schema_to_py(py, value)),
+    )?;
+    set_optional_py_object(
+        py,
+        &dict,
+        "label_constraints",
+        schema
+            .label_constraints
+            .as_ref()
+            .map(|value| node_label_constraints_to_py(py, value)),
+    )?;
+    set_optional_py_object(
+        py,
+        &dict,
+        "weight",
+        schema
+            .weight
+            .as_ref()
+            .map(|value| numeric_field_schema_to_py(py, value)),
+    )?;
+    set_optional_py_object(
+        py,
+        &dict,
+        "dense_vector",
+        schema
+            .dense_vector
+            .as_ref()
+            .map(|value| dense_vector_schema_to_py(py, value)),
+    )?;
+    set_optional_py_object(
+        py,
+        &dict,
+        "sparse_vector",
+        schema
+            .sparse_vector
+            .as_ref()
+            .map(|value| sparse_vector_schema_to_py(py, value)),
+    )?;
+    Ok(dict.into_any().unbind())
+}
+
+fn edge_schema_to_py(py: Python<'_>, schema: &CoreEdgeSchema) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "additional_properties",
+        additional_properties_to_py(schema.additional_properties),
+    )?;
+    dict.set_item(
+        "properties",
+        schema_properties_to_py(py, &schema.properties)?,
+    )?;
+    set_optional_py_object(
+        py,
+        &dict,
+        "from",
+        schema
+            .from
+            .as_ref()
+            .map(|value| endpoint_label_schema_to_py(py, value)),
+    )?;
+    set_optional_py_object(
+        py,
+        &dict,
+        "to",
+        schema
+            .to
+            .as_ref()
+            .map(|value| endpoint_label_schema_to_py(py, value)),
+    )?;
+    dict.set_item("allow_self_loops", schema.allow_self_loops)?;
+    set_optional_py_object(
+        py,
+        &dict,
+        "weight",
+        schema
+            .weight
+            .as_ref()
+            .map(|value| numeric_field_schema_to_py(py, value)),
+    )?;
+    set_optional_py_object(
+        py,
+        &dict,
+        "validity",
+        schema
+            .validity
+            .as_ref()
+            .map(|value| edge_validity_schema_to_py(py, value)),
+    )?;
+    Ok(dict.into_any().unbind())
+}
+
+fn schema_properties_to_py(
+    py: Python<'_>,
+    properties: &BTreeMap<String, CorePropertySchema>,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    for (key, value) in properties {
+        dict.set_item(key, property_schema_to_py(py, value)?)?;
+    }
+    Ok(dict.into_any().unbind())
+}
+
+fn property_schema_to_py(py: Python<'_>, schema: &CorePropertySchema) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("required", schema.required)?;
+    dict.set_item("nullable", schema.nullable)?;
+    dict.set_item(
+        "types",
+        schema
+            .types
+            .iter()
+            .map(|value| schema_value_type_to_py(*value))
+            .collect::<Vec<_>>(),
+    )?;
+    set_optional_py_object(
+        py,
+        &dict,
+        "numeric_min",
+        schema
+            .numeric_min
+            .as_ref()
+            .map(|value| schema_numeric_bound_to_py(py, value)),
+    )?;
+    set_optional_py_object(
+        py,
+        &dict,
+        "numeric_max",
+        schema
+            .numeric_max
+            .as_ref()
+            .map(|value| schema_numeric_bound_to_py(py, value)),
+    )?;
+    dict.set_item("string_min_bytes", schema.string_min_bytes)?;
+    dict.set_item("string_max_bytes", schema.string_max_bytes)?;
+    dict.set_item("bytes_min_len", schema.bytes_min_len)?;
+    dict.set_item("bytes_max_len", schema.bytes_max_len)?;
+    dict.set_item("array_min_items", schema.array_min_items)?;
+    dict.set_item("array_max_items", schema.array_max_items)?;
+    dict.set_item("map_min_entries", schema.map_min_entries)?;
+    dict.set_item("map_max_entries", schema.map_max_entries)?;
+    let enum_values: PyResult<Vec<PyObject>> = schema
+        .enum_values
+        .iter()
+        .map(|value| schema_literal_to_py_obj(py, value))
+        .collect();
+    dict.set_item("enum_values", PyList::new(py, enum_values?)?)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn schema_numeric_bound_to_py(
+    py: Python<'_>,
+    bound: &CoreSchemaNumericBound,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("value", schema_literal_to_py_obj(py, &bound.value)?)?;
+    dict.set_item("inclusive", bound.inclusive)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn string_field_schema_to_py(py: Python<'_>, schema: &CoreStringFieldSchema) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("min_bytes", schema.min_bytes)?;
+    dict.set_item("max_bytes", schema.max_bytes)?;
+    dict.set_item("enum_values", schema.enum_values.clone())?;
+    Ok(dict.into_any().unbind())
+}
+
+fn numeric_field_schema_to_py(
+    py: Python<'_>,
+    schema: &CoreNumericFieldSchema,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    set_optional_py_object(
+        py,
+        &dict,
+        "min",
+        schema
+            .min
+            .as_ref()
+            .map(|value| schema_numeric_bound_to_py(py, value)),
+    )?;
+    set_optional_py_object(
+        py,
+        &dict,
+        "max",
+        schema
+            .max
+            .as_ref()
+            .map(|value| schema_numeric_bound_to_py(py, value)),
+    )?;
+    dict.set_item("finite", schema.finite)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn node_label_constraints_to_py(
+    py: Python<'_>,
+    schema: &CoreNodeLabelConstraintSchema,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("all_of", schema.all_of.clone())?;
+    dict.set_item("any_of", schema.any_of.clone())?;
+    dict.set_item("none_of", schema.none_of.clone())?;
+    Ok(dict.into_any().unbind())
+}
+
+fn endpoint_label_schema_to_py(
+    py: Python<'_>,
+    schema: &CoreEndpointLabelSchema,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("all_of", schema.all_of.clone())?;
+    dict.set_item("any_of", schema.any_of.clone())?;
+    dict.set_item("none_of", schema.none_of.clone())?;
+    Ok(dict.into_any().unbind())
+}
+
+fn dense_vector_schema_to_py(py: Python<'_>, schema: &CoreDenseVectorSchema) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("presence", schema_vector_presence_to_py(schema.presence))?;
+    dict.set_item("dimension", schema.dimension)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn sparse_vector_schema_to_py(
+    py: Python<'_>,
+    schema: &CoreSparseVectorSchema,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("presence", schema_vector_presence_to_py(schema.presence))?;
+    dict.set_item("min_entries", schema.min_entries)?;
+    dict.set_item("max_entries", schema.max_entries)?;
+    dict.set_item("max_dimension_id", schema.max_dimension_id)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn edge_validity_schema_to_py(
+    py: Python<'_>,
+    schema: &CoreEdgeValiditySchema,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "require_valid_from_before_valid_to",
+        schema.require_valid_from_before_valid_to,
+    )?;
+    dict.set_item("valid_from_min", schema.valid_from_min)?;
+    dict.set_item("valid_from_max", schema.valid_from_max)?;
+    dict.set_item("valid_to_min", schema.valid_to_min)?;
+    dict.set_item("valid_to_max", schema.valid_to_max)?;
+    dict.set_item(
+        "allow_open_ended_valid_to",
+        schema.allow_open_ended_valid_to,
+    )?;
+    Ok(dict.into_any().unbind())
+}
+
+fn set_optional_py_object(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    key: &str,
+    value: Option<PyResult<PyObject>>,
+) -> PyResult<()> {
+    match value {
+        Some(value) => dict.set_item(key, value?)?,
+        None => dict.set_item(key, py.None())?,
+    }
+    Ok(())
+}
+
+fn schema_literal_to_py_obj(py: Python<'_>, value: &PropValue) -> PyResult<PyObject> {
+    match value {
+        PropValue::Null => Ok(py.None()),
+        PropValue::Bool(value) => Ok(value.into_pyobject(py)?.to_owned().into_any().unbind()),
+        PropValue::Int(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
+        PropValue::UInt(value) => {
+            let dict = PyDict::new(py);
+            dict.set_item("type", "uint")?;
+            dict.set_item("value", *value)?;
+            Ok(dict.into_any().unbind())
+        }
+        PropValue::Float(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
+        PropValue::String(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
+        PropValue::Bytes(value) => Ok(PyBytes::new(py, value).into_any().unbind()),
+        PropValue::Array(values) => {
+            let items: PyResult<Vec<PyObject>> = values
+                .iter()
+                .map(|item| schema_literal_to_py_obj(py, item))
+                .collect();
+            Ok(PyList::new(py, items?)?.into_any().unbind())
+        }
+        PropValue::Map(values) => {
+            let dict = PyDict::new(py);
+            for (key, value) in values {
+                dict.set_item(key, schema_literal_to_py_obj(py, value)?)?;
+            }
+            Ok(dict.into_any().unbind())
+        }
+    }
+}
+
+fn schema_violation_target_to_py(
+    py: Python<'_>,
+    target: &CoreSchemaViolationTarget,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    match target {
+        CoreSchemaViolationTarget::Node { id, labels, key } => {
+            dict.set_item("kind", "node")?;
+            dict.set_item("id", *id)?;
+            dict.set_item("labels", labels.clone())?;
+            dict.set_item("key", key)?;
+        }
+        CoreSchemaViolationTarget::Edge {
+            id,
+            label,
+            from,
+            to,
+        } => {
+            dict.set_item("kind", "edge")?;
+            dict.set_item("id", *id)?;
+            dict.set_item("label", label)?;
+            dict.set_item("from_id", *from)?;
+            dict.set_item("to_id", *to)?;
+        }
+    }
+    Ok(dict.into_any().unbind())
+}
+
+fn schema_target_kind_to_py(kind: CoreSchemaTargetKind) -> &'static str {
+    match kind {
+        CoreSchemaTargetKind::Node => "node",
+        CoreSchemaTargetKind::Edge => "edge",
+    }
+}
+
+fn graph_schema_operation_kind_to_py(kind: CoreGraphSchemaOperationKind) -> &'static str {
+    match kind {
+        CoreGraphSchemaOperationKind::Add => "add",
+        CoreGraphSchemaOperationKind::Set => "set",
+        CoreGraphSchemaOperationKind::Drop => "drop",
+        CoreGraphSchemaOperationKind::DropAll => "drop_all",
+        CoreGraphSchemaOperationKind::CheckAdd => "check_add",
+        CoreGraphSchemaOperationKind::CheckSet => "check_set",
+    }
+}
+
+fn graph_schema_drop_action_to_py(action: CoreGraphSchemaDropAction) -> &'static str {
+    match action {
+        CoreGraphSchemaDropAction::Dropped => "dropped",
+        CoreGraphSchemaDropAction::NotFound => "not_found",
+    }
+}
+
 fn parse_py_gql_options(
     mode: &str,
     allow_full_scan: bool,
@@ -3762,6 +5420,14 @@ fn gql_result_to_py(
     match result.mutation_stats {
         Some(stats) => dict.set_item("mutation_stats", gql_mutation_stats_to_py(py, stats)?)?,
         None => dict.set_item("mutation_stats", py.None())?,
+    }
+    match result.schema_stats {
+        Some(stats) => dict.set_item("schema_stats", gql_schema_stats_to_py(py, stats)?)?,
+        None => dict.set_item("schema_stats", py.None())?,
+    }
+    match result.index_stats {
+        Some(stats) => dict.set_item("index_stats", gql_index_stats_to_py(py, stats)?)?,
+        None => dict.set_item("index_stats", py.None())?,
     }
     match result.plan {
         Some(plan) => dict.set_item("plan", gql_explain_to_py(py, plan)?)?,
@@ -4190,10 +5856,38 @@ fn gql_mutation_stats_to_py(py: Python<'_>, stats: eg::GqlMutationStats) -> PyRe
     Ok(dict.into_any().unbind())
 }
 
+fn gql_schema_stats_to_py(py: Python<'_>, stats: eg::GqlSchemaStats) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("operation", stats.operation)?;
+    dict.set_item("targets_checked", stats.targets_checked)?;
+    dict.set_item("targets_published", stats.targets_published)?;
+    dict.set_item("targets_dropped", stats.targets_dropped)?;
+    dict.set_item("checked_records", stats.checked_records)?;
+    dict.set_item("violation_count", stats.violation_count)?;
+    dict.set_item("truncated", stats.truncated)?;
+    dict.set_item("scan_limit_hit", stats.scan_limit_hit)?;
+    dict.set_item("elapsed_us", stats.elapsed_us)?;
+    dict.set_item("warnings", stats.warnings)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn gql_index_stats_to_py(py: Python<'_>, stats: eg::GqlIndexStats) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("operation", stats.operation)?;
+    dict.set_item("indexes_ensured", stats.indexes_ensured)?;
+    dict.set_item("indexes_dropped", stats.indexes_dropped)?;
+    dict.set_item("indexes_returned", stats.indexes_returned)?;
+    dict.set_item("elapsed_us", stats.elapsed_us)?;
+    dict.set_item("warnings", stats.warnings)?;
+    Ok(dict.into_any().unbind())
+}
+
 fn gql_statement_kind_to_py(kind: GqlStatementKind) -> &'static str {
     match kind {
         GqlStatementKind::Query => "query",
         GqlStatementKind::Mutation => "mutation",
+        GqlStatementKind::Schema => "schema",
+        GqlStatementKind::Index => "index",
     }
 }
 
@@ -4208,6 +5902,14 @@ fn gql_explain_to_py(py: Python<'_>, explain: GqlExecutionExplain) -> PyResult<P
     match explain.mutation {
         Some(mutation) => dict.set_item("mutation", gql_mutation_explain_to_py(py, mutation)?)?,
         None => dict.set_item("mutation", py.None())?,
+    }
+    match explain.schema {
+        Some(schema) => dict.set_item("schema", gql_schema_explain_to_py(py, schema)?)?,
+        None => dict.set_item("schema", py.None())?,
+    }
+    match explain.index {
+        Some(index) => dict.set_item("index", gql_index_explain_to_py(py, index)?)?,
+        None => dict.set_item("index", py.None())?,
     }
     dict.set_item("caps", gql_execution_caps_to_py(py, explain.caps)?)?;
     dict.set_item("warnings", explain.warnings)?;
@@ -4290,6 +5992,63 @@ fn gql_mutation_explain_to_py(
     dict.set_item("uses_write_txn", explain.uses_write_txn)?;
     dict.set_item("replacement_adapters", explain.replacement_adapters)?;
     dict.set_item("atomic_commit", explain.atomic_commit)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn gql_schema_explain_to_py(py: Python<'_>, explain: eg::GqlSchemaExplain) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("operation", explain.operation)?;
+    let targets = explain
+        .targets
+        .into_iter()
+        .map(|target| {
+            let item = PyDict::new(py);
+            item.set_item("target_kind", target.target_kind)?;
+            item.set_item("label", target.label)?;
+            item.set_item("action", target.action)?;
+            Ok(item.into_any().unbind())
+        })
+        .collect::<PyResult<Vec<PyObject>>>()?;
+    dict.set_item("targets", targets)?;
+    dict.set_item("replaces_entire_catalog", explain.replaces_entire_catalog)?;
+    dict.set_item("publishes_manifest", explain.publishes_manifest)?;
+    dict.set_item("validates_existing_data", explain.validates_existing_data)?;
+    dict.set_item("uses_core_write_queue", explain.uses_core_write_queue)?;
+    dict.set_item("side_effect_free", explain.side_effect_free)?;
+    let options = PyDict::new(py);
+    options.set_item("max_violations", explain.options.max_violations)?;
+    options.set_item("chunk_size", explain.options.chunk_size)?;
+    options.set_item("scan_limit", explain.options.scan_limit)?;
+    dict.set_item("options", options)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn gql_index_explain_to_py(py: Python<'_>, explain: eg::GqlIndexExplain) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("operation", explain.operation)?;
+    let targets = explain
+        .targets
+        .into_iter()
+        .map(|target| {
+            let item = PyDict::new(py);
+            item.set_item("target_kind", target.target_kind)?;
+            item.set_item("label", target.label)?;
+            item.set_item("prop_key", target.prop_key)?;
+            item.set_item("kind", target.kind)?;
+            item.set_item("action", target.action)?;
+            Ok(item.into_any().unbind())
+        })
+        .collect::<PyResult<Vec<PyObject>>>()?;
+    dict.set_item("targets", targets)?;
+    dict.set_item("uses_core_write_queue", explain.uses_core_write_queue)?;
+    dict.set_item("publishes_manifest", explain.publishes_manifest)?;
+    dict.set_item("creates_labels", explain.creates_labels)?;
+    dict.set_item(
+        "schedules_background_build",
+        explain.schedules_background_build,
+    )?;
+    dict.set_item("drops_index_data_async", explain.drops_index_data_async)?;
+    dict.set_item("side_effect_free", explain.side_effect_free)?;
     Ok(dict.into_any().unbind())
 }
 
@@ -8551,6 +10310,14 @@ fn overgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<EdgeLabelInfo>()?;
     m.add_class::<NodePropertyIndexInfo>()?;
     m.add_class::<EdgePropertyIndexInfo>()?;
+    m.add_class::<NodeSchemaInfo>()?;
+    m.add_class::<EdgeSchemaInfo>()?;
+    m.add_class::<SchemaValidationReport>()?;
+    m.add_class::<GraphSchemaValidationReportEntry>()?;
+    m.add_class::<GraphSchemaCheckReport>()?;
+    m.add_class::<GraphSchemaDropTargetResult>()?;
+    m.add_class::<GraphSchemaPublishResult>()?;
+    m.add_class::<SchemaViolation>()?;
     m.add_class::<PropertyRangeBound>()?;
     m.add_class::<PropertyRangeCursor>()?;
     m.add_class::<TraversalCursor>()?;

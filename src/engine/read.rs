@@ -56,7 +56,11 @@ fn finish_verified_id_page(mut items: Vec<u64>, limit: usize) -> PageResult<u64>
 }
 
 enum NodeLabelScanSource<'a> {
-    Owned(Vec<u64>),
+    Memtable {
+        memtable: &'a Memtable,
+        label_id: u32,
+        snapshot_seq: u64,
+    },
     Segment {
         segment: &'a SegmentReader,
         posting: SegmentLabelPosting,
@@ -64,26 +68,58 @@ enum NodeLabelScanSource<'a> {
 }
 
 impl NodeLabelScanSource<'_> {
-    fn get_id(&self, index: usize) -> Result<Option<u64>, EngineError> {
+    fn next_after(&self, after: Option<u64>) -> Result<Option<u64>, EngineError> {
         match self {
-            NodeLabelScanSource::Owned(ids) => Ok(ids.get(index).copied()),
+            NodeLabelScanSource::Memtable {
+                memtable,
+                label_id,
+                snapshot_seq,
+            } => Ok(memtable.next_visible_node_by_label_id_after(
+                *label_id,
+                *snapshot_seq,
+                after,
+            )),
             NodeLabelScanSource::Segment { segment, posting } => {
+                let index = match after {
+                    Some(after) => segment.node_label_posting_lower_bound(*posting, after)?,
+                    None => 0,
+                };
                 segment.node_id_at_label_posting(*posting, index)
             }
         }
     }
+}
 
-    fn seek_after(&self, after: Option<u64>) -> Result<usize, EngineError> {
-        let Some(after) = after else {
-            return Ok(0);
-        };
+enum EdgeLabelScanSource<'a> {
+    Memtable {
+        memtable: &'a Memtable,
+        label_id: u32,
+        snapshot_seq: u64,
+    },
+    Segment {
+        segment: &'a SegmentReader,
+        posting: SegmentLabelPosting,
+    },
+}
+
+impl EdgeLabelScanSource<'_> {
+    fn next_after(&self, after: Option<u64>) -> Result<Option<u64>, EngineError> {
         match self {
-            NodeLabelScanSource::Owned(ids) => match ids.binary_search(&after) {
-                Ok(index) => Ok(index + 1),
-                Err(index) => Ok(index),
-            },
-            NodeLabelScanSource::Segment { segment, posting } => {
-                segment.node_label_posting_lower_bound(*posting, after)
+            EdgeLabelScanSource::Memtable {
+                memtable,
+                label_id,
+                snapshot_seq,
+            } => Ok(memtable.next_visible_edge_by_label_id_after(
+                *label_id,
+                *snapshot_seq,
+                after,
+            )),
+            EdgeLabelScanSource::Segment { segment, posting } => {
+                let index = match after {
+                    Some(after) => segment.edge_label_id_lower_bound_posting(*posting, after)?,
+                    None => 0,
+                };
+                segment.edge_label_id_at_posting(*posting, index)
             }
         }
     }
@@ -1140,17 +1176,6 @@ impl ReadView {
         single_label_id: u32,
         page: &PageRequest,
     ) -> Result<PageResult<u64>, EngineError> {
-        if self.immutable_epochs.is_empty() && self.segments.is_empty() {
-            let deleted = NodeIdSet::default();
-            return Ok(merge_record_ids_paged(
-                self.memtable
-                    .visible_nodes_by_label_id(single_label_id, self.snapshot_seq),
-                Vec::new(),
-                &deleted,
-                page,
-            ));
-        }
-
         let limit = page.limit.unwrap_or(0);
         let target = page_verify_target(limit);
         let chunk_limit = match page.limit {
@@ -1194,16 +1219,17 @@ impl ReadView {
         single_label_id: u32,
     ) -> Result<Vec<NodeLabelScanSource<'_>>, EngineError> {
         let mut sources = Vec::with_capacity(1 + self.immutable_epochs.len() + self.segments.len());
-        sources.push(NodeLabelScanSource::Owned(
-            self.memtable
-                .visible_nodes_by_label_id(single_label_id, self.snapshot_seq),
-        ));
+        sources.push(NodeLabelScanSource::Memtable {
+            memtable: self.memtable.as_ref(),
+            label_id: single_label_id,
+            snapshot_seq: self.snapshot_seq,
+        });
         for epoch in &self.immutable_epochs {
-            sources.push(NodeLabelScanSource::Owned(
-                epoch
-                    .memtable
-                    .visible_nodes_by_label_id(single_label_id, self.snapshot_seq),
-            ));
+            sources.push(NodeLabelScanSource::Memtable {
+                memtable: epoch.memtable.as_ref(),
+                label_id: single_label_id,
+                snapshot_seq: self.snapshot_seq,
+            });
         }
         for segment in &self.segments {
             if let Some(posting) = segment.node_label_posting(single_label_id)? {
@@ -1234,18 +1260,16 @@ impl ReadView {
 
         let mut heap = BinaryHeap::new();
         for (source_index, source) in sources.iter().enumerate() {
-            let start = source.seek_after(start_after)?;
-            if let Some(node_id) = source.get_id(start)? {
-                heap.push(Reverse((node_id, source_index, start)));
+            if let Some(node_id) = source.next_after(start_after)? {
+                heap.push(Reverse((node_id, source_index)));
             }
         }
 
         let mut chunk = Vec::with_capacity(chunk_limit);
         let mut last_seen = None;
-        while let Some(Reverse((node_id, source_index, offset))) = heap.pop() {
-            let next_offset = offset + 1;
-            if let Some(next_id) = sources[source_index].get_id(next_offset)? {
-                heap.push(Reverse((next_id, source_index, next_offset)));
+        while let Some(Reverse((node_id, source_index))) = heap.pop() {
+            if let Some(next_id) = sources[source_index].next_after(Some(node_id))? {
+                heap.push(Reverse((next_id, source_index)));
             }
 
             if last_seen == Some(node_id) {
@@ -1253,6 +1277,80 @@ impl ReadView {
             }
             last_seen = Some(node_id);
             chunk.push(node_id);
+            if chunk.len() >= chunk_limit {
+                if visitor(&chunk)?.is_break() {
+                    return Ok(());
+                }
+                chunk.clear();
+            }
+        }
+
+        if !chunk.is_empty() {
+            let _ = visitor(&chunk)?;
+        }
+        Ok(())
+    }
+
+    fn single_label_edge_sources(
+        &self,
+        label_id: u32,
+    ) -> Result<Vec<EdgeLabelScanSource<'_>>, EngineError> {
+        let mut sources = Vec::with_capacity(1 + self.immutable_epochs.len() + self.segments.len());
+        sources.push(EdgeLabelScanSource::Memtable {
+            memtable: self.memtable.as_ref(),
+            label_id,
+            snapshot_seq: self.snapshot_seq,
+        });
+        for epoch in &self.immutable_epochs {
+            sources.push(EdgeLabelScanSource::Memtable {
+                memtable: epoch.memtable.as_ref(),
+                label_id,
+                snapshot_seq: self.snapshot_seq,
+            });
+        }
+        for segment in &self.segments {
+            if let Some(posting) = segment.edge_label_posting(label_id)? {
+                sources.push(EdgeLabelScanSource::Segment {
+                    segment: segment.as_ref(),
+                    posting,
+                });
+            }
+        }
+        Ok(sources)
+    }
+
+    fn scan_raw_edge_label_candidates<F>(
+        &self,
+        label_id: u32,
+        start_after: Option<u64>,
+        chunk_limit: usize,
+        mut visitor: F,
+    ) -> Result<(), EngineError>
+    where
+        F: FnMut(&[u64]) -> Result<ControlFlow<()>, EngineError>,
+    {
+        let chunk_limit = chunk_limit.max(1);
+        let sources = self.single_label_edge_sources(label_id)?;
+
+        let mut heap = BinaryHeap::new();
+        for (source_index, source) in sources.iter().enumerate() {
+            if let Some(edge_id) = source.next_after(start_after)? {
+                heap.push(Reverse((edge_id, source_index)));
+            }
+        }
+
+        let mut chunk = Vec::with_capacity(chunk_limit);
+        let mut last_seen = None;
+        while let Some(Reverse((edge_id, source_index))) = heap.pop() {
+            if let Some(next_id) = sources[source_index].next_after(Some(edge_id))? {
+                heap.push(Reverse((next_id, source_index)));
+            }
+
+            if last_seen == Some(edge_id) {
+                continue;
+            }
+            last_seen = Some(edge_id);
+            chunk.push(edge_id);
             if chunk.len() >= chunk_limit {
                 if visitor(&chunk)?.is_break() {
                     return Ok(());
@@ -1282,18 +1380,16 @@ impl ReadView {
         let sources = self.single_label_node_sources(single_label_id)?;
         let mut heap = BinaryHeap::new();
         for (source_index, source) in sources.iter().enumerate() {
-            let start = source.seek_after(start_after)?;
-            if let Some(node_id) = source.get_id(start)? {
-                heap.push(Reverse((node_id, source_index, start)));
+            if let Some(node_id) = source.next_after(start_after)? {
+                heap.push(Reverse((node_id, source_index)));
             }
         }
 
         let mut chunk = Vec::with_capacity(chunk_limit);
         let mut last_seen = None;
-        while let Some(Reverse((node_id, source_index, offset))) = heap.pop() {
-            let next_offset = offset + 1;
-            if let Some(next_id) = sources[source_index].get_id(next_offset)? {
-                heap.push(Reverse((next_id, source_index, next_offset)));
+        while let Some(Reverse((node_id, source_index))) = heap.pop() {
+            if let Some(next_id) = sources[source_index].next_after(Some(node_id))? {
+                heap.push(Reverse((next_id, source_index)));
             }
 
             if last_seen == Some(node_id) {

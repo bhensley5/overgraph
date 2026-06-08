@@ -80,6 +80,26 @@ def run_bench(
     return s
 
 
+def run_bench_with_setup(
+    setup: Callable[[int], Any],
+    fn: Callable[[int], Any],
+    warmup: int,
+    iters: int,
+) -> dict[str, float]:
+    for i in range(warmup):
+        setup(i)
+        fn(i)
+    samples_us: list[float] = []
+    for i in range(iters):
+        idx = warmup + i
+        setup(idx)
+        t0 = time.perf_counter_ns()
+        fn(idx)
+        t1 = time.perf_counter_ns()
+        samples_us.append((t1 - t0) / 1000.0)
+    return stats(samples_us)
+
+
 def throughput_ops_per_sec(mean_us: float, ops_per_iter: int) -> float | None:
     if mean_us <= 0:
         return None
@@ -586,6 +606,79 @@ def graph_row_scenario_params(layout: dict[str, int], preload_edges: int, limit:
     }
 
 
+SCHEMA_SCENARIO_IDS = {
+    "S-SCHEMA-001",
+    "S-SCHEMA-002",
+    "S-SCHEMA-003",
+    "S-SCHEMA-004",
+}
+
+GQL_SCHEMA_ALTER_ADD = "ALTER CURRENT GRAPH TYPE ADD { NODE SchemaPerson = { properties: { name: { required: true, nullable: false, types: ['string'] } } }, EDGE SCHEMA_WORKS_AT = { from: { all_of: ['SchemaPerson'] }, to: { all_of: ['SchemaCompany'] }, properties: { role: { required: true, nullable: false, types: ['string'] } } } } OPTIONS { chunk_size: 128 }"
+GQL_SCHEMA_CHECK_ADD = "CHECK CURRENT GRAPH TYPE ADD { NODE SchemaPerson = { properties: { name: { required: true, nullable: false, types: ['string'] } } }, EDGE SCHEMA_WORKS_AT = { from: { all_of: ['SchemaPerson'] }, to: { all_of: ['SchemaCompany'] }, properties: { role: { required: true, nullable: false, types: ['string'] } } } } OPTIONS { chunk_size: 128, max_violations: 4 }"
+
+
+def schema_name_props(i: int) -> dict[str, Any]:
+    return {"name": f"name-{i}"}
+
+
+def schema_role_props(i: int) -> dict[str, Any]:
+    return {"role": f"role-{i}"}
+
+
+def schema_node_schema() -> dict[str, Any]:
+    return {
+        "properties": {
+            "name": {"required": True, "nullable": False, "types": ["string"]},
+        },
+    }
+
+
+def schema_edge_schema() -> dict[str, Any]:
+    return {
+        "properties": {
+            "role": {"required": True, "nullable": False, "types": ["string"]},
+        },
+        "from": {"all_of": ["SchemaPerson"]},
+        "to": {"all_of": ["SchemaCompany"]},
+    }
+
+
+def schema_graph_operations() -> list[dict[str, Any]]:
+    return [
+        {"kind": "set_node", "label": "SchemaPerson", "schema": schema_node_schema()},
+        {"kind": "set_edge", "label": "SCHEMA_WORKS_AT", "schema": schema_edge_schema()},
+    ]
+
+
+def seed_schema_publish_data(db: OverGraph) -> None:
+    person = db.upsert_node("SchemaPerson", "person-0", props=schema_name_props(0))
+    company = db.upsert_node("SchemaCompany", "company-0")
+    db.upsert_edge(person, company, "SCHEMA_WORKS_AT", props=schema_role_props(0))
+
+
+def schema_publish_params(operation: str) -> dict[str, Any]:
+    return {
+        "api": "gql" if operation.startswith("gql_") else "native",
+        "operation": operation,
+        "node_targets": ["SchemaPerson"],
+        "edge_targets": ["SCHEMA_WORKS_AT"],
+        "preload_nodes": 2,
+        "preload_edges": 1,
+        "chunk_size": 128,
+    }
+
+
+def schema_active_write_params() -> dict[str, Any]:
+    return {
+        "api": "native",
+        "operation": "upsert_node_active_schema",
+        "registered_node_schemas": ["SchemaPerson"],
+        "registered_edge_schemas": ["SCHEMA_WORKS_AT"],
+        "write_label": "SchemaPerson",
+        "with_props": True,
+    }
+
+
 def push_graph_row_optional_scenario(
     args: argparse.Namespace,
     scenario_contract: dict[str, Any],
@@ -663,6 +756,156 @@ def push_gql_graph_row_optional_scenario(
         db.close()
 
 
+def push_schema_scenarios(
+    args: argparse.Namespace,
+    scenario_contract: dict[str, Any],
+    tmp_root: Path,
+    scenarios: list[dict[str, Any]],
+) -> None:
+    scenario_id = "S-SCHEMA-001"
+    if not args.scenario_id or scenario_id in args.scenario_id:
+        iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+        db = OverGraph.open(str(tmp_root / "schema-gql-alter-add"))
+        try:
+            seed_schema_publish_data(db)
+            s = run_bench_with_setup(
+                lambda _i: db.drop_graph_schema(),
+                lambda _i: _assert_gql_schema_targets_published(
+                    db.execute_gql(GQL_SCHEMA_ALTER_ADD),
+                    2,
+                ),
+                iter_cfg["warmup"],
+                iter_cfg["iters"],
+            )
+            scenarios.append(
+                scenario(
+                    scenario_id,
+                    "gql_schema_alter_add_existing_data",
+                    "schema",
+                    s,
+                    iter_cfg,
+                    schema_publish_params("gql_alter_current_graph_type_add"),
+                    scenario_comparability(scenario_contract, scenario_id),
+                )
+            )
+        finally:
+            db.close()
+
+    scenario_id = "S-SCHEMA-002"
+    if not args.scenario_id or scenario_id in args.scenario_id:
+        iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+        db = OverGraph.open(str(tmp_root / "schema-native-bulk-add"))
+        try:
+            seed_schema_publish_data(db)
+            s = run_bench_with_setup(
+                lambda _i: db.drop_graph_schema(),
+                lambda _i: _assert_targets_published(
+                    db.alter_graph_schema(schema_graph_operations(), chunk_size=128),
+                    2,
+                ),
+                iter_cfg["warmup"],
+                iter_cfg["iters"],
+            )
+            scenarios.append(
+                scenario(
+                    scenario_id,
+                    "bulk_graph_schema_add_existing_data",
+                    "schema",
+                    s,
+                    iter_cfg,
+                    schema_publish_params("alter_graph_schema_add"),
+                    scenario_comparability(scenario_contract, scenario_id),
+                )
+            )
+        finally:
+            db.close()
+
+    scenario_id = "S-SCHEMA-003"
+    if not args.scenario_id or scenario_id in args.scenario_id:
+        iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+        db = OverGraph.open(str(tmp_root / "schema-active-upsert-node"))
+        try:
+            seed_schema_publish_data(db)
+            db.alter_graph_schema(schema_graph_operations(), chunk_size=128)
+            s = run_bench(
+                lambda i: db.upsert_node(
+                    "SchemaPerson",
+                    f"person-write-{i}",
+                    props=schema_name_props(i),
+                ),
+                iter_cfg["warmup"],
+                iter_cfg["iters"],
+                growth=True,
+            )
+            scenarios.append(
+                scenario(
+                    scenario_id,
+                    "upsert_node_active_schema",
+                    "schema",
+                    s,
+                    iter_cfg,
+                    schema_active_write_params(),
+                    scenario_comparability(scenario_contract, scenario_id),
+                )
+            )
+        finally:
+            db.close()
+
+    scenario_id = "S-SCHEMA-004"
+    if not args.scenario_id or scenario_id in args.scenario_id:
+        iter_cfg = scenario_iterations(args.warmup, args.iters, scenario_contract, scenario_id)
+        db = OverGraph.open(str(tmp_root / "schema-gql-check-add"))
+        try:
+            seed_schema_publish_data(db)
+            s = run_bench(
+                lambda _i: _assert_gql_schema_violations(
+                    db.execute_gql(GQL_SCHEMA_CHECK_ADD),
+                    0,
+                ),
+                iter_cfg["warmup"],
+                iter_cfg["iters"],
+            )
+            scenarios.append(
+                scenario(
+                    scenario_id,
+                    "gql_schema_check_add_existing_data",
+                    "schema",
+                    s,
+                    iter_cfg,
+                    {
+                        "api": "gql",
+                        "operation": "gql_check_current_graph_type_add",
+                        "node_targets": ["SchemaPerson"],
+                        "edge_targets": ["SCHEMA_WORKS_AT"],
+                        "preload_nodes": 2,
+                        "preload_edges": 1,
+                        "chunk_size": 128,
+                        "max_violations": 4,
+                    },
+                    scenario_comparability(scenario_contract, scenario_id),
+                )
+            )
+        finally:
+            db.close()
+
+
+def _assert_targets_published(result: Any, expected: int) -> None:
+    if result.targets_published != expected:
+        raise RuntimeError(f"expected {expected} schema targets published")
+
+
+def _assert_gql_schema_targets_published(result: dict[str, Any], expected: int) -> None:
+    stats_obj = result.get("schema_stats") or {}
+    if stats_obj.get("targets_published") != expected:
+        raise RuntimeError(f"expected {expected} GQL schema targets published")
+
+
+def _assert_gql_schema_violations(result: dict[str, Any], expected: int) -> None:
+    stats_obj = result.get("schema_stats") or {}
+    if stats_obj.get("violation_count") != expected:
+        raise RuntimeError(f"expected {expected} GQL schema violations")
+
+
 def push_query_scenarios(
     args: argparse.Namespace,
     scenario_contract: dict[str, Any],
@@ -674,10 +917,10 @@ def push_query_scenarios(
     limit = 100
     selected_scenario_ids = set(args.scenario_id)
     if selected_scenario_ids:
-        unsupported = selected_scenario_ids - {"S-QUERY-007", "S-GQL-006"}
+        unsupported = selected_scenario_ids - {"S-QUERY-007", "S-GQL-006"} - SCHEMA_SCENARIO_IDS
         if unsupported:
             raise ValueError(
-                "--scenario-id is currently limited to CP32.10 final scenarios; "
+                "--scenario-id is currently limited to final graph-row and schema scenarios; "
                 f"unsupported: {', '.join(sorted(unsupported))}"
             )
         if "S-QUERY-007" in selected_scenario_ids:
@@ -1131,6 +1374,11 @@ def main() -> int:
 
     try:
         push_query_scenarios(args, scenario_contract, cfg, tmp_root, scenarios)
+        if (
+            (args.scenario_set == "all" and not args.scenario_id)
+            or bool(set(args.scenario_id) & SCHEMA_SCENARIO_IDS)
+        ):
+            push_schema_scenarios(args, scenario_contract, tmp_root, scenarios)
 
         if args.scenario_set == "query" or args.scenario_id:
             output = {

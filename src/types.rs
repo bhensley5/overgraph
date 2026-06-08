@@ -48,6 +48,8 @@ pub enum GqlParamValue {
 pub enum GqlStatementKind {
     Query,
     Mutation,
+    Schema,
+    Index,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +189,8 @@ pub struct GqlExecutionResult {
     pub next_cursor: Option<String>,
     pub stats: GqlExecutionStats,
     pub mutation_stats: Option<GqlMutationStats>,
+    pub schema_stats: Option<GqlSchemaStats>,
+    pub index_stats: Option<GqlIndexStats>,
     pub plan: Option<GqlExecutionExplain>,
 }
 
@@ -219,6 +223,30 @@ pub struct GqlMutationStats {
     pub skipped_null_targets: usize,
     pub duplicate_targets: usize,
     pub db_hits: usize,
+    pub elapsed_us: Option<u64>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlSchemaStats {
+    pub operation: String,
+    pub targets_checked: u64,
+    pub targets_published: u64,
+    pub targets_dropped: u64,
+    pub checked_records: u64,
+    pub violation_count: u64,
+    pub truncated: bool,
+    pub scan_limit_hit: bool,
+    pub elapsed_us: Option<u64>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlIndexStats {
+    pub operation: String,
+    pub indexes_ensured: u64,
+    pub indexes_dropped: u64,
+    pub indexes_returned: u64,
     pub elapsed_us: Option<u64>,
     pub warnings: Vec<String>,
 }
@@ -271,9 +299,58 @@ pub struct GqlExecutionExplain {
     pub columns: Vec<String>,
     pub read: Option<GqlExplain>,
     pub mutation: Option<GqlMutationExplain>,
+    pub schema: Option<GqlSchemaExplain>,
+    pub index: Option<GqlIndexExplain>,
     pub caps: GqlExecutionCapSummary,
     pub warnings: Vec<String>,
     pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlIndexExplain {
+    pub operation: String,
+    pub targets: Vec<GqlIndexExplainTarget>,
+    pub uses_core_write_queue: bool,
+    pub publishes_manifest: bool,
+    pub creates_labels: bool,
+    pub schedules_background_build: bool,
+    pub drops_index_data_async: bool,
+    pub side_effect_free: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GqlIndexExplainTarget {
+    pub target_kind: String,
+    pub label: Option<String>,
+    pub prop_key: Option<String>,
+    pub kind: Option<String>,
+    pub action: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GqlSchemaExplain {
+    pub operation: String,
+    pub targets: Vec<GqlSchemaExplainTarget>,
+    pub replaces_entire_catalog: bool,
+    pub publishes_manifest: bool,
+    pub validates_existing_data: bool,
+    pub uses_core_write_queue: bool,
+    pub side_effect_free: bool,
+    pub options: GqlSchemaExplainOptions,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GqlSchemaExplainTarget {
+    pub target_kind: String,
+    pub label: Option<String>,
+    pub action: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GqlSchemaExplainOptions {
+    pub max_violations: Option<usize>,
+    pub chunk_size: Option<usize>,
+    pub scan_limit: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -355,6 +432,7 @@ pub enum GqlSemanticErrorCode {
 }
 
 pub(crate) const LABEL_TOKEN_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_CATALOG_VERSION: u32 = 1;
 #[allow(dead_code)]
 pub(crate) const MAX_NODE_LABELS_PER_NODE: usize = 10;
 
@@ -2445,6 +2523,209 @@ pub struct SecondaryIndexManifestEntry {
     pub last_error: Option<String>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchemaAdditionalPropertiesManifest {
+    Allow,
+    Reject,
+}
+
+impl Default for SchemaAdditionalPropertiesManifest {
+    fn default() -> Self {
+        Self::Allow
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchemaValueTypeManifest {
+    Bool,
+    Int,
+    UInt,
+    Float,
+    Number,
+    String,
+    Bytes,
+    Array,
+    Map,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchemaVectorPresenceManifest {
+    Optional,
+    Required,
+    Forbidden,
+}
+
+impl Default for SchemaVectorPresenceManifest {
+    fn default() -> Self {
+        Self::Optional
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchemaNumericBoundManifest {
+    pub value: PropValue,
+    #[serde(default = "default_true")]
+    pub inclusive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PropertySchemaManifestRule {
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default = "default_true")]
+    pub nullable: bool,
+    #[serde(default)]
+    pub types: Vec<SchemaValueTypeManifest>,
+    #[serde(default)]
+    pub numeric_min: Option<SchemaNumericBoundManifest>,
+    #[serde(default)]
+    pub numeric_max: Option<SchemaNumericBoundManifest>,
+    #[serde(default)]
+    pub string_min_bytes: Option<usize>,
+    #[serde(default)]
+    pub string_max_bytes: Option<usize>,
+    #[serde(default)]
+    pub bytes_min_len: Option<usize>,
+    #[serde(default)]
+    pub bytes_max_len: Option<usize>,
+    #[serde(default)]
+    pub array_min_items: Option<usize>,
+    #[serde(default)]
+    pub array_max_items: Option<usize>,
+    #[serde(default)]
+    pub map_min_entries: Option<usize>,
+    #[serde(default)]
+    pub map_max_entries: Option<usize>,
+    #[serde(default)]
+    pub enum_values: Vec<PropValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StringFieldSchemaManifestRule {
+    #[serde(default)]
+    pub min_bytes: Option<usize>,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+    #[serde(default)]
+    pub enum_values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NumericFieldSchemaManifestRule {
+    #[serde(default)]
+    pub min: Option<SchemaNumericBoundManifest>,
+    #[serde(default)]
+    pub max: Option<SchemaNumericBoundManifest>,
+    #[serde(default = "default_true")]
+    pub finite: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeLabelConstraintManifestRule {
+    #[serde(default)]
+    pub all_of: Vec<u32>,
+    #[serde(default)]
+    pub any_of: Vec<u32>,
+    #[serde(default)]
+    pub none_of: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointLabelManifestRule {
+    #[serde(default)]
+    pub all_of: Vec<u32>,
+    #[serde(default)]
+    pub any_of: Vec<u32>,
+    #[serde(default)]
+    pub none_of: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DenseVectorSchemaManifestRule {
+    #[serde(default)]
+    pub presence: SchemaVectorPresenceManifest,
+    #[serde(default)]
+    pub dimension: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SparseVectorSchemaManifestRule {
+    #[serde(default)]
+    pub presence: SchemaVectorPresenceManifest,
+    #[serde(default)]
+    pub min_entries: Option<usize>,
+    #[serde(default)]
+    pub max_entries: Option<usize>,
+    #[serde(default)]
+    pub max_dimension_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeValiditySchemaManifestRule {
+    #[serde(default)]
+    pub require_valid_from_before_valid_to: bool,
+    #[serde(default)]
+    pub valid_from_min: Option<i64>,
+    #[serde(default)]
+    pub valid_from_max: Option<i64>,
+    #[serde(default)]
+    pub valid_to_min: Option<i64>,
+    #[serde(default)]
+    pub valid_to_max: Option<i64>,
+    #[serde(default = "default_true")]
+    pub allow_open_ended_valid_to: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeSchemaManifestEntry {
+    pub schema_id: u64,
+    pub revision: u64,
+    pub label_id: u32,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    #[serde(default)]
+    pub additional_properties: SchemaAdditionalPropertiesManifest,
+    #[serde(default)]
+    pub properties: BTreeMap<String, PropertySchemaManifestRule>,
+    #[serde(default)]
+    pub key: Option<StringFieldSchemaManifestRule>,
+    #[serde(default)]
+    pub label_constraints: Option<NodeLabelConstraintManifestRule>,
+    #[serde(default)]
+    pub weight: Option<NumericFieldSchemaManifestRule>,
+    #[serde(default)]
+    pub dense_vector: Option<DenseVectorSchemaManifestRule>,
+    #[serde(default)]
+    pub sparse_vector: Option<SparseVectorSchemaManifestRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EdgeSchemaManifestEntry {
+    pub schema_id: u64,
+    pub revision: u64,
+    pub label_id: u32,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    #[serde(default)]
+    pub additional_properties: SchemaAdditionalPropertiesManifest,
+    #[serde(default)]
+    pub properties: BTreeMap<String, PropertySchemaManifestRule>,
+    #[serde(default)]
+    pub from: Option<EndpointLabelManifestRule>,
+    #[serde(default)]
+    pub to: Option<EndpointLabelManifestRule>,
+    #[serde(default = "default_true")]
+    pub allow_self_loops: bool,
+    #[serde(default)]
+    pub weight: Option<NumericFieldSchemaManifestRule>,
+    #[serde(default)]
+    pub validity: Option<EdgeValiditySchemaManifestRule>,
+}
+
 /// User-facing information about a node-property optional secondary index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodePropertyIndexInfo {
@@ -2628,6 +2909,18 @@ pub struct ManifestState {
     /// Next declaration ID to allocate.
     #[serde(default)]
     pub next_secondary_index_id: u64,
+    /// Schema catalog format marker. Version 0 with no entries is an old manifest.
+    #[serde(default)]
+    pub schema_catalog_version: u32,
+    /// Next schema ID to allocate.
+    #[serde(default)]
+    pub next_schema_id: u64,
+    /// Persisted node schema declarations keyed by internal node label IDs.
+    #[serde(default)]
+    pub node_schemas: Vec<NodeSchemaManifestEntry>,
+    /// Persisted edge schema declarations keyed by internal edge label IDs.
+    #[serde(default)]
+    pub edge_schemas: Vec<EdgeSchemaManifestEntry>,
 }
 
 /// State of a flush epoch in the manifest.
@@ -3803,6 +4096,10 @@ mod tests {
             pending_flush_epochs: Vec::new(),
             secondary_indexes: Vec::new(),
             next_secondary_index_id: 1,
+            schema_catalog_version: SCHEMA_CATALOG_VERSION,
+            next_schema_id: 1,
+            node_schemas: Vec::new(),
+            edge_schemas: Vec::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let loaded: ManifestState = serde_json::from_str(&json).unwrap();
@@ -3811,6 +4108,10 @@ mod tests {
         assert_eq!(loaded.next_node_id, 151);
         assert_eq!(loaded.next_edge_id, 276);
         assert_eq!(loaded.dense_vector, state.dense_vector);
+        assert_eq!(loaded.schema_catalog_version, SCHEMA_CATALOG_VERSION);
+        assert_eq!(loaded.next_schema_id, 1);
+        assert!(loaded.node_schemas.is_empty());
+        assert!(loaded.edge_schemas.is_empty());
     }
 
     #[test]

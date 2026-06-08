@@ -84,6 +84,23 @@ function runBench(fn, warmup, iters, growth = false) {
   return s;
 }
 
+function runBenchWithSetup(setup, fn, warmup, iters) {
+  for (let i = 0; i < warmup; i++) {
+    setup(i);
+    fn(i);
+  }
+  const samples = [];
+  for (let i = 0; i < iters; i++) {
+    const idx = warmup + i;
+    setup(idx);
+    const t0 = performance.now();
+    fn(idx);
+    const t1 = performance.now();
+    samples.push((t1 - t0) * 1000);
+  }
+  return stats(samples);
+}
+
 function throughputOpsPerSec(meanUs, opsPerIter) {
   if (!meanUs || meanUs <= 0) return null;
   return (opsPerIter * 1_000_000.0) / meanUs;
@@ -137,6 +154,10 @@ function scenarioComparability(scenarioContract, scenarioId) {
     status: entry.status,
     reason: entry.reason || null,
   };
+}
+
+function scenarioSelected(args, scenarioId) {
+  return args.scenarioIds.length === 0 || args.scenarioIds.includes(scenarioId);
 }
 
 function effectiveConfig(profile, scenarioContract) {
@@ -579,6 +600,81 @@ function graphRowScenarioParams(layout, preloadEdges, limit) {
   };
 }
 
+const SCHEMA_SCENARIO_IDS = new Set([
+  'S-SCHEMA-001',
+  'S-SCHEMA-002',
+  'S-SCHEMA-003',
+  'S-SCHEMA-004',
+]);
+
+const GQL_SCHEMA_ALTER_ADD =
+  "ALTER CURRENT GRAPH TYPE ADD { NODE SchemaPerson = { properties: { name: { required: true, nullable: false, types: ['string'] } } }, EDGE SCHEMA_WORKS_AT = { from: { all_of: ['SchemaPerson'] }, to: { all_of: ['SchemaCompany'] }, properties: { role: { required: true, nullable: false, types: ['string'] } } } } OPTIONS { chunk_size: 128 }";
+
+const GQL_SCHEMA_CHECK_ADD =
+  "CHECK CURRENT GRAPH TYPE ADD { NODE SchemaPerson = { properties: { name: { required: true, nullable: false, types: ['string'] } } }, EDGE SCHEMA_WORKS_AT = { from: { all_of: ['SchemaPerson'] }, to: { all_of: ['SchemaCompany'] }, properties: { role: { required: true, nullable: false, types: ['string'] } } } } OPTIONS { chunk_size: 128, max_violations: 4 }";
+
+function schemaNameProps(i) {
+  return { name: `name-${i}` };
+}
+
+function schemaRoleProps(i) {
+  return { role: `role-${i}` };
+}
+
+function schemaNodeSchema() {
+  return {
+    properties: {
+      name: { required: true, nullable: false, types: ['string'] },
+    },
+  };
+}
+
+function schemaEdgeSchema() {
+  return {
+    properties: {
+      role: { required: true, nullable: false, types: ['string'] },
+    },
+    from: { allOf: ['SchemaPerson'] },
+    to: { allOf: ['SchemaCompany'] },
+  };
+}
+
+function schemaGraphOperations() {
+  return [
+    { kind: 'setNode', label: 'SchemaPerson', schema: schemaNodeSchema() },
+    { kind: 'setEdge', label: 'SCHEMA_WORKS_AT', schema: schemaEdgeSchema() },
+  ];
+}
+
+function seedSchemaPublishData(db) {
+  const person = db.upsertNode('SchemaPerson', 'person-0', { props: schemaNameProps(0) });
+  const company = db.upsertNode('SchemaCompany', 'company-0');
+  db.upsertEdge(person, company, 'SCHEMA_WORKS_AT', { props: schemaRoleProps(0) });
+}
+
+function schemaPublishParams(operation) {
+  return {
+    api: operation.startsWith('gql_') ? 'gql' : 'native',
+    operation,
+    node_targets: ['SchemaPerson'],
+    edge_targets: ['SCHEMA_WORKS_AT'],
+    preload_nodes: 2,
+    preload_edges: 1,
+    chunk_size: 128,
+  };
+}
+
+function schemaActiveWriteParams() {
+  return {
+    api: 'native',
+    operation: 'upsert_node_active_schema',
+    registered_node_schemas: ['SchemaPerson'],
+    registered_edge_schemas: ['SCHEMA_WORKS_AT'],
+    write_label: 'SchemaPerson',
+    with_props: true,
+  };
+}
+
 function pushGraphRowOptionalScenario(args, scenarioContract, tmpRoot, preloadNodes, limit, scenarios) {
   const scenarioId = 'S-QUERY-007';
   const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
@@ -640,16 +736,162 @@ function pushGqlGraphRowOptionalScenario(args, scenarioContract, tmpRoot, preloa
   }
 }
 
+function pushSchemaScenarios(args, scenarioContract, tmpRoot, scenarios) {
+  {
+    const scenarioId = 'S-SCHEMA-001';
+    if (scenarioSelected(args, scenarioId)) {
+      const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+      const db = OverGraph.open(join(tmpRoot, 'schema-gql-alter-add'));
+      try {
+        seedSchemaPublishData(db);
+        const s = runBenchWithSetup(
+          () => db.dropGraphSchema(),
+          () => {
+            const result = db.executeGql(GQL_SCHEMA_ALTER_ADD);
+            if (result.schemaStats?.targetsPublished !== 2) {
+              throw new Error('GQL schema ALTER benchmark expected two published targets');
+            }
+          },
+          iterCfg.warmup,
+          iterCfg.iters
+        );
+        scenarios.push(
+          scenario(
+            scenarioId,
+            'gql_schema_alter_add_existing_data',
+            'schema',
+            s,
+            iterCfg,
+            schemaPublishParams('gql_alter_current_graph_type_add'),
+            scenarioComparability(scenarioContract, scenarioId)
+          )
+        );
+      } finally {
+        db.close();
+      }
+    }
+  }
+
+  {
+    const scenarioId = 'S-SCHEMA-002';
+    if (scenarioSelected(args, scenarioId)) {
+      const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+      const db = OverGraph.open(join(tmpRoot, 'schema-native-bulk-add'));
+      try {
+        seedSchemaPublishData(db);
+        const s = runBenchWithSetup(
+          () => db.dropGraphSchema(),
+          () => {
+            const result = db.alterGraphSchema(schemaGraphOperations(), { chunkSize: 128 });
+            if (result.targetsPublished !== 2) {
+              throw new Error('bulk graph-schema benchmark expected two published targets');
+            }
+          },
+          iterCfg.warmup,
+          iterCfg.iters
+        );
+        scenarios.push(
+          scenario(
+            scenarioId,
+            'bulk_graph_schema_add_existing_data',
+            'schema',
+            s,
+            iterCfg,
+            schemaPublishParams('alter_graph_schema_add'),
+            scenarioComparability(scenarioContract, scenarioId)
+          )
+        );
+      } finally {
+        db.close();
+      }
+    }
+  }
+
+  {
+    const scenarioId = 'S-SCHEMA-003';
+    if (scenarioSelected(args, scenarioId)) {
+      const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+      const db = OverGraph.open(join(tmpRoot, 'schema-active-upsert-node'));
+      try {
+        seedSchemaPublishData(db);
+        db.alterGraphSchema(schemaGraphOperations(), { chunkSize: 128 });
+        const s = runBench(
+          (i) => db.upsertNode('SchemaPerson', `person-write-${i}`, { props: schemaNameProps(i) }),
+          iterCfg.warmup,
+          iterCfg.iters,
+          true
+        );
+        scenarios.push(
+          scenario(
+            scenarioId,
+            'upsert_node_active_schema',
+            'schema',
+            s,
+            iterCfg,
+            schemaActiveWriteParams(),
+            scenarioComparability(scenarioContract, scenarioId)
+          )
+        );
+      } finally {
+        db.close();
+      }
+    }
+  }
+
+  {
+    const scenarioId = 'S-SCHEMA-004';
+    if (scenarioSelected(args, scenarioId)) {
+      const iterCfg = scenarioIterations(args, scenarioContract, scenarioId);
+      const db = OverGraph.open(join(tmpRoot, 'schema-gql-check-add'));
+      try {
+        seedSchemaPublishData(db);
+        const s = runBench(
+          () => {
+            const result = db.executeGql(GQL_SCHEMA_CHECK_ADD);
+            if (result.schemaStats?.violationCount !== 0) {
+              throw new Error('GQL schema CHECK benchmark expected zero violations');
+            }
+          },
+          iterCfg.warmup,
+          iterCfg.iters
+        );
+        scenarios.push(
+          scenario(
+            scenarioId,
+            'gql_schema_check_add_existing_data',
+            'schema',
+            s,
+            iterCfg,
+            {
+              api: 'gql',
+              operation: 'gql_check_current_graph_type_add',
+              node_targets: ['SchemaPerson'],
+              edge_targets: ['SCHEMA_WORKS_AT'],
+              preload_nodes: 2,
+              preload_edges: 1,
+              chunk_size: 128,
+              max_violations: 4,
+            },
+            scenarioComparability(scenarioContract, scenarioId)
+          )
+        );
+      } finally {
+        db.close();
+      }
+    }
+  }
+}
+
 function pushQueryScenarios(args, scenarioContract, cfg, tmpRoot, scenarios) {
   const preloadNodes = cfg.time_range_nodes;
   const limit = 100;
   if (args.scenarioIds.length > 0) {
     const selectedScenarioIds = new Set(args.scenarioIds);
-    const supportedScenarioIds = new Set(['S-QUERY-007', 'S-GQL-006']);
+    const supportedScenarioIds = new Set(['S-QUERY-007', 'S-GQL-006', ...SCHEMA_SCENARIO_IDS]);
     const unsupported = [...selectedScenarioIds].filter((id) => !supportedScenarioIds.has(id));
     if (unsupported.length > 0) {
       throw new Error(
-        `--scenario-id is currently limited to final graph-row scenarios; unsupported: ${unsupported.sort().join(', ')}`
+        `--scenario-id is currently limited to final graph-row and schema scenarios; unsupported: ${unsupported.sort().join(', ')}`
       );
     }
     if (selectedScenarioIds.has('S-QUERY-007')) {
@@ -1077,6 +1319,12 @@ const scenarios = [];
 
 try {
   pushQueryScenarios(args, scenarioContract, cfg, tmpRoot, scenarios);
+  if (
+    (args.scenarioSet === 'all' && args.scenarioIds.length === 0) ||
+    args.scenarioIds.some((id) => SCHEMA_SCENARIO_IDS.has(id))
+  ) {
+    pushSchemaScenarios(args, scenarioContract, tmpRoot, scenarios);
+  }
 
   if (args.scenarioSet === 'all' && args.scenarioIds.length === 0) {
   // S-CRUD-001: single upsert node (growth)

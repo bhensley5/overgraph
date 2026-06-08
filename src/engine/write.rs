@@ -319,6 +319,137 @@ fn stage_label_tokens_in_manifest(
     Ok(())
 }
 
+struct SchemaWriteOverlay {
+    final_nodes: NodeIdMap<NodeRecord>,
+    final_edges: NodeIdMap<EdgeRecord>,
+    deleted_nodes: NodeIdSet,
+    deleted_edges: NodeIdSet,
+    final_upserted_edges: NodeIdSet,
+    node_order: Vec<u64>,
+    edge_order: Vec<u64>,
+}
+
+impl SchemaWriteOverlay {
+    fn new() -> Self {
+        Self {
+            final_nodes: NodeIdMap::default(),
+            final_edges: NodeIdMap::default(),
+            deleted_nodes: NodeIdSet::default(),
+            deleted_edges: NodeIdSet::default(),
+            final_upserted_edges: NodeIdSet::default(),
+            node_order: Vec::new(),
+            edge_order: Vec::new(),
+        }
+    }
+}
+
+#[cfg(not(test))]
+const SCHEMA_ENDPOINT_VALIDATION_CHUNK_SIZE: usize = 4096;
+#[cfg(test)]
+const SCHEMA_ENDPOINT_VALIDATION_CHUNK_SIZE: usize = 8;
+
+#[derive(Clone, Copy)]
+enum SchemaEndpointNodeState {
+    Live(NodeLabelSet),
+    Missing,
+}
+
+#[derive(Default)]
+struct SchemaEndpointLabelCache {
+    states: NodeIdMap<SchemaEndpointNodeState>,
+}
+
+impl SchemaEndpointLabelCache {
+    fn hydrate_node_ids(
+        &mut self,
+        core: &EngineCore,
+        overlay: &SchemaWriteOverlay,
+        node_ids: &[u64],
+    ) -> Result<(), EngineError> {
+        if node_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut unique = node_ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+
+        let mut hydrate_current = Vec::new();
+        for node_id in unique {
+            if self.states.contains_key(&node_id) {
+                continue;
+            }
+            if let Some(node) = overlay.final_nodes.get(&node_id) {
+                self.states
+                    .insert(node_id, SchemaEndpointNodeState::Live(node.label_ids));
+            } else if overlay.deleted_nodes.contains(&node_id) {
+                self.states.insert(node_id, SchemaEndpointNodeState::Missing);
+            } else {
+                hydrate_current.push(node_id);
+            }
+        }
+
+        for chunk in hydrate_current.chunks(SCHEMA_ENDPOINT_VALIDATION_CHUNK_SIZE) {
+            let visibility = core.sources().find_node_visibility_meta(chunk)?;
+            for (&node_id, state) in chunk.iter().zip(visibility.iter()) {
+                let endpoint_state = match state {
+                    NodeVisibilityState::Live(meta) => {
+                        SchemaEndpointNodeState::Live(meta.label_ids)
+                    }
+                    NodeVisibilityState::Deleted | NodeVisibilityState::Missing => {
+                        SchemaEndpointNodeState::Missing
+                    }
+                };
+                self.states.insert(node_id, endpoint_state);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn labels_for(&self, node_id: u64) -> Option<NodeLabelSet> {
+        debug_assert!(
+            self.states.contains_key(&node_id),
+            "endpoint node labels must be hydrated before validation"
+        );
+        match self.states.get(&node_id).copied() {
+            Some(SchemaEndpointNodeState::Live(labels)) => Some(labels),
+            Some(SchemaEndpointNodeState::Missing) | None => None,
+        }
+    }
+}
+
+impl IdCounterSnapshot {
+    fn capture(core: &EngineCore) -> Self {
+        Self {
+            next_node_id: core.next_node_id,
+            next_edge_id: core.next_edge_id,
+            next_node_id_seen: core.next_node_id_seen.load(Ordering::Acquire),
+            next_edge_id_seen: core.next_edge_id_seen.load(Ordering::Acquire),
+        }
+    }
+
+    fn restore(self, core: &mut EngineCore) {
+        core.next_node_id = self.next_node_id;
+        core.next_edge_id = self.next_edge_id;
+        core.next_node_id_seen
+            .store(self.next_node_id_seen, Ordering::Release);
+        core.next_edge_id_seen
+            .store(self.next_edge_id_seen, Ordering::Release);
+    }
+}
+
+fn is_schema_violation_error(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::InvalidOperation(message) if message.starts_with("schema violation:")
+    )
+}
+
+fn schema_validation_failure_error(failure: SchemaValidationFailure) -> EngineError {
+    EngineError::InvalidOperation(failure.message)
+}
+
 impl EngineCore {
     fn apply_manifest_token_creations(
         &mut self,
@@ -343,11 +474,22 @@ impl EngineCore {
 
     fn commit_core_write_plan(
         &mut self,
-        plan: CoreWritePlan,
+        planned: PlannedCoreWrite,
     ) -> (Result<CoreWriteReply, EngineError>, PublishImpact) {
+        let PlannedCoreWrite {
+            plan,
+            id_counter_snapshot,
+        } = planned;
         let mut publish_impact = PublishImpact::NoPublish;
 
         let result = (|| -> Result<CoreWriteReply, EngineError> {
+            if let Err(error) = self.validate_schema_for_wal_ops(&plan.ops) {
+                if is_schema_violation_error(&error) {
+                    id_counter_snapshot.restore(self);
+                }
+                return Err(error);
+            }
+
             match plan.ops.as_slice() {
                 [] => {}
                 [op] => self.append_and_apply_one_normalized(op)?,
@@ -366,6 +508,12 @@ impl EngineCore {
                     self.track_id(op);
                 }
             }
+            if self.next_node_id != id_counter_snapshot.next_node_id {
+                self.update_next_node_id_seen();
+            }
+            if self.next_edge_id != id_counter_snapshot.next_edge_id {
+                self.update_next_edge_id_seen();
+            }
 
             if plan.auto_flush {
                 let (auto_flush_result, auto_flush_impact) = self.maybe_auto_flush();
@@ -382,8 +530,9 @@ impl EngineCore {
     fn plan_core_write(
         &mut self,
         request: &CoreWriteRequest,
-    ) -> Result<CoreWritePlan, EngineError> {
-        match request {
+    ) -> Result<PlannedCoreWrite, EngineError> {
+        let id_counter_snapshot = IdCounterSnapshot::capture(self);
+        let plan = match request {
             CoreWriteRequest::EnsureNodeLabel { label } => self.plan_ensure_node_label(label),
             CoreWriteRequest::EnsureEdgeLabel { label } => self.plan_ensure_edge_label(label),
             CoreWriteRequest::UpsertNode {
@@ -417,6 +566,13 @@ impl EngineCore {
             CoreWriteRequest::Prune { policy } => self.plan_prune(policy),
             CoreWriteRequest::SetPrunePolicy { .. }
             | CoreWriteRequest::RemovePrunePolicy { .. }
+            | CoreWriteRequest::SetNodeSchema { .. }
+            | CoreWriteRequest::DropNodeSchema { .. }
+            | CoreWriteRequest::SetEdgeSchema { .. }
+            | CoreWriteRequest::DropEdgeSchema { .. }
+            | CoreWriteRequest::SetGraphSchema { .. }
+            | CoreWriteRequest::AlterGraphSchema { .. }
+            | CoreWriteRequest::DropGraphSchema
             | CoreWriteRequest::EnsureNodePropertyIndex { .. }
             | CoreWriteRequest::DropNodePropertyIndex { .. }
             | CoreWriteRequest::EnsureEdgePropertyIndex { .. }
@@ -429,7 +585,256 @@ impl EngineCore {
             | CoreWriteRequest::Compact => Err(EngineError::InvalidOperation(
                 "request does not use the planner write path".to_string(),
             )),
+        }?;
+        Ok(PlannedCoreWrite {
+            plan,
+            id_counter_snapshot,
+        })
+    }
+
+    fn validate_schema_for_wal_ops(&self, ops: &[WalOp]) -> Result<(), EngineError> {
+        let catalog = &self.runtime_schema_catalog;
+        if catalog.is_empty() {
+            return Ok(());
         }
+        if !self.schema_wal_ops_may_need_validation(catalog, ops) {
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        self.schema_validation_overlay_builds
+            .fetch_add(1, Ordering::Relaxed);
+
+        let overlay = self.build_schema_write_overlay(catalog, ops);
+        self.validate_schema_write_overlay(catalog, &overlay)
+    }
+
+    fn schema_wal_ops_may_need_validation(
+        &self,
+        catalog: &RuntimeSchemaCatalog,
+        ops: &[WalOp],
+    ) -> bool {
+        ops.iter().any(|op| match op {
+            WalOp::UpsertNode(node) => {
+                catalog.node_has_applicable_schema(&node.label_ids)
+                    || catalog.has_edge_endpoint_constraints
+            }
+            WalOp::UpsertEdge(edge) => catalog.edge_has_wal_validation_rules(edge.label_id),
+            WalOp::DeleteNode { .. } => catalog.has_edge_endpoint_constraints,
+            WalOp::DeleteEdge { .. }
+            | WalOp::EnsureNodeLabel { .. }
+            | WalOp::EnsureEdgeLabel { .. }
+            | WalOp::BeginAtomicBatch { .. }
+            | WalOp::CommitAtomicBatch { .. } => false,
+        })
+    }
+
+    fn build_schema_write_overlay(
+        &self,
+        catalog: &RuntimeSchemaCatalog,
+        ops: &[WalOp],
+    ) -> SchemaWriteOverlay {
+        let mut overlay = SchemaWriteOverlay::new();
+        for op in ops {
+            match op {
+                WalOp::UpsertNode(node) => {
+                    overlay.deleted_nodes.remove(&node.id);
+                    if catalog.has_edge_endpoint_constraints
+                        || catalog.node_has_applicable_schema(&node.label_ids)
+                    {
+                        overlay.final_nodes.insert(node.id, node.clone());
+                        overlay.node_order.push(node.id);
+                    } else {
+                        overlay.final_nodes.remove(&node.id);
+                    }
+                }
+                WalOp::UpsertEdge(edge) => {
+                    overlay.deleted_edges.remove(&edge.id);
+                    overlay.final_upserted_edges.insert(edge.id);
+                    if catalog.edge_has_wal_validation_rules(edge.label_id) {
+                        overlay.final_edges.insert(edge.id, edge.clone());
+                        overlay.edge_order.push(edge.id);
+                    } else {
+                        overlay.final_edges.remove(&edge.id);
+                    }
+                }
+                WalOp::DeleteNode { id, .. } => {
+                    overlay.deleted_nodes.insert(*id);
+                    overlay.final_nodes.remove(id);
+                }
+                WalOp::DeleteEdge { id, .. } => {
+                    overlay.deleted_edges.insert(*id);
+                    overlay.final_edges.remove(id);
+                    overlay.final_upserted_edges.remove(id);
+                }
+                WalOp::EnsureNodeLabel { .. }
+                | WalOp::EnsureEdgeLabel { .. }
+                | WalOp::BeginAtomicBatch { .. }
+                | WalOp::CommitAtomicBatch { .. } => {}
+            }
+        }
+        overlay
+    }
+
+    fn validate_schema_write_overlay(
+        &self,
+        catalog: &RuntimeSchemaCatalog,
+        overlay: &SchemaWriteOverlay,
+    ) -> Result<(), EngineError> {
+        let _deleted_record_count = overlay.deleted_nodes.len() + overlay.deleted_edges.len();
+        let mut visited_nodes = NodeIdSet::default();
+        for node_id in &overlay.node_order {
+            if !visited_nodes.insert(*node_id) {
+                continue;
+            }
+            let Some(node) = overlay.final_nodes.get(node_id) else {
+                continue;
+            };
+            catalog
+                .validate_node_record_detailed(node, self.manifest.dense_vector.as_ref())
+                .map_err(schema_validation_failure_error)?;
+        }
+
+        let mut visited_edges = NodeIdSet::default();
+        let mut endpoint_edge_order = Vec::new();
+        let mut endpoint_node_ids = Vec::new();
+        for edge_id in &overlay.edge_order {
+            if !visited_edges.insert(*edge_id) {
+                continue;
+            }
+            let Some(edge) = overlay.final_edges.get(edge_id) else {
+                continue;
+            };
+            catalog
+                .validate_edge_record_detailed(edge)
+                .map_err(schema_validation_failure_error)?;
+            if catalog.edge_schema_has_endpoint_rules(edge.label_id) {
+                endpoint_edge_order.push(*edge_id);
+                endpoint_node_ids.push(edge.from);
+                endpoint_node_ids.push(edge.to);
+            }
+        }
+
+        let mut endpoint_cache = SchemaEndpointLabelCache::default();
+        endpoint_cache.hydrate_node_ids(self, overlay, &endpoint_node_ids)?;
+        for edge_id in endpoint_edge_order {
+            let Some(edge) = overlay.final_edges.get(&edge_id) else {
+                continue;
+            };
+            let from_labels = endpoint_cache.labels_for(edge.from);
+            let to_labels = endpoint_cache.labels_for(edge.to);
+            catalog
+                .validate_edge_endpoint_labels_detailed(
+                    edge,
+                    from_labels.as_ref(),
+                    to_labels.as_ref(),
+                )
+                .map_err(schema_validation_failure_error)?;
+        }
+
+        self.validate_endpoint_incident_edges(catalog, overlay, &mut endpoint_cache)?;
+        Ok(())
+    }
+
+    fn validate_endpoint_incident_edges(
+        &self,
+        catalog: &RuntimeSchemaCatalog,
+        overlay: &SchemaWriteOverlay,
+        endpoint_cache: &mut SchemaEndpointLabelCache,
+    ) -> Result<(), EngineError> {
+        if !catalog.has_edge_endpoint_constraints {
+            return Ok(());
+        }
+        let label_filter_ids = catalog.endpoint_constrained_edge_label_ids.as_slice();
+        if label_filter_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut candidate_node_ids = Vec::new();
+        if !overlay.final_nodes.is_empty() {
+            let mut final_node_ids: Vec<u64> = overlay.final_nodes.keys().copied().collect();
+            final_node_ids.sort_unstable();
+            let current_states = self.sources().find_node_visibility_meta(&final_node_ids)?;
+            for (&node_id, current_state) in final_node_ids.iter().zip(current_states.iter()) {
+                let final_labels = overlay
+                    .final_nodes
+                    .get(&node_id)
+                    .map(|node| node.label_ids)
+                    .expect("final node id came from final_nodes map");
+                let old_labels = match current_state {
+                    NodeVisibilityState::Live(meta) => Some(meta.label_ids),
+                    NodeVisibilityState::Deleted | NodeVisibilityState::Missing => None,
+                };
+                if catalog.label_change_may_affect_endpoint_rules(
+                    old_labels.as_ref(),
+                    Some(&final_labels),
+                    false,
+                ) {
+                    candidate_node_ids.push(node_id);
+                }
+            }
+        }
+
+        candidate_node_ids.extend(overlay.deleted_nodes.iter().copied());
+        if candidate_node_ids.is_empty() {
+            return Ok(());
+        }
+        candidate_node_ids.sort_unstable();
+        candidate_node_ids.dedup();
+
+        self.sources().scan_edge_ids_by_endpoints(
+            &candidate_node_ids,
+            Direction::Both,
+            Some(label_filter_ids),
+            SCHEMA_ENDPOINT_VALIDATION_CHUNK_SIZE,
+            |chunk| {
+                #[cfg(test)]
+                self.schema_validation_incident_scan_chunks
+                    .fetch_add(1, Ordering::Relaxed);
+
+                let mut edge_ids = Vec::with_capacity(chunk.len());
+                for &edge_id in chunk {
+                    if overlay.deleted_edges.contains(&edge_id)
+                        || overlay.final_upserted_edges.contains(&edge_id)
+                    {
+                        continue;
+                    }
+                    edge_ids.push(edge_id);
+                }
+                if edge_ids.is_empty() {
+                    return Ok(ControlFlow::Continue(()));
+                }
+
+                let hydrated = self.sources().find_edges(&edge_ids)?;
+                let mut endpoint_node_ids = Vec::new();
+                let mut edges = Vec::new();
+                for edge in hydrated.into_iter().flatten() {
+                    if !catalog.edge_schema_has_endpoint_rules(edge.label_id) {
+                        continue;
+                    }
+                    endpoint_node_ids.push(edge.from);
+                    endpoint_node_ids.push(edge.to);
+                    edges.push(edge);
+                }
+                if edges.is_empty() {
+                    return Ok(ControlFlow::Continue(()));
+                }
+
+                endpoint_cache.hydrate_node_ids(self, overlay, &endpoint_node_ids)?;
+                for edge in &edges {
+                    let from_labels = endpoint_cache.labels_for(edge.from);
+                    let to_labels = endpoint_cache.labels_for(edge.to);
+                    catalog
+                        .validate_edge_endpoint_labels_detailed(
+                            edge,
+                            from_labels.as_ref(),
+                            to_labels.as_ref(),
+                        )
+                        .map_err(schema_validation_failure_error)?;
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )
     }
 
     fn plan_ensure_node_label(&mut self, label: &str) -> Result<CoreWritePlan, EngineError> {
@@ -503,7 +908,6 @@ impl EngineCore {
             None => {
                 let id = self.next_node_id;
                 self.next_node_id += 1;
-                self.update_next_node_id_seen();
                 (id, now)
             }
         };
@@ -798,14 +1202,12 @@ impl EngineCore {
                 None => {
                     let id = self.next_edge_id;
                     self.next_edge_id += 1;
-                    self.update_next_edge_id_seen();
                     (id, now)
                 }
             }
         } else {
             let id = self.next_edge_id;
             self.next_edge_id += 1;
-            self.update_next_edge_id_seen();
             (id, now)
         };
 
@@ -874,7 +1276,6 @@ impl EngineCore {
             self.plan_node_upsert_records(inputs, &label_sets, normalized_vectors, now)?;
         if next_node_id != self.next_node_id {
             self.next_node_id = next_node_id;
-            self.update_next_node_id_seen();
         }
         ops.extend(records.into_iter().map(WalOp::UpsertNode));
 
@@ -934,13 +1335,11 @@ impl EngineCore {
                 } else {
                     let id = self.next_edge_id;
                     self.next_edge_id += 1;
-                    self.update_next_edge_id_seen();
                     (id, now)
                 }
             } else {
                 let id = self.next_edge_id;
                 self.next_edge_id += 1;
-                self.update_next_edge_id_seen();
                 (id, now)
             };
 
@@ -1162,13 +1561,11 @@ impl EngineCore {
                 } else {
                     let id = self.next_edge_id;
                     self.next_edge_id += 1;
-                    self.update_next_edge_id_seen();
                     (id, now)
                 }
             } else {
                 let id = self.next_edge_id;
                 self.next_edge_id += 1;
-                self.update_next_edge_id_seen();
                 (id, now)
             };
             if self.edge_uniqueness {
@@ -1297,7 +1694,6 @@ impl EngineCore {
 
         if next_node_id != self.next_node_id {
             self.next_node_id = next_node_id;
-            self.update_next_node_id_seen();
         }
 
         Ok(CoreWritePlan {

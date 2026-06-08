@@ -884,6 +884,8 @@ export type GqlParams = Record<string, GqlParam>
 
 export type GqlExecutionMode = 'auto' | 'readOnly'
 
+export type GqlStatementKind = 'query' | 'mutation' | 'schema' | 'index'
+
 export interface GqlExecutionOptions {
   mode?: GqlExecutionMode
   allowFullScan?: boolean
@@ -1053,11 +1055,55 @@ export interface GqlMutationExplain {
   atomicCommit: boolean
 }
 
+export interface GqlSchemaExplainTarget {
+  targetKind: string
+  label: string | null
+  action: string | null
+}
+
+export interface GqlSchemaExplainOptions {
+  maxViolations: number | null
+  chunkSize: number | null
+  scanLimit: number | null
+}
+
+export interface GqlSchemaExplain {
+  operation: string
+  targets: Array<GqlSchemaExplainTarget>
+  replacesEntireCatalog: boolean
+  publishesManifest: boolean
+  validatesExistingData: boolean
+  usesCoreWriteQueue: boolean
+  sideEffectFree: boolean
+  options: GqlSchemaExplainOptions
+}
+
+export interface GqlIndexExplainTarget {
+  targetKind: string
+  label: string | null
+  propKey: string | null
+  kind: string | null
+  action: string | null
+}
+
+export interface GqlIndexExplain {
+  operation: string
+  targets: Array<GqlIndexExplainTarget>
+  usesCoreWriteQueue: boolean
+  publishesManifest: boolean
+  createsLabels: boolean
+  schedulesBackgroundBuild: boolean
+  dropsIndexDataAsync: boolean
+  sideEffectFree: boolean
+}
+
 export interface GqlExecutionExplain {
-  kind: 'query' | 'mutation'
+  kind: GqlStatementKind
   columns: Array<string>
   read: GqlReadExplain | null
   mutation: GqlMutationExplain | null
+  schema: GqlSchemaExplain | null
+  index: GqlIndexExplain | null
   caps: GqlExecutionCapSummary
   warnings: Array<string>
   notes: Array<string>
@@ -1084,23 +1130,49 @@ export interface GqlMutationStats {
   warnings: Array<string>
 }
 
+export interface GqlSchemaStats {
+  operation: string
+  targetsChecked: number
+  targetsPublished: number
+  targetsDropped: number
+  checkedRecords: number
+  violationCount: number
+  truncated: boolean
+  scanLimitHit: boolean
+  elapsedUs: number | null
+  warnings: Array<string>
+}
+
+export interface GqlIndexStats {
+  operation: string
+  indexesEnsured: number
+  indexesDropped: number
+  indexesReturned: number
+  elapsedUs: number | null
+  warnings: Array<string>
+}
+
 export interface GqlObjectRowsExecutionResult {
-  kind: 'query' | 'mutation'
+  kind: GqlStatementKind
   columns: Array<string>
   rows: Array<Record<string, GqlValue>>
   nextCursor: string | null
   stats: GqlExecutionStats
   mutationStats: GqlMutationStats | null
+  schemaStats: GqlSchemaStats | null
+  indexStats: GqlIndexStats | null
   plan: GqlExecutionExplain | null
 }
 
 export interface GqlCompactRowsExecutionResult {
-  kind: 'query' | 'mutation'
+  kind: GqlStatementKind
   columns: Array<string>
   rows: Array<Array<GqlValue>>
   nextCursor: string | null
   stats: GqlExecutionStats
   mutationStats: GqlMutationStats | null
+  schemaStats: GqlSchemaStats | null
+  indexStats: GqlIndexStats | null
   plan: GqlExecutionExplain | null
 }
 

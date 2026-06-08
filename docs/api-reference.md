@@ -76,6 +76,11 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
   - [PropertyRangeCursor](#propertyrangecursor)
   - [PropertyRangePageRequest](#propertyrangepagerequest-rust-only)
   - [PropertyRangePageResult](#propertyrangepageresult)
+- [Schema Management](#schema-management)
+  - [Schema semantics](#schema-semantics)
+  - [Schema methods](#schema-methods)
+  - [Schema DTOs](#schema-dtos)
+  - [Schema examples](#schema-examples)
 - [Property & Time Queries](#property--time-queries)
   - [find_nodes](#find_nodes)
   - [find_nodes_range](#find_nodes_range)
@@ -2205,6 +2210,359 @@ Result object returned by [`find_nodes_range_paged`](#find_nodes_range_paged).
 
 ---
 
+## Schema Management
+
+Schemas are optional constraints on graph records. Databases are open by default: if no schema is
+published for a label, matching writes are accepted by the normal API rules.
+
+Schemas are not property indexes. Optional property indexes are performance declarations for query
+routing; they do not enforce uniqueness or required fields. Graph schemas validate record shape
+and values, but they do not add arbitrary property uniqueness constraints.
+
+### Schema semantics
+
+- Node schemas are label-scoped. A node can carry multiple labels, and every matching node schema
+  composes against the final node record. If `User` and `Employee` both have schemas, a
+  `["User", "Employee"]` node must satisfy both.
+- Edge schemas are scoped by edge label. They can validate edge properties, weight, validity
+  metadata, self-loop policy, and endpoint node labels.
+- `set_node_schema` / `setNodeSchema` / `set_node_schema` and the edge equivalents validate
+  existing matching live data before publishing the schema. Publication is serialized through the
+  core write queue, so a large validation can block writes until it finishes.
+- `check_node_schema` / `checkNodeSchema` / `check_node_schema` and the edge equivalents are
+  non-publishing dry runs. They validate against a published read snapshot, return a bounded report,
+  do not reserve labels permanently, and do not occupy the write queue. A clean dry run can still be
+  invalidated by later writes before `set_*_schema` runs.
+- Active schemas are enforced in the Rust core before WAL append. Rejected writes do not append to
+  the WAL and do not partially mutate the memtable.
+- Rust, Node.js, and Python expose parity APIs over the same Rust enforcement. Connectors convert
+  DTOs and may reject malformed schema objects early, but they do not provide separate
+  connector-side enforcement semantics.
+- GQL mutations use the shared write path, so mutations that create, update, or leave live records
+  must satisfy active schemas before commit. The supported GQL schema DDL subset is an adapter over
+  the same graph-schema APIs described here.
+- Manifest schema fields are diagnostic and introspection data. Do not treat raw manifest JSON as a
+  user-editable persistence contract.
+
+### Schema methods
+
+| Operation | Rust | Node.js | Python | Description |
+|-----------|------|---------|--------|-------------|
+| Publish node schema | `set_node_schema(label, schema)` / `set_node_schema_with_options` | `setNodeSchema(label, schema, options?)` | `set_node_schema(label, schema, **options)` | Validate matching live nodes, then publish. |
+| Dry-run node schema | `check_node_schema(label, schema, options)` | `checkNodeSchema(label, schema, options?)` | `check_node_schema(label, schema, **options)` | Snapshot-scoped report only. |
+| Drop node schema | `drop_node_schema(label)` | `dropNodeSchema(label)` | `drop_node_schema(label)` | Remove the active node schema for a label. |
+| Get node schema | `get_node_schema(label)` | `getNodeSchema(label)` | `get_node_schema(label)` | Return one schema info object or `None` / `null`. |
+| List node schemas | `list_node_schemas()` | `listNodeSchemas()` | `list_node_schemas()` | Return published node schemas sorted by label. |
+| Publish edge schema | `set_edge_schema(label, schema)` / `set_edge_schema_with_options` | `setEdgeSchema(label, schema, options?)` | `set_edge_schema(label, schema, **options)` | Validate matching live edges, then publish. |
+| Dry-run edge schema | `check_edge_schema(label, schema, options)` | `checkEdgeSchema(label, schema, options?)` | `check_edge_schema(label, schema, **options)` | Snapshot-scoped report only. |
+| Drop edge schema | `drop_edge_schema(label)` | `dropEdgeSchema(label)` | `drop_edge_schema(label)` | Remove the active edge schema for an edge label. |
+| Get edge schema | `get_edge_schema(label)` | `getEdgeSchema(label)` | `get_edge_schema(label)` | Return one schema info object or `None` / `null`. |
+| List edge schemas | `list_edge_schemas()` | `listEdgeSchemas()` | `list_edge_schemas()` | Return published edge schemas sorted by label. |
+| Replace graph schema | `set_graph_schema(schema, options)` | `setGraphSchema(schema, options?)` / `setGraphSchemaAsync(...)` | `set_graph_schema(schema, **options)` / async | Atomically replace the node/edge schema catalog. `GraphSchema::default()` / `{}` clears it. |
+| Alter graph schema | `alter_graph_schema(operations, options)` | `alterGraphSchema(operations, options?)` / `alterGraphSchemaAsync(...)` | `alter_graph_schema(operations, **options)` / async | Atomically set/add/drop selected node and edge schema targets. |
+| Dry-run graph schema SET | `check_graph_schema_set(schema, options)` | `checkGraphSchemaSet(schema, options?)` / `checkGraphSchemaSetAsync(...)` | `check_graph_schema_set(schema, **options)` / async | Validate the proposed full replacement without publishing. |
+| Dry-run graph schema ADD | `check_graph_schema_add(schema, options)` | `checkGraphSchemaAdd(schema, options?)` / `checkGraphSchemaAddAsync(...)` | `check_graph_schema_add(schema, **options)` / async | Validate adding selected schema targets without publishing. |
+| Drop graph schema | `drop_graph_schema()` | `dropGraphSchema()` / `dropGraphSchemaAsync()` | `drop_graph_schema()` / async | Atomically remove all active node and edge schemas. |
+
+Set/check option fields:
+
+| Option | Rust | Node.js | Python | Default for `set` | Default for `check` | Description |
+|--------|------|---------|--------|-------------------|---------------------|-------------|
+| Max retained violations | `max_violations` | `maxViolations` | `max_violations` | `1` | `100` | Caps sampled violations returned in the report/error. |
+| Chunk size | `chunk_size` | `chunkSize` | `chunk_size` | `4096` | `4096` | Bounded scan chunk size. |
+| Scan limit | `scan_limit` | `scanLimit` | `scan_limit` | `None` / `null` | `None` / `null` | Optional maximum matching records to scan. |
+
+`SchemaValidationReport` fields:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| Checked records | `checked_records` | `checkedRecords` | `checked_records` | Matching live records scanned. |
+| Violation count | `violation_count` | `violationCount` | `violation_count` | Total violations observed, including those omitted by truncation. |
+| Violations | `violations` | `violations` | `violations` | Sampled violation targets, paths, and messages. |
+| Truncated | `truncated` | `truncated` | `truncated` | More violations existed than were retained. |
+| Scan limit hit | `scan_limit_hit` | `scanLimitHit` | `scan_limit_hit` | The optional scan limit stopped the scan. |
+
+Graph-level schema APIs use the same `NodeSchema` and `EdgeSchema` DTOs inside a `GraphSchema`:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| Node schemas | `node_schemas: Vec<NodeSchemaInfo>` | `nodeSchemas?: GraphSchemaNodeEntry[]` | `node_schemas?: list[GraphSchemaNodeEntry]` | Label/schema pairs to publish, check, or replace. |
+| Edge schemas | `edge_schemas: Vec<EdgeSchemaInfo>` | `edgeSchemas?: GraphSchemaEdgeEntry[]` | `edge_schemas?: list[GraphSchemaEdgeEntry]` | Edge-label/schema pairs to publish, check, or replace. |
+
+`alter_graph_schema` / `alterGraphSchema` / `alter_graph_schema` takes ordered operations:
+
+| Operation | Node.js `kind` | Python `kind` | Rust variant |
+|-----------|----------------|---------------|--------------|
+| Set node schema | `setNode` | `set_node` | `GraphSchemaOperation::SetNode { label, schema }` |
+| Set edge schema | `setEdge` | `set_edge` | `GraphSchemaOperation::SetEdge { label, schema }` |
+| Drop node schema | `dropNode` | `drop_node` | `GraphSchemaOperation::DropNode { label }` |
+| Drop edge schema | `dropEdge` | `drop_edge` | `GraphSchemaOperation::DropEdge { label }` |
+
+Bulk check reports aggregate one entry per validated target:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| Operation | `operation` | `operation` | `operation` | `Add`, `Set`, `Drop`, `DropAll`, `CheckAdd`, or `CheckSet`; connectors use `add` / `dropAll` / `drop_all` naming. |
+| Entries | `entries` | `entries` | `entries` | Per-target `target_kind`, `label`, and nested `SchemaValidationReport`. |
+| Checked records | `checked_records` | `checkedRecords` | `checked_records` | Sum across validated targets. |
+| Violation count | `violation_count` | `violationCount` | `violation_count` | Sum across validated targets. |
+| Truncated | `truncated` | `truncated` | `truncated` | True if any target report was truncated. |
+| Scan limit hit | `scan_limit_hit` | `scanLimitHit` | `scan_limit_hit` | True if any target hit the optional scan limit. |
+
+Bulk publish/drop results include the final catalog snapshot and exact drop accounting:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| Operation | `operation` | `operation` | `operation` | Publish/drop operation kind. |
+| Node schemas | `node_schemas` | `nodeSchemas` | `node_schemas` | Final published node-schema snapshot, sorted by label. |
+| Edge schemas | `edge_schemas` | `edgeSchemas` | `edge_schemas` | Final published edge-schema snapshot, sorted by label. |
+| Validation | `validation` | `validation` | `validation` | Aggregate check report from publish validation. |
+| Targets published | `targets_published` | `targetsPublished` | `targets_published` | Number of schema targets published. |
+| Targets dropped | `targets_dropped` | `targetsDropped` | `targets_dropped` | Number of schema targets removed. |
+| Drop targets | `drop_targets` | `dropTargets` | `drop_targets` | Ordered selected-drop results with `target_kind`, `label`, and `dropped` / `notFound` / `not_found`. |
+| Node schemas dropped | `node_schemas_dropped` | `nodeSchemasDropped` | `node_schemas_dropped` | Node-schema count removed by replacement or drop-all. |
+| Edge schemas dropped | `edge_schemas_dropped` | `edgeSchemasDropped` | `edge_schemas_dropped` | Edge-schema count removed by replacement or drop-all. |
+
+### Schema DTOs
+
+Node schema fields:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| Additional properties | `additional_properties` | `additionalProperties` | `additional_properties` | `"allow"` / `Allow` by default, or `"reject"` / `Reject` to reject undeclared props. |
+| Properties | `properties` | `properties` | `properties` | Property-key map of `PropertySchema` rules. |
+| Key | `key` | `key` | `key` | Optional string rules for the node key. |
+| Label constraints | `label_constraints` | `labelConstraints` | `label_constraints` | Optional final-label `all_of`, `any_of`, and `none_of` rules. |
+| Weight | `weight` | `weight` | `weight` | Optional finite numeric rules for node weight. |
+| Dense vector | `dense_vector` | `denseVector` | `dense_vector` | Optional required/forbidden/dimension rule. |
+| Sparse vector | `sparse_vector` | `sparseVector` | `sparse_vector` | Optional required/forbidden/count/dimension rule. |
+
+Edge schema fields:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| Additional properties | `additional_properties` | `additionalProperties` | `additional_properties` | `"allow"` / `Allow` by default, or `"reject"` / `Reject`. |
+| Properties | `properties` | `properties` | `properties` | Property-key map of `PropertySchema` rules. |
+| From endpoint | `from` | `from` | `from` | Optional source-node label rules. |
+| To endpoint | `to` | `to` | `to` | Optional target-node label rules. |
+| Self loops | `allow_self_loops` | `allowSelfLoops` | `allow_self_loops` | Defaults to true. |
+| Weight | `weight` | `weight` | `weight` | Optional finite numeric rules for edge weight. |
+| Validity | `validity` | `validity` | `validity` | Optional `valid_from` / `valid_to` rules. |
+
+Property schemas support `required`, `nullable`, `types`, numeric min/max, string byte bounds,
+bytes length bounds, array length bounds, map entry-count bounds, and exact enum values. Schemas
+do not add recursive array item schemas or map key/value schemas. Value types are `bool`, `int`,
+`uint`, `float`, `number`, `string`, `bytes`, `array`, and `map`; `number` accepts finite signed
+integers, unsigned integers, and floats.
+
+Node.js schema literals use camelCase and explicit tagged literals when the schema needs exact
+unsigned or bytes values:
+
+```javascript
+{
+  numericMin: { value: { type: 'uint', value: '0' } },
+  enumValues: [{ type: 'bytes', value: Buffer.from([1, 2, 3]) }],
+}
+```
+
+Returned Node.js schemas canonicalize UInt literals as `{ type: 'uint', value: string }` and bytes
+literals as `{ type: 'bytes', value: Buffer }`. A schema map literal can be escaped as
+`{ type: 'map', value: { ... } }` when a plain map would otherwise look like a tagged literal.
+
+Python schema dicts use snake_case. Python accepts explicit UInt literals as
+`{"type": "uint", "value": int | str}` and bytes literals as `bytes` or `bytearray`; returned
+schemas canonicalize UInt as `{"type": "uint", "value": int}` and bytes as `bytes`.
+
+### Schema examples
+
+Rust:
+
+```rust
+use overgraph::*;
+use std::collections::BTreeMap;
+
+let user_schema = NodeSchema {
+    additional_properties: SchemaAdditionalProperties::Reject,
+    properties: BTreeMap::from([
+        ("name".to_string(), PropertySchema {
+            required: true,
+            nullable: false,
+            types: vec![SchemaValueType::String],
+            ..Default::default()
+        }),
+    ]),
+    ..Default::default()
+};
+
+let report = db.check_node_schema("User", user_schema.clone(), SchemaCheckOptions::default())?;
+if report.violation_count == 0 {
+    db.set_node_schema("User", user_schema)?;
+}
+
+let works_at_schema = EdgeSchema {
+    properties: BTreeMap::from([(
+        "since".to_string(),
+        PropertySchema {
+            required: true,
+            nullable: false,
+            types: vec![SchemaValueType::Int],
+            ..Default::default()
+        },
+    )]),
+    from: Some(EndpointLabelSchema {
+        all_of: vec!["User".into()],
+        ..Default::default()
+    }),
+    to: Some(EndpointLabelSchema {
+        all_of: vec!["Company".into()],
+        ..Default::default()
+    }),
+    allow_self_loops: false,
+    ..Default::default()
+};
+
+db.set_edge_schema("WORKS_AT", works_at_schema)?;
+```
+
+Node.js:
+
+```javascript
+const userSchema = {
+  additionalProperties: 'reject',
+  properties: {
+    name: { required: true, nullable: false, types: ['string'] },
+    accountId: {
+      required: true,
+      nullable: false,
+      types: ['uint'],
+      numericMin: { value: { type: 'uint', value: '1' } },
+    },
+  },
+};
+
+const report = db.checkNodeSchema('User', userSchema);
+if (report.violationCount === 0) db.setNodeSchema('User', userSchema);
+
+db.setEdgeSchema('WORKS_AT', {
+  properties: {
+    since: { required: true, nullable: false, types: ['int'] },
+  },
+  from: { allOf: ['User'] },
+  to: { allOf: ['Company'] },
+  allowSelfLoops: false,
+});
+```
+
+Python:
+
+```python
+user_schema = {
+    "additional_properties": "reject",
+    "properties": {
+        "name": {"required": True, "nullable": False, "types": ["string"]},
+        "account_id": {
+            "required": True,
+            "nullable": False,
+            "types": ["uint"],
+            "numeric_min": {"value": {"type": "uint", "value": 1}},
+        },
+    },
+}
+
+report = db.check_node_schema("User", user_schema)
+if report.violation_count == 0:
+    db.set_node_schema("User", user_schema)
+
+db.set_edge_schema("WORKS_AT", {
+    "properties": {
+        "since": {"required": True, "nullable": False, "types": ["int"]},
+    },
+    "from": {"all_of": ["User"]},
+    "to": {"all_of": ["Company"]},
+    "allow_self_loops": False,
+})
+```
+
+Bulk graph-schema APIs publish multiple targets atomically and use the same DTO fields.
+
+Rust:
+
+```rust
+let graph = GraphSchema {
+    node_schemas: vec![NodeSchemaInfo {
+        label: "User".into(),
+        schema: user_schema.clone(),
+    }],
+    edge_schemas: vec![EdgeSchemaInfo {
+        label: "WORKS_AT".into(),
+        schema: works_at_schema.clone(),
+    }],
+};
+
+let dry_run = db.check_graph_schema_set(graph.clone(), GraphSchemaCheckOptions::default())?;
+if dry_run.violation_count == 0 {
+    let published = db.set_graph_schema(graph, GraphSchemaSetOptions::default())?;
+    assert_eq!(published.targets_published, 2);
+}
+```
+
+Node.js:
+
+```javascript
+const graph = {
+  nodeSchemas: [{ label: 'User', schema: userSchema }],
+  edgeSchemas: [{
+    label: 'WORKS_AT',
+    schema: {
+      properties: { since: { required: true, nullable: false, types: ['int'] } },
+      from: { allOf: ['User'] },
+      to: { allOf: ['Company'] },
+    },
+  }],
+};
+
+const dryRun = db.checkGraphSchemaSet(graph);
+if (dryRun.violationCount === 0) {
+  const published = db.setGraphSchema(graph);
+  console.log(published.targetsPublished);
+}
+
+const removed = db.alterGraphSchema([
+  { kind: 'dropNode', label: 'ArchivedUser' },
+  { kind: 'dropEdge', label: 'OLD_EDGE' },
+]);
+console.log(removed.dropTargets);
+```
+
+Python:
+
+```python
+graph = {
+    "node_schemas": [{"label": "User", "schema": user_schema}],
+    "edge_schemas": [{
+        "label": "WORKS_AT",
+        "schema": {
+            "properties": {"since": {"required": True, "nullable": False, "types": ["int"]}},
+            "from": {"all_of": ["User"]},
+            "to": {"all_of": ["Company"]},
+        },
+    }],
+}
+
+dry_run = db.check_graph_schema_set(graph)
+if dry_run.violation_count == 0:
+    published = db.set_graph_schema(graph)
+    print(published.targets_published)
+
+removed = db.alter_graph_schema([
+    {"kind": "drop_node", "label": "ArchivedUser"},
+    {"kind": "drop_edge", "label": "OLD_EDGE"},
+])
+print([(target.label, target.action) for target in removed.drop_targets])
+```
+
+---
+
 ## Property & Time Queries
 
 Equality and numeric range queries are index-transparent. Callers do not choose indexed versus fallback execution. If a matching optional declaration is `Ready`, OverGraph uses it. Otherwise it scans through the same public query method.
@@ -3176,6 +3534,8 @@ Supported at a glance:
 - keyed mutations: `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE r`, and `DETACH DELETE n`
 - keyed node `MERGE`, unique relationship `MERGE`, `ON CREATE SET`, and `ON MATCH SET`
 - mutation `RETURN` for `CREATE`, `MERGE`, `SET`, and `REMOVE`, including `RETURN DISTINCT`
+- graph-schema DDL: `ALTER CURRENT GRAPH TYPE`, `CHECK CURRENT GRAPH TYPE`, `DROP CURRENT GRAPH TYPE`, and schema `SHOW`
+- property-index DDL: `CREATE PROPERTY INDEX`, `DROP PROPERTY INDEX`, and `SHOW PROPERTY INDEXES`
 - mutation stats and unified query/mutation result shapes
 - scalar values, node values, edge values, path values, lists, maps, bytes, and nulls
 - params, read cursors, full-scan opt-in, caps, ReadOnly mode, explain/profile, warnings, and stats
@@ -3513,6 +3873,208 @@ Mutation `RETURN` aggregation remains unsupported. Mutation `RETURN ORDER BY`, `
 and `MERGE` actions cannot depend on commit-assigned values such as newly created IDs, timestamps,
 created-edge endpoint metadata, or same-mutation `updated_at`.
 
+#### Schema DDL Syntax
+
+GQL Beta can manage the current graph type, which is OverGraph's active label-scoped schema catalog.
+Schema DDL is atomic at the graph-schema target level and uses the same Rust core schema-management
+APIs as the programmatic Rust, Node.js, and Python methods.
+
+Supported statements:
+
+```gql
+ALTER CURRENT GRAPH TYPE ADD { NODE <label> = <node-schema>, EDGE <label> = <edge-schema> } [OPTIONS <options>]
+ALTER CURRENT GRAPH TYPE SET { NODE <label> = <node-schema>, EDGE <label> = <edge-schema> } [OPTIONS <options>]
+ALTER CURRENT GRAPH TYPE DROP { NODE <label>, EDGE <label> }
+DROP CURRENT GRAPH TYPE
+CHECK CURRENT GRAPH TYPE ADD { NODE <label> = <node-schema>, EDGE <label> = <edge-schema> } [OPTIONS <options>]
+CHECK CURRENT GRAPH TYPE SET { NODE <label> = <node-schema>, EDGE <label> = <edge-schema> } [OPTIONS <options>]
+SHOW CURRENT GRAPH TYPE
+SHOW NODE SCHEMAS
+SHOW EDGE SCHEMAS
+SHOW NODE SCHEMA <label>
+SHOW EDGE SCHEMA <label>
+```
+
+`ADD` publishes listed schemas while preserving unlisted targets. `SET` replaces the entire schema
+catalog; `SET {}` clears it. Selected `DROP` reports one row per requested target, including
+`not_found` rows. `DROP CURRENT GRAPH TYPE` removes all node and edge schemas and returns one
+summary row. `CHECK` validates the proposed `ADD` or `SET` against a published read snapshot and
+does not publish labels or schema state. `OPTIONS` applies to `ADD`, `SET`, and `CHECK`; selected
+and full-catalog `DROP` statements do not accept options.
+
+Schema maps use the same fields as `NodeSchema` and `EdgeSchema`, but field names are snake_case in
+GQL text. `OPTIONS` supports `max_violations`, `chunk_size`, and `scan_limit`:
+
+```gql
+ALTER CURRENT GRAPH TYPE ADD {
+  NODE Person = {
+    additional_properties: 'reject',
+    properties: {
+      name: { required: true, nullable: false, types: ['string'] },
+      account_id: {
+        required: true,
+        nullable: false,
+        types: ['uint'],
+        numeric_min: { value: { type: 'uint', value: '1' } }
+      },
+      token: {
+        enum_values: [{ type: 'bytes', value: [0, 1, 255] }]
+      }
+    }
+  },
+  EDGE WORKS_AT = {
+    from: { all_of: ['Person'] },
+    to: { all_of: ['Company'] },
+    properties: {
+      since: { required: true, nullable: false, types: ['int'] }
+    },
+    allow_self_loops: false
+  }
+} OPTIONS { max_violations: 1, chunk_size: 4096, scan_limit: null }
+```
+
+Dry-run and introspection examples:
+
+```gql
+CHECK CURRENT GRAPH TYPE ADD {
+  NODE Person = { properties: { name: { required: true, nullable: false, types: ['string'] } } }
+} OPTIONS { max_violations: 10 }
+
+SHOW CURRENT GRAPH TYPE
+SHOW NODE SCHEMA Person
+ALTER CURRENT GRAPH TYPE DROP { NODE ArchivedPerson, EDGE OLD_EDGE }
+```
+
+Result row columns are stable:
+
+| Statement | Columns |
+|-----------|---------|
+| `ALTER ... ADD` / `ALTER ... SET` | `operation`, `target_kind`, `label`, `action`, `checked_records`, `violation_count`, `truncated`, `scan_limit_hit` |
+| `ALTER ... DROP` | `operation`, `target_kind`, `label`, `action` |
+| `DROP CURRENT GRAPH TYPE` | `operation`, `target_kind`, `label`, `action`, `node_schemas_dropped`, `edge_schemas_dropped` |
+| `CHECK ... ADD` / `CHECK ... SET` | `operation`, `target_kind`, `label`, `checked_records`, `violation_count`, `truncated`, `scan_limit_hit`, `violations` |
+| `SHOW ...` | `target_kind`, `label`, `schema` |
+
+Operation values are snake_case strings such as `alter_graph_type_add`,
+`drop_current_graph_type`, `check_graph_type_set`, and `show_current_graph_type`.
+`target_kind` is `node`, `edge`, or `graph`. `SHOW` returns canonical schema maps; unsigned integer
+schema literals are returned as `{ type: 'uint', value: '<decimal>' }` in Node.js and as
+`{"type": "uint", "value": "<decimal>"}` through GQL rows, while bytes literals use
+`{ type: 'bytes', value: [0, 1] }`.
+
+Schema statements return `kind = schema`, `mutation_stats = null`, `next_cursor = null`, and
+`schema_stats` / `schemaStats` populated. `CHECK` and `SHOW` are allowed in `ReadOnly` mode.
+`ALTER` and `DROP` are rejected in `ReadOnly`. All schema statements reject `cursor`; schema
+introspection does not page. For `SHOW`, `max_rows` is a hard cap: if the schema catalog would
+return more rows than `max_rows`, OverGraph returns an error instead of silently truncating.
+
+#### Property-Index DDL Syntax
+
+GQL Beta can manage the same optional equality and range property-index declarations exposed by the
+native Rust, Node.js, and Python property-index APIs. These declarations are performance
+accelerators for eligible node and edge property predicates; they do not enforce uniqueness,
+required properties, value constraints, or query correctness. Public query APIs remain correct
+without them, while they are building, or after they are dropped.
+
+Native property-index APIs remain unchanged. Use GQL property-index DDL when target-based text is
+clearer than calling the existing Rust/Python snake_case or Node.js camelCase ensure, list, and drop
+property-index methods directly.
+
+Supported statements:
+
+```gql
+CREATE PROPERTY INDEX FOR (n:<node-label>) ON (n.<property-key>) KIND EQUALITY
+CREATE PROPERTY INDEX FOR (n:<node-label>) ON (n.<property-key>) KIND RANGE
+CREATE PROPERTY INDEX FOR ()-[r:<edge-label>]-() ON (r.<property-key>) KIND EQUALITY
+CREATE PROPERTY INDEX FOR ()-[r:<edge-label>]-() ON (r.<property-key>) KIND RANGE
+DROP PROPERTY INDEX FOR (n:<node-label>) ON (n.<property-key>) KIND EQUALITY
+DROP PROPERTY INDEX FOR (n:<node-label>) ON (n.<property-key>) KIND RANGE
+DROP PROPERTY INDEX FOR ()-[r:<edge-label>]-() ON (r.<property-key>) KIND EQUALITY
+DROP PROPERTY INDEX FOR ()-[r:<edge-label>]-() ON (r.<property-key>) KIND RANGE
+SHOW PROPERTY INDEXES
+SHOW NODE PROPERTY INDEXES
+SHOW EDGE PROPERTY INDEXES
+```
+
+For `SHOW`, singular `INDEX` and plural `INDEXES` are both accepted.
+
+Examples:
+
+```gql
+CREATE PROPERTY INDEX FOR (n:Person) ON (n.status) KIND EQUALITY
+CREATE PROPERTY INDEX FOR ()-[r:WORKS_AT]-() ON (r.since) KIND RANGE
+SHOW PROPERTY INDEXES
+DROP PROPERTY INDEX FOR (n:Person) ON (n.status) KIND EQUALITY
+DROP PROPERTY INDEX FOR ()-[r:WORKS_AT]-() ON (r.since) KIND RANGE
+```
+
+Labels and property keys can be bare identifiers or quoted strings. Index identity is target-based:
+target kind, label, property key, and kind. There are no user-assigned index names in this GQL
+surface.
+
+Result row columns are stable:
+
+| Statement | Columns |
+|-----------|---------|
+| `CREATE PROPERTY INDEX ...` | `operation`, `target_kind`, `label`, `prop_key`, `kind`, `action`, `state`, `index_id`, `last_error` |
+| `DROP PROPERTY INDEX ...` | `operation`, `target_kind`, `label`, `prop_key`, `kind`, `action` |
+| `SHOW PROPERTY INDEXES` | `target_kind`, `label`, `prop_key`, `kind`, `state`, `index_id`, `last_error` |
+
+Operation values are `create_property_index`, `drop_property_index`, `show_property_indexes`,
+`show_node_property_indexes`, or `show_edge_property_indexes`. `target_kind` is `node` or `edge`
+in action and catalog rows. `kind` is `equality` or `range`. Row `action` is `ensured`, `dropped`,
+or `not_found`. Explain target `action` is `ensure`, `drop`, or `show`. `state` is the current
+declaration lifecycle state, such as `building`, `ready`, or `failed`; `last_error` is null unless
+the declaration reports a retained error.
+
+Index statements return `kind = index`, `mutation_stats` / `mutationStats = null`,
+`schema_stats` / `schemaStats = null`, `next_cursor` / `nextCursor = null`, and
+`index_stats` / `indexStats` populated. Non-index statements include the same index payload field as
+null.
+
+Index stats fields:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| Operation | `operation` | `operation` | `operation` | Index operation string. |
+| Indexes ensured | `indexes_ensured` | `indexesEnsured` | `indexes_ensured` | Number of declarations ensured by this statement. |
+| Indexes dropped | `indexes_dropped` | `indexesDropped` | `indexes_dropped` | Number of declarations removed by this statement. |
+| Indexes returned | `indexes_returned` | `indexesReturned` | `indexes_returned` | Number of catalog rows returned by `SHOW`. |
+| Elapsed time | `elapsed_us` | `elapsedUs` | `elapsed_us` | Populated only when profile is true. |
+| Warnings | `warnings` | `warnings` | `warnings` | Index statement warnings. |
+
+`explain_gql` / `explainGql` and `include_plan` / `includePlan` return the same `index` explain
+payload for index statements, with `read`, `mutation`, and `schema` set to null.
+
+Nested index explain fields:
+
+| Field | Node.js | Python | Description |
+|-------|---------|--------|-------------|
+| `operation` | `operation` | `operation` | Index operation string. |
+| `targets` | `targets` | `targets` | Planned targets with target kind, label, property key, kind, and action. |
+| `usesCoreWriteQueue` / `uses_core_write_queue` | `usesCoreWriteQueue` | `uses_core_write_queue` | True for mutating CREATE and DROP statements. |
+| `publishesManifest` / `publishes_manifest` | `publishesManifest` | `publishes_manifest` | True for statements that can publish index declaration state when executed. |
+| `createsLabels` / `creates_labels` | `createsLabels` | `creates_labels` | True for CREATE statements that may create missing label tokens. |
+| `schedulesBackgroundBuild` / `schedules_background_build` | `schedulesBackgroundBuild` | `schedules_background_build` | True for CREATE statements that may start asynchronous index build work. |
+| `dropsIndexDataAsync` / `drops_index_data_async` | `dropsIndexDataAsync` | `drops_index_data_async` | True for DROP statements that may remove declaration-backed index data asynchronously. |
+| `sideEffectFree` / `side_effect_free` | `sideEffectFree` | `side_effect_free` | True for SHOW; false for CREATE and DROP. |
+
+Index explain target fields:
+
+| Field | Node.js | Python | Description |
+|-------|---------|--------|-------------|
+| `targetKind` / `target_kind` | `targetKind` | `target_kind` | `node`, `edge`, or `property_index_catalog` for all-index SHOW. |
+| `label` | `label` | `label` | Node or edge label for CREATE/DROP; null for SHOW. |
+| `propKey` / `prop_key` | `propKey` | `prop_key` | Property key for CREATE/DROP; null for SHOW. |
+| `kind` | `kind` | `kind` | `equality` or `range` for CREATE/DROP; null for SHOW. |
+| `action` | `action` | `action` | `ensure`, `drop`, or `show`. |
+
+`CREATE` and `DROP` are rejected in `ReadOnly` mode. `SHOW PROPERTY INDEXES`, `SHOW NODE PROPERTY
+INDEXES`, and `SHOW EDGE PROPERTY INDEXES` are allowed in `ReadOnly` mode. All index statements
+reject `cursor`; index catalog introspection does not page. For `SHOW`, `max_rows` is a hard cap:
+if the index catalog would return more rows than `max_rows`, OverGraph returns an error instead of
+silently truncating.
+
 #### Method Reference
 
 | Language | Execute | Explain |
@@ -3621,7 +4183,7 @@ explain = db.explain_gql(
 
 | Parameter | Rust | Node.js | Python | Required | Default | Description |
 |-----------|------|---------|--------|----------|---------|-------------|
-| statement | `&str` | `string` | `str` | Yes | - | One GQL Beta read or mutation statement. |
+| statement | `&str` | `string` | `str` | Yes | - | One GQL Beta read, mutation, schema, or property-index statement. |
 | params | `&GqlParams` | `GqlParams \| null` | `GqlParams \| None` | No | empty | Named params referenced as `$name` in the statement. |
 | options | `&GqlExecutionOptions` | `GqlExecutionOptions \| null` | keyword options | No | default options | Execution mode, caps, explain/profile, row-format, cursor, and vector options. |
 
@@ -3631,8 +4193,8 @@ Option fields:
 |--------|------|---------|--------|---------|-------------|
 | Mode | `mode` | `mode` | `mode` | `Auto` / `"auto"` | `"auto"` permits reads and mutations. `"readOnly"` / `"read_only"` rejects mutation statements before write staging. |
 | Full-scan opt-in | `allow_full_scan` | `allowFullScan` | `allow_full_scan` | `false` | Allows legal broad node/edge scans when no bounded anchor exists. |
-| Result row cap | `max_rows` | `maxRows` | `max_rows` | `10000` | Maximum returned rows after row operations. Mutations do not page with cursors, so mutation `RETURN` must fit this cap. |
-| Cursor | `cursor` | `cursor` | `cursor` | `None` / `null` | Read continuation token from `next_cursor` / `nextCursor`. Mutation statements reject cursors. |
+| Result row cap | `max_rows` | `maxRows` | `max_rows` | `10000` | Maximum returned rows after row operations. Mutations do not page with cursors, so mutation `RETURN` must fit this cap. Schema and index `SHOW` treat this as a hard cap and error if the catalog would exceed it. |
+| Cursor | `cursor` | `cursor` | `cursor` | `None` / `null` | Read continuation token from `next_cursor` / `nextCursor`. Mutation, schema, and index statements reject cursors. |
 | Cursor byte cap | `max_cursor_bytes` | `maxCursorBytes` | `max_cursor_bytes` | `16384` | Maximum accepted or emitted read cursor token size. |
 | Mutation row cap | `max_mutation_rows` | `maxMutationRows` | `max_mutation_rows` | `10000` | Maximum input rows a mutation may write from. |
 | Mutation op cap | `max_mutation_ops` | `maxMutationOps` | `max_mutation_ops` | `50000` | Maximum staged logical mutation operations before commit, including cascaded deletes. |
@@ -3667,12 +4229,14 @@ Rust returns positional rows:
 
 ```rust
 GqlExecutionResult {
-    kind: GqlStatementKind::Query, // or Mutation
+    kind: GqlStatementKind::Query, // or Mutation, Schema, or Index
     columns: Vec<String>,
     rows: Vec<GqlRow>,          // each GqlRow has values: Vec<GqlValue>
     next_cursor: Option<String>,
     stats: GqlExecutionStats,
     mutation_stats: Option<GqlMutationStats>,
+    schema_stats: Option<GqlSchemaStats>,
+    index_stats: Option<GqlIndexStats>,
     plan: Option<GqlExecutionExplain>,
 }
 ```
@@ -3698,6 +4262,8 @@ Node.js and Python return object rows by default:
     warnings: [],
   },
   mutationStats: null,
+  schemaStats: null,
+  indexStats: null,
   plan: null,
 }
 ```
@@ -3723,8 +4289,8 @@ unambiguous: if multiple `RETURN` items use the same alias, clauses such as `ORD
 
 When a result has another page, it includes `next_cursor` / `nextCursor`. Pass that value as the
 next call's `cursor` option with the same logical query and params. GQL cursors continue final
-logical result rows; they are not pinned storage snapshots across pages. Mutation statements reject
-`cursor` and always return `next_cursor` / `nextCursor` as null.
+logical result rows; they are not pinned storage snapshots across pages. Mutation, schema, and
+index statements reject `cursor` and always return `next_cursor` / `nextCursor` as null.
 
 Mutation results use the same row shapes and include `mutation_stats` / `mutationStats`:
 
@@ -3737,6 +4303,21 @@ console.log(result.kind);                    // 'mutation'
 console.log(result.nextCursor);              // null
 console.log(result.mutationStats.nodesUpdated);
 console.log(result.rows[0].status);
+```
+
+Schema results use the same row format, set `kind` to `schema`, leave `mutation_stats` /
+`mutationStats` null, and include `schema_stats` / `schemaStats`:
+
+```javascript
+const result = db.executeGql(
+  `CHECK CURRENT GRAPH TYPE ADD {
+     NODE Person = { properties: { name: { required: true, nullable: false, types: ['string'] } } }
+   }`
+);
+
+console.log(result.kind);                         // 'schema'
+console.log(result.schemaStats.operation);        // 'check_graph_type_add'
+console.log(result.rows[0].violation_count);
 ```
 
 #### Nodes, Edges, Values, and Vectors
@@ -3888,16 +4469,20 @@ let result = db.execute_gql(
 
 `explain_gql` / `explainGql` validates and plans the statement without executing read rows or
 mutating data. In `Auto` mode, mutation explain is side-effect safe: it does not allocate IDs,
-create labels, stage writes, or commit. In `ReadOnly` mode, mutation statements are rejected.
+create labels, stage writes, or commit. Schema and index explain are also side-effect safe and do
+not publish. In `ReadOnly` mode, data mutations, schema publication statements, and mutating index
+statements are rejected.
 
 Explain result fields:
 
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
-| Kind | `kind` | `kind` | `kind` | `Query` / `Mutation`, or `"query"` / `"mutation"` in connectors. |
+| Kind | `kind` | `kind` | `kind` | `Query` / `Mutation` / `Schema` / `Index`, or `"query"` / `"mutation"` / `"schema"` / `"index"` in connectors. |
 | Columns | `columns` | `columns` | `columns` | Output column names after `RETURN` expansion and aliases. |
 | Read explain | `read` | `read` | `read` | Nested read-plan payload for read statements or mutation read prefixes. |
 | Mutation explain | `mutation` | `mutation` | `mutation` | Nested mutation plan payload for mutation statements. |
+| Schema explain | `schema` | `schema` | `schema` | Nested schema plan payload for schema statements. |
+| Index explain | `index` | `index` | `index` | Nested index plan payload for property-index statements. |
 | Caps | `caps` | `caps` | `caps` | Effective execution caps. |
 | Warnings | `warnings` | `warnings` | `warnings` | GQL planning warnings. |
 | Notes | `notes` | `notes` | `notes` | Human-readable execution/planning notes. |
@@ -3933,6 +4518,19 @@ Nested mutation explain fields:
 | `usesWriteTxn` / `uses_write_txn` | `usesWriteTxn` | `uses_write_txn` | True for executable mutations. |
 | `replacementAdapters` / `replacement_adapters` | `replacementAdapters` | `replacement_adapters` | True when SET/REMOVE may replace records by ID. |
 | `atomicCommit` / `atomic_commit` | `atomicCommit` | `atomic_commit` | True when the plan commits as one transaction. |
+
+Nested schema explain fields:
+
+| Field | Node.js | Python | Description |
+|-------|---------|--------|-------------|
+| `operation` | `operation` | `operation` | Operation string such as `alter_graph_type_set`, `check_graph_type_add`, or `show_node_schema`. |
+| `targets` | `targets` | `targets` | Planned node/edge/schema targets with target kind, label, and action. |
+| `replacesEntireCatalog` / `replaces_entire_catalog` | `replacesEntireCatalog` | `replaces_entire_catalog` | True for full-catalog replacement statements. |
+| `publishesManifest` / `publishes_manifest` | `publishesManifest` | `publishes_manifest` | True for statements that can publish schema state when executed. |
+| `validatesExistingData` / `validates_existing_data` | `validatesExistingData` | `validates_existing_data` | True for publish/check statements that scan affected existing records. |
+| `usesCoreWriteQueue` / `uses_core_write_queue` | `usesCoreWriteQueue` | `uses_core_write_queue` | True for mutating schema statements. |
+| `sideEffectFree` / `side_effect_free` | `sideEffectFree` | `side_effect_free` | True for `CHECK`, `SHOW`, and all `explain_gql` schema planning. |
+| `options` | `options` | `options` | Effective `max_violations`, `chunk_size`, and `scan_limit` for schema validation. |
 
 `includePlan` / `include_plan` attaches that same explain payload to executed results:
 
@@ -3988,6 +4586,21 @@ Mutation stats fields:
 | Elapsed time | `elapsed_us` | `elapsedUs` | `elapsed_us` | Populated only when profile is true. |
 | Warnings | `warnings` | `warnings` | `warnings` | Mutation planning/execution warnings. |
 
+Schema stats fields:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| Operation | `operation` | `operation` | `operation` | Schema operation string, for example `alter_graph_type_add` or `show_current_graph_type`. |
+| Targets checked | `targets_checked` | `targetsChecked` | `targets_checked` | Number of schema targets validated. |
+| Targets published | `targets_published` | `targetsPublished` | `targets_published` | Number of schema targets published. |
+| Targets dropped | `targets_dropped` | `targetsDropped` | `targets_dropped` | Number of schema targets removed. |
+| Checked records | `checked_records` | `checkedRecords` | `checked_records` | Matching live records scanned during validation. |
+| Violation count | `violation_count` | `violationCount` | `violation_count` | Total schema violations observed. |
+| Truncated | `truncated` | `truncated` | `truncated` | True if retained violation examples were capped. |
+| Scan limit hit | `scan_limit_hit` | `scanLimitHit` | `scan_limit_hit` | True if validation stopped at `scan_limit`. |
+| Elapsed time | `elapsed_us` | `elapsedUs` | `elapsed_us` | Populated only when profile is true. |
+| Warnings | `warnings` | `warnings` | `warnings` | Schema planning/execution warnings. |
+
 Full scans are rejected unless explicitly allowed:
 
 ```javascript
@@ -4004,7 +4617,9 @@ const broad = db.executeGql(
 The same full-scan rule applies to mutation read prefixes. For example,
 `MATCH (n) SET n.seen = true` requires `allowFullScan: true` / `allow_full_scan=True`.
 
-ReadOnly mode rejects mutation statements before write staging:
+ReadOnly mode rejects data mutations, mutating schema statements, and mutating index statements
+before write staging or catalog publication. `CHECK` / schema `SHOW` and property-index `SHOW`
+statements are allowed:
 
 ```javascript
 db.executeGql(
@@ -4015,7 +4630,7 @@ db.executeGql(
 // throws: ReadOnly violation
 ```
 
-Mutation statements reject cursors:
+Mutation, schema, and index statements reject cursors:
 
 ```javascript
 db.executeGql(
@@ -4024,6 +4639,20 @@ db.executeGql(
   { cursor: 'opaque-read-cursor' }
 );
 // throws: GQL mutation statements do not accept cursors
+
+db.executeGql(
+  "SHOW CURRENT GRAPH TYPE",
+  null,
+  { cursor: 'opaque-read-cursor' }
+);
+// throws: GQL schema statements do not accept cursors
+
+db.executeGql(
+  "SHOW PROPERTY INDEXES",
+  null,
+  { cursor: 'opaque-read-cursor' }
+);
+// throws: GQL index statements do not accept cursors
 ```
 
 #### Examples
@@ -4091,6 +4720,22 @@ db.executeGql(
    DELETE r`,
   { key: 'ada' }
 );
+```
+
+GQL schema publish and show:
+
+```javascript
+db.executeGql(
+  `ALTER CURRENT GRAPH TYPE ADD {
+     NODE Person = {
+       properties: { name: { required: true, nullable: false, types: ['string'] } }
+     }
+   }`
+);
+
+const schemas = db.executeGql('SHOW NODE SCHEMA Person');
+console.log(schemas.kind); // 'schema'
+console.log(schemas.rows[0].schema.properties.name.types);
 ```
 
 Basic node rows:
@@ -4325,7 +4970,9 @@ GQL Beta is intentionally narrower than ISO GQL and Cypher. It rejects:
 - `DELETE n` without `DETACH`, and `RETURN` after `DELETE` or `DETACH DELETE`
 - Mutation cursors and mutation `RETURN` aggregation
 - Read-after-write graph matching, including `WITH`, `MATCH`, `CALL`, `UNION`, or subqueries after the first write clause
-- Schema operations: `CREATE INDEX`, constraints, `DROP`, `ALTER`, `SHOW`
+- Schema/index operations outside the supported current-graph-type and property-index DDL subsets,
+  including name-based `CREATE INDEX`, constraints, named graph types, graph catalog/session DDL, and
+  database lifecycle DDL
 - Vector writes or vector mutation syntax
 - Mutating subqueries and procedure calls such as `CALL db.labels()`
 - Unsupported `MERGE` shapes: unkeyed nodes, multi-label nodes, non-key identity maps,
@@ -6495,7 +7142,14 @@ println!("label token schema: {}", manifest.label_token_schema_version);
 | node_label_tokens | `BTreeMap<String, u32>` | Public node label to internal `label_id`. |
 | edge_label_tokens | `BTreeMap<String, u32>` | Public edge label to internal `label_id`. |
 | secondary_indexes | `Vec<SecondaryIndexManifestEntry>` | Raw optional secondary-index declarations. Node targets use `SecondaryIndexTarget::NodeProperty { label_id, prop_key }`; edge targets use `SecondaryIndexTarget::EdgeProperty { label_id, prop_key }`. |
+| schema_catalog_version | `u32` | Raw schema catalog marker for diagnostics. |
+| node_schemas | `Vec<NodeSchemaManifestEntry>` | Raw persisted node-schema entries keyed by internal label IDs. Use schema APIs for ordinary reads/writes. |
+| edge_schemas | `Vec<EdgeSchemaManifestEntry>` | Raw persisted edge-schema entries keyed by internal label IDs. Use schema APIs for ordinary reads/writes. |
 | segments | `Vec<SegmentInfo>` | Published segment metadata. |
+
+Manifest schema fields are diagnostic/introspection fields, not a user-editable persistence
+contract. Use [`set_node_schema`](#schema-management), [`set_edge_schema`](#schema-management), and
+the matching get/list/drop APIs to manage schemas.
 
 ### manifest::load_manifest_readonly (Rust only)
 
@@ -6667,7 +7321,7 @@ const node = await db.getNodeAsync(42);
 
 Async methods run on the libuv thread pool. Write operations acquire an exclusive lock; read operations acquire a shared lock (allowing concurrent reads).
 
-**Available async methods:** `closeAsync`, `ensureNodeLabelAsync`, `ensureEdgeLabelAsync`, `getNodeLabelIdAsync`, `getEdgeLabelIdAsync`, `getNodeLabelAsync`, `getEdgeLabelAsync`, `listNodeLabelsAsync`, `listEdgeLabelsAsync`, `upsertNodeAsync`, `upsertEdgeAsync`, `addNodeLabelAsync`, `removeNodeLabelAsync`, `batchUpsertNodesAsync`, `batchUpsertEdgesAsync`, `batchUpsertNodesBinaryAsync`, `batchUpsertEdgesBinaryAsync`, `getNodeAsync`, `getEdgeAsync`, `getNodeByKeyAsync`, `getEdgeByTripleAsync`, `getNodesAsync`, `getNodesByKeysAsync`, `getEdgesAsync`, `deleteNodeAsync`, `deleteEdgeAsync`, `invalidateEdgeAsync`, `graphPatchAsync`, `beginWriteTxnAsync`, `neighborsAsync`, `neighborsPagedAsync`, `neighborsBatchAsync`, `traverseAsync`, `topKNeighborsAsync`, `extractSubgraphAsync`, `shortestPathAsync`, `allShortestPathsAsync`, `isConnectedAsync`, `degreeAsync`, `degreesAsync`, `sumEdgeWeightsAsync`, `avgEdgeWeightAsync`, `findNodesAsync`, `findNodesPagedAsync`, `ensureNodePropertyIndexAsync`, `dropNodePropertyIndexAsync`, `listNodePropertyIndexesAsync`, `ensureEdgePropertyIndexAsync`, `dropEdgePropertyIndexAsync`, `listEdgePropertyIndexesAsync`, `findNodesRangeAsync`, `findNodesRangePagedAsync`, `findNodesByTimeRangeAsync`, `findNodesByTimeRangePagedAsync`, `nodesByLabelsAsync`, `edgesByLabelAsync`, `getNodesByLabelsAsync`, `getEdgesByLabelAsync`, `countNodesByLabelsAsync`, `countEdgesByLabelAsync`, `nodesByLabelsPagedAsync`, `edgesByLabelPagedAsync`, `getNodesByLabelsPagedAsync`, `getEdgesByLabelPagedAsync`, `queryNodeIdsAsync`, `queryNodesAsync`, `queryEdgeIdsAsync`, `queryEdgesAsync`, `queryGraphRowsAsync`, `queryGraphPipelineAsync`, `explainNodeQueryAsync`, `explainEdgeQueryAsync`, `explainGraphRowsAsync`, `explainGraphPipelineAsync`, `executeGqlAsync`, `explainGqlAsync`, `personalizedPagerankAsync`, `connectedComponentsAsync`, `componentOfAsync`, `vectorSearchAsync`, `exportAdjacencyAsync`, `pruneAsync`, `setPrunePolicyAsync`, `removePrunePolicyAsync`, `listPrunePoliciesAsync`, `syncAsync`, `flushAsync`, `compactAsync`, `compactWithProgressAsync`, `ingestModeAsync`, `endIngestAsync`.
+**Available async methods:** `closeAsync`, `ensureNodeLabelAsync`, `ensureEdgeLabelAsync`, `getNodeLabelIdAsync`, `getEdgeLabelIdAsync`, `getNodeLabelAsync`, `getEdgeLabelAsync`, `listNodeLabelsAsync`, `listEdgeLabelsAsync`, `setNodeSchemaAsync`, `checkNodeSchemaAsync`, `dropNodeSchemaAsync`, `getNodeSchemaAsync`, `listNodeSchemasAsync`, `setEdgeSchemaAsync`, `checkEdgeSchemaAsync`, `dropEdgeSchemaAsync`, `getEdgeSchemaAsync`, `listEdgeSchemasAsync`, `upsertNodeAsync`, `upsertEdgeAsync`, `addNodeLabelAsync`, `removeNodeLabelAsync`, `batchUpsertNodesAsync`, `batchUpsertEdgesAsync`, `batchUpsertNodesBinaryAsync`, `batchUpsertEdgesBinaryAsync`, `getNodeAsync`, `getEdgeAsync`, `getNodeByKeyAsync`, `getEdgeByTripleAsync`, `getNodesAsync`, `getNodesByKeysAsync`, `getEdgesAsync`, `deleteNodeAsync`, `deleteEdgeAsync`, `invalidateEdgeAsync`, `graphPatchAsync`, `beginWriteTxnAsync`, `neighborsAsync`, `neighborsPagedAsync`, `neighborsBatchAsync`, `traverseAsync`, `topKNeighborsAsync`, `extractSubgraphAsync`, `shortestPathAsync`, `allShortestPathsAsync`, `isConnectedAsync`, `degreeAsync`, `degreesAsync`, `sumEdgeWeightsAsync`, `avgEdgeWeightAsync`, `findNodesAsync`, `findNodesPagedAsync`, `ensureNodePropertyIndexAsync`, `dropNodePropertyIndexAsync`, `listNodePropertyIndexesAsync`, `ensureEdgePropertyIndexAsync`, `dropEdgePropertyIndexAsync`, `listEdgePropertyIndexesAsync`, `findNodesRangeAsync`, `findNodesRangePagedAsync`, `findNodesByTimeRangeAsync`, `findNodesByTimeRangePagedAsync`, `nodesByLabelsAsync`, `edgesByLabelAsync`, `getNodesByLabelsAsync`, `getEdgesByLabelAsync`, `countNodesByLabelsAsync`, `countEdgesByLabelAsync`, `nodesByLabelsPagedAsync`, `edgesByLabelPagedAsync`, `getNodesByLabelsPagedAsync`, `getEdgesByLabelPagedAsync`, `queryNodeIdsAsync`, `queryNodesAsync`, `queryEdgeIdsAsync`, `queryEdgesAsync`, `queryGraphRowsAsync`, `queryGraphPipelineAsync`, `explainNodeQueryAsync`, `explainEdgeQueryAsync`, `explainGraphRowsAsync`, `explainGraphPipelineAsync`, `executeGqlAsync`, `explainGqlAsync`, `personalizedPagerankAsync`, `connectedComponentsAsync`, `componentOfAsync`, `vectorSearchAsync`, `exportAdjacencyAsync`, `pruneAsync`, `setPrunePolicyAsync`, `removePrunePolicyAsync`, `listPrunePoliciesAsync`, `syncAsync`, `flushAsync`, `compactAsync`, `compactWithProgressAsync`, `ingestModeAsync`, `endIngestAsync`.
 
 `WriteTxn` handles expose async counterparts for the full transaction surface: `upsertNodeAsync`, `upsertNodeAsAsync`, `upsertEdgeAsync`, `upsertEdgeAsAsync`, `deleteNodeAsync`, `deleteEdgeAsync`, `invalidateEdgeAsync`, `stageAsync`, `getNodeAsync`, `getEdgeAsync`, `getNodeByKeyAsync`, `getEdgeByTripleAsync`, `commitAsync`, and `rollbackAsync`. Async transaction operations on one handle execute in call order.
 
@@ -6730,6 +7384,21 @@ asyncio.run(main())
 | | `get_edge_label` / `getEdgeLabel` | Diagnostic ID-to-name lookup |
 | | `list_node_labels` / `listNodeLabels` | List node-label catalog entries |
 | | `list_edge_labels` / `listEdgeLabels` | List edge-label catalog entries |
+| **Schemas** | `set_node_schema` / `setNodeSchema` | Publish label-scoped node constraints |
+| | `check_node_schema` / `checkNodeSchema` | Dry-run node schema validation |
+| | `drop_node_schema` / `dropNodeSchema` | Remove a node schema |
+| | `get_node_schema` / `getNodeSchema` | Inspect one node schema |
+| | `list_node_schemas` / `listNodeSchemas` | List node schemas |
+| | `set_edge_schema` / `setEdgeSchema` | Publish edge-label-scoped constraints |
+| | `check_edge_schema` / `checkEdgeSchema` | Dry-run edge schema validation |
+| | `drop_edge_schema` / `dropEdgeSchema` | Remove an edge schema |
+| | `get_edge_schema` / `getEdgeSchema` | Inspect one edge schema |
+| | `list_edge_schemas` / `listEdgeSchemas` | List edge schemas |
+| | `set_graph_schema` / `setGraphSchema` | Atomically replace graph schema catalog |
+| | `alter_graph_schema` / `alterGraphSchema` | Atomically alter selected schema targets |
+| | `check_graph_schema_set` / `checkGraphSchemaSet` | Dry-run full graph schema replacement |
+| | `check_graph_schema_add` / `checkGraphSchemaAdd` | Dry-run additive graph schema publish |
+| | `drop_graph_schema` / `dropGraphSchema` | Remove all graph schemas |
 | **Label and Edge-Label Queries** | `nodes_by_labels` | Node ID convenience query |
 | | `edges_by_label` | All edge IDs of an edge label |
 | | `get_nodes_by_labels` | Hydrated node convenience query |

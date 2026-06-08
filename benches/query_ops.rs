@@ -1621,6 +1621,68 @@ fn assert_gql_mutation_result(
     result
 }
 
+const GQL_SCHEMA_ALTER_ADD_BENCH: &str = "ALTER CURRENT GRAPH TYPE ADD { NODE SchemaPerson = { properties: { name: { required: true, nullable: false, types: ['string'] } } }, EDGE SCHEMA_WORKS_AT = { from: { all_of: ['SchemaPerson'] }, to: { all_of: ['SchemaCompany'] }, properties: { role: { required: true, nullable: false, types: ['string'] } } } } OPTIONS { chunk_size: 128 }";
+const GQL_SCHEMA_CHECK_ADD_BENCH: &str = "CHECK CURRENT GRAPH TYPE ADD { NODE SchemaPerson = { properties: { name: { required: true, nullable: false, types: ['string'] } } }, EDGE SCHEMA_WORKS_AT = { from: { all_of: ['SchemaPerson'] }, to: { all_of: ['SchemaCompany'] }, properties: { role: { required: true, nullable: false, types: ['string'] } } } } OPTIONS { chunk_size: 128, max_violations: 4 }";
+
+fn setup_gql_schema_existing_data_db() -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, engine) = temp_db();
+    let ids = engine
+        .batch_upsert_nodes(vec![
+            NodeInput {
+                labels: vec!["SchemaPerson".to_string()],
+                key: "person-0".to_string(),
+                props: BTreeMap::from([(
+                    "name".to_string(),
+                    PropValue::String("name-0".to_string()),
+                )]),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            },
+            NodeInput {
+                labels: vec!["SchemaCompany".to_string()],
+                key: "company-0".to_string(),
+                props: BTreeMap::new(),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            },
+        ])
+        .unwrap();
+    engine
+        .batch_upsert_edges(vec![EdgeInput {
+            from: ids[0],
+            to: ids[1],
+            label: "SCHEMA_WORKS_AT".to_string(),
+            props: BTreeMap::from([("role".to_string(), PropValue::String("role-0".to_string()))]),
+            weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+        }])
+        .unwrap();
+    (dir, engine)
+}
+
+fn assert_gql_schema_targets_published(
+    result: overgraph::GqlExecutionResult,
+    expected_targets: u64,
+) -> overgraph::GqlExecutionResult {
+    assert_eq!(result.kind, GqlStatementKind::Schema);
+    let stats = result.schema_stats.as_ref().unwrap();
+    assert_eq!(stats.targets_published, expected_targets);
+    result
+}
+
+fn assert_gql_schema_violations(
+    result: overgraph::GqlExecutionResult,
+    expected_violations: u64,
+) -> overgraph::GqlExecutionResult {
+    assert_eq!(result.kind, GqlStatementKind::Schema);
+    let stats = result.schema_stats.as_ref().unwrap();
+    assert_eq!(stats.violation_count, expected_violations);
+    result
+}
+
 fn bench_gql_queries(c: &mut Criterion) {
     let mut graph_group = c.benchmark_group("graph_row_query");
     graph_group.sample_size(20);
@@ -1905,6 +1967,41 @@ fn bench_gql_queries(c: &mut Criterion) {
                 .unwrap();
             assert_eq!(result.rows.len(), QUERY_LIMIT);
             black_box(result)
+        });
+    });
+
+    group.bench_function("gql_schema_alter_add_existing_data", |b| {
+        let params = GqlParams::new();
+        let options = GqlExecutionOptions::default();
+        b.iter_batched(
+            setup_gql_schema_existing_data_db,
+            |(_dir, engine)| {
+                let result = engine
+                    .execute_gql(
+                        black_box(GQL_SCHEMA_ALTER_ADD_BENCH),
+                        black_box(&params),
+                        black_box(&options),
+                    )
+                    .unwrap();
+                black_box(assert_gql_schema_targets_published(result, 2))
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("gql_schema_check_add_existing_data", |b| {
+        let (_dir, engine) = setup_gql_schema_existing_data_db();
+        let params = GqlParams::new();
+        let options = GqlExecutionOptions::default();
+        b.iter(|| {
+            let result = engine
+                .execute_gql(
+                    black_box(GQL_SCHEMA_CHECK_ADD_BENCH),
+                    black_box(&params),
+                    black_box(&options),
+                )
+                .unwrap();
+            black_box(assert_gql_schema_violations(result, 0))
         });
     });
 
