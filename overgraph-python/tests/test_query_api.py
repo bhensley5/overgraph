@@ -657,11 +657,19 @@ def test_query_invalid_canonical_filter_shapes(db):
 
 def test_query_boolean_explain_serialization(db):
     seed_query_graph(db)
-    db.ensure_node_property_index("Person", "status", "equality")
+    db.ensure_node_property_index(
+        "Person",
+        {"kind": "equality", "fields": [{"source": "property", "key": "status"}]},
+    )
     wait_for_index_state(
         db,
         lambda infos: next(
-            (info for info in infos if info.label == "Person" and info.prop_key == "status"),
+            (
+                info
+                for info in infos
+                if info.label == "Person"
+                and info.fields == [{"source": "property", "key": "status"}]
+            ),
             None,
         ),
     )

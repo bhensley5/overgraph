@@ -1,6 +1,10 @@
 use crate::error::EngineError;
 use crate::gql::ast::{BinaryOp, Expr, ExprKind, Literal, MapLiteral, UnaryOp};
-use crate::gql::semantic::{gql_semantic_error, GqlAliasKind, GqlReturnPlan, GqlSemanticPlan};
+use crate::gql::metadata::{GqlEndpointFunction, GqlMetadataFunction};
+use crate::gql::semantic::{
+    edge_endpoint_id_call, gql_semantic_error, variable_name, GqlAliasKind, GqlReturnPlan,
+    GqlSemanticPlan,
+};
 use crate::graph_row::{
     eval_graph_binary_values, eval_graph_scalar_function_values, eval_graph_unary_value,
     GraphEvalValue,
@@ -412,6 +416,22 @@ fn collect_expr_refs(
             )?;
         }
         ExprKind::FunctionCall { name, args } => {
+            if let Some((endpoint, endpoint_arg)) = edge_endpoint_id_call(name, args) {
+                let alias = variable_name(endpoint_arg).expect("endpoint call shape checked");
+                if plan
+                    .aliases
+                    .get(alias)
+                    .is_some_and(|binding| binding.kind == GqlAliasKind::Edge)
+                {
+                    add_edge_metadata_ref(
+                        alias,
+                        projection_alias(alias, alias_projection),
+                        edge_endpoint_projection_field(endpoint),
+                        refs,
+                    );
+                    return Ok(());
+                }
+            }
             if args.len() == 1 {
                 if let ExprKind::Variable(alias) = &args[0].kind {
                     if let Some(kind) = plan.aliases.get(alias).map(|binding| binding.kind) {
@@ -593,36 +613,28 @@ fn add_property_ref(
     let projection_alias = projection_alias(alias, alias_projection);
     match kind {
         GqlAliasKind::Node => {
-            if let Some(field) = node_projection_field(property) {
-                add_node_metadata_ref(alias, projection_alias, field, refs);
-            } else {
-                let key = GqlRuntimeValueKey::NodeProperty {
-                    alias: alias.to_string(),
+            let key = GqlRuntimeValueKey::NodeProperty {
+                alias: alias.to_string(),
+                key: property.to_string(),
+            };
+            refs.entry(key)
+                .or_insert_with(|| ProjectionColumn::NodeProperty {
+                    alias: projection_alias,
                     key: property.to_string(),
-                };
-                refs.entry(key)
-                    .or_insert_with(|| ProjectionColumn::NodeProperty {
-                        alias: projection_alias,
-                        key: property.to_string(),
-                        output_name: internal_output_name(alias, property),
-                    });
-            }
+                    output_name: internal_output_name(alias, property),
+                });
         }
         GqlAliasKind::Edge => {
-            if let Some(field) = edge_projection_field(property) {
-                add_edge_metadata_ref(alias, projection_alias, field, refs);
-            } else {
-                let key = GqlRuntimeValueKey::EdgeProperty {
-                    alias: alias.to_string(),
+            let key = GqlRuntimeValueKey::EdgeProperty {
+                alias: alias.to_string(),
+                key: property.to_string(),
+            };
+            refs.entry(key)
+                .or_insert_with(|| ProjectionColumn::EdgeProperty {
+                    alias: projection_alias,
                     key: property.to_string(),
-                };
-                refs.entry(key)
-                    .or_insert_with(|| ProjectionColumn::EdgeProperty {
-                        alias: projection_alias,
-                        key: property.to_string(),
-                        output_name: internal_output_name(alias, property),
-                    });
-            }
+                    output_name: internal_output_name(alias, property),
+                });
         }
         GqlAliasKind::Path | GqlAliasKind::Scalar => {}
     }
@@ -637,21 +649,32 @@ fn add_function_ref(
     refs: &mut BTreeMap<GqlRuntimeValueKey, ProjectionColumn>,
 ) -> Result<(), EngineError> {
     let projection_alias = projection_alias(alias, alias_projection);
-    match function.to_ascii_lowercase().as_str() {
-        "id" => match kind {
+    let lower = function.to_ascii_lowercase();
+    match lower.as_str() {
+        "labels" => {
+            add_node_metadata_ref(alias, projection_alias, NodeProjectionField::Labels, refs);
+            return Ok(());
+        }
+        "type" => {
+            add_edge_metadata_ref(alias, projection_alias, EdgeProjectionField::Label, refs);
+            return Ok(());
+        }
+        _ => {}
+    }
+    if let Some(metadata) = GqlMetadataFunction::from_lower(&lower) {
+        match kind {
             GqlAliasKind::Node => {
-                add_node_metadata_ref(alias, projection_alias, NodeProjectionField::Id, refs)
+                if let Some(field) = node_metadata_projection_field(metadata) {
+                    add_node_metadata_ref(alias, projection_alias, field, refs);
+                }
             }
             GqlAliasKind::Edge => {
-                add_edge_metadata_ref(alias, projection_alias, EdgeProjectionField::Id, refs)
+                if let Some(field) = edge_metadata_projection_field(metadata) {
+                    add_edge_metadata_ref(alias, projection_alias, field, refs);
+                }
             }
             GqlAliasKind::Path | GqlAliasKind::Scalar => {}
-        },
-        "labels" => {
-            add_node_metadata_ref(alias, projection_alias, NodeProjectionField::Labels, refs)
         }
-        "type" => add_edge_metadata_ref(alias, projection_alias, EdgeProjectionField::Label, refs),
-        _ => {}
     }
     Ok(())
 }
@@ -793,6 +816,21 @@ fn eval_expr(expr: &Expr, context: &GqlEvalContext<'_>) -> Result<RuntimeValue, 
             if let Some(function) = gql_eval_scalar_function_name(&lower) {
                 return eval_scalar_function(function, &name.name, args, context, &expr.span);
             }
+            if let Some((endpoint, endpoint_arg)) = edge_endpoint_id_call(name, args) {
+                let alias = variable_name(endpoint_arg).expect("endpoint call shape checked");
+                if context.alias_kind(alias) != Some(GqlAliasKind::Edge) {
+                    return Err(invalid_expression_error(
+                        expr,
+                        "startNode()/endNode() inside id() expects an edge alias",
+                    ));
+                }
+                return Ok(RuntimeValue::Value(context.value(
+                    GqlRuntimeValueKey::EdgeMetadata {
+                        alias: alias.to_string(),
+                        field: edge_endpoint_projection_field(endpoint),
+                    },
+                )));
+            }
             if args.len() != 1 {
                 return Err(invalid_expression_error(
                     expr,
@@ -811,29 +849,7 @@ fn eval_expr(expr: &Expr, context: &GqlEvalContext<'_>) -> Result<RuntimeValue, 
                     "unknown alias during GQL function evaluation",
                 ));
             };
-            let value = match name.name.to_ascii_lowercase().as_str() {
-                "id" => match kind {
-                    GqlAliasKind::Node => context.value(GqlRuntimeValueKey::NodeMetadata {
-                        alias: alias.clone(),
-                        field: NodeProjectionField::Id,
-                    }),
-                    GqlAliasKind::Edge => context.value(GqlRuntimeValueKey::EdgeMetadata {
-                        alias: alias.clone(),
-                        field: EdgeProjectionField::Id,
-                    }),
-                    GqlAliasKind::Path => {
-                        return Err(invalid_expression_error(
-                            expr,
-                            "id() expects a node or edge alias",
-                        ));
-                    }
-                    GqlAliasKind::Scalar => {
-                        return Err(invalid_expression_error(
-                            expr,
-                            "id() expects a node or edge alias",
-                        ));
-                    }
-                },
+            let value = match lower.as_str() {
                 "labels" => context.value(GqlRuntimeValueKey::NodeMetadata {
                     alias: alias.clone(),
                     field: NodeProjectionField::Labels,
@@ -843,10 +859,38 @@ fn eval_expr(expr: &Expr, context: &GqlEvalContext<'_>) -> Result<RuntimeValue, 
                     field: EdgeProjectionField::Label,
                 }),
                 _ => {
-                    return Err(invalid_expression_error(
-                        expr,
-                        "unsupported GQL scalar function",
-                    ));
+                    let Some(metadata) = GqlMetadataFunction::from_lower(&lower) else {
+                        return Err(invalid_expression_error(
+                            expr,
+                            "unsupported GQL scalar function",
+                        ));
+                    };
+                    let field_value = match kind {
+                        GqlAliasKind::Node => node_metadata_projection_field(metadata).map(
+                            |field| {
+                                context.value(GqlRuntimeValueKey::NodeMetadata {
+                                    alias: alias.clone(),
+                                    field,
+                                })
+                            },
+                        ),
+                        GqlAliasKind::Edge => edge_metadata_projection_field(metadata).map(
+                            |field| {
+                                context.value(GqlRuntimeValueKey::EdgeMetadata {
+                                    alias: alias.clone(),
+                                    field,
+                                })
+                            },
+                        ),
+                        GqlAliasKind::Path | GqlAliasKind::Scalar => None,
+                    };
+                    let Some(value) = field_value else {
+                        return Err(invalid_expression_error(
+                            expr,
+                            "metadata function target does not support this metadata field",
+                        ));
+                    };
+                    value
                 }
             };
             Ok(RuntimeValue::Value(value))
@@ -1124,9 +1168,9 @@ fn gql_eval_binary_op_to_graph_op(op: BinaryOp) -> GraphBinaryOp {
 fn gql_eval_scalar_function_name(lower: &str) -> Option<GraphFunction> {
     match lower {
         "coalesce" => Some(GraphFunction::Coalesce),
-        "to_string" => Some(GraphFunction::ToString),
-        "to_integer" => Some(GraphFunction::ToInteger),
-        "to_float" => Some(GraphFunction::ToFloat),
+        "tostring" => Some(GraphFunction::ToString),
+        "tointeger" => Some(GraphFunction::ToInteger),
+        "tofloat" => Some(GraphFunction::ToFloat),
         "abs" => Some(GraphFunction::Abs),
         "floor" => Some(GraphFunction::Floor),
         "ceil" => Some(GraphFunction::Ceil),
@@ -1151,7 +1195,7 @@ fn validate_eval_scalar_function_arity(
     let valid = match lower {
         "coalesce" => arg_count >= 1,
         "substring" => matches!(arg_count, 2 | 3),
-        "to_string" | "to_integer" | "to_float" | "abs" | "floor" | "ceil" | "round" | "lower"
+        "tostring" | "tointeger" | "tofloat" | "abs" | "floor" | "ceil" | "round" | "lower"
         | "upper" | "trim" | "size" | "head" | "last" => arg_count == 1,
         _ => false,
     };
@@ -1257,32 +1301,14 @@ fn property_value_for_alias(
     context: &GqlEvalContext<'_>,
 ) -> ProjectedValue {
     match kind {
-        GqlAliasKind::Node => {
-            if let Some(field) = node_projection_field(property) {
-                context.value(GqlRuntimeValueKey::NodeMetadata {
-                    alias: alias.to_string(),
-                    field,
-                })
-            } else {
-                context.value(GqlRuntimeValueKey::NodeProperty {
-                    alias: alias.to_string(),
-                    key: property.to_string(),
-                })
-            }
-        }
-        GqlAliasKind::Edge => {
-            if let Some(field) = edge_projection_field(property) {
-                context.value(GqlRuntimeValueKey::EdgeMetadata {
-                    alias: alias.to_string(),
-                    field,
-                })
-            } else {
-                context.value(GqlRuntimeValueKey::EdgeProperty {
-                    alias: alias.to_string(),
-                    key: property.to_string(),
-                })
-            }
-        }
+        GqlAliasKind::Node => context.value(GqlRuntimeValueKey::NodeProperty {
+            alias: alias.to_string(),
+            key: property.to_string(),
+        }),
+        GqlAliasKind::Edge => context.value(GqlRuntimeValueKey::EdgeProperty {
+            alias: alias.to_string(),
+            key: property.to_string(),
+        }),
         GqlAliasKind::Path | GqlAliasKind::Scalar => ProjectedValue::Null,
     }
 }
@@ -1434,28 +1460,33 @@ fn projection_alias(alias: &str, alias_projection: &BTreeMap<String, String>) ->
         .unwrap_or_else(|| alias.to_string())
 }
 
-fn node_projection_field(name: &str) -> Option<NodeProjectionField> {
-    match name {
-        "id" => Some(NodeProjectionField::Id),
-        "labels" => Some(NodeProjectionField::Labels),
-        "key" => Some(NodeProjectionField::Key),
-        "weight" => Some(NodeProjectionField::Weight),
-        "created_at" => Some(NodeProjectionField::CreatedAt),
-        "updated_at" => Some(NodeProjectionField::UpdatedAt),
-        _ => None,
+fn node_metadata_projection_field(metadata: GqlMetadataFunction) -> Option<NodeProjectionField> {
+    match metadata {
+        GqlMetadataFunction::Id => Some(NodeProjectionField::Id),
+        GqlMetadataFunction::ElementKey => Some(NodeProjectionField::Key),
+        GqlMetadataFunction::Weight => Some(NodeProjectionField::Weight),
+        GqlMetadataFunction::CreatedAt => Some(NodeProjectionField::CreatedAt),
+        GqlMetadataFunction::UpdatedAt => Some(NodeProjectionField::UpdatedAt),
+        GqlMetadataFunction::ValidFrom | GqlMetadataFunction::ValidTo => None,
     }
 }
 
-fn edge_projection_field(name: &str) -> Option<EdgeProjectionField> {
-    match name {
-        "from" => Some(EdgeProjectionField::From),
-        "to" => Some(EdgeProjectionField::To),
-        "weight" => Some(EdgeProjectionField::Weight),
-        "created_at" => Some(EdgeProjectionField::CreatedAt),
-        "updated_at" => Some(EdgeProjectionField::UpdatedAt),
-        "valid_from" => Some(EdgeProjectionField::ValidFrom),
-        "valid_to" => Some(EdgeProjectionField::ValidTo),
-        _ => None,
+fn edge_metadata_projection_field(metadata: GqlMetadataFunction) -> Option<EdgeProjectionField> {
+    match metadata {
+        GqlMetadataFunction::Id => Some(EdgeProjectionField::Id),
+        GqlMetadataFunction::Weight => Some(EdgeProjectionField::Weight),
+        GqlMetadataFunction::CreatedAt => Some(EdgeProjectionField::CreatedAt),
+        GqlMetadataFunction::UpdatedAt => Some(EdgeProjectionField::UpdatedAt),
+        GqlMetadataFunction::ValidFrom => Some(EdgeProjectionField::ValidFrom),
+        GqlMetadataFunction::ValidTo => Some(EdgeProjectionField::ValidTo),
+        GqlMetadataFunction::ElementKey => None,
+    }
+}
+
+fn edge_endpoint_projection_field(endpoint: GqlEndpointFunction) -> EdgeProjectionField {
+    match endpoint {
+        GqlEndpointFunction::StartNode => EdgeProjectionField::From,
+        GqlEndpointFunction::EndNode => EdgeProjectionField::To,
     }
 }
 

@@ -6,6 +6,10 @@ use crate::property_value_semantics::{
     NumericRangeSortKey,
 };
 use crate::row_projection::{EdgeSelectedFieldNeeds, NodeSelectedFieldNeeds, PropertySelection};
+use crate::secondary_index_key::{
+    encode_compound_tuple_key, CompoundFieldValue, CompoundLowerBound, CompoundPrefixBounds,
+    CompoundRangeBounds, CompoundSidecarTargetKind, CompoundTupleContext,
+};
 use crate::types::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Bound, ControlFlow};
@@ -115,11 +119,27 @@ type MembershipSlot<T> = VersionedSlot<Option<T>>;
 type SecondaryEqMemberState = HashMap<u64, NodeIdMap<MembershipSlot<()>>>;
 type SecondaryEqState = HashMap<u64, SecondaryEqMemberState>;
 type SecondaryRangeState = HashMap<u64, BTreeMap<(NumericRangeSortKey, u64), MembershipSlot<()>>>;
+type CompoundSecondaryIndexState = HashMap<u64, BTreeMap<(Vec<u8>, u64), MembershipSlot<()>>>;
+type CompoundAction = (u64, Vec<u8>, u64, bool);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MemtableEndpointCountEstimate {
     pub(crate) count: usize,
     pub(crate) exact: bool,
+}
+
+impl MemtableEndpointCountEstimate {
+    fn exact_zero() -> Self {
+        Self {
+            count: 0,
+            exact: true,
+        }
+    }
+
+    fn add_assign(&mut self, other: Self) {
+        self.count = self.count.saturating_add(other.count);
+        self.exact &= other.exact;
+    }
 }
 
 fn apply_size_delta(total: &mut usize, before: usize, after: usize) {
@@ -157,11 +177,20 @@ fn estimate_adj_slot(slot: &MembershipSlot<AdjEntry>) -> usize {
 }
 
 fn estimate_secondary_decl_entry(entry: &SecondaryIndexManifestEntry) -> usize {
-    let prop_key_len = match &entry.target {
+    let field_bytes = match &entry.target {
         SecondaryIndexTarget::NodeProperty { prop_key, .. }
         | SecondaryIndexTarget::EdgeProperty { prop_key, .. } => prop_key.len(),
+        SecondaryIndexTarget::NodeFieldIndex { fields, .. }
+        | SecondaryIndexTarget::EdgeFieldIndex { fields, .. } => fields
+            .iter()
+            .map(|field| match field {
+                SecondaryIndexFieldManifest::Property { key } => key.len(),
+                SecondaryIndexFieldManifest::NodeMetadata { .. }
+                | SecondaryIndexFieldManifest::EdgeMetadata { .. } => 16,
+            })
+            .sum(),
     };
-    96 + prop_key_len + entry.last_error.as_ref().map(|msg| msg.len()).unwrap_or(0)
+    96 + field_bytes + entry.last_error.as_ref().map(|msg| msg.len()).unwrap_or(0)
 }
 
 fn estimate_secondary_eq_lookup_entry(prop_key: &str, index_ids: &[u64]) -> usize {
@@ -170,6 +199,10 @@ fn estimate_secondary_eq_lookup_entry(prop_key: &str, index_ids: &[u64]) -> usiz
 
 fn estimate_secondary_range_lookup_entry(prop_key: &str, indexes: &[u64]) -> usize {
     48 + prop_key.len() + indexes.len() * 8
+}
+
+fn estimate_secondary_field_lookup_entry(index_ids: &[u64]) -> usize {
+    48 + index_ids.len() * 8
 }
 
 fn estimate_secondary_eq_state_groups(groups: &SecondaryEqMemberState) -> usize {
@@ -190,9 +223,20 @@ fn estimate_secondary_range_state_entries(
     entries.values().map(estimate_membership_slot).sum()
 }
 
+fn estimate_compound_state_entries(
+    entries: &BTreeMap<(Vec<u8>, u64), MembershipSlot<()>>,
+) -> usize {
+    entries
+        .iter()
+        .map(|((tuple_key, _), slot)| tuple_key.len() + 8 + estimate_membership_slot(slot))
+        .sum()
+}
+
 #[derive(Clone, Default)]
 struct MemtableState {
     estimated_bytes: usize,
+    live_node_count: usize,
+    live_edge_count: usize,
     nodes: NodeIdMap<VersionedRecordSlot<NodeRecord>>,
     edges: NodeIdMap<VersionedRecordSlot<EdgeRecord>>,
     node_tombstones: NodeIdMap<MembershipSlot<()>>,
@@ -213,8 +257,11 @@ struct MemtableState {
     secondary_range_by_prop: HashMap<u32, HashMap<String, Vec<u64>>>,
     secondary_edge_eq_by_prop: HashMap<u32, HashMap<String, Vec<u64>>>,
     secondary_edge_range_by_prop: HashMap<u32, HashMap<String, Vec<u64>>>,
+    secondary_node_field_indexes_by_label: HashMap<u32, Vec<u64>>,
+    secondary_edge_field_indexes_by_label: HashMap<u32, Vec<u64>>,
     secondary_eq_state: SecondaryEqState,
     secondary_range_state: SecondaryRangeState,
+    secondary_compound_state: CompoundSecondaryIndexState,
 }
 
 fn slot_option_current<T: Clone>(slot: &VersionedSlot<Option<T>>) -> Option<&T> {
@@ -235,6 +282,103 @@ fn optional_semantic_property_eq(left: Option<&PropValue>, right: Option<&PropVa
         (None, None) => true,
         _ => false,
     }
+}
+
+fn node_compound_field_value<'a>(
+    node: &'a NodeRecord,
+    field: &'a SecondaryIndexFieldManifest,
+) -> CompoundFieldValue<'a> {
+    match field {
+        SecondaryIndexFieldManifest::Property { key } => {
+            CompoundFieldValue::Property(node.props.get(key))
+        }
+        SecondaryIndexFieldManifest::NodeMetadata { field } => match field {
+            NodeMetadataIndexFieldManifest::Id => CompoundFieldValue::MetadataU64(node.id),
+            NodeMetadataIndexFieldManifest::Key => CompoundFieldValue::MetadataString(&node.key),
+            NodeMetadataIndexFieldManifest::Weight => {
+                CompoundFieldValue::MetadataF64(node.weight as f64)
+            }
+            NodeMetadataIndexFieldManifest::CreatedAt => {
+                CompoundFieldValue::MetadataI64(node.created_at)
+            }
+            NodeMetadataIndexFieldManifest::UpdatedAt => {
+                CompoundFieldValue::MetadataI64(node.updated_at)
+            }
+        },
+        SecondaryIndexFieldManifest::EdgeMetadata { .. } => {
+            unreachable!("node field-index declaration contains edge metadata")
+        }
+    }
+}
+
+fn edge_compound_field_value<'a>(
+    edge: &'a EdgeRecord,
+    field: &'a SecondaryIndexFieldManifest,
+) -> CompoundFieldValue<'a> {
+    match field {
+        SecondaryIndexFieldManifest::Property { key } => {
+            CompoundFieldValue::Property(edge.props.get(key))
+        }
+        SecondaryIndexFieldManifest::EdgeMetadata { field } => match field {
+            EdgeMetadataIndexFieldManifest::Id => CompoundFieldValue::MetadataU64(edge.id),
+            EdgeMetadataIndexFieldManifest::From => CompoundFieldValue::MetadataU64(edge.from),
+            EdgeMetadataIndexFieldManifest::To => CompoundFieldValue::MetadataU64(edge.to),
+            EdgeMetadataIndexFieldManifest::Weight => {
+                CompoundFieldValue::MetadataF64(edge.weight as f64)
+            }
+            EdgeMetadataIndexFieldManifest::CreatedAt => {
+                CompoundFieldValue::MetadataI64(edge.created_at)
+            }
+            EdgeMetadataIndexFieldManifest::UpdatedAt => {
+                CompoundFieldValue::MetadataI64(edge.updated_at)
+            }
+            EdgeMetadataIndexFieldManifest::ValidFrom => {
+                CompoundFieldValue::MetadataI64(edge.valid_from)
+            }
+            EdgeMetadataIndexFieldManifest::ValidTo => {
+                CompoundFieldValue::MetadataI64(edge.valid_to)
+            }
+        },
+        SecondaryIndexFieldManifest::NodeMetadata { .. } => {
+            unreachable!("edge field-index declaration contains node metadata")
+        }
+    }
+}
+
+fn encode_node_compound_tuple_key(
+    label_id: u32,
+    fields: &[SecondaryIndexFieldManifest],
+    node: &NodeRecord,
+) -> Vec<u8> {
+    let context = CompoundTupleContext {
+        target_kind: CompoundSidecarTargetKind::Node,
+        target_label_id: label_id,
+        fields,
+    };
+    let values = fields
+        .iter()
+        .map(|field| node_compound_field_value(node, field))
+        .collect::<Vec<_>>();
+    encode_compound_tuple_key(&context, &values)
+        .expect("validated node field-index declaration must encode")
+}
+
+fn encode_edge_compound_tuple_key(
+    label_id: u32,
+    fields: &[SecondaryIndexFieldManifest],
+    edge: &EdgeRecord,
+) -> Vec<u8> {
+    let context = CompoundTupleContext {
+        target_kind: CompoundSidecarTargetKind::Edge,
+        target_label_id: label_id,
+        fields,
+    };
+    let values = fields
+        .iter()
+        .map(|field| edge_compound_field_value(edge, field))
+        .collect::<Vec<_>>();
+    encode_compound_tuple_key(&context, &values)
+        .expect("validated edge field-index declaration must encode")
 }
 
 fn secondary_range_start_bound(
@@ -272,6 +416,53 @@ fn secondary_range_past_upper(
     upper.is_some_and(|(upper_value, inclusive)| {
         encoded > upper_value || (!inclusive && encoded == upper_value)
     })
+}
+
+#[allow(dead_code)]
+fn compound_start_bound(lower: Option<&CompoundLowerBound>) -> Bound<(Vec<u8>, u64)> {
+    match lower {
+        Some(lower) => Bound::Included((lower.key.clone(), 0)),
+        None => Bound::Unbounded,
+    }
+}
+
+#[allow(dead_code)]
+fn collect_visible_compound_ids(
+    entries: &BTreeMap<(Vec<u8>, u64), MembershipSlot<()>>,
+    lower: Bound<(Vec<u8>, u64)>,
+    upper_exclusive: &[u8],
+    skip_exact_lower_component_prefix: Option<&[u8]>,
+    snapshot_seq: u64,
+) -> Vec<u64> {
+    let upper = Bound::Excluded((upper_exclusive.to_vec(), 0));
+    let mut ids = Vec::new();
+    for ((tuple_key, record_id), slot) in entries.range((lower, upper)) {
+        if skip_exact_lower_component_prefix.is_some_and(|prefix| tuple_key.starts_with(prefix)) {
+            continue;
+        }
+        if slot_option_visible(slot, snapshot_seq) {
+            ids.push(*record_id);
+        }
+    }
+    ids
+}
+
+#[allow(dead_code)]
+fn count_visible_compound_ids(
+    entries: &BTreeMap<(Vec<u8>, u64), MembershipSlot<()>>,
+    lower: Bound<(Vec<u8>, u64)>,
+    upper_exclusive: &[u8],
+    skip_exact_lower_component_prefix: Option<&[u8]>,
+    snapshot_seq: u64,
+) -> usize {
+    let upper = Bound::Excluded((upper_exclusive.to_vec(), 0));
+    entries
+        .range((lower, upper))
+        .filter(|((tuple_key, _), slot)| {
+            !skip_exact_lower_component_prefix.is_some_and(|prefix| tuple_key.starts_with(prefix))
+                && slot_option_visible(slot, snapshot_seq)
+        })
+        .count()
 }
 
 fn record_current<T: Clone>(slot: &VersionedRecordSlot<T>) -> Option<&T> {
@@ -357,6 +548,51 @@ fn current_secondary_range_state(
                 visible.insert(key);
             }
         }
+        if !visible.is_empty() {
+            result.insert(index_id, visible);
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+fn current_compound_secondary_state(
+    source: &CompoundSecondaryIndexState,
+) -> HashMap<u64, BTreeSet<(Vec<u8>, u64)>> {
+    let mut result = HashMap::new();
+    for (&index_id, entries) in source {
+        let mut visible = BTreeSet::new();
+        for ((tuple_key, record_id), slot) in entries {
+            if slot_option_current(slot).is_some() {
+                visible.insert((tuple_key.clone(), *record_id));
+            }
+        }
+        if !visible.is_empty() {
+            result.insert(index_id, visible);
+        }
+    }
+    result
+}
+
+fn current_compound_secondary_state_for_indexes(
+    source: &CompoundSecondaryIndexState,
+    index_ids: &[u64],
+) -> HashMap<u64, Vec<(Vec<u8>, u64)>> {
+    let mut requested = index_ids.to_vec();
+    requested.sort_unstable();
+    requested.dedup();
+
+    let mut result = HashMap::new();
+    for index_id in requested {
+        let Some(entries) = source.get(&index_id) else {
+            continue;
+        };
+        let visible: Vec<(Vec<u8>, u64)> = entries
+            .iter()
+            .filter_map(|((tuple_key, record_id), slot)| {
+                slot_option_current(slot).map(|_| (tuple_key.clone(), *record_id))
+            })
+            .collect();
         if !visible.is_empty() {
             result.insert(index_id, visible);
         }
@@ -651,6 +887,71 @@ impl MemtableState {
         }
     }
 
+    fn set_compound_slot_in(
+        state: &mut CompoundSecondaryIndexState,
+        index_id: u64,
+        tuple_key: Vec<u8>,
+        record_id: u64,
+        present: bool,
+        write_seq: u64,
+    ) -> (usize, usize) {
+        let value = present.then_some(());
+        let entries = state.entry(index_id).or_default();
+        let key = (tuple_key, record_id);
+        if let Some(slot) = entries.get_mut(&key) {
+            let before = key.0.len() + 8 + estimate_membership_slot(slot);
+            slot.replace(write_seq, value);
+            let after = key.0.len() + 8 + estimate_membership_slot(slot);
+            (before, after)
+        } else {
+            let slot = VersionedSlot::new(write_seq, value);
+            let after = key.0.len() + 8 + estimate_membership_slot(&slot);
+            entries.insert(key, slot);
+            (0, after)
+        }
+    }
+
+    fn add_field_index_lookup(
+        map: &mut HashMap<u32, Vec<u64>>,
+        label_id: u32,
+        index_id: u64,
+    ) -> (usize, usize) {
+        match map.get_mut(&label_id) {
+            Some(index_ids) => {
+                let before = estimate_secondary_field_lookup_entry(index_ids);
+                index_ids.push(index_id);
+                let after = estimate_secondary_field_lookup_entry(index_ids);
+                (before, after)
+            }
+            None => {
+                let index_ids = vec![index_id];
+                let after = estimate_secondary_field_lookup_entry(&index_ids);
+                map.insert(label_id, index_ids);
+                (0, after)
+            }
+        }
+    }
+
+    fn remove_field_index_lookup(
+        map: &mut HashMap<u32, Vec<u64>>,
+        label_id: u32,
+        index_id: u64,
+    ) -> (usize, usize, bool) {
+        let mut before = 0;
+        let mut after = 0;
+        let mut remove_label_entry = false;
+        if let Some(index_ids) = map.get_mut(&label_id) {
+            before = estimate_secondary_field_lookup_entry(index_ids);
+            index_ids.retain(|&id| id != index_id);
+            if index_ids.is_empty() {
+                remove_label_entry = true;
+            } else {
+                after = estimate_secondary_field_lookup_entry(index_ids);
+            }
+        }
+        (before, after, remove_label_entry)
+    }
+
     fn set_node_label_slot(
         &mut self,
         label_id: u32,
@@ -784,6 +1085,25 @@ impl MemtableState {
         apply_size_delta(&mut self.estimated_bytes, before, after);
     }
 
+    fn set_compound_slot(
+        &mut self,
+        index_id: u64,
+        tuple_key: Vec<u8>,
+        record_id: u64,
+        present: bool,
+        write_seq: u64,
+    ) {
+        let (before, after) = Self::set_compound_slot_in(
+            &mut self.secondary_compound_state,
+            index_id,
+            tuple_key,
+            record_id,
+            present,
+            write_seq,
+        );
+        apply_size_delta(&mut self.estimated_bytes, before, after);
+    }
+
     #[cfg(test)]
     fn recompute_estimated_size(&self) -> usize {
         let node_size: usize = self.nodes.values().map(estimate_node_record_slot).sum();
@@ -905,6 +1225,16 @@ impl MemtableState {
                     .sum::<usize>()
             })
             .sum();
+        let secondary_node_field_lookup_size: usize = self
+            .secondary_node_field_indexes_by_label
+            .values()
+            .map(|index_ids| estimate_secondary_field_lookup_entry(index_ids))
+            .sum();
+        let secondary_edge_field_lookup_size: usize = self
+            .secondary_edge_field_indexes_by_label
+            .values()
+            .map(|index_ids| estimate_secondary_field_lookup_entry(index_ids))
+            .sum();
         let secondary_eq_state_size: usize = self
             .secondary_eq_state
             .values()
@@ -930,6 +1260,11 @@ impl MemtableState {
                     .sum::<usize>()
             })
             .sum();
+        let secondary_compound_state_size: usize = self
+            .secondary_compound_state
+            .values()
+            .map(estimate_compound_state_entries)
+            .sum();
 
         node_size
             + edge_size
@@ -946,8 +1281,11 @@ impl MemtableState {
             + secondary_range_lookup_size
             + secondary_edge_eq_lookup_size
             + secondary_edge_range_lookup_size
+            + secondary_node_field_lookup_size
+            + secondary_edge_field_lookup_size
             + secondary_eq_state_size
             + secondary_range_state_size
+            + secondary_compound_state_size
     }
 
     fn current_node(&self, id: u64) -> Option<&NodeRecord> {
@@ -1108,12 +1446,71 @@ impl MemtableState {
         }
     }
 
+    fn collect_compound_index_entries_for_node_label(
+        &self,
+        label_id: u32,
+        node: &NodeRecord,
+        present: bool,
+        actions: &mut Vec<CompoundAction>,
+    ) {
+        let Some(index_ids) = self.secondary_node_field_indexes_by_label.get(&label_id) else {
+            return;
+        };
+        for &index_id in index_ids {
+            let entry = self
+                .secondary_index_declarations
+                .get(&index_id)
+                .expect("node field-index lookup points at a declaration");
+            let SecondaryIndexTarget::NodeFieldIndex { fields, .. } = &entry.target else {
+                unreachable!("node field-index lookup points at non-node-field target");
+            };
+            actions.push((
+                index_id,
+                encode_node_compound_tuple_key(label_id, fields, node),
+                node.id,
+                present,
+            ));
+        }
+    }
+
+    fn collect_compound_index_updates_for_node_label(
+        &self,
+        label_id: u32,
+        old_node: &NodeRecord,
+        new_node: &NodeRecord,
+        actions: &mut Vec<CompoundAction>,
+    ) {
+        let Some(index_ids) = self.secondary_node_field_indexes_by_label.get(&label_id) else {
+            return;
+        };
+        for &index_id in index_ids {
+            let entry = self
+                .secondary_index_declarations
+                .get(&index_id)
+                .expect("node field-index lookup points at a declaration");
+            let SecondaryIndexTarget::NodeFieldIndex { fields, .. } = &entry.target else {
+                unreachable!("node field-index lookup points at non-node-field target");
+            };
+            let old_key = encode_node_compound_tuple_key(label_id, fields, old_node);
+            let new_key = encode_node_compound_tuple_key(label_id, fields, new_node);
+            if old_key == new_key {
+                continue;
+            }
+            actions.push((index_id, old_key, old_node.id, false));
+            actions.push((index_id, new_key, new_node.id, true));
+        }
+    }
+
     fn add_secondary_index_entries_for_node(&mut self, node: &NodeRecord, write_seq: u64) {
-        if self.secondary_eq_by_prop.is_empty() && self.secondary_range_by_prop.is_empty() {
+        if self.secondary_eq_by_prop.is_empty()
+            && self.secondary_range_by_prop.is_empty()
+            && self.secondary_node_field_indexes_by_label.is_empty()
+        {
             return;
         }
         let mut eq_actions = Vec::new();
         let mut range_actions = Vec::new();
+        let mut compound_actions = Vec::new();
         for &label_id in node.label_ids.as_slice() {
             self.collect_secondary_index_entries_for_node_label(
                 label_id,
@@ -1123,6 +1520,12 @@ impl MemtableState {
                 &mut eq_actions,
                 &mut range_actions,
             );
+            self.collect_compound_index_entries_for_node_label(
+                label_id,
+                node,
+                true,
+                &mut compound_actions,
+            );
         }
         for (index_id, value_hash, node_id, present) in eq_actions {
             self.set_secondary_eq_slot(index_id, value_hash, node_id, present, write_seq);
@@ -1130,14 +1533,21 @@ impl MemtableState {
         for (index_id, encoded, node_id, present) in range_actions {
             self.set_secondary_range_slot(index_id, encoded, node_id, present, write_seq);
         }
+        for (index_id, tuple_key, node_id, present) in compound_actions {
+            self.set_compound_slot(index_id, tuple_key, node_id, present, write_seq);
+        }
     }
 
     fn remove_secondary_index_entries_for_node(&mut self, node: &NodeRecord, write_seq: u64) {
-        if self.secondary_eq_by_prop.is_empty() && self.secondary_range_by_prop.is_empty() {
+        if self.secondary_eq_by_prop.is_empty()
+            && self.secondary_range_by_prop.is_empty()
+            && self.secondary_node_field_indexes_by_label.is_empty()
+        {
             return;
         }
         let mut eq_actions = Vec::new();
         let mut range_actions = Vec::new();
+        let mut compound_actions = Vec::new();
         for &label_id in node.label_ids.as_slice() {
             self.collect_secondary_index_entries_for_node_label(
                 label_id,
@@ -1147,12 +1557,21 @@ impl MemtableState {
                 &mut eq_actions,
                 &mut range_actions,
             );
+            self.collect_compound_index_entries_for_node_label(
+                label_id,
+                node,
+                false,
+                &mut compound_actions,
+            );
         }
         for (index_id, value_hash, node_id, present) in eq_actions {
             self.set_secondary_eq_slot(index_id, value_hash, node_id, present, write_seq);
         }
         for (index_id, encoded, node_id, present) in range_actions {
             self.set_secondary_range_slot(index_id, encoded, node_id, present, write_seq);
+        }
+        for (index_id, tuple_key, node_id, present) in compound_actions {
+            self.set_compound_slot(index_id, tuple_key, node_id, present, write_seq);
         }
     }
 
@@ -1162,7 +1581,10 @@ impl MemtableState {
         new_node: &NodeRecord,
         write_seq: u64,
     ) {
-        if self.secondary_eq_by_prop.is_empty() && self.secondary_range_by_prop.is_empty() {
+        if self.secondary_eq_by_prop.is_empty()
+            && self.secondary_range_by_prop.is_empty()
+            && self.secondary_node_field_indexes_by_label.is_empty()
+        {
             return;
         }
 
@@ -1173,6 +1595,7 @@ impl MemtableState {
 
         let mut eq_actions = Vec::new();
         let mut range_actions = Vec::new();
+        let mut compound_actions = Vec::new();
 
         for &old_label_id in old_node.label_ids.as_slice() {
             if !new_node.label_ids.contains(old_label_id) {
@@ -1183,6 +1606,12 @@ impl MemtableState {
                     false,
                     &mut eq_actions,
                     &mut range_actions,
+                );
+                self.collect_compound_index_entries_for_node_label(
+                    old_label_id,
+                    old_node,
+                    false,
+                    &mut compound_actions,
                 );
             }
         }
@@ -1196,6 +1625,12 @@ impl MemtableState {
                     &mut eq_actions,
                     &mut range_actions,
                 );
+                self.collect_compound_index_updates_for_node_label(
+                    new_label_id,
+                    old_node,
+                    new_node,
+                    &mut compound_actions,
+                );
             } else {
                 self.collect_secondary_index_entries_for_node_label(
                     new_label_id,
@@ -1205,6 +1640,12 @@ impl MemtableState {
                     &mut eq_actions,
                     &mut range_actions,
                 );
+                self.collect_compound_index_entries_for_node_label(
+                    new_label_id,
+                    new_node,
+                    true,
+                    &mut compound_actions,
+                );
             }
         }
         for (index_id, value_hash, node_id, present) in eq_actions {
@@ -1213,79 +1654,177 @@ impl MemtableState {
         for (index_id, encoded, node_id, present) in range_actions {
             self.set_secondary_range_slot(index_id, encoded, node_id, present, write_seq);
         }
+        for (index_id, tuple_key, node_id, present) in compound_actions {
+            self.set_compound_slot(index_id, tuple_key, node_id, present, write_seq);
+        }
+    }
+
+    fn collect_compound_index_entries_for_edge_label(
+        &self,
+        label_id: u32,
+        edge: &EdgeRecord,
+        present: bool,
+        actions: &mut Vec<CompoundAction>,
+    ) {
+        let Some(index_ids) = self.secondary_edge_field_indexes_by_label.get(&label_id) else {
+            return;
+        };
+        for &index_id in index_ids {
+            let entry = self
+                .secondary_index_declarations
+                .get(&index_id)
+                .expect("edge field-index lookup points at a declaration");
+            let SecondaryIndexTarget::EdgeFieldIndex { fields, .. } = &entry.target else {
+                unreachable!("edge field-index lookup points at non-edge-field target");
+            };
+            actions.push((
+                index_id,
+                encode_edge_compound_tuple_key(label_id, fields, edge),
+                edge.id,
+                present,
+            ));
+        }
+    }
+
+    fn collect_compound_index_updates_for_edge_label(
+        &self,
+        label_id: u32,
+        old_edge: &EdgeRecord,
+        new_edge: &EdgeRecord,
+        actions: &mut Vec<CompoundAction>,
+    ) {
+        let Some(index_ids) = self.secondary_edge_field_indexes_by_label.get(&label_id) else {
+            return;
+        };
+        for &index_id in index_ids {
+            let entry = self
+                .secondary_index_declarations
+                .get(&index_id)
+                .expect("edge field-index lookup points at a declaration");
+            let SecondaryIndexTarget::EdgeFieldIndex { fields, .. } = &entry.target else {
+                unreachable!("edge field-index lookup points at non-edge-field target");
+            };
+            let old_key = encode_edge_compound_tuple_key(label_id, fields, old_edge);
+            let new_key = encode_edge_compound_tuple_key(label_id, fields, new_edge);
+            if old_key == new_key {
+                continue;
+            }
+            actions.push((index_id, old_key, old_edge.id, false));
+            actions.push((index_id, new_key, new_edge.id, true));
+        }
     }
 
     fn add_secondary_index_entries_for_edge(&mut self, edge: &EdgeRecord, write_seq: u64) {
-        if self.secondary_edge_eq_by_prop.is_empty() && self.secondary_edge_range_by_prop.is_empty()
+        if self.secondary_edge_eq_by_prop.is_empty()
+            && self.secondary_edge_range_by_prop.is_empty()
+            && self.secondary_edge_field_indexes_by_label.is_empty()
         {
             return;
         }
         let eq_by_prop = self.secondary_edge_eq_by_prop.get(&edge.label_id);
         let range_by_prop = self.secondary_edge_range_by_prop.get(&edge.label_id);
-        if eq_by_prop.is_none() && range_by_prop.is_none() {
+        let has_compound = self
+            .secondary_edge_field_indexes_by_label
+            .contains_key(&edge.label_id);
+        if eq_by_prop.is_none() && range_by_prop.is_none() && !has_compound {
             return;
         }
         let mut eq_actions = Vec::new();
         let mut range_actions = Vec::new();
-        for (prop_key, prop_value) in &edge.props {
-            if let Some(index_ids) = eq_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str())) {
-                let value_hash = hash_prop_equality_key(prop_value);
-                for &index_id in index_ids {
-                    eq_actions.push((index_id, value_hash));
+        let mut compound_actions = Vec::new();
+        if eq_by_prop.is_some() || range_by_prop.is_some() {
+            for (prop_key, prop_value) in &edge.props {
+                if let Some(index_ids) =
+                    eq_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str()))
+                {
+                    let value_hash = hash_prop_equality_key(prop_value);
+                    for &index_id in index_ids {
+                        eq_actions.push((index_id, value_hash));
+                    }
                 }
-            }
 
-            if let Some(indexes) = range_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str()))
-            {
-                for &index_id in indexes {
-                    if let Some(encoded) = numeric_range_sort_key_for_value(prop_value) {
-                        range_actions.push((index_id, encoded));
+                if let Some(indexes) =
+                    range_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str()))
+                {
+                    for &index_id in indexes {
+                        if let Some(encoded) = numeric_range_sort_key_for_value(prop_value) {
+                            range_actions.push((index_id, encoded));
+                        }
                     }
                 }
             }
         }
+        self.collect_compound_index_entries_for_edge_label(
+            edge.label_id,
+            edge,
+            true,
+            &mut compound_actions,
+        );
         for (index_id, value_hash) in eq_actions {
             self.set_secondary_eq_slot(index_id, value_hash, edge.id, true, write_seq);
         }
         for (index_id, encoded) in range_actions {
             self.set_secondary_range_slot(index_id, encoded, edge.id, true, write_seq);
         }
+        for (index_id, tuple_key, edge_id, present) in compound_actions {
+            self.set_compound_slot(index_id, tuple_key, edge_id, present, write_seq);
+        }
     }
 
     fn remove_secondary_index_entries_for_edge(&mut self, edge: &EdgeRecord, write_seq: u64) {
-        if self.secondary_edge_eq_by_prop.is_empty() && self.secondary_edge_range_by_prop.is_empty()
+        if self.secondary_edge_eq_by_prop.is_empty()
+            && self.secondary_edge_range_by_prop.is_empty()
+            && self.secondary_edge_field_indexes_by_label.is_empty()
         {
             return;
         }
         let eq_by_prop = self.secondary_edge_eq_by_prop.get(&edge.label_id);
         let range_by_prop = self.secondary_edge_range_by_prop.get(&edge.label_id);
-        if eq_by_prop.is_none() && range_by_prop.is_none() {
+        let has_compound = self
+            .secondary_edge_field_indexes_by_label
+            .contains_key(&edge.label_id);
+        if eq_by_prop.is_none() && range_by_prop.is_none() && !has_compound {
             return;
         }
         let mut eq_actions = Vec::new();
         let mut range_actions = Vec::new();
-        for (prop_key, prop_value) in &edge.props {
-            if let Some(index_ids) = eq_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str())) {
-                let value_hash = hash_prop_equality_key(prop_value);
-                for &index_id in index_ids {
-                    eq_actions.push((index_id, value_hash));
+        let mut compound_actions = Vec::new();
+        if eq_by_prop.is_some() || range_by_prop.is_some() {
+            for (prop_key, prop_value) in &edge.props {
+                if let Some(index_ids) =
+                    eq_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str()))
+                {
+                    let value_hash = hash_prop_equality_key(prop_value);
+                    for &index_id in index_ids {
+                        eq_actions.push((index_id, value_hash));
+                    }
                 }
-            }
 
-            if let Some(indexes) = range_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str()))
-            {
-                for &index_id in indexes {
-                    if let Some(encoded) = numeric_range_sort_key_for_value(prop_value) {
-                        range_actions.push((index_id, encoded));
+                if let Some(indexes) =
+                    range_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str()))
+                {
+                    for &index_id in indexes {
+                        if let Some(encoded) = numeric_range_sort_key_for_value(prop_value) {
+                            range_actions.push((index_id, encoded));
+                        }
                     }
                 }
             }
         }
+        self.collect_compound_index_entries_for_edge_label(
+            edge.label_id,
+            edge,
+            false,
+            &mut compound_actions,
+        );
         for (index_id, value_hash) in eq_actions {
             self.set_secondary_eq_slot(index_id, value_hash, edge.id, false, write_seq);
         }
         for (index_id, encoded) in range_actions {
             self.set_secondary_range_slot(index_id, encoded, edge.id, false, write_seq);
+        }
+        for (index_id, tuple_key, edge_id, present) in compound_actions {
+            self.set_compound_slot(index_id, tuple_key, edge_id, present, write_seq);
         }
     }
 
@@ -1295,7 +1834,9 @@ impl MemtableState {
         new_edge: &EdgeRecord,
         write_seq: u64,
     ) {
-        if self.secondary_edge_eq_by_prop.is_empty() && self.secondary_edge_range_by_prop.is_empty()
+        if self.secondary_edge_eq_by_prop.is_empty()
+            && self.secondary_edge_range_by_prop.is_empty()
+            && self.secondary_edge_field_indexes_by_label.is_empty()
         {
             return;
         }
@@ -1313,11 +1854,15 @@ impl MemtableState {
 
         let eq_by_prop = self.secondary_edge_eq_by_prop.get(&new_edge.label_id);
         let range_by_prop = self.secondary_edge_range_by_prop.get(&new_edge.label_id);
-        if eq_by_prop.is_none() && range_by_prop.is_none() {
+        let has_compound = self
+            .secondary_edge_field_indexes_by_label
+            .contains_key(&new_edge.label_id);
+        if eq_by_prop.is_none() && range_by_prop.is_none() && !has_compound {
             return;
         }
         let mut eq_actions = Vec::new();
         let mut range_actions = Vec::new();
+        let mut compound_actions = Vec::new();
 
         if let Some(by_prop) = eq_by_prop {
             for (prop_key, index_ids) in by_prop {
@@ -1360,11 +1905,20 @@ impl MemtableState {
                 }
             }
         }
+        self.collect_compound_index_updates_for_edge_label(
+            new_edge.label_id,
+            old_edge,
+            new_edge,
+            &mut compound_actions,
+        );
         for (index_id, value_hash, edge_id, present) in eq_actions {
             self.set_secondary_eq_slot(index_id, value_hash, edge_id, present, write_seq);
         }
         for (index_id, encoded, edge_id, present) in range_actions {
             self.set_secondary_range_slot(index_id, encoded, edge_id, present, write_seq);
+        }
+        for (index_id, tuple_key, edge_id, present) in compound_actions {
+            self.set_compound_slot(index_id, tuple_key, edge_id, present, write_seq);
         }
     }
 }
@@ -1402,6 +1956,7 @@ impl Memtable {
         match op {
             WalOp::UpsertNode(node) => {
                 let old_node = state.current_node(node.id).cloned();
+                let was_live = old_node.is_some();
                 let was_deleted = state.node_deleted_at(node.id, u64::MAX);
                 if let Some(old) = old_node.as_ref() {
                     for &old_label_id in old.label_ids.as_slice() {
@@ -1442,9 +1997,13 @@ impl Memtable {
                     state.set_node_tombstone_slot(node.id, false, last_write_seq);
                 }
                 state.set_node_state(node.id, RecordState::Live(stored), last_write_seq);
+                if !was_live {
+                    state.live_node_count = state.live_node_count.saturating_add(1);
+                }
             }
             WalOp::UpsertEdge(edge) => {
                 let old_edge = state.current_edge(edge.id).cloned();
+                let was_live = old_edge.is_some();
                 let was_deleted = state.edge_deleted_at(edge.id, u64::MAX);
                 if let Some(old) = old_edge.as_ref() {
                     if (old.from != edge.from || old.to != edge.to || old.label_id != edge.label_id)
@@ -1523,6 +2082,9 @@ impl Memtable {
                     state.set_edge_tombstone_slot(edge.id, false, last_write_seq);
                 }
                 state.set_edge_state(edge.id, RecordState::Live(stored), last_write_seq);
+                if !was_live {
+                    state.live_edge_count = state.live_edge_count.saturating_add(1);
+                }
             }
             WalOp::DeleteNode { id, deleted_at } => {
                 if let Some(node) = state.current_node(*id).cloned() {
@@ -1536,6 +2098,7 @@ impl Memtable {
                         );
                     }
                     state.remove_secondary_index_entries_for_node(&node, last_write_seq);
+                    state.live_node_count = state.live_node_count.saturating_sub(1);
                 }
                 state.set_node_state(
                     *id,
@@ -1570,6 +2133,7 @@ impl Memtable {
                     state.set_adj_in_slot(edge.to, edge.id, None, last_write_seq);
                     state.set_ordered_edge_slot(edge.id, false, last_write_seq);
                     state.remove_secondary_index_entries_for_edge(&edge, last_write_seq);
+                    state.live_edge_count = state.live_edge_count.saturating_sub(1);
                 }
                 state.set_edge_state(
                     *id,
@@ -1813,6 +2377,64 @@ impl Memtable {
                     }
                 }
             },
+            SecondaryIndexTarget::NodeFieldIndex { label_id, fields } => {
+                let (lookup_before, lookup_after) = MemtableState::add_field_index_lookup(
+                    &mut state.secondary_node_field_indexes_by_label,
+                    *label_id,
+                    entry.index_id,
+                );
+                apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
+                state
+                    .secondary_compound_state
+                    .entry(entry.index_id)
+                    .or_default();
+                let mut seeded = Vec::new();
+                for slot in state.nodes.values() {
+                    let Some(node) = record_current(slot) else {
+                        continue;
+                    };
+                    if !node.label_ids.contains(*label_id) {
+                        continue;
+                    }
+                    seeded.push((
+                        encode_node_compound_tuple_key(*label_id, fields, node),
+                        node.id,
+                        node.last_write_seq,
+                    ));
+                }
+                for (tuple_key, node_id, write_seq) in seeded {
+                    state.set_compound_slot(entry.index_id, tuple_key, node_id, true, write_seq);
+                }
+            }
+            SecondaryIndexTarget::EdgeFieldIndex { label_id, fields } => {
+                let (lookup_before, lookup_after) = MemtableState::add_field_index_lookup(
+                    &mut state.secondary_edge_field_indexes_by_label,
+                    *label_id,
+                    entry.index_id,
+                );
+                apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
+                state
+                    .secondary_compound_state
+                    .entry(entry.index_id)
+                    .or_default();
+                let mut seeded = Vec::new();
+                for slot in state.edges.values() {
+                    let Some(edge) = record_current(slot) else {
+                        continue;
+                    };
+                    if edge.label_id != *label_id {
+                        continue;
+                    }
+                    seeded.push((
+                        encode_edge_compound_tuple_key(*label_id, fields, edge),
+                        edge.id,
+                        edge.last_write_seq,
+                    ));
+                }
+                for (tuple_key, edge_id, write_seq) in seeded {
+                    state.set_compound_slot(entry.index_id, tuple_key, edge_id, true, write_seq);
+                }
+            }
         }
     }
 
@@ -1962,6 +2584,44 @@ impl Memtable {
                     }
                 }
             },
+            SecondaryIndexTarget::NodeFieldIndex { label_id, .. } => {
+                let (lookup_before, lookup_after, remove_label_entry) =
+                    MemtableState::remove_field_index_lookup(
+                        &mut state.secondary_node_field_indexes_by_label,
+                        label_id,
+                        index_id,
+                    );
+                apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
+                if remove_label_entry {
+                    state
+                        .secondary_node_field_indexes_by_label
+                        .remove(&label_id);
+                }
+                if let Some(entries) = state.secondary_compound_state.remove(&index_id) {
+                    state.estimated_bytes = state
+                        .estimated_bytes
+                        .saturating_sub(estimate_compound_state_entries(&entries));
+                }
+            }
+            SecondaryIndexTarget::EdgeFieldIndex { label_id, .. } => {
+                let (lookup_before, lookup_after, remove_label_entry) =
+                    MemtableState::remove_field_index_lookup(
+                        &mut state.secondary_edge_field_indexes_by_label,
+                        label_id,
+                        index_id,
+                    );
+                apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
+                if remove_label_entry {
+                    state
+                        .secondary_edge_field_indexes_by_label
+                        .remove(&label_id);
+                }
+                if let Some(entries) = state.secondary_compound_state.remove(&index_id) {
+                    state.estimated_bytes = state
+                        .estimated_bytes
+                        .saturating_sub(estimate_compound_state_entries(&entries));
+                }
+            }
         }
         true
     }
@@ -2795,6 +3455,27 @@ impl Memtable {
         ids
     }
 
+    pub(crate) fn visible_node_time_range_count_at(
+        &self,
+        label_id: u32,
+        from_ms: i64,
+        to_ms: i64,
+        snapshot_seq: u64,
+    ) -> usize {
+        let mut count = 0usize;
+        let _ = self.for_each_visible_node_by_time_range_at(
+            label_id,
+            from_ms,
+            to_ms,
+            snapshot_seq,
+            &mut |_| {
+                count = count.saturating_add(1);
+                ControlFlow::Continue(())
+            },
+        );
+        count
+    }
+
     pub(crate) fn for_each_visible_node_by_time_range_at<F>(
         &self,
         label_id: u32,
@@ -3087,6 +3768,71 @@ impl Memtable {
         }
     }
 
+    fn visible_adj_edges_count_estimate(
+        state: &MemtableState,
+        node_ids: &[u64],
+        outgoing: bool,
+        label_filter_ids: Option<&[u32]>,
+        snapshot_seq: u64,
+    ) -> MemtableEndpointCountEstimate {
+        if node_ids.is_empty() || label_filter_ids.is_some_and(<[u32]>::is_empty) {
+            return MemtableEndpointCountEstimate::exact_zero();
+        }
+        let mut estimate = MemtableEndpointCountEstimate::exact_zero();
+        for &node_id in node_ids {
+            estimate.add_assign(Self::visible_adj_edge_count_estimate(
+                state,
+                node_id,
+                outgoing,
+                label_filter_ids,
+                snapshot_seq,
+            ));
+        }
+        estimate
+    }
+
+    fn visible_endpoint_edges_count_estimate(
+        state: &MemtableState,
+        node_ids: &[u64],
+        direction: Direction,
+        label_filter_ids: Option<&[u32]>,
+        snapshot_seq: u64,
+    ) -> MemtableEndpointCountEstimate {
+        match direction {
+            Direction::Outgoing => Self::visible_adj_edges_count_estimate(
+                state,
+                node_ids,
+                true,
+                label_filter_ids,
+                snapshot_seq,
+            ),
+            Direction::Incoming => Self::visible_adj_edges_count_estimate(
+                state,
+                node_ids,
+                false,
+                label_filter_ids,
+                snapshot_seq,
+            ),
+            Direction::Both => {
+                let mut estimate = Self::visible_adj_edges_count_estimate(
+                    state,
+                    node_ids,
+                    true,
+                    label_filter_ids,
+                    snapshot_seq,
+                );
+                estimate.add_assign(Self::visible_adj_edges_count_estimate(
+                    state,
+                    node_ids,
+                    false,
+                    label_filter_ids,
+                    snapshot_seq,
+                ));
+                estimate
+            }
+        }
+    }
+
     pub(crate) fn next_visible_edge_from_endpoint_after(
         &self,
         node_id: u64,
@@ -3123,6 +3869,7 @@ impl Memtable {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn visible_edges_from_endpoint_count_estimate(
         &self,
         node_id: u64,
@@ -3133,6 +3880,7 @@ impl Memtable {
         Self::visible_adj_edge_count_estimate(&state, node_id, true, label_filter_ids, snapshot_seq)
     }
 
+    #[cfg(test)]
     pub(crate) fn visible_edges_to_endpoint_count_estimate(
         &self,
         node_id: u64,
@@ -3144,6 +3892,23 @@ impl Memtable {
             &state,
             node_id,
             false,
+            label_filter_ids,
+            snapshot_seq,
+        )
+    }
+
+    pub(crate) fn visible_endpoint_edges_count_estimate_at(
+        &self,
+        node_ids: &[u64],
+        direction: Direction,
+        label_filter_ids: Option<&[u32]>,
+        snapshot_seq: u64,
+    ) -> MemtableEndpointCountEstimate {
+        let state = self.state.read().unwrap();
+        Self::visible_endpoint_edges_count_estimate(
+            &state,
+            node_ids,
+            direction,
             label_filter_ids,
             snapshot_seq,
         )
@@ -3281,6 +4046,25 @@ impl Memtable {
         count
     }
 
+    pub(crate) fn secondary_eq_node_hash_count_at(
+        &self,
+        index_id: u64,
+        value_hash: u64,
+        snapshot_seq: u64,
+    ) -> usize {
+        let state = self.state.read().unwrap();
+        let Some(groups) = state.secondary_eq_state.get(&index_id) else {
+            return 0;
+        };
+        let Some(group) = groups.get(&value_hash) else {
+            return 0;
+        };
+        group
+            .values()
+            .filter(|slot| slot_option_visible(slot, snapshot_seq))
+            .count()
+    }
+
     pub(crate) fn find_secondary_eq_edges_by_hash_at_limited(
         &self,
         index_id: u64,
@@ -3343,6 +4127,25 @@ impl Memtable {
             }
         }
         count
+    }
+
+    pub(crate) fn secondary_eq_edge_hash_count_at(
+        &self,
+        index_id: u64,
+        value_hash: u64,
+        snapshot_seq: u64,
+    ) -> usize {
+        let state = self.state.read().unwrap();
+        let Some(groups) = state.secondary_eq_state.get(&index_id) else {
+            return 0;
+        };
+        let Some(group) = groups.get(&value_hash) else {
+            return 0;
+        };
+        group
+            .values()
+            .filter(|slot| slot_option_visible(slot, snapshot_seq))
+            .count()
     }
 
     #[cfg(test)]
@@ -3452,6 +4255,176 @@ impl Memtable {
         ControlFlow::Continue(())
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn find_node_compound_prefix_at(
+        &self,
+        index_id: u64,
+        bounds: &CompoundPrefixBounds,
+        snapshot_seq: u64,
+    ) -> Vec<u64> {
+        self.find_compound_prefix_at(index_id, bounds, snapshot_seq)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn find_edge_compound_prefix_at(
+        &self,
+        index_id: u64,
+        bounds: &CompoundPrefixBounds,
+        snapshot_seq: u64,
+    ) -> Vec<u64> {
+        self.find_compound_prefix_at(index_id, bounds, snapshot_seq)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn count_node_compound_prefix_at(
+        &self,
+        index_id: u64,
+        bounds: &CompoundPrefixBounds,
+        snapshot_seq: u64,
+    ) -> usize {
+        self.count_compound_prefix_at(index_id, bounds, snapshot_seq)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn count_edge_compound_prefix_at(
+        &self,
+        index_id: u64,
+        bounds: &CompoundPrefixBounds,
+        snapshot_seq: u64,
+    ) -> usize {
+        self.count_compound_prefix_at(index_id, bounds, snapshot_seq)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn find_node_compound_range_at(
+        &self,
+        index_id: u64,
+        bounds: &CompoundRangeBounds,
+        snapshot_seq: u64,
+    ) -> Vec<u64> {
+        self.find_compound_range_at(index_id, bounds, snapshot_seq)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn find_edge_compound_range_at(
+        &self,
+        index_id: u64,
+        bounds: &CompoundRangeBounds,
+        snapshot_seq: u64,
+    ) -> Vec<u64> {
+        self.find_compound_range_at(index_id, bounds, snapshot_seq)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn count_node_compound_range_at(
+        &self,
+        index_id: u64,
+        bounds: &CompoundRangeBounds,
+        snapshot_seq: u64,
+    ) -> usize {
+        self.count_compound_range_at(index_id, bounds, snapshot_seq)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn count_edge_compound_range_at(
+        &self,
+        index_id: u64,
+        bounds: &CompoundRangeBounds,
+        snapshot_seq: u64,
+    ) -> usize {
+        self.count_compound_range_at(index_id, bounds, snapshot_seq)
+    }
+
+    #[allow(dead_code)]
+    fn find_compound_prefix_at(
+        &self,
+        index_id: u64,
+        bounds: &CompoundPrefixBounds,
+        snapshot_seq: u64,
+    ) -> Vec<u64> {
+        let state = self.state.read().unwrap();
+        let Some(entries) = state.secondary_compound_state.get(&index_id) else {
+            return Vec::new();
+        };
+        collect_visible_compound_ids(
+            entries,
+            Bound::Included((bounds.lower.clone(), 0)),
+            &bounds.upper_exclusive,
+            None,
+            snapshot_seq,
+        )
+    }
+
+    #[allow(dead_code)]
+    fn count_compound_prefix_at(
+        &self,
+        index_id: u64,
+        bounds: &CompoundPrefixBounds,
+        snapshot_seq: u64,
+    ) -> usize {
+        let state = self.state.read().unwrap();
+        let Some(entries) = state.secondary_compound_state.get(&index_id) else {
+            return 0;
+        };
+        count_visible_compound_ids(
+            entries,
+            Bound::Included((bounds.lower.clone(), 0)),
+            &bounds.upper_exclusive,
+            None,
+            snapshot_seq,
+        )
+    }
+
+    #[allow(dead_code)]
+    fn find_compound_range_at(
+        &self,
+        index_id: u64,
+        bounds: &CompoundRangeBounds,
+        snapshot_seq: u64,
+    ) -> Vec<u64> {
+        let state = self.state.read().unwrap();
+        let Some(entries) = state.secondary_compound_state.get(&index_id) else {
+            return Vec::new();
+        };
+        let skip_prefix = bounds
+            .lower
+            .as_ref()
+            .filter(|lower| lower.exclusive_component_prefix)
+            .map(|lower| lower.key.as_slice());
+        collect_visible_compound_ids(
+            entries,
+            compound_start_bound(bounds.lower.as_ref()),
+            &bounds.upper_exclusive,
+            skip_prefix,
+            snapshot_seq,
+        )
+    }
+
+    #[allow(dead_code)]
+    fn count_compound_range_at(
+        &self,
+        index_id: u64,
+        bounds: &CompoundRangeBounds,
+        snapshot_seq: u64,
+    ) -> usize {
+        let state = self.state.read().unwrap();
+        let Some(entries) = state.secondary_compound_state.get(&index_id) else {
+            return 0;
+        };
+        let skip_prefix = bounds
+            .lower
+            .as_ref()
+            .filter(|lower| lower.exclusive_component_prefix)
+            .map(|lower| lower.key.as_slice());
+        count_visible_compound_ids(
+            entries,
+            compound_start_bound(bounds.lower.as_ref()),
+            &bounds.upper_exclusive,
+            skip_prefix,
+            snapshot_seq,
+        )
+    }
+
     pub(crate) fn collect_deleted_nodes_at(&self, snapshot_seq: u64) -> NodeIdSet {
         let state = self.state.read().unwrap();
         let mut deleted = NodeIdSet::default();
@@ -3521,20 +4494,12 @@ impl Memtable {
 
     pub fn node_count(&self) -> usize {
         let state = self.state.read().unwrap();
-        state
-            .nodes
-            .values()
-            .filter(|slot| record_current(slot).is_some())
-            .count()
+        state.live_node_count
     }
 
     pub fn edge_count(&self) -> usize {
         let state = self.state.read().unwrap();
-        state
-            .edges
-            .values()
-            .filter(|slot| record_current(slot).is_some())
-            .count()
+        state.live_edge_count
     }
 
     pub fn nodes(&self) -> NodeIdMap<NodeRecord> {
@@ -3633,6 +4598,20 @@ impl Memtable {
         current_secondary_range_state(&state.secondary_range_state)
     }
 
+    #[cfg(test)]
+    pub(crate) fn compound_secondary_state(&self) -> HashMap<u64, BTreeSet<(Vec<u8>, u64)>> {
+        let state = self.state.read().unwrap();
+        current_compound_secondary_state(&state.secondary_compound_state)
+    }
+
+    pub(crate) fn compound_secondary_state_for_indexes(
+        &self,
+        index_ids: &[u64],
+    ) -> HashMap<u64, Vec<(Vec<u8>, u64)>> {
+        let state = self.state.read().unwrap();
+        current_compound_secondary_state_for_indexes(&state.secondary_compound_state, index_ids)
+    }
+
     pub fn time_node_index(&self) -> BTreeSet<(u32, i64, u64)> {
         let state = self.state.read().unwrap();
         current_time_index(&state.time_node_index)
@@ -3724,6 +4703,10 @@ impl Memtable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secondary_index_key::{
+        compound_prefix_bounds, compound_range_bounds, encode_compound_field_component,
+        encode_compound_tuple_prefix,
+    };
     use std::collections::BTreeMap;
 
     fn make_node(id: u64, label_id: u32, key: &str) -> NodeRecord {
@@ -3817,6 +4800,59 @@ mod tests {
         }
     }
 
+    fn property_field(key: &str) -> SecondaryIndexFieldManifest {
+        SecondaryIndexFieldManifest::Property {
+            key: key.to_string(),
+        }
+    }
+
+    fn node_meta_field(field: NodeMetadataIndexFieldManifest) -> SecondaryIndexFieldManifest {
+        SecondaryIndexFieldManifest::NodeMetadata { field }
+    }
+
+    fn edge_meta_field(field: EdgeMetadataIndexFieldManifest) -> SecondaryIndexFieldManifest {
+        SecondaryIndexFieldManifest::EdgeMetadata { field }
+    }
+
+    fn node_field_entry(
+        index_id: u64,
+        label_id: u32,
+        fields: Vec<SecondaryIndexFieldManifest>,
+        kind: SecondaryIndexKind,
+    ) -> SecondaryIndexManifestEntry {
+        SecondaryIndexManifestEntry {
+            index_id,
+            target: SecondaryIndexTarget::NodeFieldIndex { label_id, fields },
+            kind,
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        }
+    }
+
+    fn edge_field_entry(
+        index_id: u64,
+        label_id: u32,
+        fields: Vec<SecondaryIndexFieldManifest>,
+        kind: SecondaryIndexKind,
+    ) -> SecondaryIndexManifestEntry {
+        SecondaryIndexManifestEntry {
+            index_id,
+            target: SecondaryIndexTarget::EdgeFieldIndex { label_id, fields },
+            kind,
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        }
+    }
+
+    fn prefix_bounds_for(
+        entry: &SecondaryIndexManifestEntry,
+        values: &[CompoundFieldValue<'_>],
+    ) -> CompoundPrefixBounds {
+        let context = CompoundTupleContext::from_manifest_entry(entry).unwrap();
+        let prefix = encode_compound_tuple_prefix(&context, values).unwrap();
+        compound_prefix_bounds(&prefix)
+    }
+
     #[test]
     fn current_head_compatibility_still_works() {
         let mt = Memtable::new();
@@ -3827,6 +4863,75 @@ mod tests {
         assert_eq!(mt.get_edge_at(1, u64::MAX).unwrap().from, 1);
         assert_eq!(mt.node_by_key_at(1, "alice", u64::MAX).unwrap().id, 1);
         assert_eq!(mt.edge_by_triple_at(1, 2, 10, u64::MAX).unwrap().id, 1);
+    }
+
+    #[test]
+    fn current_live_counts_track_delete_and_resurrection_without_changing_snapshots() {
+        let mt = Memtable::new();
+        assert_eq!(mt.node_count(), 0);
+        assert_eq!(mt.edge_count(), 0);
+        assert!(mt.is_empty());
+
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 1);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 2);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)), 3);
+        assert_eq!(mt.node_count(), 2);
+        assert_eq!(mt.edge_count(), 1);
+        assert_eq!(mt.visible_node_count_at(2), 2);
+
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 1,
+                deleted_at: 4,
+            },
+            4,
+        );
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 10,
+                deleted_at: 5,
+            },
+            5,
+        );
+        assert_eq!(mt.node_count(), 1);
+        assert_eq!(mt.edge_count(), 0);
+        assert_eq!(mt.visible_node_count_at(2), 2);
+        assert_eq!(mt.visible_node_count_at(4), 1);
+
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a2")), 6);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)), 7);
+        assert_eq!(mt.node_count(), 2);
+        assert_eq!(mt.edge_count(), 1);
+        assert_eq!(mt.visible_node_count_at(4), 1);
+        assert_eq!(mt.visible_node_count_at(6), 2);
+
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 1,
+                deleted_at: 8,
+            },
+            8,
+        );
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 2,
+                deleted_at: 9,
+            },
+            9,
+        );
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 10,
+                deleted_at: 10,
+            },
+            10,
+        );
+        assert_eq!(mt.node_count(), 0);
+        assert_eq!(mt.edge_count(), 0);
+        assert!(
+            !mt.is_empty(),
+            "tombstone-only memtables still carry flushable state"
+        );
     }
 
     #[test]
@@ -4036,6 +5141,107 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_batch_count_estimates_match_scalar_counts_across_snapshots() {
+        fn scalar_endpoint_estimate(
+            mt: &Memtable,
+            node_ids: &[u64],
+            direction: Direction,
+            label_filter_ids: Option<&[u32]>,
+            snapshot_seq: u64,
+        ) -> MemtableEndpointCountEstimate {
+            let mut estimate = MemtableEndpointCountEstimate::exact_zero();
+            for &node_id in node_ids {
+                match direction {
+                    Direction::Outgoing => {
+                        estimate.add_assign(mt.visible_edges_from_endpoint_count_estimate(
+                            node_id,
+                            label_filter_ids,
+                            snapshot_seq,
+                        ));
+                    }
+                    Direction::Incoming => {
+                        estimate.add_assign(mt.visible_edges_to_endpoint_count_estimate(
+                            node_id,
+                            label_filter_ids,
+                            snapshot_seq,
+                        ));
+                    }
+                    Direction::Both => {
+                        estimate.add_assign(mt.visible_edges_from_endpoint_count_estimate(
+                            node_id,
+                            label_filter_ids,
+                            snapshot_seq,
+                        ));
+                        estimate.add_assign(mt.visible_edges_to_endpoint_count_estimate(
+                            node_id,
+                            label_filter_ids,
+                            snapshot_seq,
+                        ));
+                    }
+                }
+            }
+            estimate
+        }
+
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 1);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 2);
+        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 3);
+        mt.apply_op(&WalOp::UpsertNode(make_node(4, 1, "d")), 4);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 7)), 5);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(11, 1, 3, 8)), 6);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(12, 4, 1, 7)), 7);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(13, 2, 1, 7)), 8);
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 2,
+                deleted_at: 20,
+            },
+            9,
+        );
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 13,
+                deleted_at: 21,
+            },
+            10,
+        );
+
+        let node_ids = [1, 2, 4, 1, 99];
+        let label_seven = [7];
+        let empty_labels: [u32; 0] = [];
+        let label_filters = [
+            None,
+            Some(label_seven.as_slice()),
+            Some(empty_labels.as_slice()),
+        ];
+
+        for snapshot_seq in 0..=10 {
+            for direction in [Direction::Outgoing, Direction::Incoming, Direction::Both] {
+                for label_filter_ids in label_filters {
+                    let batch = mt.visible_endpoint_edges_count_estimate_at(
+                        &node_ids,
+                        direction,
+                        label_filter_ids,
+                        snapshot_seq,
+                    );
+                    let scalar = scalar_endpoint_estimate(
+                        &mt,
+                        &node_ids,
+                        direction,
+                        label_filter_ids,
+                        snapshot_seq,
+                    );
+                    assert_eq!(
+                        batch, scalar,
+                        "snapshot={snapshot_seq}; direction={direction:?}; label_filter_ids={label_filter_ids:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn time_membership_history_is_snapshot_correct() {
         let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node_at(1, 1, "a", 100)), 1);
@@ -4044,6 +5250,32 @@ mod tests {
         assert_eq!(mt.visible_nodes_by_time_range(1, 50, 150, 1), vec![1]);
         assert!(mt.visible_nodes_by_time_range(1, 50, 150, 2).is_empty());
         assert_eq!(mt.visible_nodes_by_time_range(1, 150, 250, 2), vec![1]);
+    }
+
+    #[test]
+    fn time_range_count_matches_visible_ids_across_snapshot_history() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node_at(1, 1, "a", 100)), 1);
+        mt.apply_op(&WalOp::UpsertNode(make_node_at(2, 1, "b", 150)), 2);
+        mt.apply_op(&WalOp::UpsertNode(make_node_at(1, 1, "a", 300)), 3);
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 2,
+                deleted_at: 400,
+            },
+            4,
+        );
+
+        for snapshot_seq in 1..=4 {
+            for (from_ms, to_ms) in [(0, 500), (50, 175), (250, 350), (500, 0)] {
+                assert_eq!(
+                    mt.visible_node_time_range_count_at(1, from_ms, to_ms, snapshot_seq),
+                    mt.visible_nodes_by_time_range(1, from_ms, to_ms, snapshot_seq)
+                        .len(),
+                    "snapshot={snapshot_seq}, range={from_ms}..={to_ms}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4240,6 +5472,83 @@ mod tests {
             mt.find_secondary_eq_nodes_at(10, "name", &PropValue::String("bob".into()), 2),
             vec![1]
         );
+    }
+
+    #[test]
+    fn secondary_eq_hash_counts_are_snapshot_aware_for_nodes_and_edges() {
+        let mt = Memtable::new();
+        let node_entry = SecondaryIndexManifestEntry {
+            index_id: 18,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 1,
+                prop_key: "status".into(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let edge_entry = SecondaryIndexManifestEntry {
+            index_id: 19,
+            target: SecondaryIndexTarget::EdgeProperty {
+                label_id: 7,
+                prop_key: "status".into(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        mt.register_secondary_index(&node_entry);
+        mt.register_secondary_index(&edge_entry);
+
+        let hot = PropValue::String("hot".into());
+        let cold = PropValue::String("cold".into());
+        let hot_hash = hash_prop_equality_key(&hot);
+        let cold_hash = hash_prop_equality_key(&cold);
+
+        let mut hot_props = BTreeMap::new();
+        hot_props.insert("status".into(), hot.clone());
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", hot_props.clone())),
+            1,
+        );
+        mt.apply_op(
+            &WalOp::UpsertEdge(make_edge_with_props(10, 1, 2, 7, hot_props)),
+            2,
+        );
+
+        let mut cold_props = BTreeMap::new();
+        cold_props.insert("status".into(), cold.clone());
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", cold_props.clone())),
+            3,
+        );
+        mt.apply_op(
+            &WalOp::UpsertEdge(make_edge_with_props(10, 1, 2, 7, cold_props)),
+            4,
+        );
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 1,
+                deleted_at: 5,
+            },
+            5,
+        );
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 10,
+                deleted_at: 6,
+            },
+            6,
+        );
+
+        assert_eq!(mt.secondary_eq_node_hash_count_at(18, hot_hash, 1), 1);
+        assert_eq!(mt.secondary_eq_node_hash_count_at(18, hot_hash, 3), 0);
+        assert_eq!(mt.secondary_eq_node_hash_count_at(18, cold_hash, 3), 1);
+        assert_eq!(mt.secondary_eq_node_hash_count_at(18, cold_hash, 5), 0);
+        assert_eq!(mt.secondary_eq_edge_hash_count_at(19, hot_hash, 2), 1);
+        assert_eq!(mt.secondary_eq_edge_hash_count_at(19, hot_hash, 4), 0);
+        assert_eq!(mt.secondary_eq_edge_hash_count_at(19, cold_hash, 4), 1);
+        assert_eq!(mt.secondary_eq_edge_hash_count_at(19, cold_hash, 6), 0);
     }
 
     #[test]
@@ -4584,6 +5893,398 @@ mod tests {
             ),
             vec![(encoded_50, 1)]
         );
+    }
+
+    #[test]
+    fn node_compound_insert_update_missing_complex_and_delete_are_visible() {
+        let mt = Memtable::new();
+        let entry = node_field_entry(
+            70,
+            1,
+            vec![
+                property_field("tenant"),
+                property_field("profile"),
+                node_meta_field(NodeMetadataIndexFieldManifest::UpdatedAt),
+            ],
+            SecondaryIndexKind::Equality,
+        );
+        mt.register_secondary_index(&entry);
+
+        let mut props = BTreeMap::new();
+        props.insert("tenant".into(), PropValue::String("acme".into()));
+        props.insert(
+            "profile".into(),
+            PropValue::Array(vec![PropValue::Float(f64::NAN)]),
+        );
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "alice", props.clone())),
+            1,
+        );
+
+        let tenant = PropValue::String("acme".into());
+        let prefix = prefix_bounds_for(&entry, &[CompoundFieldValue::Property(Some(&tenant))]);
+        assert_eq!(mt.find_node_compound_prefix_at(70, &prefix, 1), vec![1]);
+        assert_eq!(mt.count_node_compound_prefix_at(70, &prefix, 1), 1);
+
+        let complex = props.get("profile").unwrap().clone();
+        let complex_prefix = prefix_bounds_for(
+            &entry,
+            &[
+                CompoundFieldValue::Property(Some(&tenant)),
+                CompoundFieldValue::Property(Some(&complex)),
+            ],
+        );
+        assert_eq!(
+            mt.find_node_compound_prefix_at(70, &complex_prefix, 1),
+            vec![1]
+        );
+
+        let mut unrelated_props = props.clone();
+        unrelated_props.insert("other".into(), PropValue::String("ignored".into()));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "alice", unrelated_props)),
+            2,
+        );
+        {
+            let state = mt.state.read().unwrap();
+            let entries = state.secondary_compound_state.get(&70).unwrap();
+            let live_slots = entries
+                .values()
+                .filter(|slot| slot_option_current(slot).is_some())
+                .collect::<Vec<_>>();
+            assert_eq!(live_slots.len(), 1);
+            assert!(live_slots[0].history.is_none());
+            assert_eq!(live_slots[0].head.write_seq, 1);
+        }
+
+        let mut changed_props = props.clone();
+        changed_props.insert("tenant".into(), PropValue::String("globex".into()));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "alice", changed_props)),
+            3,
+        );
+        assert!(mt.find_node_compound_prefix_at(70, &prefix, 3).is_empty());
+        assert_eq!(
+            mt.find_node_compound_prefix_at(70, &prefix, 1),
+            vec![1],
+            "old snapshot keeps the old tuple visible"
+        );
+        let globex = PropValue::String("globex".into());
+        let globex_prefix =
+            prefix_bounds_for(&entry, &[CompoundFieldValue::Property(Some(&globex))]);
+        assert_eq!(
+            mt.find_node_compound_prefix_at(70, &globex_prefix, 3),
+            vec![1]
+        );
+
+        let missing_entry = node_field_entry(
+            71,
+            1,
+            vec![property_field("tenant"), property_field("missing_suffix")],
+            SecondaryIndexKind::Equality,
+        );
+        mt.register_secondary_index(&missing_entry);
+        let missing_prefix = prefix_bounds_for(
+            &missing_entry,
+            &[CompoundFieldValue::Property(Some(&globex))],
+        );
+        assert_eq!(
+            mt.find_node_compound_prefix_at(71, &missing_prefix, 3),
+            vec![1],
+            "missing suffix still emits a tuple for prefix completeness"
+        );
+
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 1,
+                deleted_at: 4,
+            },
+            4,
+        );
+        assert!(mt
+            .find_node_compound_prefix_at(70, &globex_prefix, 4)
+            .is_empty());
+        assert!(mt
+            .find_node_compound_prefix_at(71, &missing_prefix, 4)
+            .is_empty());
+    }
+
+    #[test]
+    fn node_compound_metadata_range_and_label_moves_are_maintained() {
+        let mt = Memtable::new();
+        let entry = node_field_entry(
+            72,
+            2,
+            vec![
+                property_field("tenant"),
+                node_meta_field(NodeMetadataIndexFieldManifest::UpdatedAt),
+            ],
+            SecondaryIndexKind::Range,
+        );
+        mt.register_secondary_index(&entry);
+
+        let mut props = BTreeMap::new();
+        props.insert("tenant".into(), PropValue::String("acme".into()));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_labels_and_props(
+                1,
+                &[1],
+                "alice",
+                props.clone(),
+                100,
+            )),
+            1,
+        );
+        let tenant = PropValue::String("acme".into());
+        let prefix = prefix_bounds_for(&entry, &[CompoundFieldValue::Property(Some(&tenant))]);
+        assert!(mt.find_node_compound_prefix_at(72, &prefix, 1).is_empty());
+
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_labels_and_props(
+                1,
+                &[1, 2],
+                "alice",
+                props.clone(),
+                100,
+            )),
+            2,
+        );
+        assert_eq!(mt.find_node_compound_prefix_at(72, &prefix, 2), vec![1]);
+
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_labels_and_props(
+                1,
+                &[1, 2],
+                "alice",
+                props.clone(),
+                250,
+            )),
+            3,
+        );
+        let context = CompoundTupleContext::from_manifest_entry(&entry).unwrap();
+        let equality_prefix =
+            encode_compound_tuple_prefix(&context, &[CompoundFieldValue::Property(Some(&tenant))])
+                .unwrap();
+        let lower =
+            encode_compound_field_component(&context, 1, CompoundFieldValue::MetadataI64(200))
+                .unwrap();
+        let upper =
+            encode_compound_field_component(&context, 1, CompoundFieldValue::MetadataI64(300))
+                .unwrap();
+        let range =
+            compound_range_bounds(&equality_prefix, Some((&lower, true)), Some((&upper, true)))
+                .unwrap();
+        assert_eq!(mt.find_node_compound_range_at(72, &range, 3), vec![1]);
+        assert_eq!(mt.count_node_compound_range_at(72, &range, 3), 1);
+
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_labels_and_props(
+                1,
+                &[1],
+                "alice",
+                props,
+                250,
+            )),
+            4,
+        );
+        assert!(mt.find_node_compound_prefix_at(72, &prefix, 4).is_empty());
+    }
+
+    #[test]
+    fn node_compound_unrelated_label_writes_do_not_mutate_tuple_state() {
+        let mt = Memtable::new();
+        let entry = node_field_entry(
+            73,
+            2,
+            vec![
+                property_field("tenant"),
+                node_meta_field(NodeMetadataIndexFieldManifest::Id),
+            ],
+            SecondaryIndexKind::Equality,
+        );
+        mt.register_secondary_index(&entry);
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+
+        let before_state = mt.compound_secondary_state();
+        let mut props = BTreeMap::new();
+        props.insert("tenant".into(), PropValue::String("acme".into()));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "alice", props)),
+            1,
+        );
+
+        assert_eq!(mt.compound_secondary_state(), before_state);
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+    }
+
+    #[test]
+    fn edge_compound_insert_update_label_move_metadata_and_delete_are_maintained() {
+        let mt = Memtable::new();
+        let entry = edge_field_entry(
+            80,
+            7,
+            vec![
+                edge_meta_field(EdgeMetadataIndexFieldManifest::From),
+                edge_meta_field(EdgeMetadataIndexFieldManifest::To),
+                edge_meta_field(EdgeMetadataIndexFieldManifest::ValidFrom),
+                edge_meta_field(EdgeMetadataIndexFieldManifest::ValidTo),
+                property_field("status"),
+            ],
+            SecondaryIndexKind::Equality,
+        );
+        mt.register_secondary_index(&entry);
+
+        let mut props = BTreeMap::new();
+        props.insert("status".into(), PropValue::String("open".into()));
+        let mut edge = make_edge_with_props(10, 1, 2, 7, props.clone());
+        edge.valid_from = 10;
+        edge.valid_to = 100;
+        mt.apply_op(&WalOp::UpsertEdge(edge.clone()), 1);
+
+        let range_entry = edge_field_entry(
+            81,
+            7,
+            vec![
+                property_field("status"),
+                edge_meta_field(EdgeMetadataIndexFieldManifest::ValidTo),
+            ],
+            SecondaryIndexKind::Range,
+        );
+        mt.register_secondary_index(&range_entry);
+        let status = PropValue::String("open".into());
+        let range_context = CompoundTupleContext::from_manifest_entry(&range_entry).unwrap();
+        let equality_prefix = encode_compound_tuple_prefix(
+            &range_context,
+            &[CompoundFieldValue::Property(Some(&status))],
+        )
+        .unwrap();
+        let lower =
+            encode_compound_field_component(&range_context, 1, CompoundFieldValue::MetadataI64(90))
+                .unwrap();
+        let upper = encode_compound_field_component(
+            &range_context,
+            1,
+            CompoundFieldValue::MetadataI64(110),
+        )
+        .unwrap();
+        let edge_range =
+            compound_range_bounds(&equality_prefix, Some((&lower, true)), Some((&upper, true)))
+                .unwrap();
+        assert_eq!(mt.find_edge_compound_range_at(81, &edge_range, 1), vec![10]);
+        assert_eq!(mt.count_edge_compound_range_at(81, &edge_range, 1), 1);
+
+        let prefix = prefix_bounds_for(
+            &entry,
+            &[
+                CompoundFieldValue::MetadataU64(1),
+                CompoundFieldValue::MetadataU64(2),
+                CompoundFieldValue::MetadataI64(10),
+                CompoundFieldValue::MetadataI64(100),
+            ],
+        );
+        assert_eq!(mt.find_edge_compound_prefix_at(80, &prefix, 1), vec![10]);
+        assert_eq!(mt.count_edge_compound_prefix_at(80, &prefix, 1), 1);
+
+        edge.valid_to = 200;
+        mt.apply_op(&WalOp::UpsertEdge(edge.clone()), 2);
+        assert!(mt.find_edge_compound_prefix_at(80, &prefix, 2).is_empty());
+        assert_eq!(mt.find_edge_compound_prefix_at(80, &prefix, 1), vec![10]);
+
+        let moved_prefix = prefix_bounds_for(
+            &entry,
+            &[
+                CompoundFieldValue::MetadataU64(1),
+                CompoundFieldValue::MetadataU64(2),
+                CompoundFieldValue::MetadataI64(10),
+                CompoundFieldValue::MetadataI64(200),
+            ],
+        );
+        assert_eq!(
+            mt.find_edge_compound_prefix_at(80, &moved_prefix, 2),
+            vec![10]
+        );
+
+        let mut other_label = edge.clone();
+        other_label.label_id = 8;
+        mt.apply_op(&WalOp::UpsertEdge(other_label), 3);
+        assert!(mt
+            .find_edge_compound_prefix_at(80, &moved_prefix, 3)
+            .is_empty());
+
+        mt.apply_op(&WalOp::UpsertEdge(edge), 4);
+        assert_eq!(
+            mt.find_edge_compound_prefix_at(80, &moved_prefix, 4),
+            vec![10]
+        );
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 10,
+                deleted_at: 5,
+            },
+            5,
+        );
+        assert!(mt
+            .find_edge_compound_prefix_at(80, &moved_prefix, 5)
+            .is_empty());
+    }
+
+    #[test]
+    fn edge_compound_unrelated_label_writes_do_not_mutate_tuple_state() {
+        let mt = Memtable::new();
+        let entry = edge_field_entry(
+            82,
+            7,
+            vec![
+                property_field("status"),
+                edge_meta_field(EdgeMetadataIndexFieldManifest::From),
+            ],
+            SecondaryIndexKind::Equality,
+        );
+        mt.register_secondary_index(&entry);
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+
+        let before_state = mt.compound_secondary_state();
+        let mut props = BTreeMap::new();
+        props.insert("status".into(), PropValue::String("open".into()));
+        mt.apply_op(
+            &WalOp::UpsertEdge(make_edge_with_props(10, 1, 2, 8, props)),
+            1,
+        );
+
+        assert_eq!(mt.compound_secondary_state(), before_state);
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+    }
+
+    #[test]
+    fn unregister_compound_index_removes_lookup_and_tuple_state() {
+        let mt = Memtable::new();
+        let entry = node_field_entry(
+            90,
+            1,
+            vec![
+                property_field("tenant"),
+                node_meta_field(NodeMetadataIndexFieldManifest::Id),
+            ],
+            SecondaryIndexKind::Equality,
+        );
+        mt.register_secondary_index(&entry);
+        let mut props = BTreeMap::new();
+        props.insert("tenant".into(), PropValue::String("acme".into()));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "alice", props)),
+            1,
+        );
+
+        let tenant = PropValue::String("acme".into());
+        let prefix = prefix_bounds_for(&entry, &[CompoundFieldValue::Property(Some(&tenant))]);
+        assert_eq!(mt.find_node_compound_prefix_at(90, &prefix, 1), vec![1]);
+        assert!(mt.compound_secondary_state().contains_key(&90));
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+
+        assert!(mt.unregister_secondary_index(90));
+        assert!(mt.find_node_compound_prefix_at(90, &prefix, 1).is_empty());
+        assert!(!mt.compound_secondary_state().contains_key(&90));
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
     }
 
     #[test]

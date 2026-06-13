@@ -14,27 +14,35 @@ use crate::parallel::{engine_cpu_join, engine_cpu_try_join};
 use crate::planner_stats::{
     assemble_compaction_stats_from_partials, assemble_flush_stats_from_partials,
     build_compaction_stats_core_partial, build_flush_stats_core_partial,
-    equality_index_stats_from_written_groups, planner_stats_sidecar_payload,
-    range_index_stats_from_written_entries, DeclaredIndexStatsEvidence,
-    PlannerStatsDeclaredIndexTarget, PLANNER_STATS_FILENAME,
+    compound_index_stats_from_written_entries, equality_index_stats_from_written_groups,
+    planner_stats_sidecar_payload, range_index_stats_from_written_entries,
+    DeclaredIndexRuntimeCoverageState, DeclaredIndexStatsEvidence, PlannerStatsDeclaredIndexTarget,
+    PLANNER_STATS_FILENAME,
 };
 use crate::property_value_semantics::{
     hash_prop_equality_key, numeric_range_sort_key_for_value, NumericRangeSortKey,
+};
+use crate::row_projection::{EdgeSelectedFieldNeeds, NodeSelectedFieldNeeds, PropertySelection};
+use crate::secondary_index_key::{
+    compound_secondary_failure_message, compound_secondary_failure_message_from_str,
+    encode_compound_tuple_key, write_compound_sidecar_payload, CompoundFieldValue,
+    CompoundSidecarDeclaration, CompoundSidecarTargetKind, CompoundTupleContext,
 };
 use crate::segment_components::{
     component_build_fingerprint, component_id, decode_identity_header, decode_manifest_envelope,
     dependency_digest, encode_identity_header, encode_manifest_envelope,
     is_packed_core_component_kind, is_refreshable_external_component_kind,
     patch_packed_range_container_id, secondary_declaration_dependency,
-    segment_source_groups_from_records, source_component_dependency, source_group_dependency,
-    validate_packed_core_records_contract, ComponentAvailability, ComponentDependencyV1,
-    ComponentFallbackClass, ComponentHandleV1, ComponentIdentityHeaderV1, ComponentIdentityWriter,
-    ComponentRequirement, ComponentTrustClass, SegmentComponentBuildKind, SegmentComponentKind,
-    SegmentComponentManifestV1, SegmentComponentRecordV1, SegmentComponentSourceGroups,
-    SegmentSourceGroupKind, COMPONENT_IDENTITY_HEADER_LEN, PACKED_CORE_FILENAME,
-    PACKED_CORE_TMP_FILENAME, SEGMENT_COMPONENT_MANIFEST_FILENAME,
-    SEGMENT_COMPONENT_MANIFEST_PAYLOAD_VERSION, SEGMENT_COMPONENT_MANIFEST_TMP_FILENAME,
-    ZERO_DIGEST,
+    secondary_index_component_dependencies_for_entry, secondary_index_component_kind_for_entry,
+    secondary_index_declaration_fingerprint_for_entry, segment_source_groups_from_records,
+    source_component_dependency, source_group_dependency, validate_packed_core_records_contract,
+    ComponentAvailability, ComponentDependencyV1, ComponentFallbackClass, ComponentHandleV1,
+    ComponentIdentityHeaderV1, ComponentIdentityWriter, ComponentRequirement, ComponentTrustClass,
+    SegmentComponentBuildKind, SegmentComponentKind, SegmentComponentManifestV1,
+    SegmentComponentRecordV1, SegmentComponentSourceGroups, SegmentSourceGroupKind,
+    COMPONENT_IDENTITY_HEADER_LEN, PACKED_CORE_FILENAME, PACKED_CORE_TMP_FILENAME,
+    SEGMENT_COMPONENT_MANIFEST_FILENAME, SEGMENT_COMPONENT_MANIFEST_PAYLOAD_VERSION,
+    SEGMENT_COMPONENT_MANIFEST_TMP_FILENAME, ZERO_DIGEST,
 };
 use crate::segment_reader::SegmentReader;
 use crate::sparse_postings::{
@@ -220,6 +228,11 @@ struct SecondaryIndexPartitions<'a> {
     edge_range: Vec<&'a SecondaryIndexManifestEntry>,
 }
 
+type CompoundSidecarEntries = Vec<(Vec<u8>, u64)>;
+type CompoundSidecarBuildResult = Result<CompoundSidecarEntries, EngineError>;
+type OptionalCompoundSidecarBuildResult = Option<CompoundSidecarBuildResult>;
+type CompoundFlushState = HashMap<u64, CompoundSidecarEntries>;
+
 fn partition_secondary_indexes(
     secondary_indexes: &[SecondaryIndexManifestEntry],
 ) -> SecondaryIndexPartitions<'_> {
@@ -243,9 +256,43 @@ fn partition_secondary_indexes(
             (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range) => {
                 partitions.edge_range.push(entry);
             }
+            (SecondaryIndexTarget::NodeFieldIndex { .. }, SecondaryIndexKind::Equality) => {
+                partitions.node_eq.push(entry);
+            }
+            (SecondaryIndexTarget::NodeFieldIndex { .. }, SecondaryIndexKind::Range) => {
+                partitions.node_range.push(entry);
+            }
+            (SecondaryIndexTarget::EdgeFieldIndex { .. }, SecondaryIndexKind::Equality) => {
+                partitions.edge_eq.push(entry);
+            }
+            (SecondaryIndexTarget::EdgeFieldIndex { .. }, SecondaryIndexKind::Range) => {
+                partitions.edge_range.push(entry);
+            }
         }
     }
     partitions
+}
+
+fn compound_flush_index_ids(partitions: &SecondaryIndexPartitions<'_>) -> Vec<u64> {
+    let mut ids = Vec::new();
+    for entry in partitions
+        .node_eq
+        .iter()
+        .chain(partitions.node_range.iter())
+        .chain(partitions.edge_eq.iter())
+        .chain(partitions.edge_range.iter())
+    {
+        if matches!(
+            &entry.target,
+            SecondaryIndexTarget::NodeFieldIndex { .. }
+                | SecondaryIndexTarget::EdgeFieldIndex { .. }
+        ) {
+            ids.push(entry.index_id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 const FLUSH_COMPONENT_GENERATION: u64 = 1;
@@ -734,59 +781,90 @@ pub(crate) fn edge_prop_range_sidecar_path(seg_dir: &Path, index_id: u64) -> Pat
     secondary_indexes_dir(seg_dir).join(format!("edge_prop_range_{}.dat", index_id))
 }
 
-fn secondary_index_component_kind_for_entry(
-    entry: &SecondaryIndexManifestEntry,
-) -> SegmentComponentKind {
-    match (&entry.target, &entry.kind) {
-        (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Equality) => {
-            SegmentComponentKind::NodePropertyEqualityIndex {
-                index_id: entry.index_id,
-            }
-        }
-        (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Range) => {
-            SegmentComponentKind::NodePropertyRangeIndex {
-                index_id: entry.index_id,
-            }
-        }
-        (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Equality) => {
-            SegmentComponentKind::EdgePropertyEqualityIndex {
-                index_id: entry.index_id,
-            }
-        }
-        (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range) => {
-            SegmentComponentKind::EdgePropertyRangeIndex {
-                index_id: entry.index_id,
-            }
-        }
+#[cfg(test)]
+pub(crate) fn node_compound_eq_sidecar_path(seg_dir: &Path, index_id: u64) -> PathBuf {
+    if let Some(path) = manifested_component_path(
+        seg_dir,
+        &SegmentComponentKind::NodeCompoundEqualityIndex { index_id },
+    ) {
+        return path;
     }
+    secondary_indexes_dir(seg_dir).join(format!("node_compound_eq_{}.dat", index_id))
 }
 
-fn secondary_index_base_relative_path_for_entry(entry: &SecondaryIndexManifestEntry) -> String {
+#[cfg(test)]
+pub(crate) fn node_compound_range_sidecar_path(seg_dir: &Path, index_id: u64) -> PathBuf {
+    if let Some(path) = manifested_component_path(
+        seg_dir,
+        &SegmentComponentKind::NodeCompoundRangeIndex { index_id },
+    ) {
+        return path;
+    }
+    secondary_indexes_dir(seg_dir).join(format!("node_compound_range_{}.dat", index_id))
+}
+
+#[cfg(test)]
+pub(crate) fn edge_compound_eq_sidecar_path(seg_dir: &Path, index_id: u64) -> PathBuf {
+    if let Some(path) = manifested_component_path(
+        seg_dir,
+        &SegmentComponentKind::EdgeCompoundEqualityIndex { index_id },
+    ) {
+        return path;
+    }
+    secondary_indexes_dir(seg_dir).join(format!("edge_compound_eq_{}.dat", index_id))
+}
+
+#[cfg(test)]
+pub(crate) fn edge_compound_range_sidecar_path(seg_dir: &Path, index_id: u64) -> PathBuf {
+    if let Some(path) = manifested_component_path(
+        seg_dir,
+        &SegmentComponentKind::EdgeCompoundRangeIndex { index_id },
+    ) {
+        return path;
+    }
+    secondary_indexes_dir(seg_dir).join(format!("edge_compound_range_{}.dat", index_id))
+}
+
+fn secondary_index_base_relative_path_for_entry(
+    entry: &SecondaryIndexManifestEntry,
+) -> Option<String> {
     match (&entry.target, &entry.kind) {
-        (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Equality) => {
-            format!(
-                "{}/node_prop_eq_{}.dat",
+        (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Equality) => Some(format!(
+            "{}/node_prop_eq_{}.dat",
+            SECONDARY_INDEX_DIRNAME, entry.index_id
+        )),
+        (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Range) => Some(format!(
+            "{}/node_prop_range_{}.dat",
+            SECONDARY_INDEX_DIRNAME, entry.index_id
+        )),
+        (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Equality) => Some(format!(
+            "{}/edge_prop_eq_{}.dat",
+            SECONDARY_INDEX_DIRNAME, entry.index_id
+        )),
+        (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range) => Some(format!(
+            "{}/edge_prop_range_{}.dat",
+            SECONDARY_INDEX_DIRNAME, entry.index_id
+        )),
+        (SecondaryIndexTarget::NodeFieldIndex { .. }, SecondaryIndexKind::Equality) => {
+            Some(format!(
+                "{}/node_compound_eq_{}.dat",
                 SECONDARY_INDEX_DIRNAME, entry.index_id
-            )
+            ))
         }
-        (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Range) => {
-            format!(
-                "{}/node_prop_range_{}.dat",
+        (SecondaryIndexTarget::NodeFieldIndex { .. }, SecondaryIndexKind::Range) => Some(format!(
+            "{}/node_compound_range_{}.dat",
+            SECONDARY_INDEX_DIRNAME, entry.index_id
+        )),
+        (SecondaryIndexTarget::EdgeFieldIndex { .. }, SecondaryIndexKind::Equality) => {
+            Some(format!(
+                "{}/edge_compound_eq_{}.dat",
                 SECONDARY_INDEX_DIRNAME, entry.index_id
-            )
+            ))
         }
-        (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Equality) => {
-            format!(
-                "{}/edge_prop_eq_{}.dat",
-                SECONDARY_INDEX_DIRNAME, entry.index_id
-            )
-        }
-        (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range) => {
-            format!(
-                "{}/edge_prop_range_{}.dat",
-                SECONDARY_INDEX_DIRNAME, entry.index_id
-            )
-        }
+        (SecondaryIndexTarget::EdgeFieldIndex { .. }, SecondaryIndexKind::Range) => Some(format!(
+            "{}/edge_compound_range_{}.dat",
+            SECONDARY_INDEX_DIRNAME, entry.index_id
+        )),
     }
 }
 
@@ -794,14 +872,18 @@ fn secondary_index_component_kind_matches_entry(
     kind: &SegmentComponentKind,
     entry: &SecondaryIndexManifestEntry,
 ) -> bool {
-    kind == &secondary_index_component_kind_for_entry(entry)
+    secondary_index_component_kind_for_entry(entry)
+        .as_ref()
+        .is_some_and(|expected| kind == expected)
 }
 
 pub(crate) fn secondary_index_sidecar_paths_for_entry(
     seg_dir: &Path,
     entry: &SecondaryIndexManifestEntry,
 ) -> Vec<PathBuf> {
-    let base_relative = secondary_index_base_relative_path_for_entry(entry);
+    let Some(base_relative) = secondary_index_base_relative_path_for_entry(entry) else {
+        return Vec::new();
+    };
     let base_path = seg_dir.join(&base_relative);
     let mut paths = vec![base_path.clone()];
     let Some(parent) = base_path.parent() else {
@@ -935,6 +1017,112 @@ pub(crate) fn node_property_range_component_fingerprint(index_id: u64) -> u64 {
 
 pub(crate) fn edge_property_range_component_fingerprint(index_id: u64) -> u64 {
     component_fingerprint("semantic.edge_prop_range.v2", &[index_id])
+}
+
+pub(crate) fn node_compound_equality_component_fingerprint(
+    index_id: u64,
+    declaration_fingerprint: u64,
+) -> u64 {
+    component_fingerprint(
+        "semantic.node_compound_eq.v1",
+        &[index_id, declaration_fingerprint],
+    )
+}
+
+pub(crate) fn node_compound_range_component_fingerprint(
+    index_id: u64,
+    declaration_fingerprint: u64,
+) -> u64 {
+    component_fingerprint(
+        "semantic.node_compound_range.v1",
+        &[index_id, declaration_fingerprint],
+    )
+}
+
+pub(crate) fn edge_compound_equality_component_fingerprint(
+    index_id: u64,
+    declaration_fingerprint: u64,
+) -> u64 {
+    component_fingerprint(
+        "semantic.edge_compound_eq.v1",
+        &[index_id, declaration_fingerprint],
+    )
+}
+
+pub(crate) fn edge_compound_range_component_fingerprint(
+    index_id: u64,
+    declaration_fingerprint: u64,
+) -> u64 {
+    component_fingerprint(
+        "semantic.edge_compound_range.v1",
+        &[index_id, declaration_fingerprint],
+    )
+}
+
+pub(crate) fn compound_component_fingerprint_for_kind_and_entry(
+    kind: &SegmentComponentKind,
+    entry: &SecondaryIndexManifestEntry,
+) -> Option<u64> {
+    let declaration_fingerprint = secondary_index_declaration_fingerprint_for_entry(entry);
+    match (kind, &entry.target, &entry.kind) {
+        (
+            SegmentComponentKind::NodeCompoundEqualityIndex { index_id },
+            SecondaryIndexTarget::NodeFieldIndex { .. },
+            SecondaryIndexKind::Equality,
+        ) => {
+            if *index_id == entry.index_id {
+                Some(node_compound_equality_component_fingerprint(
+                    *index_id,
+                    declaration_fingerprint,
+                ))
+            } else {
+                None
+            }
+        }
+        (
+            SegmentComponentKind::NodeCompoundRangeIndex { index_id },
+            SecondaryIndexTarget::NodeFieldIndex { .. },
+            SecondaryIndexKind::Range,
+        ) => {
+            if *index_id == entry.index_id {
+                Some(node_compound_range_component_fingerprint(
+                    *index_id,
+                    declaration_fingerprint,
+                ))
+            } else {
+                None
+            }
+        }
+        (
+            SegmentComponentKind::EdgeCompoundEqualityIndex { index_id },
+            SecondaryIndexTarget::EdgeFieldIndex { .. },
+            SecondaryIndexKind::Equality,
+        ) => {
+            if *index_id == entry.index_id {
+                Some(edge_compound_equality_component_fingerprint(
+                    *index_id,
+                    declaration_fingerprint,
+                ))
+            } else {
+                None
+            }
+        }
+        (
+            SegmentComponentKind::EdgeCompoundRangeIndex { index_id },
+            SecondaryIndexTarget::EdgeFieldIndex { .. },
+            SecondaryIndexKind::Range,
+        ) => {
+            if *index_id == entry.index_id {
+                Some(edge_compound_range_component_fingerprint(
+                    *index_id,
+                    declaration_fingerprint,
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn planner_stats_component_dependencies(
@@ -1516,6 +1704,8 @@ fn write_flush_dependent_components(
     source_groups: SegmentComponentSourceGroups,
 ) -> Result<(Vec<SegmentComponentRecordV1>, DeclaredIndexStatsEvidence), EngineError> {
     let partitions = partition_secondary_indexes(secondary_indexes);
+    let compound_flush_state =
+        memtable.compound_secondary_state_for_indexes(&compound_flush_index_ids(&partitions));
     let (((node_output, edge_output), sparse_posting_records), built_hnsw) = engine_cpu_try_join(
         || {
             engine_cpu_try_join(
@@ -1529,6 +1719,7 @@ fn write_flush_dependent_components(
                                 nodes,
                                 &partitions.node_eq,
                                 &partitions.node_range,
+                                &compound_flush_state,
                                 source_groups,
                             )
                         },
@@ -1541,6 +1732,7 @@ fn write_flush_dependent_components(
                                 degree_entries,
                                 &partitions.edge_eq,
                                 &partitions.edge_range,
+                                &compound_flush_state,
                                 source_groups,
                             )
                         },
@@ -1574,6 +1766,7 @@ fn write_flush_dependent_components(
     Ok((records, declared_evidence))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_flush_node_index_components<'a>(
     seg_dir: &Path,
     segment_id: u64,
@@ -1581,6 +1774,7 @@ fn write_flush_node_index_components<'a>(
     nodes: &'a NodeIdMap<NodeRecord>,
     node_eq_indexes: &[&SecondaryIndexManifestEntry],
     node_range_indexes: &[&SecondaryIndexManifestEntry],
+    compound_state: &CompoundFlushState,
     source_groups: SegmentComponentSourceGroups,
 ) -> Result<FlushNodeIndexOutput<'a>, EngineError> {
     let mut records = Vec::with_capacity(node_eq_indexes.len() + node_range_indexes.len());
@@ -1597,10 +1791,26 @@ fn write_flush_node_index_components<'a>(
         source_groups,
         &mut records,
     )?;
+    evidence.extend(write_flush_declared_compound_components(
+        seg_dir,
+        segment_id,
+        compound_state,
+        node_eq_indexes,
+        source_groups,
+        &mut records,
+    )?);
     evidence.extend(write_flush_declared_range_components(
         seg_dir,
         segment_id,
         memtable,
+        node_range_indexes,
+        source_groups,
+        &mut records,
+    )?);
+    evidence.extend(write_flush_declared_compound_components(
+        seg_dir,
+        segment_id,
+        compound_state,
         node_range_indexes,
         source_groups,
         &mut records,
@@ -1666,10 +1876,19 @@ fn write_flush_declared_equality_components(
     if eq_entries.is_empty() {
         return Ok(DeclaredIndexStatsEvidence::default());
     }
+    if !eq_entries
+        .iter()
+        .any(|entry| matches!(&entry.target, SecondaryIndexTarget::NodeProperty { .. }))
+    {
+        return Ok(DeclaredIndexStatsEvidence::default());
+    }
 
     let secondary_eq_state = memtable.secondary_eq_state();
     let mut evidence = DeclaredIndexStatsEvidence::default();
     for entry in eq_entries {
+        if !matches!(&entry.target, SecondaryIndexTarget::NodeProperty { .. }) {
+            continue;
+        }
         let mut groups = BTreeMap::new();
         if let Some(values) = secondary_eq_state.get(&entry.index_id) {
             for (&value_hash, ids) in values {
@@ -1725,10 +1944,19 @@ fn write_flush_declared_range_components(
     if range_entries.is_empty() {
         return Ok(DeclaredIndexStatsEvidence::default());
     }
+    if !range_entries
+        .iter()
+        .any(|entry| matches!(&entry.target, SecondaryIndexTarget::NodeProperty { .. }))
+    {
+        return Ok(DeclaredIndexStatsEvidence::default());
+    }
 
     let secondary_range_state = memtable.secondary_range_state();
     let mut evidence = DeclaredIndexStatsEvidence::default();
     for entry in range_entries {
+        if !matches!(&entry.target, SecondaryIndexTarget::NodeProperty { .. }) {
+            continue;
+        }
         let sidecar_entries: Vec<(NumericRangeSortKey, u64)> = secondary_range_state
             .get(&entry.index_id)
             .map(|entries| entries.iter().copied().collect())
@@ -1772,6 +2000,144 @@ fn write_flush_declared_range_components(
     Ok(evidence)
 }
 
+fn write_flush_compound_sidecar_component(
+    seg_dir: &Path,
+    segment_id: u64,
+    entry: &SecondaryIndexManifestEntry,
+    entries: &[(Vec<u8>, u64)],
+    source_groups: SegmentComponentSourceGroups,
+) -> Result<SegmentComponentRecordV1, EngineError> {
+    let kind = secondary_index_component_kind_for_entry(entry).ok_or_else(|| {
+        EngineError::InvalidOperation(
+            "compound secondary index unavailable: declaration has no compound sidecar kind"
+                .to_string(),
+        )
+    })?;
+    let relative_path = secondary_index_base_relative_path_for_entry(entry).ok_or_else(|| {
+        EngineError::InvalidOperation(
+            "compound secondary index unavailable: declaration has no sidecar path".to_string(),
+        )
+    })?;
+    let declaration = CompoundSidecarDeclaration::from_manifest_entry(
+        entry,
+        secondary_index_declaration_fingerprint_for_entry(entry),
+    )?;
+    let build_fingerprint = compound_component_fingerprint_for_kind_and_entry(&kind, entry)
+        .ok_or_else(|| {
+            EngineError::InvalidOperation(
+                "compound secondary index unavailable: declaration does not match sidecar kind"
+                    .to_string(),
+            )
+        })?;
+    let dependencies = secondary_index_component_dependencies_for_entry(entry, &source_groups);
+    let (record, _) = write_flush_component(
+        seg_dir,
+        segment_id,
+        &relative_path,
+        kind,
+        ComponentRequirement::Optional {
+            fallback: ComponentFallbackClass::RecordScan,
+        },
+        ComponentTrustClass::OptionalCandidateIndex,
+        dependencies,
+        build_fingerprint,
+        |writer| write_compound_sidecar_payload(writer, &declaration, entries),
+    )?;
+    Ok(record)
+}
+
+fn write_compaction_compound_sidecar_component(
+    seg_dir: &Path,
+    segment_id: u64,
+    entry: &SecondaryIndexManifestEntry,
+    entries: &[(Vec<u8>, u64)],
+    source_groups: SegmentComponentSourceGroups,
+) -> Result<SegmentComponentRecordV1, EngineError> {
+    let kind = secondary_index_component_kind_for_entry(entry).ok_or_else(|| {
+        EngineError::InvalidOperation(
+            "compound secondary index unavailable: declaration has no compound sidecar kind"
+                .to_string(),
+        )
+    })?;
+    let relative_path = secondary_index_base_relative_path_for_entry(entry).ok_or_else(|| {
+        EngineError::InvalidOperation(
+            "compound secondary index unavailable: declaration has no sidecar path".to_string(),
+        )
+    })?;
+    let declaration = CompoundSidecarDeclaration::from_manifest_entry(
+        entry,
+        secondary_index_declaration_fingerprint_for_entry(entry),
+    )?;
+    let build_fingerprint = compound_component_fingerprint_for_kind_and_entry(&kind, entry)
+        .ok_or_else(|| {
+            EngineError::InvalidOperation(
+                "compound secondary index unavailable: declaration does not match sidecar kind"
+                    .to_string(),
+            )
+        })?;
+    let dependencies = secondary_index_component_dependencies_for_entry(entry, &source_groups);
+    let (record, _) = write_compaction_component(
+        seg_dir,
+        segment_id,
+        &relative_path,
+        kind,
+        ComponentRequirement::Optional {
+            fallback: ComponentFallbackClass::RecordScan,
+        },
+        ComponentTrustClass::OptionalCandidateIndex,
+        dependencies,
+        build_fingerprint,
+        |writer| write_compound_sidecar_payload(writer, &declaration, entries),
+    )?;
+    Ok(record)
+}
+
+fn write_flush_declared_compound_components(
+    seg_dir: &Path,
+    segment_id: u64,
+    compound_state: &CompoundFlushState,
+    entries: &[&SecondaryIndexManifestEntry],
+    source_groups: SegmentComponentSourceGroups,
+    records: &mut Vec<SegmentComponentRecordV1>,
+) -> Result<DeclaredIndexStatsEvidence, EngineError> {
+    if entries.is_empty() {
+        return Ok(DeclaredIndexStatsEvidence::default());
+    }
+    let mut evidence = DeclaredIndexStatsEvidence::default();
+    for entry in entries {
+        if !matches!(
+            &entry.target,
+            SecondaryIndexTarget::NodeFieldIndex { .. }
+                | SecondaryIndexTarget::EdgeFieldIndex { .. }
+        ) {
+            continue;
+        }
+        let sidecar_entries = compound_state
+            .get(&entry.index_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let record = write_flush_compound_sidecar_component(
+            seg_dir,
+            segment_id,
+            entry,
+            sidecar_entries,
+            source_groups,
+        )?;
+        records.push(record);
+        if entry.state == SecondaryIndexState::Ready {
+            evidence
+                .compound_index_stats
+                .push(compound_index_stats_from_written_entries(
+                    entry,
+                    sidecar_entries,
+                    DeclaredIndexRuntimeCoverageState::Available,
+                )?);
+        }
+    }
+    evidence.sort();
+    Ok(evidence)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_flush_edge_index_components(
     seg_dir: &Path,
@@ -1781,6 +2147,7 @@ fn write_flush_edge_index_components(
     degree_entries: Option<&[(u64, DegreeDelta)]>,
     edge_eq_indexes: &[&SecondaryIndexManifestEntry],
     edge_range_indexes: &[&SecondaryIndexManifestEntry],
+    compound_state: &CompoundFlushState,
     source_groups: SegmentComponentSourceGroups,
 ) -> Result<FlushEdgeIndexOutput, EngineError> {
     let mut records = Vec::with_capacity(
@@ -1824,10 +2191,26 @@ fn write_flush_edge_index_components(
         source_groups,
         &mut records,
     )?;
+    evidence.extend(write_flush_declared_compound_components(
+        seg_dir,
+        segment_id,
+        compound_state,
+        edge_eq_indexes,
+        source_groups,
+        &mut records,
+    )?);
     evidence.extend(write_flush_declared_edge_range_components(
         seg_dir,
         segment_id,
         memtable,
+        edge_range_indexes,
+        source_groups,
+        &mut records,
+    )?);
+    evidence.extend(write_flush_declared_compound_components(
+        seg_dir,
+        segment_id,
+        compound_state,
         edge_range_indexes,
         source_groups,
         &mut records,
@@ -1856,10 +2239,19 @@ fn write_flush_declared_edge_equality_components(
     if eq_entries.is_empty() {
         return Ok(DeclaredIndexStatsEvidence::default());
     }
+    if !eq_entries
+        .iter()
+        .any(|entry| matches!(&entry.target, SecondaryIndexTarget::EdgeProperty { .. }))
+    {
+        return Ok(DeclaredIndexStatsEvidence::default());
+    }
 
     let secondary_eq_state = memtable.secondary_eq_state();
     let mut evidence = DeclaredIndexStatsEvidence::default();
     for entry in eq_entries {
+        if !matches!(&entry.target, SecondaryIndexTarget::EdgeProperty { .. }) {
+            continue;
+        }
         let mut groups = BTreeMap::new();
         if let Some(values) = secondary_eq_state.get(&entry.index_id) {
             for (&value_hash, ids) in values {
@@ -1915,10 +2307,19 @@ fn write_flush_declared_edge_range_components(
     if range_entries.is_empty() {
         return Ok(DeclaredIndexStatsEvidence::default());
     }
+    if !range_entries
+        .iter()
+        .any(|entry| matches!(&entry.target, SecondaryIndexTarget::EdgeProperty { .. }))
+    {
+        return Ok(DeclaredIndexStatsEvidence::default());
+    }
 
     let secondary_range_state = memtable.secondary_range_state();
     let mut evidence = DeclaredIndexStatsEvidence::default();
     for entry in range_entries {
+        if !matches!(&entry.target, SecondaryIndexTarget::EdgeProperty { .. }) {
+            continue;
+        }
         let sidecar_entries: Vec<(NumericRangeSortKey, u64)> = secondary_range_state
             .get(&entry.index_id)
             .map(|entries| entries.iter().copied().collect())
@@ -2391,6 +2792,67 @@ pub(crate) fn publish_edge_prop_range_sidecar_component(
         dependencies,
         edge_property_range_component_fingerprint(entry.index_id),
         |writer| write_node_prop_range_sidecar_payload(writer, entries),
+    )
+}
+
+pub(crate) fn publish_compound_sidecar_component(
+    seg_dir: &Path,
+    entry: &SecondaryIndexManifestEntry,
+    entries: &[(Vec<u8>, u64)],
+) -> Result<(), EngineError> {
+    let manifest = read_segment_component_manifest(seg_dir)?;
+    let source_groups = segment_source_groups_from_records(
+        manifest.segment_id,
+        manifest.node_count,
+        manifest.edge_count,
+        &manifest.components,
+    )?;
+    let Some(kind) = secondary_index_component_kind_for_entry(entry) else {
+        return Err(EngineError::InvalidOperation(
+            "compound secondary index unavailable: declaration has no compound sidecar kind"
+                .to_string(),
+        ));
+    };
+    if !matches!(
+        kind,
+        SegmentComponentKind::NodeCompoundEqualityIndex { .. }
+            | SegmentComponentKind::NodeCompoundRangeIndex { .. }
+            | SegmentComponentKind::EdgeCompoundEqualityIndex { .. }
+            | SegmentComponentKind::EdgeCompoundRangeIndex { .. }
+    ) {
+        return Err(EngineError::InvalidOperation(
+            "compound secondary index unavailable: declaration uses a single-property sidecar kind"
+                .to_string(),
+        ));
+    }
+    let Some(relative_path) = secondary_index_base_relative_path_for_entry(entry) else {
+        return Err(EngineError::InvalidOperation(
+            "compound secondary index unavailable: declaration has no sidecar path".to_string(),
+        ));
+    };
+    let declaration = CompoundSidecarDeclaration::from_manifest_entry(
+        entry,
+        secondary_index_declaration_fingerprint_for_entry(entry),
+    )?;
+    let dependencies = secondary_index_component_dependencies_for_entry(entry, &source_groups);
+    let build_fingerprint = compound_component_fingerprint_for_kind_and_entry(&kind, entry)
+        .ok_or_else(|| {
+            EngineError::InvalidOperation(
+                "compound secondary index unavailable: declaration does not match sidecar kind"
+                    .to_string(),
+            )
+        })?;
+    refresh_optional_component_with_writer(
+        seg_dir,
+        kind,
+        &relative_path,
+        ComponentRequirement::Optional {
+            fallback: ComponentFallbackClass::RecordScan,
+        },
+        ComponentTrustClass::OptionalCandidateIndex,
+        dependencies,
+        build_fingerprint,
+        |writer| write_compound_sidecar_payload(writer, &declaration, entries),
     )
 }
 
@@ -3473,7 +3935,8 @@ fn cleanup_orphan_optional_component_files_in_dir(
             continue;
         };
         if (is_optional_refresh_tmp_file_name(file_name)
-            || is_optional_generation_file_name(file_name))
+            || is_optional_generation_file_name(file_name)
+            || is_compound_secondary_index_base_file_name(file_name))
             && fs::remove_file(&path).is_ok()
         {
             if let Some(parent) = path.parent() {
@@ -3485,6 +3948,23 @@ fn cleanup_orphan_optional_component_files_in_dir(
 
 fn is_optional_refresh_tmp_file_name(file_name: &str) -> bool {
     file_name.contains(".refresh_tmp.")
+}
+
+fn is_compound_secondary_index_base_file_name(file_name: &str) -> bool {
+    const PREFIXES: [&str; 4] = [
+        "node_compound_eq_",
+        "node_compound_range_",
+        "edge_compound_eq_",
+        "edge_compound_range_",
+    ];
+    let Some(id) = PREFIXES
+        .iter()
+        .find_map(|prefix| file_name.strip_prefix(prefix))
+        .and_then(|rest| rest.strip_suffix(".dat"))
+    else {
+        return false;
+    };
+    !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn is_optional_generation_file_name(file_name: &str) -> bool {
@@ -4552,6 +5032,39 @@ pub(crate) fn write_indexes_from_metadata_with_secondary_indexes(
                                         .extend(branch_outcome.report.failed_range_indexes);
                                     outcome.stats_evidence.extend(branch_outcome.stats_evidence);
                                     outcome.records.extend(branch_outcome.records);
+
+                                    let node_compound_entries: Vec<&SecondaryIndexManifestEntry> =
+                                        partitions
+                                            .node_eq
+                                            .iter()
+                                            .chain(partitions.node_range.iter())
+                                            .copied()
+                                            .filter(|entry| {
+                                                matches!(
+                                                    &entry.target,
+                                                    SecondaryIndexTarget::NodeFieldIndex { .. }
+                                                )
+                                            })
+                                            .collect();
+                                    let branch_outcome =
+                                        write_declared_node_compound_sidecars_from_metadata(
+                                            seg_dir,
+                                            segment_id,
+                                            segments,
+                                            node_metas,
+                                            &node_compound_entries,
+                                            source_groups,
+                                        )?;
+                                    outcome
+                                        .report
+                                        .failed_equality_indexes
+                                        .extend(branch_outcome.report.failed_equality_indexes);
+                                    outcome
+                                        .report
+                                        .failed_range_indexes
+                                        .extend(branch_outcome.report.failed_range_indexes);
+                                    outcome.stats_evidence.extend(branch_outcome.stats_evidence);
+                                    outcome.records.extend(branch_outcome.records);
                                     let timestamp_index =
                                         prepare_timestamp_index_payload_from_meta(node_metas);
                                     outcome.stats_evidence.sort();
@@ -4632,8 +5145,39 @@ pub(crate) fn write_indexes_from_metadata_with_secondary_indexes(
                                         .failed_range_indexes
                                         .extend(edge_range_outcome.report.failed_range_indexes);
                                     declared_evidence.extend(edge_range_outcome.stats_evidence);
-                                    declared_evidence.sort();
                                     external_records.extend(edge_range_outcome.records);
+
+                                    let edge_compound_entries: Vec<&SecondaryIndexManifestEntry> =
+                                        partitions
+                                            .edge_eq
+                                            .iter()
+                                            .chain(partitions.edge_range.iter())
+                                            .copied()
+                                            .filter(|entry| {
+                                                matches!(
+                                                    &entry.target,
+                                                    SecondaryIndexTarget::EdgeFieldIndex { .. }
+                                                )
+                                            })
+                                            .collect();
+                                    let edge_compound_outcome =
+                                        write_declared_edge_compound_sidecars_from_metadata(
+                                            seg_dir,
+                                            segment_id,
+                                            segments,
+                                            edge_metas,
+                                            &edge_compound_entries,
+                                            source_groups,
+                                        )?;
+                                    report.failed_equality_indexes.extend(
+                                        edge_compound_outcome.report.failed_equality_indexes,
+                                    );
+                                    report
+                                        .failed_range_indexes
+                                        .extend(edge_compound_outcome.report.failed_range_indexes);
+                                    declared_evidence.extend(edge_compound_outcome.stats_evidence);
+                                    external_records.extend(edge_compound_outcome.records);
+                                    declared_evidence.sort();
                                     Ok((
                                         FlushEdgeIndexOutput {
                                             adj_out,
@@ -5069,6 +5613,873 @@ fn build_edge_secondary_range_entries_from_targeted_decode(
     entries.sort_unstable();
     entries.dedup();
     Ok(entries)
+}
+
+fn compound_property_keys(fields: &[SecondaryIndexFieldManifest]) -> Vec<String> {
+    let mut keys = BTreeSet::new();
+    for field in fields {
+        if let SecondaryIndexFieldManifest::Property { key } = field {
+            keys.insert(key.clone());
+        }
+    }
+    keys.into_iter().collect()
+}
+
+fn node_compound_selected_field_needs(
+    fields: &[SecondaryIndexFieldManifest],
+) -> NodeSelectedFieldNeeds {
+    let mut needs = NodeSelectedFieldNeeds::default();
+    for field in fields {
+        if let SecondaryIndexFieldManifest::NodeMetadata { field } = field {
+            match field {
+                NodeMetadataIndexFieldManifest::Key => needs.key = true,
+                NodeMetadataIndexFieldManifest::CreatedAt => needs.created_at = true,
+                NodeMetadataIndexFieldManifest::Id
+                | NodeMetadataIndexFieldManifest::Weight
+                | NodeMetadataIndexFieldManifest::UpdatedAt => {}
+            }
+        }
+    }
+    let prop_keys = compound_property_keys(fields);
+    if !prop_keys.is_empty() {
+        needs.props = PropertySelection::Keys(prop_keys);
+    }
+    needs
+}
+
+fn edge_compound_selected_field_needs(
+    fields: &[SecondaryIndexFieldManifest],
+) -> EdgeSelectedFieldNeeds {
+    let mut needs = EdgeSelectedFieldNeeds::default();
+    for field in fields {
+        if let SecondaryIndexFieldManifest::EdgeMetadata {
+            field: EdgeMetadataIndexFieldManifest::CreatedAt,
+        } = field
+        {
+            needs.created_at = true;
+        }
+    }
+    let prop_keys = compound_property_keys(fields);
+    if !prop_keys.is_empty() {
+        needs.props = PropertySelection::Keys(prop_keys);
+    }
+    needs
+}
+
+fn node_compound_needs_record(needs: &NodeSelectedFieldNeeds) -> bool {
+    needs.key || needs.created_at || !matches!(needs.props, PropertySelection::None)
+}
+
+fn edge_compound_needs_record(needs: &EdgeSelectedFieldNeeds) -> bool {
+    needs.created_at || !matches!(needs.props, PropertySelection::None)
+}
+
+fn node_field_index_parts(
+    entry: &SecondaryIndexManifestEntry,
+) -> Result<(u32, &[SecondaryIndexFieldManifest]), EngineError> {
+    match &entry.target {
+        SecondaryIndexTarget::NodeFieldIndex { label_id, fields } => Ok((*label_id, fields)),
+        _ => Err(EngineError::InvalidOperation(
+            compound_secondary_failure_message_from_str(&format!(
+                "index {} is not a node compound declaration",
+                entry.index_id
+            )),
+        )),
+    }
+}
+
+fn edge_field_index_parts(
+    entry: &SecondaryIndexManifestEntry,
+) -> Result<(u32, &[SecondaryIndexFieldManifest]), EngineError> {
+    match &entry.target {
+        SecondaryIndexTarget::EdgeFieldIndex { label_id, fields } => Ok((*label_id, fields)),
+        _ => Err(EngineError::InvalidOperation(
+            compound_secondary_failure_message_from_str(&format!(
+                "index {} is not an edge compound declaration",
+                entry.index_id
+            )),
+        )),
+    }
+}
+
+/// Union of selected-field needs across several declarations on one label,
+/// so each survivor record is decoded once for the whole group.
+fn merged_node_compound_needs(
+    group_fields: &[&[SecondaryIndexFieldManifest]],
+) -> NodeSelectedFieldNeeds {
+    let mut needs = NodeSelectedFieldNeeds::default();
+    let mut prop_keys = BTreeSet::new();
+    for fields in group_fields {
+        for field in *fields {
+            match field {
+                SecondaryIndexFieldManifest::Property { key } => {
+                    prop_keys.insert(key.clone());
+                }
+                SecondaryIndexFieldManifest::NodeMetadata { field } => match field {
+                    NodeMetadataIndexFieldManifest::Key => needs.key = true,
+                    NodeMetadataIndexFieldManifest::CreatedAt => needs.created_at = true,
+                    NodeMetadataIndexFieldManifest::Id
+                    | NodeMetadataIndexFieldManifest::Weight
+                    | NodeMetadataIndexFieldManifest::UpdatedAt => {}
+                },
+                SecondaryIndexFieldManifest::EdgeMetadata { .. } => {}
+            }
+        }
+    }
+    if !prop_keys.is_empty() {
+        needs.props = PropertySelection::Keys(prop_keys.into_iter().collect());
+    }
+    needs
+}
+
+fn merged_edge_compound_needs(
+    group_fields: &[&[SecondaryIndexFieldManifest]],
+) -> EdgeSelectedFieldNeeds {
+    let mut needs = EdgeSelectedFieldNeeds::default();
+    let mut prop_keys = BTreeSet::new();
+    for fields in group_fields {
+        for field in *fields {
+            match field {
+                SecondaryIndexFieldManifest::Property { key } => {
+                    prop_keys.insert(key.clone());
+                }
+                SecondaryIndexFieldManifest::EdgeMetadata {
+                    field: EdgeMetadataIndexFieldManifest::CreatedAt,
+                } => needs.created_at = true,
+                _ => {}
+            }
+        }
+    }
+    if !prop_keys.is_empty() {
+        needs.props = PropertySelection::Keys(prop_keys.into_iter().collect());
+    }
+    needs
+}
+
+/// Record-decoded fields a compound tuple may reference. Metadata-only
+/// components come straight from the compact meta tables instead.
+struct CompoundNodeRecordFields {
+    key: Option<String>,
+    props: BTreeMap<String, PropValue>,
+    created_at: Option<i64>,
+}
+
+struct CompoundEdgeRecordFields {
+    props: BTreeMap<String, PropValue>,
+    created_at: Option<i64>,
+}
+
+/// Re-materialize a shared decode error for each declaration it fails.
+fn replicate_decode_error(error: &EngineError) -> EngineError {
+    EngineError::CorruptRecord(match error {
+        EngineError::CorruptRecord(message) => message.clone(),
+        other => other.to_string(),
+    })
+}
+
+fn build_node_compound_entries_from_source_sidecars(
+    segments: &[Arc<SegmentReader>],
+    node_metas: &[CompactNodeMeta],
+    entry: &SecondaryIndexManifestEntry,
+) -> CompoundSidecarBuildResult {
+    let (target_label_id, _) = node_field_index_parts(entry)?;
+    let winner_sources: HashMap<u64, usize> = node_metas
+        .iter()
+        .filter(|meta| meta.label_ids.contains(target_label_id))
+        .map(|meta| (meta.node_id, meta.src_seg_idx))
+        .collect();
+    let mut entries = Vec::new();
+    for (seg_idx, segment) in segments.iter().enumerate() {
+        let sidecar_present = segment.for_each_compound_sidecar_entry(entry, |key, node_id| {
+            if winner_sources.get(&node_id) == Some(&seg_idx) {
+                entries.push((key.to_vec(), node_id));
+            }
+            Ok(())
+        })?;
+        if !sidecar_present {
+            return Err(EngineError::CorruptRecord(
+                compound_secondary_failure_message_from_str(&format!(
+                    "source segment at index {seg_idx} has no compound sidecar for index {} during reuse",
+                    entry.index_id
+                )),
+            ));
+        }
+    }
+    entries.sort();
+    entries.dedup();
+    Ok(entries)
+}
+
+fn build_edge_compound_entries_from_source_sidecars(
+    segments: &[Arc<SegmentReader>],
+    edge_metas: &[CompactEdgeMeta],
+    entry: &SecondaryIndexManifestEntry,
+) -> CompoundSidecarBuildResult {
+    let (target_label_id, _) = edge_field_index_parts(entry)?;
+    let winner_sources: HashMap<u64, usize> = edge_metas
+        .iter()
+        .filter(|meta| meta.label_id == target_label_id)
+        .map(|meta| (meta.edge_id, meta.src_seg_idx))
+        .collect();
+    let mut entries = Vec::new();
+    for (seg_idx, segment) in segments.iter().enumerate() {
+        let sidecar_present = segment.for_each_compound_sidecar_entry(entry, |key, edge_id| {
+            if winner_sources.get(&edge_id) == Some(&seg_idx) {
+                entries.push((key.to_vec(), edge_id));
+            }
+            Ok(())
+        })?;
+        if !sidecar_present {
+            return Err(EngineError::CorruptRecord(
+                compound_secondary_failure_message_from_str(&format!(
+                    "source segment at index {seg_idx} has no compound sidecar for index {} during reuse",
+                    entry.index_id
+                )),
+            ));
+        }
+    }
+    entries.sort();
+    entries.dedup();
+    Ok(entries)
+}
+
+fn selected_node_field_value<'a>(
+    meta: &'a CompactNodeMeta,
+    selected: Option<&'a CompoundNodeRecordFields>,
+    field: &'a SecondaryIndexFieldManifest,
+) -> Result<CompoundFieldValue<'a>, EngineError> {
+    match field {
+        SecondaryIndexFieldManifest::Property { key } => {
+            let selected = selected.ok_or_else(|| {
+                EngineError::CorruptRecord(format!(
+                    "compound secondary index unavailable: node {} selected properties were not decoded",
+                    meta.node_id
+                ))
+            })?;
+            Ok(CompoundFieldValue::Property(selected.props.get(key)))
+        }
+        SecondaryIndexFieldManifest::NodeMetadata { field } => match field {
+            NodeMetadataIndexFieldManifest::Id => Ok(CompoundFieldValue::MetadataU64(meta.node_id)),
+            NodeMetadataIndexFieldManifest::Key => {
+                let key = selected
+                    .and_then(|selected| selected.key.as_deref())
+                    .ok_or_else(|| {
+                        EngineError::CorruptRecord(format!(
+                            "compound secondary index unavailable: node {} key was not decoded",
+                            meta.node_id
+                        ))
+                    })?;
+                Ok(CompoundFieldValue::MetadataString(key))
+            }
+            NodeMetadataIndexFieldManifest::Weight => {
+                Ok(CompoundFieldValue::MetadataF64(meta.weight as f64))
+            }
+            NodeMetadataIndexFieldManifest::CreatedAt => {
+                let created_at = selected
+                    .and_then(|selected| selected.created_at)
+                    .ok_or_else(|| {
+                        EngineError::CorruptRecord(format!(
+                            "compound secondary index unavailable: node {} created_at was not decoded",
+                            meta.node_id
+                        ))
+                    })?;
+                Ok(CompoundFieldValue::MetadataI64(created_at))
+            }
+            NodeMetadataIndexFieldManifest::UpdatedAt => {
+                Ok(CompoundFieldValue::MetadataI64(meta.updated_at))
+            }
+        },
+        SecondaryIndexFieldManifest::EdgeMetadata { .. } => Err(EngineError::InvalidOperation(
+            "compound secondary index unavailable: node declaration contains edge metadata"
+                .to_string(),
+        )),
+    }
+}
+
+fn selected_edge_field_value<'a>(
+    meta: &'a CompactEdgeMeta,
+    selected: Option<&'a CompoundEdgeRecordFields>,
+    field: &'a SecondaryIndexFieldManifest,
+) -> Result<CompoundFieldValue<'a>, EngineError> {
+    match field {
+        SecondaryIndexFieldManifest::Property { key } => {
+            let selected = selected.ok_or_else(|| {
+                EngineError::CorruptRecord(format!(
+                    "compound secondary index unavailable: edge {} selected properties were not decoded",
+                    meta.edge_id
+                ))
+            })?;
+            Ok(CompoundFieldValue::Property(selected.props.get(key)))
+        }
+        SecondaryIndexFieldManifest::EdgeMetadata { field } => match field {
+            EdgeMetadataIndexFieldManifest::Id => Ok(CompoundFieldValue::MetadataU64(meta.edge_id)),
+            EdgeMetadataIndexFieldManifest::From => Ok(CompoundFieldValue::MetadataU64(meta.from)),
+            EdgeMetadataIndexFieldManifest::To => Ok(CompoundFieldValue::MetadataU64(meta.to)),
+            EdgeMetadataIndexFieldManifest::Weight => {
+                Ok(CompoundFieldValue::MetadataF64(meta.weight as f64))
+            }
+            EdgeMetadataIndexFieldManifest::CreatedAt => {
+                let created_at = selected
+                    .and_then(|selected| selected.created_at)
+                    .ok_or_else(|| {
+                        EngineError::CorruptRecord(format!(
+                            "compound secondary index unavailable: edge {} created_at was not decoded",
+                            meta.edge_id
+                        ))
+                    })?;
+                Ok(CompoundFieldValue::MetadataI64(created_at))
+            }
+            EdgeMetadataIndexFieldManifest::UpdatedAt => {
+                Ok(CompoundFieldValue::MetadataI64(meta.updated_at))
+            }
+            EdgeMetadataIndexFieldManifest::ValidFrom => {
+                Ok(CompoundFieldValue::MetadataI64(meta.valid_from))
+            }
+            EdgeMetadataIndexFieldManifest::ValidTo => {
+                Ok(CompoundFieldValue::MetadataI64(meta.valid_to))
+            }
+        },
+        SecondaryIndexFieldManifest::NodeMetadata { .. } => Err(EngineError::InvalidOperation(
+            "compound secondary index unavailable: edge declaration contains node metadata"
+                .to_string(),
+        )),
+    }
+}
+
+pub(crate) fn build_node_compound_entries_from_metadata(
+    segments: &[Arc<SegmentReader>],
+    node_metas: &[CompactNodeMeta],
+    entry: &SecondaryIndexManifestEntry,
+) -> CompoundSidecarBuildResult {
+    build_node_compound_entries_grouped_from_metadata(segments, node_metas, &[entry])
+        .pop()
+        .expect("grouped compound build returns one result per entry")
+}
+
+/// Build compound sidecar entries for several declarations in one pass.
+///
+/// Declarations are grouped by target label; each survivor record is decoded
+/// at most once per label with the union of the group's field needs, directly
+/// at the offset pinned by the compact meta table (no ID-based re-location).
+/// Results align with `entries` by position. A record decode failure fails
+/// every declaration in that label group that reads record fields;
+/// metadata-only declarations are unaffected.
+pub(crate) fn build_node_compound_entries_grouped_from_metadata(
+    segments: &[Arc<SegmentReader>],
+    node_metas: &[CompactNodeMeta],
+    entries: &[&SecondaryIndexManifestEntry],
+) -> Vec<CompoundSidecarBuildResult> {
+    let mut results: Vec<OptionalCompoundSidecarBuildResult> =
+        (0..entries.len()).map(|_| None).collect();
+    let mut label_groups: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (pos, entry) in entries.iter().enumerate() {
+        match node_field_index_parts(entry) {
+            Ok((label_id, _)) => label_groups.entry(label_id).or_default().push(pos),
+            Err(error) => results[pos] = Some(Err(error)),
+        }
+    }
+
+    for (target_label_id, positions) in label_groups {
+        let group_fields: Vec<&[SecondaryIndexFieldManifest]> = positions
+            .iter()
+            .map(|&pos| {
+                node_field_index_parts(entries[pos])
+                    .expect("grouped entries are node field indexes")
+                    .1
+            })
+            .collect();
+        let merged_needs = merged_node_compound_needs(&group_fields);
+
+        let mut decoded: Vec<Option<CompoundNodeRecordFields>> = Vec::new();
+        let mut decode_error: Option<EngineError> = None;
+        if node_compound_needs_record(&merged_needs) {
+            decoded = (0..node_metas.len()).map(|_| None).collect();
+            for (index, meta) in node_metas.iter().enumerate() {
+                if !meta.label_ids.contains(target_label_id) {
+                    continue;
+                }
+                match segments[meta.src_seg_idx].node_selected_fields_at_offset(
+                    meta.node_id,
+                    meta.src_data_offset,
+                    &merged_needs,
+                ) {
+                    Ok((key, props, created_at)) => {
+                        decoded[index] = Some(CompoundNodeRecordFields {
+                            key,
+                            props,
+                            created_at,
+                        });
+                    }
+                    Err(error) => {
+                        decode_error = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (&pos, fields) in positions.iter().zip(&group_fields) {
+            if let Some(error) = &decode_error {
+                if node_compound_needs_record(&node_compound_selected_field_needs(fields)) {
+                    results[pos] = Some(Err(replicate_decode_error(error)));
+                    continue;
+                }
+            }
+            results[pos] = Some(node_compound_entries_for_decoded(
+                node_metas,
+                &decoded,
+                target_label_id,
+                fields,
+            ));
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|result| result.expect("every entry position is resolved"))
+        .collect()
+}
+
+fn node_compound_entries_for_decoded(
+    node_metas: &[CompactNodeMeta],
+    decoded: &[Option<CompoundNodeRecordFields>],
+    target_label_id: u32,
+    fields: &[SecondaryIndexFieldManifest],
+) -> CompoundSidecarBuildResult {
+    let context = CompoundTupleContext {
+        target_kind: CompoundSidecarTargetKind::Node,
+        target_label_id,
+        fields,
+    };
+    let mut entries = Vec::new();
+    for (index, meta) in node_metas.iter().enumerate() {
+        if !meta.label_ids.contains(target_label_id) {
+            continue;
+        }
+        let selected = decoded.get(index).and_then(|fields| fields.as_ref());
+        let values = fields
+            .iter()
+            .map(|field| selected_node_field_value(meta, selected, field))
+            .collect::<Result<Vec<_>, _>>()?;
+        let tuple_key = encode_compound_tuple_key(&context, &values)?;
+        entries.push((tuple_key, meta.node_id));
+    }
+    entries.sort();
+    entries.dedup();
+    Ok(entries)
+}
+
+pub(crate) fn build_edge_compound_entries_from_metadata(
+    segments: &[Arc<SegmentReader>],
+    edge_metas: &[CompactEdgeMeta],
+    entry: &SecondaryIndexManifestEntry,
+) -> CompoundSidecarBuildResult {
+    build_edge_compound_entries_grouped_from_metadata(segments, edge_metas, &[entry])
+        .pop()
+        .expect("grouped compound build returns one result per entry")
+}
+
+/// Edge counterpart of [`build_node_compound_entries_grouped_from_metadata`].
+pub(crate) fn build_edge_compound_entries_grouped_from_metadata(
+    segments: &[Arc<SegmentReader>],
+    edge_metas: &[CompactEdgeMeta],
+    entries: &[&SecondaryIndexManifestEntry],
+) -> Vec<CompoundSidecarBuildResult> {
+    let mut results: Vec<OptionalCompoundSidecarBuildResult> =
+        (0..entries.len()).map(|_| None).collect();
+    let mut label_groups: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (pos, entry) in entries.iter().enumerate() {
+        match edge_field_index_parts(entry) {
+            Ok((label_id, _)) => label_groups.entry(label_id).or_default().push(pos),
+            Err(error) => results[pos] = Some(Err(error)),
+        }
+    }
+
+    for (target_label_id, positions) in label_groups {
+        let group_fields: Vec<&[SecondaryIndexFieldManifest]> = positions
+            .iter()
+            .map(|&pos| {
+                edge_field_index_parts(entries[pos])
+                    .expect("grouped entries are edge field indexes")
+                    .1
+            })
+            .collect();
+        let merged_needs = merged_edge_compound_needs(&group_fields);
+
+        let mut decoded: Vec<Option<CompoundEdgeRecordFields>> = Vec::new();
+        let mut decode_error: Option<EngineError> = None;
+        if edge_compound_needs_record(&merged_needs) {
+            decoded = (0..edge_metas.len()).map(|_| None).collect();
+            for (index, meta) in edge_metas.iter().enumerate() {
+                if meta.label_id != target_label_id {
+                    continue;
+                }
+                match segments[meta.src_seg_idx].edge_selected_fields_at_offset(
+                    meta.edge_id,
+                    meta.src_data_offset,
+                    &merged_needs,
+                ) {
+                    Ok((props, created_at)) => {
+                        decoded[index] = Some(CompoundEdgeRecordFields { props, created_at });
+                    }
+                    Err(error) => {
+                        decode_error = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (&pos, fields) in positions.iter().zip(&group_fields) {
+            if let Some(error) = &decode_error {
+                if edge_compound_needs_record(&edge_compound_selected_field_needs(fields)) {
+                    results[pos] = Some(Err(replicate_decode_error(error)));
+                    continue;
+                }
+            }
+            results[pos] = Some(edge_compound_entries_for_decoded(
+                edge_metas,
+                &decoded,
+                target_label_id,
+                fields,
+            ));
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|result| result.expect("every entry position is resolved"))
+        .collect()
+}
+
+fn edge_compound_entries_for_decoded(
+    edge_metas: &[CompactEdgeMeta],
+    decoded: &[Option<CompoundEdgeRecordFields>],
+    target_label_id: u32,
+    fields: &[SecondaryIndexFieldManifest],
+) -> CompoundSidecarBuildResult {
+    let context = CompoundTupleContext {
+        target_kind: CompoundSidecarTargetKind::Edge,
+        target_label_id,
+        fields,
+    };
+    let mut entries = Vec::new();
+    for (index, meta) in edge_metas.iter().enumerate() {
+        if meta.label_id != target_label_id {
+            continue;
+        }
+        let selected = decoded.get(index).and_then(|fields| fields.as_ref());
+        let values = fields
+            .iter()
+            .map(|field| selected_edge_field_value(meta, selected, field))
+            .collect::<Result<Vec<_>, _>>()?;
+        let tuple_key = encode_compound_tuple_key(&context, &values)?;
+        entries.push((tuple_key, meta.edge_id));
+    }
+    entries.sort();
+    entries.dedup();
+    Ok(entries)
+}
+
+fn compound_source_sidecar_reuse_status(
+    segments: &[Arc<SegmentReader>],
+    entry: &SecondaryIndexManifestEntry,
+) -> (bool, Option<String>) {
+    let kind = secondary_index_component_kind_for_entry(entry);
+    for segment in segments {
+        match segment.compound_sidecar_lightweight_available_for_entry(entry) {
+            Ok(true) => {}
+            Ok(false) => {
+                let failure_message = if entry.state == SecondaryIndexState::Ready {
+                    kind.clone()
+                        .and_then(|kind| sidecar_unavailable_failure_reason(segment, kind))
+                        .map(|reason| compound_secondary_failure_message_from_str(&reason))
+                } else {
+                    None
+                };
+                return (false, failure_message);
+            }
+            Err(error) => {
+                let failure_message = if entry.state == SecondaryIndexState::Ready {
+                    Some(compound_secondary_failure_message(&error))
+                } else {
+                    None
+                };
+                return (false, failure_message);
+            }
+        }
+    }
+    (true, None)
+}
+
+fn write_declared_node_compound_sidecars_from_metadata(
+    seg_dir: &Path,
+    segment_id: u64,
+    segments: &[Arc<SegmentReader>],
+    node_metas: &[CompactNodeMeta],
+    entries: &[&SecondaryIndexManifestEntry],
+    source_groups: SegmentComponentSourceGroups,
+) -> Result<DeclaredSidecarWriteOutcome, EngineError> {
+    let mut outcome = DeclaredSidecarWriteOutcome::default();
+
+    // Phase 1: attempt source-sidecar reuse per declaration; collect the
+    // declarations that need a metadata rebuild so survivors are decoded
+    // once per label instead of once per declaration.
+    struct PendingCompoundSidecar<'a> {
+        entry: &'a SecondaryIndexManifestEntry,
+        failure_message: Option<String>,
+        result: OptionalCompoundSidecarBuildResult,
+    }
+    let mut pending = Vec::new();
+    let mut rebuild_positions = Vec::new();
+    for entry in entries {
+        if !matches!(&entry.target, SecondaryIndexTarget::NodeFieldIndex { .. }) {
+            continue;
+        }
+        let mut failure_message = None;
+        let source_entries = if entry.state == SecondaryIndexState::Failed {
+            None
+        } else {
+            let (use_source_sidecars, source_failure_message) =
+                compound_source_sidecar_reuse_status(segments, entry);
+            failure_message = source_failure_message;
+            if use_source_sidecars {
+                match build_node_compound_entries_from_source_sidecars(segments, node_metas, entry)
+                {
+                    Ok(entries) => Some(entries),
+                    Err(error) => {
+                        if entry.state == SecondaryIndexState::Ready && failure_message.is_none() {
+                            failure_message = Some(compound_secondary_failure_message(&error));
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        if source_entries.is_none() {
+            rebuild_positions.push(pending.len());
+        }
+        pending.push(PendingCompoundSidecar {
+            entry,
+            failure_message,
+            result: source_entries.map(Ok),
+        });
+    }
+
+    // Phase 2: grouped metadata rebuild for everything reuse could not serve.
+    let rebuild_entries: Vec<&SecondaryIndexManifestEntry> = rebuild_positions
+        .iter()
+        .map(|&pos| pending[pos].entry)
+        .collect();
+    let rebuild_results =
+        build_node_compound_entries_grouped_from_metadata(segments, node_metas, &rebuild_entries);
+    for (&pos, result) in rebuild_positions.iter().zip(rebuild_results) {
+        pending[pos].result = Some(result);
+    }
+
+    // Phase 3: report failures and write sidecars in declaration order.
+    for item in pending {
+        let entry = item.entry;
+        let sidecar_entries = match item.result.expect("every pending declaration is resolved") {
+            Ok(entries) => entries,
+            Err(error) => {
+                let message = compound_secondary_failure_message(&error);
+                match entry.kind {
+                    SecondaryIndexKind::Equality => outcome
+                        .report
+                        .failed_equality_indexes
+                        .push((entry.index_id, message)),
+                    SecondaryIndexKind::Range => outcome
+                        .report
+                        .failed_range_indexes
+                        .push((entry.index_id, message)),
+                }
+                continue;
+            }
+        };
+        if let Some(message) = item.failure_message {
+            match entry.kind {
+                SecondaryIndexKind::Equality => outcome
+                    .report
+                    .failed_equality_indexes
+                    .push((entry.index_id, message)),
+                SecondaryIndexKind::Range => outcome
+                    .report
+                    .failed_range_indexes
+                    .push((entry.index_id, message)),
+            }
+        }
+        let record = match write_compaction_compound_sidecar_component(
+            seg_dir,
+            segment_id,
+            entry,
+            &sidecar_entries,
+            source_groups,
+        ) {
+            Ok(record) => record,
+            Err(error) => {
+                let message = compound_secondary_failure_message(&error);
+                match entry.kind {
+                    SecondaryIndexKind::Equality => outcome
+                        .report
+                        .failed_equality_indexes
+                        .push((entry.index_id, message)),
+                    SecondaryIndexKind::Range => outcome
+                        .report
+                        .failed_range_indexes
+                        .push((entry.index_id, message)),
+                }
+                continue;
+            }
+        };
+        outcome.records.push(record);
+        if entry.state == SecondaryIndexState::Ready {
+            outcome.stats_evidence.compound_index_stats.push(
+                compound_index_stats_from_written_entries(
+                    entry,
+                    &sidecar_entries,
+                    DeclaredIndexRuntimeCoverageState::Available,
+                )?,
+            );
+        }
+    }
+    outcome.stats_evidence.sort();
+    Ok(outcome)
+}
+
+fn write_declared_edge_compound_sidecars_from_metadata(
+    seg_dir: &Path,
+    segment_id: u64,
+    segments: &[Arc<SegmentReader>],
+    edge_metas: &[CompactEdgeMeta],
+    entries: &[&SecondaryIndexManifestEntry],
+    source_groups: SegmentComponentSourceGroups,
+) -> Result<DeclaredSidecarWriteOutcome, EngineError> {
+    let mut outcome = DeclaredSidecarWriteOutcome::default();
+
+    // Mirrors the node path: reuse first, then one grouped metadata rebuild.
+    struct PendingCompoundSidecar<'a> {
+        entry: &'a SecondaryIndexManifestEntry,
+        failure_message: Option<String>,
+        result: OptionalCompoundSidecarBuildResult,
+    }
+    let mut pending = Vec::new();
+    let mut rebuild_positions = Vec::new();
+    for entry in entries {
+        if !matches!(&entry.target, SecondaryIndexTarget::EdgeFieldIndex { .. }) {
+            continue;
+        }
+        let mut failure_message = None;
+        let source_entries = if entry.state == SecondaryIndexState::Failed {
+            None
+        } else {
+            let (use_source_sidecars, source_failure_message) =
+                compound_source_sidecar_reuse_status(segments, entry);
+            failure_message = source_failure_message;
+            if use_source_sidecars {
+                match build_edge_compound_entries_from_source_sidecars(segments, edge_metas, entry)
+                {
+                    Ok(entries) => Some(entries),
+                    Err(error) => {
+                        if entry.state == SecondaryIndexState::Ready && failure_message.is_none() {
+                            failure_message = Some(compound_secondary_failure_message(&error));
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        if source_entries.is_none() {
+            rebuild_positions.push(pending.len());
+        }
+        pending.push(PendingCompoundSidecar {
+            entry,
+            failure_message,
+            result: source_entries.map(Ok),
+        });
+    }
+
+    let rebuild_entries: Vec<&SecondaryIndexManifestEntry> = rebuild_positions
+        .iter()
+        .map(|&pos| pending[pos].entry)
+        .collect();
+    let rebuild_results =
+        build_edge_compound_entries_grouped_from_metadata(segments, edge_metas, &rebuild_entries);
+    for (&pos, result) in rebuild_positions.iter().zip(rebuild_results) {
+        pending[pos].result = Some(result);
+    }
+
+    for item in pending {
+        let entry = item.entry;
+        let sidecar_entries = match item.result.expect("every pending declaration is resolved") {
+            Ok(entries) => entries,
+            Err(error) => {
+                let message = compound_secondary_failure_message(&error);
+                match entry.kind {
+                    SecondaryIndexKind::Equality => outcome
+                        .report
+                        .failed_equality_indexes
+                        .push((entry.index_id, message)),
+                    SecondaryIndexKind::Range => outcome
+                        .report
+                        .failed_range_indexes
+                        .push((entry.index_id, message)),
+                }
+                continue;
+            }
+        };
+        if let Some(message) = item.failure_message {
+            match entry.kind {
+                SecondaryIndexKind::Equality => outcome
+                    .report
+                    .failed_equality_indexes
+                    .push((entry.index_id, message)),
+                SecondaryIndexKind::Range => outcome
+                    .report
+                    .failed_range_indexes
+                    .push((entry.index_id, message)),
+            }
+        }
+        let record = match write_compaction_compound_sidecar_component(
+            seg_dir,
+            segment_id,
+            entry,
+            &sidecar_entries,
+            source_groups,
+        ) {
+            Ok(record) => record,
+            Err(error) => {
+                let message = compound_secondary_failure_message(&error);
+                match entry.kind {
+                    SecondaryIndexKind::Equality => outcome
+                        .report
+                        .failed_equality_indexes
+                        .push((entry.index_id, message)),
+                    SecondaryIndexKind::Range => outcome
+                        .report
+                        .failed_range_indexes
+                        .push((entry.index_id, message)),
+                }
+                continue;
+            }
+        };
+        outcome.records.push(record);
+        if entry.state == SecondaryIndexState::Ready {
+            outcome.stats_evidence.compound_index_stats.push(
+                compound_index_stats_from_written_entries(
+                    entry,
+                    &sidecar_entries,
+                    DeclaredIndexRuntimeCoverageState::Available,
+                )?,
+            );
+        }
+    }
+    outcome.stats_evidence.sort();
+    Ok(outcome)
 }
 
 fn write_declared_equality_sidecars_from_metadata(
@@ -8950,6 +10361,769 @@ mod tests {
     }
 
     #[test]
+    fn compound_field_index_paths_and_flush_build_are_wired() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let entry = SecondaryIndexManifestEntry {
+            index_id: 701,
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 1,
+                fields: vec![
+                    SecondaryIndexFieldManifest::Property {
+                        key: "tenant".to_string(),
+                    },
+                    SecondaryIndexFieldManifest::NodeMetadata {
+                        field: NodeMetadataIndexFieldManifest::UpdatedAt,
+                    },
+                ],
+            },
+            kind: SecondaryIndexKind::Range,
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        };
+        assert_eq!(
+            secondary_index_component_kind_for_entry(&entry),
+            Some(SegmentComponentKind::NodeCompoundRangeIndex {
+                index_id: entry.index_id,
+            })
+        );
+        assert_eq!(
+            secondary_index_base_relative_path_for_entry(&entry).unwrap(),
+            format!(
+                "{}/node_compound_range_{}.dat",
+                SECONDARY_INDEX_DIRNAME, entry.index_id
+            )
+        );
+        assert_eq!(
+            edge_compound_eq_sidecar_path(&seg_dir, 702),
+            secondary_indexes_dir(&seg_dir).join("edge_compound_eq_702.dat")
+        );
+        assert_eq!(
+            edge_compound_range_sidecar_path(&seg_dir, 703),
+            secondary_indexes_dir(&seg_dir).join("edge_compound_range_703.dat")
+        );
+
+        let partitions = partition_secondary_indexes(std::slice::from_ref(&entry));
+        assert!(partitions.node_eq.is_empty());
+        assert_eq!(partitions.node_range.len(), 1);
+        assert!(partitions.edge_eq.is_empty());
+        assert!(partitions.edge_range.is_empty());
+
+        let mt = Memtable::new();
+        let info = write_segment_with_secondary_indexes(
+            &seg_dir,
+            1,
+            &mt,
+            None,
+            std::slice::from_ref(&entry),
+        )
+        .unwrap();
+        assert!(node_compound_range_sidecar_path(&seg_dir, entry.index_id).exists());
+        let manifest = read_segment_component_manifest(&seg_dir).unwrap();
+        assert!(manifest.components.iter().any(|record| {
+            record.kind
+                == SegmentComponentKind::NodeCompoundRangeIndex {
+                    index_id: entry.index_id,
+                }
+        }));
+        let maintained = maintained_secondary_index_ids_from_component_records(
+            &manifest.components,
+            std::slice::from_ref(&entry),
+        );
+        assert!(maintained.equality_index_ids.is_empty());
+        assert!(maintained.range_index_ids.contains(&entry.index_id));
+        let reader =
+            SegmentReader::open_with_info(&seg_dir, &info, None, std::slice::from_ref(&entry))
+                .unwrap();
+        assert!(reader.validate_compound_sidecar_for_entry(&entry).unwrap());
+        assert_eq!(
+            reader.optional_component_availability(SegmentComponentKind::NodeCompoundRangeIndex {
+                index_id: entry.index_id,
+            }),
+            ComponentAvailability::Available
+        );
+    }
+
+    fn node_compound_entry_for_storage_test(
+        index_id: u64,
+        kind: SecondaryIndexKind,
+    ) -> SecondaryIndexManifestEntry {
+        SecondaryIndexManifestEntry {
+            index_id,
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 1,
+                fields: vec![
+                    SecondaryIndexFieldManifest::Property {
+                        key: "tenant".to_string(),
+                    },
+                    SecondaryIndexFieldManifest::NodeMetadata {
+                        field: NodeMetadataIndexFieldManifest::UpdatedAt,
+                    },
+                ],
+            },
+            kind,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        }
+    }
+
+    fn edge_compound_entry_for_storage_test(
+        index_id: u64,
+        kind: SecondaryIndexKind,
+    ) -> SecondaryIndexManifestEntry {
+        SecondaryIndexManifestEntry {
+            index_id,
+            target: SecondaryIndexTarget::EdgeFieldIndex {
+                label_id: 4,
+                fields: vec![
+                    SecondaryIndexFieldManifest::Property {
+                        key: "status".to_string(),
+                    },
+                    SecondaryIndexFieldManifest::EdgeMetadata {
+                        field: EdgeMetadataIndexFieldManifest::ValidTo,
+                    },
+                ],
+            },
+            kind,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        }
+    }
+
+    fn edge_compound_from_status_valid_to_entry_for_storage_test(
+        index_id: u64,
+        kind: SecondaryIndexKind,
+    ) -> SecondaryIndexManifestEntry {
+        SecondaryIndexManifestEntry {
+            index_id,
+            target: SecondaryIndexTarget::EdgeFieldIndex {
+                label_id: 4,
+                fields: vec![
+                    SecondaryIndexFieldManifest::EdgeMetadata {
+                        field: EdgeMetadataIndexFieldManifest::From,
+                    },
+                    SecondaryIndexFieldManifest::Property {
+                        key: "status".to_string(),
+                    },
+                    SecondaryIndexFieldManifest::EdgeMetadata {
+                        field: EdgeMetadataIndexFieldManifest::ValidTo,
+                    },
+                ],
+            },
+            kind,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        }
+    }
+
+    fn compound_entries_for_reader(
+        reader: &SegmentReader,
+        entry: &SecondaryIndexManifestEntry,
+    ) -> BTreeSet<(Vec<u8>, u64)> {
+        let mut entries = BTreeSet::new();
+        assert!(reader
+            .for_each_compound_sidecar_entry(entry, |key, id| {
+                entries.insert((key.to_vec(), id));
+                Ok(())
+            })
+            .unwrap());
+        entries
+    }
+
+    #[test]
+    fn compound_compaction_selected_field_needs_are_targeted() {
+        let node_metadata_fields = vec![
+            SecondaryIndexFieldManifest::NodeMetadata {
+                field: NodeMetadataIndexFieldManifest::Id,
+            },
+            SecondaryIndexFieldManifest::NodeMetadata {
+                field: NodeMetadataIndexFieldManifest::UpdatedAt,
+            },
+        ];
+        let node_metadata_needs = node_compound_selected_field_needs(&node_metadata_fields);
+        assert!(!node_metadata_needs.key);
+        assert!(!node_metadata_needs.created_at);
+        assert!(matches!(node_metadata_needs.props, PropertySelection::None));
+        assert!(!node_compound_needs_record(&node_metadata_needs));
+
+        let node_mixed_fields = vec![
+            SecondaryIndexFieldManifest::Property {
+                key: "tenant".to_string(),
+            },
+            SecondaryIndexFieldManifest::Property {
+                key: "status".to_string(),
+            },
+            SecondaryIndexFieldManifest::NodeMetadata {
+                field: NodeMetadataIndexFieldManifest::Key,
+            },
+        ];
+        let node_mixed_needs = node_compound_selected_field_needs(&node_mixed_fields);
+        assert!(node_mixed_needs.key);
+        assert!(matches!(
+            node_mixed_needs.props,
+            PropertySelection::Keys(ref keys) if keys == &vec!["status".to_string(), "tenant".to_string()]
+        ));
+        assert!(node_compound_needs_record(&node_mixed_needs));
+
+        let edge_metadata_fields = vec![
+            SecondaryIndexFieldManifest::EdgeMetadata {
+                field: EdgeMetadataIndexFieldManifest::From,
+            },
+            SecondaryIndexFieldManifest::EdgeMetadata {
+                field: EdgeMetadataIndexFieldManifest::ValidTo,
+            },
+        ];
+        let edge_metadata_needs = edge_compound_selected_field_needs(&edge_metadata_fields);
+        assert!(!edge_metadata_needs.created_at);
+        assert!(matches!(edge_metadata_needs.props, PropertySelection::None));
+        assert!(!edge_compound_needs_record(&edge_metadata_needs));
+
+        let edge_mixed_fields = vec![
+            SecondaryIndexFieldManifest::Property {
+                key: "status".to_string(),
+            },
+            SecondaryIndexFieldManifest::EdgeMetadata {
+                field: EdgeMetadataIndexFieldManifest::CreatedAt,
+            },
+        ];
+        let edge_mixed_needs = edge_compound_selected_field_needs(&edge_mixed_fields);
+        assert!(edge_mixed_needs.created_at);
+        assert!(matches!(
+            edge_mixed_needs.props,
+            PropertySelection::Keys(ref keys) if keys == &vec!["status".to_string()]
+        ));
+        assert!(edge_compound_needs_record(&edge_mixed_needs));
+    }
+
+    #[test]
+    fn flush_writes_node_compound_equality_and_range_sidecars_that_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let eq_entry = node_compound_entry_for_storage_test(810, SecondaryIndexKind::Equality);
+        let range_entry = node_compound_entry_for_storage_test(811, SecondaryIndexKind::Range);
+        let indexes = vec![eq_entry.clone(), range_entry.clone()];
+        let mt = Memtable::new();
+        for (id, tenant, updated_at) in [(1, "acme", 100), (2, "acme", 200), (3, "globex", 150)] {
+            let mut props = BTreeMap::new();
+            props.insert("tenant".to_string(), PropValue::String(tenant.to_string()));
+            mt.apply_op(
+                &WalOp::UpsertNode(make_node_with_custom_props(
+                    id,
+                    1,
+                    &format!("node-{id}"),
+                    props,
+                    updated_at,
+                )),
+                id,
+            );
+        }
+        mt.register_secondary_index(&eq_entry);
+        mt.register_secondary_index(&range_entry);
+
+        let info = write_segment_with_secondary_indexes(&seg_dir, 1, &mt, None, &indexes).unwrap();
+        assert!(node_compound_eq_sidecar_path(&seg_dir, eq_entry.index_id).exists());
+        assert!(node_compound_range_sidecar_path(&seg_dir, range_entry.index_id).exists());
+        let reader = SegmentReader::open_with_info(&seg_dir, &info, None, &indexes).unwrap();
+
+        let tenant = PropValue::String("acme".to_string());
+        let context = CompoundTupleContext::from_manifest_entry(&eq_entry).unwrap();
+        let prefix = crate::secondary_index_key::encode_compound_tuple_prefix(
+            &context,
+            &[CompoundFieldValue::Property(Some(&tenant))],
+        )
+        .unwrap();
+        assert_eq!(
+            reader
+                .compound_prefix_candidates_if_present(
+                    &eq_entry,
+                    &crate::secondary_index_key::compound_prefix_bounds(&prefix)
+                )
+                .unwrap(),
+            Some(vec![1, 2])
+        );
+
+        let range_context = CompoundTupleContext::from_manifest_entry(&range_entry).unwrap();
+        let lower = crate::secondary_index_key::encode_compound_field_component(
+            &range_context,
+            1,
+            CompoundFieldValue::MetadataI64(150),
+        )
+        .unwrap();
+        let upper = crate::secondary_index_key::encode_compound_field_component(
+            &range_context,
+            1,
+            CompoundFieldValue::MetadataI64(250),
+        )
+        .unwrap();
+        let bounds = crate::secondary_index_key::compound_range_bounds(
+            &prefix,
+            Some((&lower, true)),
+            Some((&upper, true)),
+        )
+        .unwrap();
+        assert_eq!(
+            reader
+                .compound_range_candidates_if_present(&range_entry, &bounds)
+                .unwrap(),
+            Some(vec![2])
+        );
+    }
+
+    #[test]
+    fn flush_writes_edge_compound_equality_and_range_sidecars_that_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let eq_entry = edge_compound_entry_for_storage_test(820, SecondaryIndexKind::Equality);
+        let range_entry = edge_compound_entry_for_storage_test(821, SecondaryIndexKind::Range);
+        let indexes = vec![eq_entry.clone(), range_entry.clone()];
+        let mt = Memtable::new();
+        for (id, status, valid_to) in [(10, "open", 100), (11, "open", 300), (12, "done", 200)] {
+            let mut edge = make_edge(id, 1, id + 10, 4);
+            edge.valid_to = valid_to;
+            edge.props
+                .insert("status".to_string(), PropValue::String(status.to_string()));
+            mt.apply_op(&WalOp::UpsertEdge(edge), id);
+        }
+        mt.register_secondary_index(&eq_entry);
+        mt.register_secondary_index(&range_entry);
+
+        let info = write_segment_with_secondary_indexes(&seg_dir, 1, &mt, None, &indexes).unwrap();
+        assert!(edge_compound_eq_sidecar_path(&seg_dir, eq_entry.index_id).exists());
+        assert!(edge_compound_range_sidecar_path(&seg_dir, range_entry.index_id).exists());
+        let reader = SegmentReader::open_with_info(&seg_dir, &info, None, &indexes).unwrap();
+        let status = PropValue::String("open".to_string());
+        let context = CompoundTupleContext::from_manifest_entry(&eq_entry).unwrap();
+        let prefix = crate::secondary_index_key::encode_compound_tuple_prefix(
+            &context,
+            &[CompoundFieldValue::Property(Some(&status))],
+        )
+        .unwrap();
+        assert_eq!(
+            reader
+                .compound_prefix_candidates_if_present(
+                    &eq_entry,
+                    &crate::secondary_index_key::compound_prefix_bounds(&prefix)
+                )
+                .unwrap(),
+            Some(vec![10, 11])
+        );
+        let range_context = CompoundTupleContext::from_manifest_entry(&range_entry).unwrap();
+        let lower = crate::secondary_index_key::encode_compound_field_component(
+            &range_context,
+            1,
+            CompoundFieldValue::MetadataI64(250),
+        )
+        .unwrap();
+        let bounds =
+            crate::secondary_index_key::compound_range_bounds(&prefix, Some((&lower, true)), None)
+                .unwrap();
+        assert_eq!(
+            reader
+                .compound_range_candidates_if_present(&range_entry, &bounds)
+                .unwrap(),
+            Some(vec![11])
+        );
+    }
+
+    #[test]
+    fn compaction_compound_sidecars_match_flush_and_rebuild_when_missing() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_seg = source_dir.path().join("seg_0001");
+        let compact_dir = tempfile::tempdir().unwrap();
+        let compact_seg = compact_dir.path().join("seg_0002");
+        let rebuild_dir = tempfile::tempdir().unwrap();
+        let rebuild_seg = rebuild_dir.path().join("seg_0003");
+        let eq_entry = node_compound_entry_for_storage_test(830, SecondaryIndexKind::Equality);
+        let range_entry = node_compound_entry_for_storage_test(831, SecondaryIndexKind::Range);
+        let indexes = vec![eq_entry.clone(), range_entry.clone()];
+        let mt = Memtable::new();
+        for (id, tenant, updated_at) in [(1, "acme", 100), (2, "acme", 200), (3, "globex", 300)] {
+            let mut props = BTreeMap::new();
+            props.insert("tenant".to_string(), PropValue::String(tenant.to_string()));
+            mt.apply_op(
+                &WalOp::UpsertNode(make_node_with_custom_props(
+                    id,
+                    1,
+                    &format!("node-{id}"),
+                    props,
+                    updated_at,
+                )),
+                id,
+            );
+        }
+        mt.register_secondary_index(&eq_entry);
+        mt.register_secondary_index(&range_entry);
+        let source_info =
+            write_segment_with_secondary_indexes(&source_seg, 1, &mt, None, &indexes).unwrap();
+        let source_reader = Arc::new(
+            SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
+        );
+
+        let compact_reader =
+            compact_copy_segment_for_test(source_reader.clone(), &compact_seg, 2, &indexes);
+        assert_eq!(
+            compound_entries_for_reader(&source_reader, &eq_entry),
+            compound_entries_for_reader(&compact_reader, &eq_entry)
+        );
+        assert_eq!(
+            compound_entries_for_reader(&source_reader, &range_entry),
+            compound_entries_for_reader(&compact_reader, &range_entry)
+        );
+
+        remove_secondary_index_component_records(&source_seg, &eq_entry).unwrap();
+        remove_secondary_index_component_records(&source_seg, &range_entry).unwrap();
+        let source_without_compound = Arc::new(
+            SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
+        );
+        let rebuilt_reader =
+            compact_copy_segment_for_test(source_without_compound, &rebuild_seg, 3, &indexes);
+        assert_eq!(
+            compound_entries_for_reader(&source_reader, &eq_entry),
+            compound_entries_for_reader(&rebuilt_reader, &eq_entry)
+        );
+        assert_eq!(
+            compound_entries_for_reader(&source_reader, &range_entry),
+            compound_entries_for_reader(&rebuilt_reader, &range_entry)
+        );
+    }
+
+    #[test]
+    fn edge_compound_compaction_matches_flush_and_rebuilds_metadata_property_mix() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_seg = source_dir.path().join("seg_0001");
+        let compact_dir = tempfile::tempdir().unwrap();
+        let compact_seg = compact_dir.path().join("seg_0002");
+        let rebuild_dir = tempfile::tempdir().unwrap();
+        let rebuild_seg = rebuild_dir.path().join("seg_0003");
+        let eq_entry = edge_compound_from_status_valid_to_entry_for_storage_test(
+            850,
+            SecondaryIndexKind::Equality,
+        );
+        let range_entry = edge_compound_from_status_valid_to_entry_for_storage_test(
+            851,
+            SecondaryIndexKind::Range,
+        );
+        let indexes = vec![eq_entry.clone(), range_entry.clone()];
+        let mt = Memtable::new();
+        for (id, from, to, status, valid_to) in [
+            (10, 1, 101, "open", 100),
+            (11, 1, 102, "open", 300),
+            (12, 2, 103, "done", 200),
+        ] {
+            let mut edge = make_edge(id, from, to, 4);
+            edge.valid_to = valid_to;
+            edge.props
+                .insert("status".to_string(), PropValue::String(status.to_string()));
+            mt.apply_op(&WalOp::UpsertEdge(edge), id);
+        }
+        mt.register_secondary_index(&eq_entry);
+        mt.register_secondary_index(&range_entry);
+        let source_info =
+            write_segment_with_secondary_indexes(&source_seg, 1, &mt, None, &indexes).unwrap();
+        let source_reader = Arc::new(
+            SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
+        );
+
+        let compact_reader =
+            compact_copy_segment_for_test(source_reader.clone(), &compact_seg, 2, &indexes);
+        assert_eq!(
+            compound_entries_for_reader(&source_reader, &eq_entry),
+            compound_entries_for_reader(&compact_reader, &eq_entry)
+        );
+        assert_eq!(
+            compound_entries_for_reader(&source_reader, &range_entry),
+            compound_entries_for_reader(&compact_reader, &range_entry)
+        );
+
+        remove_secondary_index_component_records(&source_seg, &eq_entry).unwrap();
+        remove_secondary_index_component_records(&source_seg, &range_entry).unwrap();
+        let source_without_compound = Arc::new(
+            SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
+        );
+        let rebuilt_reader =
+            compact_copy_segment_for_test(source_without_compound, &rebuild_seg, 3, &indexes);
+        assert_eq!(
+            compound_entries_for_reader(&source_reader, &eq_entry),
+            compound_entries_for_reader(&rebuilt_reader, &eq_entry)
+        );
+        assert_eq!(
+            compound_entries_for_reader(&source_reader, &range_entry),
+            compound_entries_for_reader(&rebuilt_reader, &range_entry)
+        );
+    }
+
+    #[test]
+    fn source_compound_sidecar_reuse_filters_non_surviving_records() {
+        let left_dir = tempfile::tempdir().unwrap();
+        let left_seg = left_dir.path().join("seg_left");
+        let right_dir = tempfile::tempdir().unwrap();
+        let right_seg = right_dir.path().join("seg_right");
+        let entry = node_compound_entry_for_storage_test(840, SecondaryIndexKind::Equality);
+        let indexes = vec![entry.clone()];
+
+        let left_mt = Memtable::new();
+        let mut left_props = BTreeMap::new();
+        left_props.insert("tenant".to_string(), PropValue::String("old".to_string()));
+        left_mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_custom_props(1, 1, "old", left_props, 100)),
+            1,
+        );
+        left_mt.register_secondary_index(&entry);
+        let left_info =
+            write_segment_with_secondary_indexes(&left_seg, 1, &left_mt, None, &indexes).unwrap();
+        let left_reader =
+            Arc::new(SegmentReader::open_with_info(&left_seg, &left_info, None, &indexes).unwrap());
+
+        let right_mt = Memtable::new();
+        let mut right_props = BTreeMap::new();
+        right_props.insert("tenant".to_string(), PropValue::String("new".to_string()));
+        right_mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_custom_props(1, 1, "new", right_props, 200)),
+            1,
+        );
+        right_mt.register_secondary_index(&entry);
+        let right_info =
+            write_segment_with_secondary_indexes(&right_seg, 2, &right_mt, None, &indexes).unwrap();
+        let right_reader = Arc::new(
+            SegmentReader::open_with_info(&right_seg, &right_info, None, &indexes).unwrap(),
+        );
+
+        let segments = vec![left_reader, right_reader.clone()];
+        let meta = right_reader.node_meta_at(0).unwrap();
+        let node_metas = vec![CompactNodeMeta {
+            node_id: meta.node_id,
+            new_data_offset: meta.data_offset,
+            data_len: meta.data_len,
+            label_ids: meta.label_ids,
+            updated_at: meta.updated_at,
+            weight: meta.weight,
+            key_len: meta.key_len,
+            dense_vector_offset: 0,
+            dense_vector_len: 0,
+            sparse_vector_offset: 0,
+            sparse_vector_len: 0,
+            src_seg_idx: 1,
+            src_data_offset: meta.data_offset,
+            last_write_seq: meta.last_write_seq,
+        }];
+        let reused =
+            build_node_compound_entries_from_source_sidecars(&segments, &node_metas, &entry)
+                .unwrap();
+        let expected = compound_entries_for_reader(&right_reader, &entry)
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(reused, expected);
+    }
+
+    #[test]
+    fn source_compound_sidecar_reuse_errors_when_sidecar_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = dir.path().join("seg_src");
+        let entry = node_compound_entry_for_storage_test(842, SecondaryIndexKind::Equality);
+        let indexes = vec![entry.clone()];
+
+        let mt = Memtable::new();
+        let mut props = BTreeMap::new();
+        props.insert("tenant".to_string(), PropValue::String("acme".to_string()));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_custom_props(1, 1, "absent", props, 100)),
+            1,
+        );
+        mt.register_secondary_index(&entry);
+        let info = write_segment_with_secondary_indexes(&seg, 1, &mt, None, &indexes).unwrap();
+
+        remove_secondary_index_component_records(&seg, &entry).unwrap();
+        let reader = Arc::new(SegmentReader::open_with_info(&seg, &info, None, &indexes).unwrap());
+
+        let meta = reader.node_meta_at(0).unwrap();
+        let node_metas = vec![CompactNodeMeta {
+            node_id: meta.node_id,
+            new_data_offset: meta.data_offset,
+            data_len: meta.data_len,
+            label_ids: meta.label_ids,
+            updated_at: meta.updated_at,
+            weight: meta.weight,
+            key_len: meta.key_len,
+            dense_vector_offset: 0,
+            dense_vector_len: 0,
+            sparse_vector_offset: 0,
+            sparse_vector_len: 0,
+            src_seg_idx: 0,
+            src_data_offset: meta.data_offset,
+            last_write_seq: meta.last_write_seq,
+        }];
+        let error =
+            build_node_compound_entries_from_source_sidecars(&[reader], &node_metas, &entry)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("compound secondary index unavailable:"),
+            "absent source sidecar must fail reuse with the stable failure prefix, got: {error}"
+        );
+    }
+
+    #[test]
+    fn grouped_compound_rebuild_handles_mixed_declarations_per_label() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_seg = source_dir.path().join("seg_0001");
+        let rebuild_dir = tempfile::tempdir().unwrap();
+        let rebuild_seg = rebuild_dir.path().join("seg_0002");
+
+        // Three declarations on the same label with distinct record needs:
+        // tenant property, score property + node key, and metadata-only.
+        let tenant_entry = node_compound_entry_for_storage_test(850, SecondaryIndexKind::Equality);
+        let score_key_entry = SecondaryIndexManifestEntry {
+            index_id: 851,
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 1,
+                fields: vec![
+                    SecondaryIndexFieldManifest::Property {
+                        key: "score".to_string(),
+                    },
+                    SecondaryIndexFieldManifest::NodeMetadata {
+                        field: NodeMetadataIndexFieldManifest::Key,
+                    },
+                ],
+            },
+            kind: SecondaryIndexKind::Range,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let metadata_only_entry = SecondaryIndexManifestEntry {
+            index_id: 852,
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 1,
+                fields: vec![
+                    SecondaryIndexFieldManifest::NodeMetadata {
+                        field: NodeMetadataIndexFieldManifest::Id,
+                    },
+                    SecondaryIndexFieldManifest::NodeMetadata {
+                        field: NodeMetadataIndexFieldManifest::UpdatedAt,
+                    },
+                ],
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let indexes = vec![
+            tenant_entry.clone(),
+            score_key_entry.clone(),
+            metadata_only_entry.clone(),
+        ];
+
+        let mt = Memtable::new();
+        for (id, tenant, score, updated_at) in [
+            (1, "acme", 10, 100),
+            (2, "acme", 20, 200),
+            (3, "globex", 30, 300),
+        ] {
+            let mut props = BTreeMap::new();
+            props.insert("tenant".to_string(), PropValue::String(tenant.to_string()));
+            props.insert("score".to_string(), PropValue::Int(score));
+            mt.apply_op(
+                &WalOp::UpsertNode(make_node_with_custom_props(
+                    id,
+                    1,
+                    &format!("grouped-{id}"),
+                    props,
+                    updated_at,
+                )),
+                id,
+            );
+        }
+        for entry in &indexes {
+            mt.register_secondary_index(entry);
+        }
+        let source_info =
+            write_segment_with_secondary_indexes(&source_seg, 1, &mt, None, &indexes).unwrap();
+        let source_reader = Arc::new(
+            SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
+        );
+
+        // Drop all source sidecars so compaction must take the grouped
+        // metadata-rebuild path; every rebuilt sidecar must match flush.
+        for entry in &indexes {
+            remove_secondary_index_component_records(&source_seg, entry).unwrap();
+        }
+        let source_without_compound = Arc::new(
+            SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
+        );
+        let rebuilt_reader =
+            compact_copy_segment_for_test(source_without_compound, &rebuild_seg, 2, &indexes);
+        for entry in &indexes {
+            assert_eq!(
+                compound_entries_for_reader(&source_reader, entry),
+                compound_entries_for_reader(&rebuilt_reader, entry),
+                "rebuilt sidecar for index {} must match the flush sidecar",
+                entry.index_id
+            );
+        }
+    }
+
+    #[test]
+    fn compound_component_build_fingerprint_includes_declaration_fingerprint() {
+        let base = SecondaryIndexManifestEntry {
+            index_id: 702,
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 1,
+                fields: vec![
+                    SecondaryIndexFieldManifest::Property {
+                        key: "tenant".to_string(),
+                    },
+                    SecondaryIndexFieldManifest::NodeMetadata {
+                        field: NodeMetadataIndexFieldManifest::UpdatedAt,
+                    },
+                ],
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        };
+        let reordered = SecondaryIndexManifestEntry {
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 1,
+                fields: vec![
+                    SecondaryIndexFieldManifest::NodeMetadata {
+                        field: NodeMetadataIndexFieldManifest::UpdatedAt,
+                    },
+                    SecondaryIndexFieldManifest::Property {
+                        key: "tenant".to_string(),
+                    },
+                ],
+            },
+            ..base.clone()
+        };
+        let source_changed = SecondaryIndexManifestEntry {
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 1,
+                fields: vec![
+                    SecondaryIndexFieldManifest::Property {
+                        key: "tenant".to_string(),
+                    },
+                    SecondaryIndexFieldManifest::Property {
+                        key: "updated_at".to_string(),
+                    },
+                ],
+            },
+            ..base.clone()
+        };
+        let kind = secondary_index_component_kind_for_entry(&base).unwrap();
+        let base_fingerprint =
+            compound_component_fingerprint_for_kind_and_entry(&kind, &base).unwrap();
+
+        assert_ne!(
+            base_fingerprint,
+            compound_component_fingerprint_for_kind_and_entry(&kind, &reordered).unwrap()
+        );
+        assert_ne!(
+            base_fingerprint,
+            compound_component_fingerprint_for_kind_and_entry(&kind, &source_changed).unwrap()
+        );
+    }
+
+    #[test]
     fn test_edge_drop_cleanup_paths_include_generated_sidecars() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
@@ -9024,6 +11198,44 @@ mod tests {
                     index_id: range_entry.index_id,
                 }
         }));
+    }
+
+    #[test]
+    fn test_orphan_cleanup_removes_unreferenced_compound_base_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let eq_entry = node_compound_entry_for_storage_test(851, SecondaryIndexKind::Equality);
+        let range_entry = node_compound_entry_for_storage_test(852, SecondaryIndexKind::Range);
+        let indexes = vec![eq_entry.clone(), range_entry.clone()];
+
+        let mt = Memtable::new();
+        let mut props = BTreeMap::new();
+        props.insert("tenant".to_string(), PropValue::String("acme".to_string()));
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_custom_props(
+                1,
+                1,
+                "compound-orphan",
+                props,
+                100,
+            )),
+            1,
+        );
+        mt.register_secondary_index(&eq_entry);
+        mt.register_secondary_index(&range_entry);
+        write_segment_with_secondary_indexes(&seg_dir, 1, &mt, None, &indexes).unwrap();
+
+        let eq_sidecar_path = node_compound_eq_sidecar_path(&seg_dir, eq_entry.index_id);
+        let range_sidecar_path = node_compound_range_sidecar_path(&seg_dir, range_entry.index_id);
+        assert!(eq_sidecar_path.exists());
+        assert!(range_sidecar_path.exists());
+
+        remove_secondary_index_component_records(&seg_dir, &eq_entry).unwrap();
+        assert!(eq_sidecar_path.exists());
+        cleanup_orphan_optional_component_files(&seg_dir);
+
+        assert!(!eq_sidecar_path.exists());
+        assert!(range_sidecar_path.exists());
     }
 
     #[test]

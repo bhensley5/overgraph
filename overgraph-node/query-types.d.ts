@@ -811,6 +811,7 @@ export type QueryPlanWarning =
   | 'verify_only_filter'
   | 'boolean_branch_fallback'
   | 'planning_probe_budget_exceeded'
+  | 'compound_index_prefix_not_satisfied'
   | 'unknown_node_label'
   | 'unknown_edge_label'
 
@@ -832,11 +833,47 @@ export interface QueryPlanPublicInputs {
   edgeLabels: Array<QueryPlanPublicName>
 }
 
+export type QueryPlanCompoundTargetKind = 'node' | 'edge'
+export type QueryPlanSecondaryIndexKind = 'equality' | 'range'
+export type QueryPlanNodeMetadataIndexField = 'id' | 'key' | 'weight' | 'created_at' | 'updated_at'
+export type QueryPlanEdgeMetadataIndexField =
+  | 'id'
+  | 'from'
+  | 'to'
+  | 'weight'
+  | 'created_at'
+  | 'updated_at'
+  | 'valid_from'
+  | 'valid_to'
+
+export type QueryPlanSecondaryIndexField =
+  | { source: 'property'; key: string; field?: null }
+  | { source: 'metadata'; key?: null; field: QueryPlanNodeMetadataIndexField | QueryPlanEdgeMetadataIndexField }
+
+export interface QueryPlanCompoundIndexDetails {
+  indexId: number
+  targetKind: QueryPlanCompoundTargetKind
+  label: string | null
+  kind: QueryPlanSecondaryIndexKind
+  fields: Array<QueryPlanSecondaryIndexField>
+  compound: boolean
+  matchedPrefixLen: number
+  rangeField: QueryPlanSecondaryIndexField | null
+  inExpansions: number
+  estimatedCandidates: number | null
+  coverage: string
+  residualPredicates: number
+  finalVerification: boolean
+  fallbackReason: string | null
+}
+
 export type QueryPlanNode =
   | { kind: 'explicit_ids' }
   | { kind: 'key_lookup' }
   | { kind: 'node_label_index' }
   | { kind: 'node_label_any_index' }
+  | { kind: 'compound_equality_index'; details: QueryPlanCompoundIndexDetails }
+  | { kind: 'compound_range_index'; details: QueryPlanCompoundIndexDetails }
   | { kind: 'property_equality_index' }
   | { kind: 'property_range_index' }
   | { kind: 'timestamp_index' }
@@ -1078,12 +1115,19 @@ export interface GqlSchemaExplain {
   options: GqlSchemaExplainOptions
 }
 
+export interface GqlIndexExplainField {
+  source: string
+  key: string | null
+  field: string | null
+}
+
 export interface GqlIndexExplainTarget {
   targetKind: string
   label: string | null
-  propKey: string | null
+  fields: Array<GqlIndexExplainField>
   kind: string | null
   action: string | null
+  compound: boolean
 }
 
 export interface GqlIndexExplain {

@@ -21,6 +21,16 @@ function sortedIds(page) {
   return Array.from(page.items).sort((a, b) => a - b);
 }
 
+function propertyIndexSpec(propKey, kind) {
+  return { kind, fields: [{ source: 'property', key: propKey }] };
+}
+
+function hasPropertyField(info, propKey) {
+  return info.fields.length === 1
+    && info.fields[0].source === 'property'
+    && info.fields[0].key === propKey;
+}
+
 async function rejectsOrThrows(fn, pattern) {
   let result;
   try {
@@ -525,10 +535,10 @@ describe('query API parity', () => {
   });
 
   it('serializes boolean explain plans with lower_snake physical nodes and warnings', async () => {
-    db.ensureNodePropertyIndex('Person', 'status', 'equality');
+    db.ensureNodePropertyIndex('Person', propertyIndexSpec('status', 'equality'));
     await waitForIndexState(
       db,
-      infos => infos.find(info => info.label === 'Person' && info.propKey === 'status' && info.kind === 'equality')
+      infos => infos.find(info => info.label === 'Person' && hasPropertyField(info, 'status') && info.kind === 'equality')
     );
 
     const indexedOr = db.explainNodeQuery({

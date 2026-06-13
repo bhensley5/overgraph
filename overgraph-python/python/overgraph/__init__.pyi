@@ -25,6 +25,33 @@ SchemaValueTypeName = Literal[
 ]
 SchemaVectorPresenceName = Literal["optional", "required", "forbidden"]
 SchemaAdditionalPropertiesMode = Literal["allow", "reject"]
+SecondaryIndexKind = Literal["equality", "range"]
+SecondaryIndexState = Literal["building", "ready", "failed"]
+NodeMetadataIndexField = Literal["id", "key", "weight", "created_at", "updated_at"]
+EdgeMetadataIndexField = Literal[
+    "id",
+    "from",
+    "to",
+    "weight",
+    "created_at",
+    "updated_at",
+    "valid_from",
+    "valid_to",
+]
+
+class SecondaryIndexPropertyField(TypedDict):
+    source: Literal["property"]
+    key: str
+
+class SecondaryIndexMetadataField(TypedDict):
+    source: Literal["metadata"]
+    field: NodeMetadataIndexField | EdgeMetadataIndexField
+
+SecondaryIndexField = SecondaryIndexPropertyField | SecondaryIndexMetadataField
+
+class SecondaryIndexSpecLike(TypedDict):
+    fields: list[SecondaryIndexField]
+    kind: SecondaryIndexKind
 
 class SchemaUIntLiteral(TypedDict):
     type: Literal["uint"]
@@ -367,19 +394,21 @@ class VectorHit:
 class NodePropertyIndexInfo:
     index_id: int
     label: str
-    prop_key: str
-    kind: str
-    state: str
+    fields: list[SecondaryIndexField]
+    kind: SecondaryIndexKind
+    state: SecondaryIndexState
     last_error: str | None
+    compound: bool
     def __repr__(self) -> str: ...
 
 class EdgePropertyIndexInfo:
     index_id: int
     label: str
-    prop_key: str
-    kind: str
-    state: str
+    fields: list[SecondaryIndexField]
+    kind: SecondaryIndexKind
+    state: SecondaryIndexState
     last_error: str | None
+    compound: bool
     def __repr__(self) -> str: ...
 
 class NodeSchemaInfo:
@@ -725,6 +754,110 @@ class GraphPipelineResult(TypedDict):
 
 GraphPipelineExplain = dict[str, Any]
 
+QueryPlanKind = Literal["node_query", "edge_query"]
+QueryPlanWarning = Literal[
+    "missing_ready_index",
+    "using_fallback_scan",
+    "full_scan_requires_opt_in",
+    "full_scan_explicitly_allowed",
+    "edge_property_post_filter",
+    "index_skipped_as_broad",
+    "candidate_cap_exceeded",
+    "range_candidate_cap_exceeded",
+    "timestamp_candidate_cap_exceeded",
+    "verify_only_filter",
+    "boolean_branch_fallback",
+    "planning_probe_budget_exceeded",
+    "compound_index_prefix_not_satisfied",
+    "unknown_node_label",
+    "unknown_edge_label",
+]
+QueryPlanNote = Literal[
+    "node_label_any_dedupe_before_pagination",
+    "node_label_any_final_verification",
+    "node_label_all_superset_verification",
+    "stale_node_label_membership_verification",
+]
+
+class QueryPlanCompoundIndexDetails(TypedDict):
+    index_id: int
+    target_kind: Literal["node", "edge"]
+    label: str | None
+    kind: SecondaryIndexKind
+    fields: list[SecondaryIndexField]
+    compound: bool
+    matched_prefix_len: int
+    range_field: SecondaryIndexField | None
+    in_expansions: int
+    estimated_candidates: int | None
+    coverage: str
+    residual_predicates: int
+    final_verification: bool
+    fallback_reason: str | None
+
+class QueryPlanSimpleNode(TypedDict):
+    kind: Literal[
+        "explicit_ids",
+        "key_lookup",
+        "node_label_index",
+        "node_label_any_index",
+        "property_equality_index",
+        "property_range_index",
+        "timestamp_index",
+        "adjacency_expansion",
+        "explicit_edge_ids",
+        "edge_label_index",
+        "edge_triple_index",
+        "edge_endpoint_adjacency",
+        "edge_weight_index",
+        "edge_updated_at_index",
+        "edge_validity_index",
+        "edge_metadata_scan",
+        "edge_property_equality_index",
+        "edge_property_range_index",
+        "fallback_node_label_scan",
+        "fallback_full_node_scan",
+        "fallback_edge_label_scan",
+        "fallback_full_edge_scan",
+        "empty_result",
+    ]
+
+class QueryPlanCompoundEqualityNode(TypedDict):
+    kind: Literal["compound_equality_index"]
+    details: QueryPlanCompoundIndexDetails
+
+class QueryPlanCompoundRangeNode(TypedDict):
+    kind: Literal["compound_range_index"]
+    details: QueryPlanCompoundIndexDetails
+
+class QueryPlanInputsNode(TypedDict):
+    kind: Literal["intersect", "union"]
+    inputs: list["QueryPlanNode"]
+
+class QueryPlanInputNode(TypedDict):
+    kind: Literal["verify_node_filter", "verify_edge_filter", "verify_edge_predicates"]
+    input: "QueryPlanNode"
+
+QueryPlanNode = QueryPlanSimpleNode | QueryPlanCompoundEqualityNode | QueryPlanCompoundRangeNode | QueryPlanInputsNode | QueryPlanInputNode
+
+class QueryPlanPublicName(TypedDict, total=False):
+    alias: str | None
+    name: str
+    known: bool
+    mode: LabelMatchMode | None
+
+class QueryPlanPublicInputs(TypedDict):
+    node_labels: list[QueryPlanPublicName]
+    edge_labels: list[QueryPlanPublicName]
+
+class QueryPlan(TypedDict):
+    kind: QueryPlanKind
+    root: QueryPlanNode
+    estimated_candidates: int | None
+    warnings: list[QueryPlanWarning]
+    notes: list[QueryPlanNote]
+    public_inputs: QueryPlanPublicInputs
+
 class GqlNode(TypedDict, total=False):
     id: int
     labels: list[str]
@@ -803,7 +936,7 @@ class GqlExecutionCapSummary(TypedDict):
 class GqlReadExplain(TypedDict):
     columns: list[str]
     target: str
-    native_plan: dict[str, Any] | None
+    native_plan: QueryPlan | None
     pushed_down: list[str]
     residual: list[str]
     projection: list[str]
@@ -861,12 +994,18 @@ class GqlSchemaExplain(TypedDict):
     side_effect_free: bool
     options: GqlSchemaExplainOptions
 
+class GqlIndexExplainField(TypedDict):
+    source: str
+    key: str | None
+    field: str | None
+
 class GqlIndexExplainTarget(TypedDict):
     target_kind: str
     label: str | None
-    prop_key: str | None
+    fields: list[GqlIndexExplainField]
     kind: str | None
     action: str | None
+    compound: bool
 
 class GqlIndexExplain(TypedDict):
     operation: str
@@ -1040,8 +1179,8 @@ class OverGraph:
     def query_edges(self, request: dict[str, Any] | EdgeQueryRequest) -> EdgePageResult: ...
     def query_graph_rows(self, request: dict[str, Any] | GraphRowRequest) -> GraphRowResult: ...
     def query_graph_pipeline(self, request: GraphPipelineRequest) -> GraphPipelineResult: ...
-    def explain_node_query(self, request: dict[str, Any] | NodeQueryRequest) -> dict[str, Any]: ...
-    def explain_edge_query(self, request: dict[str, Any] | EdgeQueryRequest) -> dict[str, Any]: ...
+    def explain_node_query(self, request: dict[str, Any] | NodeQueryRequest) -> QueryPlan: ...
+    def explain_edge_query(self, request: dict[str, Any] | EdgeQueryRequest) -> QueryPlan: ...
     def explain_graph_rows(self, request: dict[str, Any] | GraphRowRequest) -> GraphRowExplain: ...
     def explain_graph_pipeline(self, request: GraphPipelineRequest) -> GraphPipelineExplain: ...
     def execute_gql(
@@ -1112,11 +1251,11 @@ class OverGraph:
         compact_rows: bool = False,
         include_vectors: bool = False,
     ) -> GqlExecutionExplain: ...
-    def ensure_node_property_index(self, label: str, prop_key: str, kind: str) -> NodePropertyIndexInfo: ...
-    def drop_node_property_index(self, label: str, prop_key: str, kind: str) -> bool: ...
+    def ensure_node_property_index(self, label: str, spec: SecondaryIndexSpecLike) -> NodePropertyIndexInfo: ...
+    def drop_node_property_index(self, label: str, spec: SecondaryIndexSpecLike) -> bool: ...
     def list_node_property_indexes(self) -> list[NodePropertyIndexInfo]: ...
-    def ensure_edge_property_index(self, label: str, prop_key: str, kind: str) -> EdgePropertyIndexInfo: ...
-    def drop_edge_property_index(self, label: str, prop_key: str, kind: str) -> bool: ...
+    def ensure_edge_property_index(self, label: str, spec: SecondaryIndexSpecLike) -> EdgePropertyIndexInfo: ...
+    def drop_edge_property_index(self, label: str, spec: SecondaryIndexSpecLike) -> bool: ...
     def list_edge_property_indexes(self) -> list[EdgePropertyIndexInfo]: ...
     def nodes_by_labels(self, labels: NodeLabels) -> IdArray: ...
     def edges_by_label(self, label: str) -> IdArray: ...
@@ -1503,8 +1642,8 @@ class AsyncOverGraph:
     async def query_edges(self, request: dict[str, Any] | EdgeQueryRequest) -> EdgePageResult: ...
     async def query_graph_rows(self, request: dict[str, Any] | GraphRowRequest) -> GraphRowResult: ...
     async def query_graph_pipeline(self, request: GraphPipelineRequest) -> GraphPipelineResult: ...
-    async def explain_node_query(self, request: dict[str, Any] | NodeQueryRequest) -> dict[str, Any]: ...
-    async def explain_edge_query(self, request: dict[str, Any] | EdgeQueryRequest) -> dict[str, Any]: ...
+    async def explain_node_query(self, request: dict[str, Any] | NodeQueryRequest) -> QueryPlan: ...
+    async def explain_edge_query(self, request: dict[str, Any] | EdgeQueryRequest) -> QueryPlan: ...
     async def explain_graph_rows(self, request: dict[str, Any] | GraphRowRequest) -> GraphRowExplain: ...
     async def explain_graph_pipeline(self, request: GraphPipelineRequest) -> GraphPipelineExplain: ...
     async def execute_gql(
@@ -1575,11 +1714,11 @@ class AsyncOverGraph:
         compact_rows: bool = False,
         include_vectors: bool = False,
     ) -> GqlExecutionExplain: ...
-    async def ensure_node_property_index(self, label: str, prop_key: str, kind: str) -> NodePropertyIndexInfo: ...
-    async def drop_node_property_index(self, label: str, prop_key: str, kind: str) -> bool: ...
+    async def ensure_node_property_index(self, label: str, spec: SecondaryIndexSpecLike) -> NodePropertyIndexInfo: ...
+    async def drop_node_property_index(self, label: str, spec: SecondaryIndexSpecLike) -> bool: ...
     async def list_node_property_indexes(self) -> list[NodePropertyIndexInfo]: ...
-    async def ensure_edge_property_index(self, label: str, prop_key: str, kind: str) -> EdgePropertyIndexInfo: ...
-    async def drop_edge_property_index(self, label: str, prop_key: str, kind: str) -> bool: ...
+    async def ensure_edge_property_index(self, label: str, spec: SecondaryIndexSpecLike) -> EdgePropertyIndexInfo: ...
+    async def drop_edge_property_index(self, label: str, spec: SecondaryIndexSpecLike) -> bool: ...
     async def list_edge_property_indexes(self) -> list[EdgePropertyIndexInfo]: ...
     async def nodes_by_labels(self, labels: NodeLabels) -> IdArray: ...
     async def edges_by_label(self, label: str) -> IdArray: ...

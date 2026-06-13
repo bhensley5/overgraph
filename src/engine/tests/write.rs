@@ -1,5 +1,9 @@
 // Write tests: upsert, batch, delete, adjacency verification.
 
+use crate::secondary_index_key::{
+    CompoundFieldValue, CompoundTupleContext, compound_prefix_bounds, encode_compound_tuple_prefix,
+};
+
     // --- Upsert API tests ---
 
     #[test]
@@ -89,24 +93,16 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         engine
-            .ensure_node_property_index("Person", "score", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         engine
-            .ensure_node_property_index("Employee", "score", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Employee", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         engine
-            .ensure_node_property_index(
-                "Person",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         engine
-            .ensure_node_property_index(
-                "Employee",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("Employee", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
 
         let id = engine
@@ -549,14 +545,10 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         engine
-            .ensure_node_property_index("ImmFreshB", "score", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("ImmFreshB", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         engine
-            .ensure_node_property_index(
-                "ImmFreshB",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("ImmFreshB", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         let id = engine
             .upsert_node(
@@ -1636,41 +1628,35 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let eq = engine
-            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         assert_eq!(eq.state, SecondaryIndexState::Building);
 
         let eq_again = engine
-            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         assert_eq!(eq_again.index_id, eq.index_id);
 
         let range = engine
-            .ensure_node_property_index("Person",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         assert_eq!(range.state, SecondaryIndexState::Building);
 
         let indexes = engine.list_node_property_indexes().unwrap();
         assert_eq!(indexes.len(), 2);
-        assert_eq!(indexes[0].prop_key, "color");
-        assert_eq!(indexes[1].prop_key, "score");
+        assert_eq!(indexes[0].fields, property_index_fields("color"));
+        assert_eq!(indexes[1].fields, property_index_fields("score"));
 
         let range_again = engine
-            .ensure_node_property_index("Person",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         assert_eq!(range_again.index_id, range.index_id);
 
         assert!(engine
-            .drop_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+            .drop_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap());
         assert!(!engine
-            .drop_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+            .drop_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap());
 
         let indexes = engine.list_node_property_indexes().unwrap();
@@ -1687,7 +1673,7 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let created = engine
-            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         engine.shutdown_secondary_index_worker();
 
@@ -1706,7 +1692,7 @@
         engine.rebuild_secondary_index_catalog().unwrap();
 
         let retried = engine
-            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         assert_eq!(retried.index_id, created.index_id);
         assert_eq!(retried.state, SecondaryIndexState::Building);
@@ -1765,13 +1751,10 @@
             .unwrap();
 
         let eq = engine
-            .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         let range = engine
-            .ensure_node_property_index("Person",
-                "age",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("age").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
 
         let status_hash = hash_prop_equality_key(&PropValue::String("active".to_string()));
@@ -1837,7 +1820,7 @@
 
         let before = engine.stats().unwrap().immutable_memtable_bytes;
         let info = engine
-            .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         let after = engine.stats().unwrap().immutable_memtable_bytes;
         let actual_after: usize = (0..engine.immutable_epoch_count())
@@ -1847,7 +1830,7 @@
         assert!(after >= before);
 
         engine
-            .drop_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+            .drop_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         let after_drop = engine.stats().unwrap().immutable_memtable_bytes;
         let actual_after_drop: usize = (0..engine.immutable_epoch_count())
@@ -1871,41 +1854,35 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let eq = engine
-            .ensure_edge_property_index("RELATES_TO", "label", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("label").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         assert_eq!(eq.state, SecondaryIndexState::Building);
 
         let eq_again = engine
-            .ensure_edge_property_index("RELATES_TO", "label", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("label").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         assert_eq!(eq_again.index_id, eq.index_id);
 
         let range = engine
-            .ensure_edge_property_index("RELATES_TO",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         assert_eq!(range.state, SecondaryIndexState::Building);
 
         let indexes = engine.list_edge_property_indexes().unwrap();
         assert_eq!(indexes.len(), 2);
-        assert_eq!(indexes[0].prop_key, "label");
-        assert_eq!(indexes[1].prop_key, "score");
+        assert_eq!(indexes[0].fields, property_index_fields("label"));
+        assert_eq!(indexes[1].fields, property_index_fields("score"));
 
         let range_again = engine
-            .ensure_edge_property_index("RELATES_TO",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         assert_eq!(range_again.index_id, range.index_id);
 
         assert!(engine
-            .drop_edge_property_index("RELATES_TO", "label", SecondaryIndexKind::Equality)
+            .drop_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("label").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap());
         assert!(!engine
-            .drop_edge_property_index("RELATES_TO", "label", SecondaryIndexKind::Equality)
+            .drop_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("label").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap());
 
         let indexes = engine.list_edge_property_indexes().unwrap();
@@ -1922,7 +1899,7 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let created = engine
-            .ensure_edge_property_index("RELATES_TO", "label", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("label").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         engine.shutdown_secondary_index_worker();
 
@@ -1941,7 +1918,7 @@
         engine.rebuild_secondary_index_catalog().unwrap();
 
         let retried = engine
-            .ensure_edge_property_index("RELATES_TO", "label", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("label").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         assert_eq!(retried.index_id, created.index_id);
         assert_eq!(retried.state, SecondaryIndexState::Building);
@@ -1998,13 +1975,10 @@
             .unwrap();
 
         let eq = engine
-            .ensure_edge_property_index("RELATES_TO", "status", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         let range = engine
-            .ensure_edge_property_index("RELATES_TO",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
 
         let status_hash = hash_prop_equality_key(&PropValue::String("active".to_string()));
@@ -2039,6 +2013,534 @@
         engine.close().unwrap();
     }
 
+    fn compound_prefix_for_entry(
+        entry: &SecondaryIndexManifestEntry,
+        values: &[CompoundFieldValue<'_>],
+    ) -> crate::secondary_index_key::CompoundPrefixBounds {
+        let context = CompoundTupleContext::from_manifest_entry(entry).unwrap();
+        let prefix = encode_compound_tuple_prefix(&context, values).unwrap();
+        compound_prefix_bounds(&prefix)
+    }
+
+    fn compound_string_props(key: &str, value: &str) -> BTreeMap<String, PropValue> {
+        let mut props = BTreeMap::new();
+        props.insert(key.to_string(), PropValue::String(value.to_string()));
+        props
+    }
+
+    fn compound_node_input(label: &str, key: &str, tenant: &str) -> NodeInput {
+        NodeInput {
+            labels: vec![label.to_string()],
+            key: key.to_string(),
+            props: compound_string_props("tenant", tenant),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        }
+    }
+
+    fn compound_edge_input(from: u64, to: u64, label: &str, status: &str) -> EdgeInput {
+        EdgeInput {
+            from,
+            to,
+            label: label.to_string(),
+            props: compound_string_props("status", status),
+            weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+        }
+    }
+
+    fn compound_edge_options(status: &str) -> UpsertEdgeOptions {
+        UpsertEdgeOptions {
+            props: compound_string_props("status", status),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_compound_index_ensure_seeds_active_and_immutable_memtables_and_drop_unregisters() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+        let mut frozen_props = BTreeMap::new();
+        frozen_props.insert("tenant".to_string(), PropValue::String("acme".to_string()));
+        let frozen_id = engine
+            .upsert_node(
+                "Person",
+                "frozen",
+                UpsertNodeOptions {
+                    props: frozen_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        engine.freeze_memtable().unwrap();
+
+        let mut active_props = BTreeMap::new();
+        active_props.insert("tenant".to_string(), PropValue::String("acme".to_string()));
+        let active_id = engine
+            .upsert_node(
+                "Person",
+                "active",
+                UpsertNodeOptions {
+                    props: active_props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let info = engine
+            .ensure_node_property_index(
+                "Person",
+                SecondaryIndexSpec {
+                    fields: vec![
+                        SecondaryIndexField::property("tenant"),
+                        SecondaryIndexField::node_meta(NodeMetadataIndexField::UpdatedAt),
+                    ],
+                    kind: SecondaryIndexKind::Equality,
+                },
+            )
+            .unwrap();
+        assert_eq!(info.state, SecondaryIndexState::Building);
+        assert!(info.compound);
+
+        let active_memtable = engine.active_memtable();
+        let active_entry = active_memtable
+            .secondary_index_declarations()
+            .get(&info.index_id)
+            .unwrap()
+            .clone();
+        let tenant = PropValue::String("acme".to_string());
+        let prefix = compound_prefix_for_entry(
+            &active_entry,
+            &[CompoundFieldValue::Property(Some(&tenant))],
+        );
+        assert_eq!(
+            active_memtable.find_node_compound_prefix_at(info.index_id, &prefix, u64::MAX),
+            vec![active_id]
+        );
+
+        let frozen_memtable = engine.immutable_memtable(0);
+        assert_eq!(
+            frozen_memtable.find_node_compound_prefix_at(info.index_id, &prefix, u64::MAX),
+            vec![frozen_id]
+        );
+
+        let left = engine
+            .upsert_node("Person", "left", UpsertNodeOptions::default())
+            .unwrap();
+        let right = engine
+            .upsert_node("Person", "right", UpsertNodeOptions::default())
+            .unwrap();
+        let mut edge_props = BTreeMap::new();
+        edge_props.insert("status".to_string(), PropValue::String("open".to_string()));
+        let edge_id = engine
+            .upsert_edge(
+                left,
+                right,
+                "RELATES_TO",
+                UpsertEdgeOptions {
+                    props: edge_props,
+                    valid_to: Some(500),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let edge_info = engine
+            .ensure_edge_property_index(
+                "RELATES_TO",
+                SecondaryIndexSpec {
+                    fields: vec![
+                        SecondaryIndexField::edge_meta(EdgeMetadataIndexField::From),
+                        SecondaryIndexField::edge_meta(EdgeMetadataIndexField::To),
+                        SecondaryIndexField::property("status"),
+                    ],
+                    kind: SecondaryIndexKind::Equality,
+                },
+            )
+            .unwrap();
+        assert!(edge_info.compound);
+        let active_memtable = engine.active_memtable();
+        let edge_entry = active_memtable
+            .secondary_index_declarations()
+            .get(&edge_info.index_id)
+            .unwrap()
+            .clone();
+        let status = PropValue::String("open".to_string());
+        let edge_prefix = compound_prefix_for_entry(
+            &edge_entry,
+            &[
+                CompoundFieldValue::MetadataU64(left),
+                CompoundFieldValue::MetadataU64(right),
+                CompoundFieldValue::Property(Some(&status)),
+            ],
+        );
+        assert_eq!(
+            active_memtable.find_edge_compound_prefix_at(
+                edge_info.index_id,
+                &edge_prefix,
+                u64::MAX
+            ),
+            vec![edge_id]
+        );
+
+        assert!(engine
+            .drop_node_property_index(
+                "Person",
+                SecondaryIndexSpec {
+                    fields: vec![
+                        SecondaryIndexField::property("tenant"),
+                        SecondaryIndexField::node_meta(NodeMetadataIndexField::UpdatedAt),
+                    ],
+                    kind: SecondaryIndexKind::Equality,
+                },
+            )
+            .unwrap());
+        assert!(!engine
+            .active_memtable()
+            .compound_secondary_state()
+            .contains_key(&info.index_id));
+        assert!(!engine
+            .immutable_memtable(0)
+            .compound_secondary_state()
+            .contains_key(&info.index_id));
+
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn test_compound_index_failed_retry_reseeds_tuple_state_and_clears_error() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+        let mut props = BTreeMap::new();
+        props.insert("tenant".to_string(), PropValue::String("acme".to_string()));
+        let node_id = engine
+            .upsert_node(
+                "Person",
+                "retry",
+                UpsertNodeOptions {
+                    props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let spec = SecondaryIndexSpec {
+            fields: vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::node_meta(NodeMetadataIndexField::Id),
+            ],
+            kind: SecondaryIndexKind::Equality,
+        };
+        let created = engine
+            .ensure_node_property_index("Person", spec.clone())
+            .unwrap();
+        engine
+            .with_core_mut(|core| {
+                core.remove_secondary_index_entry_from_memtables(created.index_id)?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!engine
+            .active_memtable()
+            .compound_secondary_state()
+            .contains_key(&created.index_id));
+
+        engine
+            .with_runtime_manifest_write(|manifest| {
+                let entry = manifest
+                    .secondary_indexes
+                    .iter_mut()
+                    .find(|entry| entry.index_id == created.index_id)
+                    .unwrap();
+                entry.state = SecondaryIndexState::Failed;
+                entry.last_error = Some("compound secondary index unavailable: boom".to_string());
+                Ok(())
+            })
+            .unwrap();
+        engine.rebuild_secondary_index_catalog().unwrap();
+
+        let retried = engine
+            .ensure_node_property_index("Person", spec)
+            .unwrap();
+        assert_eq!(retried.index_id, created.index_id);
+        assert_eq!(retried.state, SecondaryIndexState::Building);
+        assert!(retried.last_error.is_none());
+
+        let active_memtable = engine.active_memtable();
+        let entry = active_memtable
+            .secondary_index_declarations()
+            .get(&retried.index_id)
+            .unwrap()
+            .clone();
+        let tenant = PropValue::String("acme".to_string());
+        let prefix = compound_prefix_for_entry(&entry, &[CompoundFieldValue::Property(Some(&tenant))]);
+        assert_eq!(
+            active_memtable.find_node_compound_prefix_at(retried.index_id, &prefix, u64::MAX),
+            vec![node_id]
+        );
+
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn test_compound_index_node_batch_graph_patch_and_txn_writes_populate_tuple_state() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+        let spec = SecondaryIndexSpec {
+            fields: vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::node_meta(NodeMetadataIndexField::Id),
+            ],
+            kind: SecondaryIndexKind::Equality,
+        };
+        let info = engine
+            .ensure_node_property_index("Person", spec)
+            .unwrap();
+        let tenant = PropValue::String("acme".to_string());
+        let batch_ids = engine
+            .batch_upsert_nodes(vec![
+                compound_node_input("Person", "batch-a", "acme"),
+                compound_node_input("Person", "batch-b", "acme"),
+            ])
+            .unwrap();
+        let patch = GraphPatch {
+            upsert_nodes: vec![compound_node_input("Person", "patch-a", "acme")],
+            ..Default::default()
+        };
+        let patch_result = engine.graph_patch(patch).unwrap();
+        let mut txn = engine.begin_write_txn().unwrap();
+        let mut txn_props = BTreeMap::new();
+        txn_props.insert("tenant".to_string(), tenant.clone());
+        txn.upsert_node(
+            "Person",
+            "txn-a",
+            UpsertNodeOptions {
+                props: txn_props,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let committed = txn.commit().unwrap();
+
+        let active_memtable = engine.active_memtable();
+        let entry = active_memtable
+            .secondary_index_declarations()
+            .get(&info.index_id)
+            .unwrap()
+            .clone();
+        let prefix = compound_prefix_for_entry(&entry, &[CompoundFieldValue::Property(Some(&tenant))]);
+        let mut ids = active_memtable.find_node_compound_prefix_at(info.index_id, &prefix, u64::MAX);
+        ids.sort_unstable();
+        let mut expected = batch_ids;
+        expected.extend(patch_result.node_ids);
+        expected.extend(committed.node_ids);
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+        assert_eq!(
+            active_memtable.count_node_compound_prefix_at(info.index_id, &prefix, u64::MAX),
+            expected.len()
+        );
+
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn test_compound_index_edge_batch_graph_patch_and_txn_writes_populate_tuple_state() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let opts = DbOptions {
+            edge_uniqueness: true,
+            ..Default::default()
+        };
+        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+
+        let endpoints = engine
+            .batch_upsert_nodes(vec![
+                compound_node_input("Endpoint", "a", "acme"),
+                compound_node_input("Endpoint", "b", "acme"),
+                compound_node_input("Endpoint", "c", "acme"),
+                compound_node_input("Endpoint", "d", "acme"),
+                compound_node_input("Endpoint", "e", "acme"),
+                compound_node_input("Endpoint", "f", "acme"),
+                compound_node_input("Endpoint", "g", "acme"),
+                compound_node_input("Endpoint", "h", "acme"),
+            ])
+            .unwrap();
+        let info = engine
+            .ensure_edge_property_index(
+                "RELATES_TO",
+                SecondaryIndexSpec {
+                    fields: vec![
+                        SecondaryIndexField::property("status"),
+                        SecondaryIndexField::edge_meta(EdgeMetadataIndexField::From),
+                        SecondaryIndexField::edge_meta(EdgeMetadataIndexField::To),
+                    ],
+                    kind: SecondaryIndexKind::Equality,
+                },
+            )
+            .unwrap();
+
+        let draft_id = engine
+            .upsert_edge(
+                endpoints[0],
+                endpoints[1],
+                "RELATES_TO",
+                compound_edge_options("draft"),
+            )
+            .unwrap();
+        let batch_ids = engine
+            .batch_upsert_edges(vec![
+                compound_edge_input(endpoints[2], endpoints[3], "RELATES_TO", "open"),
+                compound_edge_input(endpoints[3], endpoints[4], "RELATES_TO", "open"),
+            ])
+            .unwrap();
+        let patch_result = engine
+            .graph_patch(GraphPatch {
+                upsert_edges: vec![compound_edge_input(
+                    endpoints[4],
+                    endpoints[5],
+                    "RELATES_TO",
+                    "open",
+                )],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let mut txn = engine.begin_write_txn().unwrap();
+        txn.upsert_edge(
+            TxnNodeRef::Id(endpoints[0]),
+            TxnNodeRef::Id(endpoints[1]),
+            "RELATES_TO",
+            compound_edge_options("open"),
+        )
+        .unwrap();
+        let txn_left = txn
+            .upsert_node("Endpoint", "txn-left", UpsertNodeOptions::default())
+            .unwrap();
+        let txn_right = txn
+            .upsert_node("Endpoint", "txn-right", UpsertNodeOptions::default())
+            .unwrap();
+        txn.upsert_edge(
+            txn_left,
+            txn_right,
+            "RELATES_TO",
+            compound_edge_options("open"),
+        )
+        .unwrap();
+        let committed = txn.commit().unwrap();
+
+        let active_memtable = engine.active_memtable();
+        let entry = active_memtable
+            .secondary_index_declarations()
+            .get(&info.index_id)
+            .unwrap()
+            .clone();
+        let open = PropValue::String("open".to_string());
+        let open_prefix =
+            compound_prefix_for_entry(&entry, &[CompoundFieldValue::Property(Some(&open))]);
+        let draft = PropValue::String("draft".to_string());
+        let draft_prefix =
+            compound_prefix_for_entry(&entry, &[CompoundFieldValue::Property(Some(&draft))]);
+
+        let mut ids =
+            active_memtable.find_edge_compound_prefix_at(info.index_id, &open_prefix, u64::MAX);
+        ids.sort_unstable();
+        let mut expected = batch_ids;
+        expected.extend(patch_result.edge_ids);
+        expected.push(draft_id);
+        expected.extend(committed.edge_ids);
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(ids, expected);
+        assert_eq!(
+            active_memtable.count_edge_compound_prefix_at(info.index_id, &open_prefix, u64::MAX),
+            expected.len()
+        );
+        assert!(
+            active_memtable
+                .find_edge_compound_prefix_at(info.index_id, &draft_prefix, u64::MAX)
+                .is_empty(),
+            "transaction update must remove the superseded draft tuple"
+        );
+
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn test_single_property_declaration_stays_out_of_compound_memtable_state_and_flush_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+        let mut props = BTreeMap::new();
+        props.insert("tenant".to_string(), PropValue::String("acme".to_string()));
+        let node_id = engine
+            .upsert_node(
+                "Person",
+                "single",
+                UpsertNodeOptions {
+                    props,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let single = engine
+            .ensure_node_property_index(
+                "Person",
+                SecondaryIndexSpec {
+                    fields: vec![SecondaryIndexField::property("tenant")],
+                    kind: SecondaryIndexKind::Equality,
+                },
+            )
+            .unwrap();
+        assert!(!single.compound);
+        assert!(engine
+            .active_memtable()
+            .secondary_eq_state()
+            .get(&single.index_id)
+            .is_some_and(|groups| groups
+                .get(&hash_prop_equality_key(&PropValue::String("acme".to_string())))
+                .is_some_and(|ids| ids.contains(&node_id))));
+        assert!(!engine
+            .active_memtable()
+            .compound_secondary_state()
+            .contains_key(&single.index_id));
+
+        let compound = engine
+            .ensure_node_property_index(
+                "Person",
+                SecondaryIndexSpec {
+                    fields: vec![
+                        SecondaryIndexField::property("tenant"),
+                        SecondaryIndexField::node_meta(NodeMetadataIndexField::Id),
+                    ],
+                    kind: SecondaryIndexKind::Equality,
+                },
+            )
+            .unwrap();
+        engine.flush().unwrap();
+        let seg_dir = segment_dir(&db_path, engine.segments_for_test()[0].segment_id);
+        assert!(!crate::segment_writer::node_compound_eq_sidecar_path(
+            &seg_dir,
+            single.index_id
+        )
+        .exists());
+        assert!(crate::segment_writer::node_compound_eq_sidecar_path(
+            &seg_dir,
+            compound.index_id
+        )
+        .exists());
+        assert!(crate::segment_writer::node_prop_eq_sidecar_path(&seg_dir, single.index_id).exists());
+
+        engine.close().unwrap();
+    }
+
     #[test]
     fn test_edge_property_index_foreground_maintenance() {
         let dir = TempDir::new().unwrap();
@@ -2053,13 +2555,10 @@
         .unwrap();
 
         let eq = engine
-            .ensure_edge_property_index("RELATES_TO", "color", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         let range = engine
-            .ensure_edge_property_index("RELATES_TO",
-                "weight",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("weight").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
 
         let node_a = engine
@@ -2171,10 +2670,10 @@
         .unwrap();
 
         let node_eq = engine
-            .ensure_node_property_index("Person", "score", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         let edge_eq = engine
-            .ensure_edge_property_index("RELATES_TO", "score", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         assert_ne!(node_eq.index_id, edge_eq.index_id);
 
@@ -2237,7 +2736,7 @@
         assert!(!edge_ids.contains(&node_id));
 
         assert!(engine
-            .drop_edge_property_index("RELATES_TO", "score", SecondaryIndexKind::Equality)
+            .drop_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap());
         let node_indexes = engine.list_node_property_indexes().unwrap();
         assert_eq!(node_indexes.len(), 1);
@@ -2252,10 +2751,10 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         let node_idx = engine
-            .ensure_node_property_index("Person", "x", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("x").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         let edge_idx = engine
-            .ensure_edge_property_index("RELATES_TO", "x", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("x").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         assert_eq!(edge_idx.index_id, node_idx.index_id + 1);
 
@@ -2270,13 +2769,10 @@
         let (color_index_id, weight_index_id) = {
             let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
             let color_info = engine
-                .ensure_edge_property_index("RELATES_TO", "color", SecondaryIndexKind::Equality)
+                .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
                 .unwrap();
             let weight_info = engine
-                .ensure_edge_property_index("RELATES_TO",
-                    "weight",
-                    SecondaryIndexKind::Range,
-                )
+                .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("weight").to_string() }], kind: SecondaryIndexKind::Range })
                 .unwrap();
             let index_ids = (color_info.index_id, weight_info.index_id);
             engine.close().unwrap();
@@ -2296,10 +2792,10 @@
         );
         let indexes = engine.list_edge_property_indexes().unwrap();
         assert_eq!(indexes.len(), 2);
-        assert_eq!(color.prop_key, "color");
+        assert_eq!(color.fields, property_index_fields("color"));
         assert!(matches!(color.kind, SecondaryIndexKind::Equality));
         assert_eq!(color.state, SecondaryIndexState::Ready);
-        assert_eq!(weight.prop_key, "weight");
+        assert_eq!(weight.fields, property_index_fields("weight"));
         assert!(matches!(
             weight.kind,
             SecondaryIndexKind::Range
@@ -2337,7 +2833,7 @@
         let segment_info = engine.flush().unwrap().expect("segment should flush");
 
         let info = engine
-            .ensure_edge_property_index("RELATES_TO", "color", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         assert_eq!(info.state, SecondaryIndexState::Building);
 
@@ -2414,13 +2910,10 @@
             .is_empty());
 
         let color = engine
-            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         let score = engine
-            .ensure_node_property_index("Person",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         assert_eq!(color.state, SecondaryIndexState::Building);
         assert_eq!(score.state, SecondaryIndexState::Building);
@@ -2516,13 +3009,10 @@
             .is_empty());
 
         let color = engine
-            .ensure_edge_property_index("RELATES_TO", "color", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         let score = engine
-            .ensure_edge_property_index("RELATES_TO",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         assert_eq!(color.state, SecondaryIndexState::Building);
         assert_eq!(score.state, SecondaryIndexState::Building);
@@ -2589,17 +3079,11 @@
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
         engine
-            .ensure_node_property_index("Person",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
 
         let edge_range = engine
-            .ensure_edge_property_index("RELATES_TO",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         assert_eq!(edge_range.state, SecondaryIndexState::Building);
 
@@ -2618,13 +3102,10 @@
             let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
             let eq = engine
-                .ensure_edge_property_index("RELATES_TO", "color", SecondaryIndexKind::Equality)
+                .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
                 .unwrap();
             let range = engine
-                .ensure_edge_property_index("RELATES_TO",
-                    "weight",
-                    SecondaryIndexKind::Range,
-                )
+                .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("weight").to_string() }], kind: SecondaryIndexKind::Range })
                 .unwrap();
             eq_index_id = eq.index_id;
             range_index_id = range.index_id;

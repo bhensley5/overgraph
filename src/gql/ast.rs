@@ -181,20 +181,55 @@ pub(crate) enum GqlPropertyIndexTarget {
     Node {
         variable: Ident,
         label: GqlIndexName,
-        on_variable: Ident,
-        prop_key: GqlIndexName,
-        property_ref_span: SourceSpan,
+        fields: Vec<GqlPropertyIndexField>,
+        field_list_span: SourceSpan,
         span: SourceSpan,
     },
     Edge {
         variable: Ident,
         label: GqlIndexName,
-        on_variable: Ident,
-        prop_key: GqlIndexName,
-        property_ref_span: SourceSpan,
+        fields: Vec<GqlPropertyIndexField>,
+        field_list_span: SourceSpan,
         span: SourceSpan,
     },
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GqlPropertyIndexField {
+    Property {
+        variable: Ident,
+        key: GqlIndexName,
+        span: SourceSpan,
+    },
+    Metadata {
+        function: GqlPropertyIndexMetadataFunction,
+        function_span: SourceSpan,
+        variable: Ident,
+        span: SourceSpan,
+    },
+    EndpointId {
+        endpoint: GqlPropertyIndexEndpointFunction,
+        function_span: SourceSpan,
+        endpoint_span: SourceSpan,
+        variable: Ident,
+        span: SourceSpan,
+    },
+}
+
+impl GqlPropertyIndexField {
+    pub(crate) fn variable(&self) -> &Ident {
+        match self {
+            Self::Property { variable, .. }
+            | Self::Metadata { variable, .. }
+            | Self::EndpointId { variable, .. } => variable,
+        }
+    }
+}
+
+pub(crate) use super::metadata::{
+    GqlEndpointFunction as GqlPropertyIndexEndpointFunction,
+    GqlMetadataFunction as GqlPropertyIndexMetadataFunction,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GqlIndexName {
@@ -350,6 +385,12 @@ pub(crate) enum SetItem {
     Property {
         alias: Ident,
         property: Ident,
+        value: Expr,
+        span: SourceSpan,
+    },
+    Metadata {
+        function: Ident,
+        alias: Ident,
         value: Expr,
         span: SourceSpan,
     },

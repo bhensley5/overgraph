@@ -6,6 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-06-13
+
+### Breaking Changes
+
+#### Compound Secondary Index APIs
+- **Property-index APIs now accept field-list specs.** The Rust, Node.js, and Python `ensure_*_property_index`, `drop_*_property_index`, and list APIs now use one unified declaration shape for single-field and compound secondary indexes instead of the older `(label, property, kind)` signature.
+- **GQL property-index DDL now distinguishes metadata functions from property fields.** Index field lists use dot access for user properties and function calls for metadata fields, matching the new GQL metadata rule.
+
+#### GQL Metadata Syntax
+- **Function calls are now the only GQL metadata surface.** Metadata reads and writes now use functions such as `elementKey(n)`, `updatedAt(n)`, `weight(r)`, `validFrom(r)`, `validTo(r)`, `id(startNode(r))`, and `id(endNode(r))`.
+- **Dot access is now always a user-property lookup.** Expressions such as `n.updated_at`, `n.key`, `r.valid_from`, and `n.weight` now read ordinary properties with those names instead of engine metadata.
+- **GQL CREATE and MERGE node identity maps now use `elementKey`.** Node creation and keyed merge maps use `{elementKey: ...}` for the node key; `key` is now an ordinary property name.
+- **Path and scalar helper names are camelCase.** Path helpers now use `startNode`, `endNode`, `nodeIds`, and `edgeIds`; scalar conversion helpers now use `toString`, `toInteger`, and `toFloat`.
+
+### Added
+
+#### Compound Secondary Indexes
+- **Manifest-backed compound secondary indexes.** Added ordered node and edge secondary-index declarations over one to eight fields, combining user properties with supported metadata fields such as node key, IDs, weights, timestamps, endpoints, and edge validity windows.
+- **Tuple-capable sidecars.** Added a tuple secondary-index sidecar family for multi-field and metadata-field declarations while preserving the hardened single-property sidecars for one-property declarations.
+- **Compound-aware planning.** Node, edge, graph-row, and GQL planning can use Ready declarations for equality prefixes, bounded `IN` expansion, and equality-prefix-plus-one-range query shapes, with final visible-record verification preserved for correctness.
+- **Compound index DDL and connector parity.** Rust, Node.js, Python, async connector APIs, TypeScript declarations, Python stubs, GQL `CREATE` / `DROP` / `SHOW PROPERTY INDEXES`, explain output, and benchmark scenarios now cover compound declarations.
+
+### Changed
+
+#### Secondary Index Lifecycle
+- **Secondary-index lifecycle is shared across single-field and compound declarations.** Ensures, drops, retry from failed declarations, active and frozen memtable maintenance, flush, compaction, reopen validation, background builds, optional refresh, drop cleanup, and planner stats now use one declaration lifecycle.
+- **Index explain and SHOW output surface ordered fields.** Public diagnostics report declaration fields, prefix eligibility, range eligibility, lifecycle state, and planner warnings for compound declarations without exposing internal token IDs.
+
+#### GQL Metadata Model
+- **Metadata parsing, validation, lowering, and execution now share one resolver.** GQL expression handling and property-index DDL use the same metadata-field mapping, keeping function spelling, target-kind checks, and display output aligned.
+- **Metadata SET targets use function l-values.** `SET weight(n) = ...`, `SET weight(r) = ...`, `SET validFrom(r) = ...`, and `SET validTo(r) = ...` route to the existing metadata mutation paths, including `MERGE ON CREATE SET` and `MERGE ON MATCH SET`.
+- **Pattern maps can filter metadata directly.** MATCH maps route `elementKey`, `weight`, `validFrom`, and `validTo` through native metadata filters where valid, while snake_case keys remain ordinary properties.
+
+### Fixed
+
+- **Compound index correctness hardening.** Compound declarations stay in sync across active writes, frozen memtables, flush, compaction, background build, reopen repair, missing/corrupt sidecar fallback, stale posting verification, label changes, tombstones, and prune visibility.
+- **Metadata syntax hardening.** Fixed endpoint-id validation over projection aliases, kind checks for reused-alias pattern maps, metadata explain spelling, and mutation-return validation for endpoint ID functions.
+- **Connector and docs parity.** Updated Rust, Node.js, Python, benchmark, README, getting-started, API reference, architecture overview, and GQL subset examples for compound indexes and function-style metadata.
+
 ## [0.12.0] - 2026-06-08
 
 ### Added
@@ -37,7 +76,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
-#### GQL Beta Language Expansion
+#### GQL Language Expansion
 - **Composable GQL read pipelines.** Added `WITH` pipelines, scalar aliases, projection-local row operations, and seeded later `MATCH` / `OPTIONAL MATCH` execution over the native graph pipeline substrate.
 - **Richer scalar expressions and functions.** Added arithmetic, string predicates, `CASE`, scalar functions, and shared expression evaluation for GQL reads, mutations, and graph-row-backed execution.
 - **`DISTINCT` and aggregation.** Added `RETURN DISTINCT`, `WITH DISTINCT`, `count`, `sum`, `avg`, `min`, `max`, `collect`, aggregate `DISTINCT`, grouping, aggregate row operations, and compact-row output support.
@@ -50,8 +89,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 #### GQL Execution
 - **GQL lowering now targets a reusable native graph pipeline substrate.** Multi-stage reads, aggregation, unions, subqueries, shortest paths, and keyed merge reuse existing graph-row, graph algorithm, and transaction machinery instead of adding parser-owned execution paths.
-- **Connector GQL coverage now includes the Phase 34 feature set.** Node.js TypeScript declarations, Python stubs, async wrappers, compact rows, cap forwarding, nested graph/path value conversion, and explain fields now cover the expanded GQL Beta subset.
-- **Docs now present GQL Beta as a composable query surface.** README, getting-started, API reference, and GQL subset docs now cover pipelines, aggregation, unions, subqueries, shortest paths, and keyed merge while preserving the native API-first positioning.
+- **Connector GQL coverage now includes the Phase 34 feature set.** Node.js TypeScript declarations, Python stubs, async wrappers, compact rows, cap forwarding, nested graph/path value conversion, and explain fields now cover the expanded GQL subset.
+- **Docs now present GQL as a composable query surface.** README, getting-started, API reference, and GQL subset docs now cover pipelines, aggregation, unions, subqueries, shortest paths, and keyed merge while preserving the native API-first positioning.
 
 ### Fixed
 
@@ -63,7 +102,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
-#### GQL Beta Mutations
+#### GQL Mutations
 - **Executable GQL writes across Rust, Node.js, and Python.** Added keyed `CREATE`, `SET`, `REMOVE`, `DELETE r`, and `DETACH DELETE n` execution to `execute_gql` / `executeGql`, using the same write-transaction machinery and durability path as the structured APIs.
 - **Mutation `RETURN` support.** `CREATE`, `SET`, and `REMOVE` statements can now return object rows or compact rows with aliases, scalar expressions, ordering, `SKIP` / `OFFSET`, `LIMIT`, vector opt-in, and embedded explain/profile output.
 - **Mutation result and explain surfaces.** GQL execution now returns unified mutation result payloads with `mutation_stats`, and `explain_gql` can describe mutation plans without side effects.
@@ -71,7 +110,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ### Changed
 
 #### GQL Execution
-- **Reads and writes now share one public GQL surface.** GQL Beta is no longer limited to read queries; read prefixes, mutation staging, caps, and result shaping now flow through one execution contract across all three language connectors.
+- **Reads and writes now share one public GQL surface.** GQL is no longer limited to read queries; read prefixes, mutation staging, caps, and result shaping now flow through one execution contract across all three language connectors.
 - **Connector docs and getting-started guidance now cover writes.** README, getting-started, API reference, and `docs/gql-subset.md` now document mutation syntax, limits, `ReadOnly` mode, and the supported mutation `RETURN` behavior.
 
 ### Fixed
@@ -83,9 +122,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
-#### GQL Beta
+#### GQL
 - **Read-only GQL/Cypher-style query strings.** Added `execute_gql` and `explain_gql` in Rust, `executeGql` / `executeGqlAsync` and `explainGql` / `explainGqlAsync` in Node.js, and `execute_gql` / `explain_gql` on both Python sync and async APIs.
-- **Graph-row-backed execution.** GQL Beta now lowers into the same shared graph-row executor as native APIs, so required matches, `OPTIONAL MATCH`, bounded variable-length paths, path values, row operations, cursors, caps, explain output, and connector result shapes share one implementation.
+- **Graph-row-backed execution.** GQL now lowers into the same shared graph-row executor as native APIs, so required matches, `OPTIONAL MATCH`, bounded variable-length paths, path values, row operations, cursors, caps, explain output, and connector result shapes share one implementation.
 - **Supported read syntax.** Added GQL support for `MATCH`, `OPTIONAL MATCH`, node and edge labels, relationship directions, finite bounded path quantifiers, `WHERE`, `RETURN`, aliases, scalar expressions, path functions, `ORDER BY`, `SKIP` / `OFFSET`, `LIMIT`, parameters, and explicit full-scan opt-in.
 - **Path result values.** Returning path aliases can now produce node IDs, edge IDs, optional hydrated elements, `length`, `start_node`, `end_node`, `nodes`, `relationships`, `node_ids`, and `edge_ids` values across Rust, Node.js, and Python.
 
@@ -93,13 +132,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 #### Query Execution
 - **Native graph-row substrate is now shared public API machinery.** Structured graph-row queries now cover optional groups, bounded paths, ordering, cursors, compact rows, selected-field projection, vector opt-in, and truthful explain/profile summaries across all connectors.
-- **GQL public naming is unified around execute/explain.** The final advertised GQL Beta surface uses `execute_gql` / `executeGql` and `explain_gql` / `explainGql`, matching the read execution model and leaving mutation-capable naming room for a later beta.
-- **Public docs position GQL as a first-class query option.** README, API reference, and `docs/gql-subset.md` now document when to use native function APIs versus GQL Beta query strings, the supported subset, and intentionally unsupported beta features.
+- **GQL public naming is unified around execute/explain.** The advertised GQL surface uses `execute_gql` / `executeGql` and `explain_gql` / `explainGql`, matching the read execution model and leaving mutation-capable naming room.
+- **Public docs position GQL as a first-class query option.** README, API reference, and `docs/gql-subset.md` now document when to use native function APIs versus GQL query strings, the supported subset, and intentionally unsupported features.
 
 ### Fixed
 
 - **GQL planner and runtime parity.** GQL reads now match native graph-row behavior for optional null extension, path expansion, relaxed self-loop distinctness, temporal and prune visibility, stale index verification, row caps, cursor validation, ordering, projection needs, and vector omission defaults.
-- **Connector parity.** Node.js TypeScript declarations, Python stubs, async wrappers, and tests now expose the same GQL Beta behavior as the Rust core.
+- **Connector parity.** Node.js TypeScript declarations, Python stubs, async wrappers, and tests now expose the same GQL behavior as the Rust core.
 
 ## [0.8.0] - 2026-05-20
 
@@ -429,6 +468,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.13.0]: https://github.com/bhensley5/overgraph/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/bhensley5/overgraph/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/bhensley5/overgraph/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/bhensley5/overgraph/compare/v0.9.0...v0.10.0

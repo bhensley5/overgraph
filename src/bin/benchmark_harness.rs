@@ -8,8 +8,9 @@ use overgraph::{
     GraphSchemaSetOptions, HnswConfig, IsConnectedOptions, LabelMatchMode, NeighborOptions,
     NodeFilterExpr, NodeInput, NodeLabelFilter, NodeQuery, NodeSchema, PageRequest, PprOptions,
     PropValue, PropertyRangeBound, PropertySchema, SchemaAdditionalProperties, SchemaValueType,
-    SecondaryIndexKind, SecondaryIndexState, ShortestPathOptions, TopKOptions, TraverseOptions,
-    UpsertEdgeOptions, UpsertNodeOptions, VectorSearchMode, VectorSearchRequest, WalSyncMode,
+    SecondaryIndexField, SecondaryIndexKind, SecondaryIndexSpec, SecondaryIndexState,
+    ShortestPathOptions, TopKOptions, TraverseOptions, UpsertEdgeOptions, UpsertNodeOptions,
+    VectorSearchMode, VectorSearchRequest, WalSyncMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2051,17 +2052,41 @@ fn build_query_benchmark_engine(
     let engine = open_db(path)?;
     let node_label = query_person_label();
     let status = engine
-        .ensure_node_property_index(&node_label, "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index(
+            &node_label,
+            SecondaryIndexSpec {
+                fields: vec![SecondaryIndexField::Property {
+                    key: ("status").to_string(),
+                }],
+                kind: SecondaryIndexKind::Equality,
+            },
+        )
         .map_err(|e| e.to_string())?;
     wait_for_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready)?;
 
     let tier = engine
-        .ensure_node_property_index(&node_label, "tier", SecondaryIndexKind::Equality)
+        .ensure_node_property_index(
+            &node_label,
+            SecondaryIndexSpec {
+                fields: vec![SecondaryIndexField::Property {
+                    key: ("tier").to_string(),
+                }],
+                kind: SecondaryIndexKind::Equality,
+            },
+        )
         .map_err(|e| e.to_string())?;
     wait_for_property_index_state(&engine, tier.index_id, SecondaryIndexState::Ready)?;
 
     let score = engine
-        .ensure_node_property_index(&node_label, "score", SecondaryIndexKind::Range)
+        .ensure_node_property_index(
+            &node_label,
+            SecondaryIndexSpec {
+                fields: vec![SecondaryIndexField::Property {
+                    key: ("score").to_string(),
+                }],
+                kind: SecondaryIndexKind::Range,
+            },
+        )
         .map_err(|e| e.to_string())?;
     wait_for_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready)?;
 
@@ -2295,14 +2320,26 @@ fn build_indexed_edge_query_benchmark_engine(
         .engine
         .ensure_edge_property_index(
             &query_work_edge_label(),
-            "role",
-            SecondaryIndexKind::Equality,
+            SecondaryIndexSpec {
+                fields: vec![SecondaryIndexField::Property {
+                    key: ("role").to_string(),
+                }],
+                kind: SecondaryIndexKind::Equality,
+            },
         )
         .map_err(|e| e.to_string())?;
     wait_for_edge_property_index_state(&fixture.engine, role.index_id, SecondaryIndexState::Ready)?;
     let score = fixture
         .engine
-        .ensure_edge_property_index(&query_work_edge_label(), "score", SecondaryIndexKind::Range)
+        .ensure_edge_property_index(
+            &query_work_edge_label(),
+            SecondaryIndexSpec {
+                fields: vec![SecondaryIndexField::Property {
+                    key: ("score").to_string(),
+                }],
+                kind: SecondaryIndexKind::Range,
+            },
+        )
         .map_err(|e| e.to_string())?;
     wait_for_edge_property_index_state(
         &fixture.engine,

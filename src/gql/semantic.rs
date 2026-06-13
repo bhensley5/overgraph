@@ -2,6 +2,7 @@
 
 use crate::error::EngineError;
 use crate::gql::ast::*;
+use crate::gql::metadata::{GqlElementMapMetadataKey, GqlEndpointFunction, GqlMetadataFunction};
 use crate::row_projection::{DIRECT_EDGE_ALIAS, DIRECT_NODE_ALIAS};
 use crate::types::{
     validate_label_token_name, GqlParams, GqlSemanticErrorCode, SourceSpan,
@@ -294,6 +295,13 @@ pub(crate) enum GqlBoundSetItem {
         alias: String,
         target_kind: GqlAliasKind,
         property: Ident,
+        value: Expr,
+        span: SourceSpan,
+    },
+    Metadata {
+        alias: String,
+        target_kind: GqlAliasKind,
+        field: GqlMetadataFunction,
         value: Expr,
         span: SourceSpan,
     },
@@ -1326,13 +1334,8 @@ impl SemanticBinder<'_> {
                         .aliases
                         .get(alias)
                         .is_some_and(|binding| binding.kind == GqlAliasKind::Path)
-                        && !is_supported_path_property(&property.name)
                     {
-                        return Err(gql_semantic_error(
-                            GqlSemanticErrorCode::InvalidPropertyAccess,
-                            format!("unsupported path property '{}'", property.name),
-                            property.span.clone(),
-                        ));
+                        return Err(path_property_access_error(&property.name, &property.span));
                     }
                 }
                 Ok(())
@@ -1531,6 +1534,27 @@ impl SemanticBinder<'_> {
                 name.span.clone(),
             ));
         }
+        if let Some((_, endpoint_arg)) = edge_endpoint_id_call(name, args) {
+            // Projection aliases (RETURN ... AS q) are not function targets: validate the
+            // inner variable against pattern aliases only, like the generic path below.
+            self.validate_expr_aggregate_context(
+                endpoint_arg,
+                &BTreeSet::new(),
+                allow_aggregate,
+                inside_aggregate,
+                allow_subquery,
+            )?;
+            let alias = variable_name(endpoint_arg).expect("endpoint call shape checked");
+            let binding = self.aliases.get(alias).expect("alias validated above");
+            if binding.kind != GqlAliasKind::Edge {
+                return Err(gql_semantic_error(
+                    GqlSemanticErrorCode::InvalidReturnExpression,
+                    "startNode()/endNode() inside id() expects an edge alias".to_string(),
+                    endpoint_arg.span.clone(),
+                ));
+            }
+            return Ok(());
+        }
         self.validate_expr_aggregate_context(
             &args[0],
             &BTreeSet::new(),
@@ -1546,17 +1570,54 @@ impl SemanticBinder<'_> {
             ));
         };
         let binding = self.aliases.get(alias).expect("alias validated above");
+        if let Some(metadata) = GqlMetadataFunction::from_lower(&function) {
+            let valid = match binding.kind {
+                GqlAliasKind::Node => metadata.valid_for_node(),
+                GqlAliasKind::Edge => metadata.valid_for_edge(),
+                GqlAliasKind::Path | GqlAliasKind::Scalar => false,
+            };
+            if valid {
+                return Ok(());
+            }
+            let expected = match metadata {
+                GqlMetadataFunction::ElementKey => "a node alias",
+                GqlMetadataFunction::ValidFrom | GqlMetadataFunction::ValidTo => "an edge alias",
+                _ => "a node or edge alias",
+            };
+            return Err(gql_semantic_error(
+                GqlSemanticErrorCode::InvalidReturnExpression,
+                format!("{}() expects {expected}", metadata.canonical_name()),
+                args[0].span.clone(),
+            ));
+        }
+        if let Some(endpoint) = GqlEndpointFunction::from_lower(&function) {
+            return match binding.kind {
+                GqlAliasKind::Path => Ok(()),
+                GqlAliasKind::Edge => Err(gql_semantic_error(
+                    GqlSemanticErrorCode::InvalidReturnExpression,
+                    format!(
+                        "{}() on an edge is only supported inside id(); use id({}({})) or the bound pattern alias",
+                        endpoint.canonical_name(),
+                        endpoint.canonical_name(),
+                        alias
+                    ),
+                    args[0].span.clone(),
+                )),
+                GqlAliasKind::Node | GqlAliasKind::Scalar => Err(gql_semantic_error(
+                    GqlSemanticErrorCode::InvalidReturnExpression,
+                    format!("{}() expects a path alias", endpoint.canonical_name()),
+                    args[0].span.clone(),
+                )),
+            };
+        }
         match (function.as_str(), binding.kind) {
             ("labels", GqlAliasKind::Node)
             | ("type", GqlAliasKind::Edge)
-            | ("id", GqlAliasKind::Node | GqlAliasKind::Edge)
             | ("length", GqlAliasKind::Path)
-            | ("start_node", GqlAliasKind::Path)
-            | ("end_node", GqlAliasKind::Path)
             | ("nodes", GqlAliasKind::Path)
             | ("relationships", GqlAliasKind::Path)
-            | ("node_ids", GqlAliasKind::Path)
-            | ("edge_ids", GqlAliasKind::Path) => Ok(()),
+            | ("nodeids", GqlAliasKind::Path)
+            | ("edgeids", GqlAliasKind::Path) => Ok(()),
             ("labels", GqlAliasKind::Edge | GqlAliasKind::Path | GqlAliasKind::Scalar) => {
                 Err(gql_semantic_error(
                     GqlSemanticErrorCode::InvalidReturnExpression,
@@ -1571,14 +1632,8 @@ impl SemanticBinder<'_> {
                     args[0].span.clone(),
                 ))
             }
-            ("id", GqlAliasKind::Path | GqlAliasKind::Scalar) => Err(gql_semantic_error(
-                GqlSemanticErrorCode::InvalidReturnExpression,
-                "id() expects a node or edge alias".to_string(),
-                args[0].span.clone(),
-            )),
             (
-                "length" | "start_node" | "end_node" | "nodes" | "relationships" | "node_ids"
-                | "edge_ids",
+                "length" | "nodes" | "relationships" | "nodeids" | "edgeids",
                 GqlAliasKind::Node | GqlAliasKind::Edge | GqlAliasKind::Scalar,
             ) => Err(gql_semantic_error(
                 GqlSemanticErrorCode::InvalidReturnExpression,
@@ -2016,22 +2071,25 @@ impl MutationSemanticBinder<'_> {
                 .as_ref()
                 .ok_or_else(|| EngineError::GqlUnsupported {
                     feature: "unkeyed node MERGE".to_string(),
-                    message: "MERGE node patterns require exactly one identity property named key"
-                        .to_string(),
+                    message:
+                        "MERGE node patterns require exactly one identity entry named elementKey"
+                            .to_string(),
                     span: pattern.span.clone(),
                 })?;
         if properties.entries.len() != 1 {
             return Err(EngineError::GqlUnsupported {
                 feature: "node MERGE property-map identity".to_string(),
-                message: "MERGE node identity supports only {key: expr}".to_string(),
+                message: "MERGE node identity supports only {elementKey: expr}".to_string(),
                 span: properties.span.clone(),
             });
         }
         let entry = &properties.entries[0];
-        if entry.key.name != "key" {
+        if GqlElementMapMetadataKey::from_key(&entry.key.name)
+            != Some(GqlElementMapMetadataKey::ElementKey)
+        {
             return Err(EngineError::GqlUnsupported {
                 feature: "node MERGE non-key identity property".to_string(),
-                message: "MERGE node identity property must be named key".to_string(),
+                message: "MERGE node identity entry must be named elementKey".to_string(),
                 span: entry.key.span.clone(),
             });
         }
@@ -2433,7 +2491,16 @@ impl MutationSemanticBinder<'_> {
                 span,
             } => {
                 let binding = self.require_target_alias(alias)?;
-                reject_reserved_set_property(binding.kind, property)?;
+                if !matches!(binding.kind, GqlAliasKind::Node | GqlAliasKind::Edge) {
+                    return Err(gql_semantic_error(
+                        GqlSemanticErrorCode::InvalidPropertyAccess,
+                        format!(
+                            "SET property target '{}' must be a node or edge alias",
+                            alias.name
+                        ),
+                        alias.span.clone(),
+                    ));
+                }
                 self.validate_expr(value, &BTreeSet::new(), allow_created_sources)?;
                 if allow_created_sources {
                     self.reject_commit_dependent_created_source_value(value)?;
@@ -2443,6 +2510,71 @@ impl MutationSemanticBinder<'_> {
                     alias: alias.name.clone(),
                     target_kind: binding.kind,
                     property: property.clone(),
+                    value: value.clone(),
+                    span: span.clone(),
+                })
+            }
+            SetItem::Metadata {
+                function,
+                alias,
+                value,
+                span,
+            } => {
+                let binding = self.require_target_alias(alias)?;
+                let field = GqlMetadataFunction::from_lower(&function.name.to_ascii_lowercase())
+                    .ok_or_else(|| {
+                        gql_semantic_error(
+                            GqlSemanticErrorCode::InvalidPropertyAccess,
+                            format!("unknown metadata function '{}' in SET", function.name),
+                            function.span.clone(),
+                        )
+                    })?;
+                let (valid_for_kind, writable) = match binding.kind {
+                    GqlAliasKind::Node => (field.valid_for_node(), field.writable_for_node()),
+                    GqlAliasKind::Edge => (field.valid_for_edge(), field.writable_for_edge()),
+                    GqlAliasKind::Path | GqlAliasKind::Scalar => {
+                        return Err(gql_semantic_error(
+                            GqlSemanticErrorCode::InvalidPropertyAccess,
+                            format!(
+                                "SET metadata target '{}' must be a node or edge alias",
+                                alias.name
+                            ),
+                            alias.span.clone(),
+                        ));
+                    }
+                };
+                if !valid_for_kind {
+                    return Err(gql_semantic_error(
+                        GqlSemanticErrorCode::InvalidPropertyAccess,
+                        format!(
+                            "{}() is not valid for {} alias '{}'",
+                            field.canonical_name(),
+                            kind_name(binding.kind),
+                            alias.name
+                        ),
+                        function.span.clone(),
+                    ));
+                }
+                if !writable {
+                    return Err(gql_semantic_error(
+                        GqlSemanticErrorCode::InvalidPropertyAccess,
+                        format!(
+                            "SET target '{}({})' is read-only metadata",
+                            field.canonical_name(),
+                            alias.name
+                        ),
+                        function.span.clone(),
+                    ));
+                }
+                self.validate_expr(value, &BTreeSet::new(), allow_created_sources)?;
+                if allow_created_sources {
+                    self.reject_commit_dependent_created_source_value(value)?;
+                }
+                self.reject_statically_element_property_value(value)?;
+                Ok(GqlBoundSetItem::Metadata {
+                    alias: alias.name.clone(),
+                    target_kind: binding.kind,
+                    field,
                     value: value.clone(),
                     span: span.clone(),
                 })
@@ -2510,7 +2642,16 @@ impl MutationSemanticBinder<'_> {
                 span,
             } => {
                 let binding = self.require_target_alias(alias)?;
-                reject_reserved_remove_property(binding.kind, property)?;
+                if !matches!(binding.kind, GqlAliasKind::Node | GqlAliasKind::Edge) {
+                    return Err(gql_semantic_error(
+                        GqlSemanticErrorCode::InvalidPropertyAccess,
+                        format!(
+                            "REMOVE property target '{}' must be a node or edge alias",
+                            alias.name
+                        ),
+                        alias.span.clone(),
+                    ));
+                }
                 Ok(GqlBoundRemoveItem::Property {
                     alias: alias.name.clone(),
                     target_kind: binding.kind,
@@ -2742,32 +2883,34 @@ impl MutationSemanticBinder<'_> {
         let Some(properties) = pattern.properties.as_ref() else {
             return Err(gql_semantic_error(
                 GqlSemanticErrorCode::InvalidReturnExpression,
-                "CREATE node patterns require a property map containing key".to_string(),
+                "CREATE node patterns require a property map containing elementKey".to_string(),
                 pattern.span.clone(),
             ));
         };
-        let mut has_key = false;
+        let mut has_element_key = false;
         for entry in &properties.entries {
-            if entry.key.name == "key" {
-                has_key = true;
-            }
-            if is_reserved_create_node_property(&entry.key.name) {
-                return Err(gql_semantic_error(
-                    GqlSemanticErrorCode::InvalidPropertyAccess,
-                    format!(
-                        "CREATE node property '{}' is reserved metadata and cannot be set here",
-                        entry.key.name
-                    ),
-                    entry.key.span.clone(),
-                ));
+            if let Some(metadata) = GqlElementMapMetadataKey::from_key(&entry.key.name) {
+                if !metadata.valid_for_node() {
+                    return Err(gql_semantic_error(
+                        GqlSemanticErrorCode::InvalidPropertyAccess,
+                        format!(
+                            "element map metadata '{}' is valid only for relationships",
+                            metadata.canonical_name()
+                        ),
+                        entry.key.span.clone(),
+                    ));
+                }
+                if metadata == GqlElementMapMetadataKey::ElementKey {
+                    has_element_key = true;
+                }
             }
             self.validate_expr(&entry.value, &BTreeSet::new(), false)?;
             self.reject_statically_element_property_value(&entry.value)?;
         }
-        if !has_key {
+        if !has_element_key {
             return Err(gql_semantic_error(
                 GqlSemanticErrorCode::InvalidReturnExpression,
-                "CREATE node property map must contain key".to_string(),
+                "CREATE node property map must contain elementKey".to_string(),
                 properties.span.clone(),
             ));
         }
@@ -2776,15 +2919,17 @@ impl MutationSemanticBinder<'_> {
 
     fn validate_create_edge_map(&mut self, properties: &MapLiteral) -> Result<(), EngineError> {
         for entry in &properties.entries {
-            if is_reserved_create_edge_property(&entry.key.name) {
-                return Err(gql_semantic_error(
-                    GqlSemanticErrorCode::InvalidPropertyAccess,
-                    format!(
-                        "CREATE relationship property '{}' is reserved metadata and cannot be set here",
-                        entry.key.name
-                    ),
-                    entry.key.span.clone(),
-                ));
+            if let Some(metadata) = GqlElementMapMetadataKey::from_key(&entry.key.name) {
+                if !metadata.valid_for_edge() {
+                    return Err(gql_semantic_error(
+                        GqlSemanticErrorCode::InvalidPropertyAccess,
+                        format!(
+                            "element map metadata '{}' is valid only for nodes",
+                            metadata.canonical_name()
+                        ),
+                        entry.key.span.clone(),
+                    ));
+                }
             }
             self.validate_expr(&entry.value, &BTreeSet::new(), false)?;
             self.reject_statically_element_property_value(&entry.value)?;
@@ -2866,13 +3011,8 @@ impl MutationSemanticBinder<'_> {
                         .aliases
                         .get(alias)
                         .is_some_and(|binding| binding.kind == GqlAliasKind::Path)
-                        && !is_supported_path_property(&property.name)
                     {
-                        return Err(gql_semantic_error(
-                            GqlSemanticErrorCode::InvalidPropertyAccess,
-                            format!("unsupported path property '{}'", property.name),
-                            property.span.clone(),
-                        ));
+                        return Err(path_property_access_error(&property.name, &property.span));
                     }
                 }
                 Ok(())
@@ -2979,6 +3119,19 @@ impl MutationSemanticBinder<'_> {
                 name.span.clone(),
             ));
         }
+        if let Some((_, endpoint_arg)) = edge_endpoint_id_call(name, args) {
+            self.validate_expr(endpoint_arg, &BTreeSet::new(), allow_created_sources)?;
+            let alias = variable_name(endpoint_arg).expect("endpoint call shape checked");
+            let binding = self.aliases.get(alias).expect("alias validated above");
+            if binding.kind != GqlAliasKind::Edge {
+                return Err(gql_semantic_error(
+                    GqlSemanticErrorCode::InvalidReturnExpression,
+                    "startNode()/endNode() inside id() expects an edge alias".to_string(),
+                    endpoint_arg.span.clone(),
+                ));
+            }
+            return Ok(());
+        }
         self.validate_expr(&args[0], &BTreeSet::new(), allow_created_sources)?;
         let Some(alias) = variable_name(&args[0]) else {
             return Err(gql_semantic_error(
@@ -2988,17 +3141,54 @@ impl MutationSemanticBinder<'_> {
             ));
         };
         let binding = self.aliases.get(alias).expect("alias validated above");
+        if let Some(metadata) = GqlMetadataFunction::from_lower(&function) {
+            let valid = match binding.kind {
+                GqlAliasKind::Node => metadata.valid_for_node(),
+                GqlAliasKind::Edge => metadata.valid_for_edge(),
+                GqlAliasKind::Path | GqlAliasKind::Scalar => false,
+            };
+            if valid {
+                return Ok(());
+            }
+            let expected = match metadata {
+                GqlMetadataFunction::ElementKey => "a node alias",
+                GqlMetadataFunction::ValidFrom | GqlMetadataFunction::ValidTo => "an edge alias",
+                _ => "a node or edge alias",
+            };
+            return Err(gql_semantic_error(
+                GqlSemanticErrorCode::InvalidReturnExpression,
+                format!("{}() expects {expected}", metadata.canonical_name()),
+                args[0].span.clone(),
+            ));
+        }
+        if let Some(endpoint) = GqlEndpointFunction::from_lower(&function) {
+            return match binding.kind {
+                GqlAliasKind::Path => Ok(()),
+                GqlAliasKind::Edge => Err(gql_semantic_error(
+                    GqlSemanticErrorCode::InvalidReturnExpression,
+                    format!(
+                        "{}() on an edge is only supported inside id(); use id({}({})) or the bound pattern alias",
+                        endpoint.canonical_name(),
+                        endpoint.canonical_name(),
+                        alias
+                    ),
+                    args[0].span.clone(),
+                )),
+                GqlAliasKind::Node | GqlAliasKind::Scalar => Err(gql_semantic_error(
+                    GqlSemanticErrorCode::InvalidReturnExpression,
+                    format!("{}() expects a path alias", endpoint.canonical_name()),
+                    args[0].span.clone(),
+                )),
+            };
+        }
         match (function.as_str(), binding.kind) {
             ("labels", GqlAliasKind::Node)
             | ("type", GqlAliasKind::Edge)
-            | ("id", GqlAliasKind::Node | GqlAliasKind::Edge)
             | ("length", GqlAliasKind::Path)
-            | ("start_node", GqlAliasKind::Path)
-            | ("end_node", GqlAliasKind::Path)
             | ("nodes", GqlAliasKind::Path)
             | ("relationships", GqlAliasKind::Path)
-            | ("node_ids", GqlAliasKind::Path)
-            | ("edge_ids", GqlAliasKind::Path) => Ok(()),
+            | ("nodeids", GqlAliasKind::Path)
+            | ("edgeids", GqlAliasKind::Path) => Ok(()),
             ("labels", GqlAliasKind::Edge | GqlAliasKind::Path | GqlAliasKind::Scalar) => {
                 Err(gql_semantic_error(
                     GqlSemanticErrorCode::InvalidReturnExpression,
@@ -3013,14 +3203,8 @@ impl MutationSemanticBinder<'_> {
                     args[0].span.clone(),
                 ))
             }
-            ("id", GqlAliasKind::Path | GqlAliasKind::Scalar) => Err(gql_semantic_error(
-                GqlSemanticErrorCode::InvalidReturnExpression,
-                "id() expects a node or edge alias".to_string(),
-                args[0].span.clone(),
-            )),
             (
-                "length" | "start_node" | "end_node" | "nodes" | "relationships" | "node_ids"
-                | "edge_ids",
+                "length" | "nodes" | "relationships" | "nodeids" | "edgeids",
                 GqlAliasKind::Node | GqlAliasKind::Edge | GqlAliasKind::Scalar,
             ) => Err(gql_semantic_error(
                 GqlSemanticErrorCode::InvalidReturnExpression,
@@ -3057,7 +3241,7 @@ impl MutationSemanticBinder<'_> {
                 let function = name.name.to_ascii_lowercase();
                 if matches!(
                     function.as_str(),
-                    "start_node" | "end_node" | "nodes" | "relationships"
+                    "startnode" | "endnode" | "nodes" | "relationships"
                 ) {
                     return Err(gql_semantic_error(
                         GqlSemanticErrorCode::InvalidReturnExpression,
@@ -3132,8 +3316,20 @@ impl MutationSemanticBinder<'_> {
     fn reject_commit_dependent_created_source_value(&self, expr: &Expr) -> Result<(), EngineError> {
         match &expr.kind {
             ExprKind::FunctionCall { name, args } => {
-                if name.name.eq_ignore_ascii_case("id") {
-                    if let Some(alias) = args.first().and_then(variable_name) {
+                let commit_dependent = matches!(
+                    GqlMetadataFunction::from_lower(&name.name.to_ascii_lowercase()),
+                    Some(
+                        GqlMetadataFunction::Id
+                            | GqlMetadataFunction::CreatedAt
+                            | GqlMetadataFunction::UpdatedAt
+                    )
+                );
+                if commit_dependent {
+                    let target = edge_endpoint_id_call(name, args)
+                        .map(|(_, endpoint_arg)| endpoint_arg)
+                        .or_else(|| args.first())
+                        .and_then(variable_name);
+                    if let Some(alias) = target {
                         if self.aliases.get(alias).is_some_and(|binding| {
                             matches!(
                                 binding.origin,
@@ -3143,8 +3339,8 @@ impl MutationSemanticBinder<'_> {
                             return Err(gql_semantic_error(
                                 GqlSemanticErrorCode::InvalidReturnExpression,
                                 format!(
-                                    "MERGE action expression cannot read commit-assigned id() from alias '{}' before commit",
-                                    alias
+                                    "MERGE action expression cannot read commit-assigned {}() from alias '{}' before commit",
+                                    name.name, alias
                                 ),
                                 name.span.clone(),
                             ));
@@ -3156,27 +3352,7 @@ impl MutationSemanticBinder<'_> {
                 }
                 Ok(())
             }
-            ExprKind::PropertyAccess { object, property } => {
-                if let ExprKind::Variable(alias) = &object.kind {
-                    if let Some(binding) = self.aliases.get(alias) {
-                        if matches!(
-                            binding.origin,
-                            GqlAliasOrigin::Created | GqlAliasOrigin::Merged
-                        ) && is_commit_dependent_created_source_property(
-                            binding.kind,
-                            &property.name,
-                        ) {
-                            return Err(gql_semantic_error(
-                                GqlSemanticErrorCode::InvalidPropertyAccess,
-                                format!(
-                                    "MERGE action expression cannot read commit-assigned metadata '{}.{}' before commit",
-                                    alias, property.name
-                                ),
-                                property.span.clone(),
-                            ));
-                        }
-                    }
-                }
+            ExprKind::PropertyAccess { object, .. } => {
                 self.reject_commit_dependent_created_source_value(object)
             }
             ExprKind::Unary { expr, .. } | ExprKind::IsNull { expr, .. } => {
@@ -3340,27 +3516,21 @@ pub(crate) fn is_reserved_user_alias(name: &str) -> bool {
 }
 
 fn is_graph_function(function: &str) -> bool {
-    matches!(
-        function,
-        "id" | "labels"
-            | "type"
-            | "length"
-            | "start_node"
-            | "end_node"
-            | "nodes"
-            | "relationships"
-            | "node_ids"
-            | "edge_ids"
-    )
+    GqlMetadataFunction::from_lower(function).is_some()
+        || GqlEndpointFunction::from_lower(function).is_some()
+        || matches!(
+            function,
+            "labels" | "type" | "length" | "nodes" | "relationships" | "nodeids" | "edgeids"
+        )
 }
 
 fn is_scalar_function(function: &str) -> bool {
     matches!(
         function,
         "coalesce"
-            | "to_string"
-            | "to_integer"
-            | "to_float"
+            | "tostring"
+            | "tointeger"
+            | "tofloat"
             | "abs"
             | "floor"
             | "ceil"
@@ -3383,7 +3553,7 @@ fn validate_scalar_function_arity(
     let valid = match function {
         "coalesce" => arg_count >= 1,
         "substring" => matches!(arg_count, 2 | 3),
-        "to_string" | "to_integer" | "to_float" | "abs" | "floor" | "ceil" | "round" | "lower"
+        "tostring" | "tointeger" | "tofloat" | "abs" | "floor" | "ceil" | "round" | "lower"
         | "upper" | "trim" | "size" | "head" | "last" => arg_count == 1,
         _ => false,
     };
@@ -3440,8 +3610,39 @@ fn push_user_alias_once(alias: &str, seen: &mut BTreeSet<String>, order: &mut Ve
     }
 }
 
-fn is_supported_path_property(property: &str) -> bool {
-    matches!(property, "node_ids" | "edge_ids" | "length")
+fn path_property_access_error(property: &str, span: &SourceSpan) -> EngineError {
+    gql_semantic_error(
+        GqlSemanticErrorCode::InvalidPropertyAccess,
+        format!(
+            "paths do not have properties; use length(p), nodeIds(p), or edgeIds(p) instead of '.{property}'"
+        ),
+        span.clone(),
+    )
+}
+
+/// Recognizes the `id(startNode(r))` / `id(endNode(r))` shape: an `id` call whose single
+/// argument is an endpoint function over a single bound variable. Returns the endpoint
+/// function and the inner variable expression; the caller checks the alias kind.
+pub(crate) fn edge_endpoint_id_call<'a>(
+    name: &Ident,
+    args: &'a [Expr],
+) -> Option<(GqlEndpointFunction, &'a Expr)> {
+    if !name.name.eq_ignore_ascii_case("id") || args.len() != 1 {
+        return None;
+    }
+    let ExprKind::FunctionCall {
+        name: inner,
+        args: inner_args,
+    } = &args[0].kind
+    else {
+        return None;
+    };
+    let endpoint = GqlEndpointFunction::from_lower(&inner.name.to_ascii_lowercase())?;
+    if inner_args.len() != 1 {
+        return None;
+    }
+    variable_name(&inner_args[0])?;
+    Some((endpoint, &inner_args[0]))
 }
 
 pub(crate) fn variable_name(expr: &Expr) -> Option<&str> {
@@ -3599,103 +3800,6 @@ fn clause_user_aliases(clause: &GqlBoundMatchClause) -> Vec<(String, bool)> {
         }
     }
     aliases
-}
-
-fn is_reserved_create_node_property(property: &str) -> bool {
-    matches!(
-        property,
-        "id" | "labels" | "created_at" | "updated_at" | "dense_vector" | "sparse_vector"
-    )
-}
-
-fn is_reserved_create_edge_property(property: &str) -> bool {
-    matches!(
-        property,
-        "id" | "from" | "to" | "label" | "type" | "created_at" | "updated_at"
-    )
-}
-
-fn reject_reserved_set_property(kind: GqlAliasKind, property: &Ident) -> Result<(), EngineError> {
-    let reserved = match kind {
-        GqlAliasKind::Node => matches!(
-            property.name.as_str(),
-            "id" | "labels"
-                | "key"
-                | "created_at"
-                | "updated_at"
-                | "dense_vector"
-                | "sparse_vector"
-        ),
-        GqlAliasKind::Edge => matches!(
-            property.name.as_str(),
-            "id" | "from" | "to" | "label" | "type" | "created_at" | "updated_at"
-        ),
-        GqlAliasKind::Path | GqlAliasKind::Scalar => true,
-    };
-    if reserved {
-        return Err(gql_semantic_error(
-            GqlSemanticErrorCode::InvalidPropertyAccess,
-            format!(
-                "SET target '{}.{}' is reserved metadata",
-                kind_name(kind),
-                property.name
-            ),
-            property.span.clone(),
-        ));
-    }
-    Ok(())
-}
-
-fn is_commit_dependent_created_source_property(kind: GqlAliasKind, property: &str) -> bool {
-    match kind {
-        GqlAliasKind::Node => matches!(property, "id" | "created_at" | "updated_at"),
-        GqlAliasKind::Edge => {
-            matches!(property, "id" | "from" | "to" | "created_at" | "updated_at")
-        }
-        GqlAliasKind::Path | GqlAliasKind::Scalar => false,
-    }
-}
-
-fn reject_reserved_remove_property(
-    kind: GqlAliasKind,
-    property: &Ident,
-) -> Result<(), EngineError> {
-    let reserved = match kind {
-        GqlAliasKind::Node => matches!(
-            property.name.as_str(),
-            "id" | "labels"
-                | "key"
-                | "created_at"
-                | "updated_at"
-                | "dense_vector"
-                | "sparse_vector"
-        ),
-        GqlAliasKind::Edge => matches!(
-            property.name.as_str(),
-            "id" | "from"
-                | "to"
-                | "label"
-                | "type"
-                | "created_at"
-                | "updated_at"
-                | "weight"
-                | "valid_from"
-                | "valid_to"
-        ),
-        GqlAliasKind::Path | GqlAliasKind::Scalar => true,
-    };
-    if reserved {
-        return Err(gql_semantic_error(
-            GqlSemanticErrorCode::InvalidPropertyAccess,
-            format!(
-                "REMOVE target '{}.{}' is reserved metadata",
-                kind_name(kind),
-                property.name
-            ),
-            property.span.clone(),
-        ));
-    }
-    Ok(())
 }
 
 fn kind_name(kind: GqlAliasKind) -> &'static str {
@@ -4065,7 +4169,7 @@ mod tests {
 
         let err = bind(
             "MATCH (a) WITH a \
-             MATCH p = shortestPath((a)-[:R*1..3]->(:Target {key: 'b'})) RETURN p",
+             MATCH p = shortestPath((a)-[:R*1..3]->(:Target {elementKey: 'b'})) RETURN p",
         )
         .expect_err("inline endpoint lookup should be rejected until specified");
         assert!(matches!(
@@ -4211,9 +4315,9 @@ mod tests {
     #[test]
     fn mutation_rejects_aggregate_expressions() {
         for source in [
-            "CREATE (n:Person {key: 'a'}) RETURN count(*)",
-            "CREATE (n:Person {key: 'a', score: count(*)})",
-            "MATCH (n:Person {key: 'a'}) SET n.score = count(*)",
+            "CREATE (n:Person {elementKey: 'a'}) RETURN count(*)",
+            "CREATE (n:Person {elementKey: 'a', score: count(*)})",
+            "MATCH (n:Person {elementKey: 'a'}) SET n.score = count(*)",
         ] {
             let err = bind_mut(source).expect_err("mutation aggregate should be rejected");
             expect_mut_semantic_code(err, GqlSemanticErrorCode::InvalidReturnExpression);
@@ -4268,7 +4372,7 @@ mod tests {
     #[test]
     fn mutation_binds_read_prefix_nullable_and_created_aliases() {
         let plan = bind_mut(
-            "MATCH (a:Person {key: 'a'}) OPTIONAL MATCH p = (a)-[r:KNOWS*1..1]->(b) CREATE (c:Person {key: 'c'})-[e:LINK]->(a) RETURN a, p, b, c, e",
+            "MATCH (a:Person {elementKey: 'a'}) OPTIONAL MATCH p = (a)-[r:KNOWS*1..1]->(b) CREATE (c:Person {elementKey: 'c'})-[e:LINK]->(a) RETURN a, p, b, c, e",
         )
         .unwrap();
         let a = plan.aliases.get("a").unwrap();
@@ -4292,7 +4396,7 @@ mod tests {
     #[test]
     fn mutation_binds_keyed_node_merge_and_relationship_merge() {
         let node = bind_mut(
-            "MERGE (n:Person {key: 'ada'}) ON CREATE SET n.status = 'new' ON MATCH SET n.status = 'seen' RETURN n",
+            "MERGE (n:Person {elementKey: 'ada'}) ON CREATE SET n.status = 'new' ON MATCH SET n.status = 'seen' RETURN n",
         )
         .unwrap();
         let n = node.aliases.get("n").unwrap();
@@ -4307,22 +4411,34 @@ mod tests {
             &merge.pattern,
             GqlBoundMergePattern::Node(node) if node.alias == "n" && node.label.name == "Person"
         ));
-        bind_mut("MERGE (n:Person {key: 'ada'}) ON MATCH SET n.count = coalesce(n.count, 0) + 1")
-            .unwrap();
+        bind_mut(
+            "MERGE (n:Person {elementKey: 'ada'}) ON MATCH SET n.count = coalesce(n.count, 0) + 1",
+        )
+        .unwrap();
+        // Property dot reads of the merged alias are plain user properties now and are
+        // no longer commit-dependent.
+        bind_mut(
+            "MERGE (n:Person {elementKey: 'ada'}) ON MATCH SET n.source_created = n.created_at",
+        )
+        .unwrap();
         for source in [
-            "MERGE (n:Person {key: 'ada'}) ON CREATE SET n.source_id = id(n)",
-            "MERGE (n:Person {key: 'ada'}) ON MATCH SET n.source_created = n.created_at",
+            "MERGE (n:Person {elementKey: 'ada'}) ON CREATE SET n.source_id = id(n)",
+            "MERGE (n:Person {elementKey: 'ada'}) ON MATCH SET n.source_created = createdAt(n)",
+            "MERGE (n:Person {elementKey: 'ada'}) ON MATCH SET n.touched = updatedAt(n)",
         ] {
             let err = bind_mut(source)
-                .expect_err("MERGE actions should reject commit-dependent local metadata");
-            assert!(matches!(
-                err,
+                .expect_err("MERGE actions should reject commit-dependent metadata functions");
+            match err {
                 EngineError::GqlSemantic {
-                    code: GqlSemanticErrorCode::InvalidReturnExpression
-                        | GqlSemanticErrorCode::InvalidPropertyAccess,
+                    code: GqlSemanticErrorCode::InvalidReturnExpression,
+                    message,
                     ..
-                }
-            ));
+                } => assert!(
+                    message.contains("commit-assigned"),
+                    "source: {source}, message: {message}"
+                ),
+                other => panic!("expected commit-dependent error for {source}, got {other:?}"),
+            }
         }
 
         let relationship = bind_mut(
@@ -4341,17 +4457,21 @@ mod tests {
                 if rel.alias == "r" && rel.from_alias == "a" && rel.to_alias == "b"
                     && rel.rel_type.name == "KNOWS"
         ));
+        // Edge dot access is a plain user property read now.
+        bind_mut(
+            "MATCH (a:Person) MATCH (b:Person) MERGE (a)-[r:KNOWS]->(b) ON MATCH SET r.source_from = r.from",
+        )
+        .unwrap();
         for source in [
             "MATCH (a:Person) MATCH (b:Person) MERGE (a)-[r:KNOWS]->(b) ON CREATE SET r.source_id = id(r)",
-            "MATCH (a:Person) MATCH (b:Person) MERGE (a)-[r:KNOWS]->(b) ON MATCH SET r.source_from = r.from",
+            "MATCH (a:Person) MATCH (b:Person) MERGE (a)-[r:KNOWS]->(b) ON MATCH SET r.source_from = id(startNode(r))",
         ] {
             let err = bind_mut(source)
-                .expect_err("MERGE relationship actions should reject local edge metadata");
+                .expect_err("MERGE relationship actions should reject commit-assigned edge metadata");
             assert!(matches!(
                 err,
                 EngineError::GqlSemantic {
-                    code: GqlSemanticErrorCode::InvalidReturnExpression
-                        | GqlSemanticErrorCode::InvalidPropertyAccess,
+                    code: GqlSemanticErrorCode::InvalidReturnExpression,
                     ..
                 }
             ));
@@ -4359,11 +4479,24 @@ mod tests {
     }
 
     #[test]
+    fn order_by_endpoint_id_over_projection_alias_errors_not_panics() {
+        // Regression: id(startNode(q)) where q is a RETURN projection alias used to
+        // panic on the pattern-alias lookup instead of returning a semantic error.
+        for source in [
+            "MATCH (a)-[r:KNOWS]->(b) RETURN r AS q ORDER BY id(startNode(q))",
+            "MATCH (a)-[r:KNOWS]->(b) RETURN r AS q ORDER BY id(endNode(q))",
+        ] {
+            let err = bind(source).expect_err("projection alias is not a function target");
+            expect_semantic_code(err, GqlSemanticErrorCode::UnknownVariable);
+        }
+    }
+
+    #[test]
     fn mutation_rejects_unsupported_merge_shapes() {
         for (source, expected_feature) in [
-            ("MERGE (n {key: 'a'})", "unlabeled node MERGE"),
+            ("MERGE (n {elementKey: 'a'})", "unlabeled node MERGE"),
             (
-                "MERGE (n:Person:Employee {key: 'a'})",
+                "MERGE (n:Person:Employee {elementKey: 'a'})",
                 "multi-label node MERGE",
             ),
             ("MERGE (n:Person)", "unkeyed node MERGE"),
@@ -4372,7 +4505,11 @@ mod tests {
                 "node MERGE non-key identity property",
             ),
             (
-                "MERGE (n:Person {key: 'a', name: 'Ada'})",
+                "MERGE (n:Person {key: 'a'})",
+                "node MERGE non-key identity property",
+            ),
+            (
+                "MERGE (n:Person {elementKey: 'a', name: 'Ada'})",
                 "node MERGE property-map identity",
             ),
             (
@@ -4398,26 +4535,27 @@ mod tests {
 
     #[test]
     fn mutation_rejects_create_alias_collisions_and_invalid_create_shapes() {
-        let duplicate = bind_mut("CREATE (n:Person {key: 'a'}), (n:Person {key: 'b'})")
+        let duplicate = bind_mut("CREATE (n:Person {elementKey: 'a'}), (n:Person {elementKey: 'b'})")
             .expect_err("duplicate created alias should fail");
         expect_mut_semantic_code(duplicate, GqlSemanticErrorCode::DuplicateAlias);
 
-        let bound_endpoint = bind_mut("MATCH (n:Person {key: 'a'}) CREATE (n:Other {key: 'b'})")
-            .expect_err("bound endpoint with labels should fail");
+        let bound_endpoint =
+            bind_mut("MATCH (n:Person {elementKey: 'a'}) CREATE (n:Other {elementKey: 'b'})")
+                .expect_err("bound endpoint with labels should fail");
         expect_mut_semantic_code(
             bound_endpoint,
             GqlSemanticErrorCode::InvalidReturnExpression,
         );
 
         let bound_endpoint_with_props =
-            bind_mut("MATCH (n:Person {key: 'a'}) CREATE (n {key: 'b'})")
+            bind_mut("MATCH (n:Person {elementKey: 'a'}) CREATE (n {elementKey: 'b'})")
                 .expect_err("bound endpoint with properties should fail");
         expect_mut_semantic_code(
             bound_endpoint_with_props,
             GqlSemanticErrorCode::InvalidReturnExpression,
         );
 
-        let standalone_existing = bind_mut("MATCH (n:Person {key: 'a'}) CREATE (n)")
+        let standalone_existing = bind_mut("MATCH (n:Person {elementKey: 'a'}) CREATE (n)")
             .expect_err("standalone existing CREATE endpoint should fail");
         expect_mut_semantic_code(
             standalone_existing,
@@ -4425,53 +4563,89 @@ mod tests {
         );
 
         let cross_pattern_created =
-            bind_mut("CREATE (a:Person {key: 'a'}), (a)-[:R]->(b:Person {key: 'b'})")
+            bind_mut("CREATE (a:Person {elementKey: 'a'}), (a)-[:R]->(b:Person {elementKey: 'b'})")
                 .expect_err("created alias reuse across CREATE patterns should fail");
         expect_mut_semantic_code(cross_pattern_created, GqlSemanticErrorCode::DuplicateAlias);
 
-        let no_label =
-            bind_mut("CREATE (n {key: 'a'})").expect_err("new node without label should fail");
+        let no_label = bind_mut("CREATE (n {elementKey: 'a'})")
+            .expect_err("new node without label should fail");
         expect_mut_semantic_code(no_label, GqlSemanticErrorCode::InvalidReturnExpression);
 
         let no_key = bind_mut("CREATE (n:Person {name: 'Ada'})")
-            .expect_err("new node without key should fail");
-        expect_mut_semantic_code(no_key, GqlSemanticErrorCode::InvalidReturnExpression);
+            .expect_err("node map without elementKey should fail");
+        match no_key {
+            EngineError::GqlSemantic {
+                code: GqlSemanticErrorCode::InvalidReturnExpression,
+                message,
+                ..
+            } => assert!(
+                message.contains("must contain elementKey"),
+                "message: {message}"
+            ),
+            other => panic!("expected missing elementKey error, got {other:?}"),
+        }
 
-        let path_create = bind_mut("CREATE p = (n:Person {key: 'a'})")
+        let no_map = bind_mut("CREATE (n:Person)")
+            .expect_err("node pattern without a property map should fail");
+        match no_map {
+            EngineError::GqlSemantic {
+                code: GqlSemanticErrorCode::InvalidReturnExpression,
+                message,
+                ..
+            } => assert!(
+                message.contains("require a property map containing elementKey"),
+                "message: {message}"
+            ),
+            other => panic!("expected missing property map error, got {other:?}"),
+        }
+
+        let path_create = bind_mut("CREATE p = (n:Person {elementKey: 'a'})")
             .expect_err("CREATE path assignment should fail");
         assert!(matches!(
             path_create,
             EngineError::GqlUnsupported { feature, .. } if feature == "CREATE path assignment"
         ));
 
-        let reserved_node = bind_mut("CREATE (n:Person {key: 'a', id: 1})")
-            .expect_err("reserved CREATE node metadata should fail");
-        expect_mut_semantic_code(reserved_node, GqlSemanticErrorCode::InvalidPropertyAccess);
+        // Property-name reservations are lifted: formerly reserved names are plain
+        // user properties in CREATE maps.
+        bind_mut("CREATE (n:Person {elementKey: 'a', id: 1, key: 'b', updated_at: 2})").unwrap();
+        bind_mut(
+            "CREATE (a:Person {elementKey: 'a'})-[r:R {from: 1, valid_from: 2}]->(b:Person {elementKey: 'b'})",
+        )
+        .unwrap();
 
-        let reserved_edge =
-            bind_mut("CREATE (a:Person {key: 'a'})-[r:R {from: 1}]->(b:Person {key: 'b'})")
-                .expect_err("reserved CREATE edge metadata should fail");
-        expect_mut_semantic_code(reserved_edge, GqlSemanticErrorCode::InvalidPropertyAccess);
+        // Kind-invalid metadata map keys still error.
+        let edge_meta_on_node = bind_mut("CREATE (n:Person {elementKey: 'a', validFrom: 1})")
+            .expect_err("edge-only metadata key on node map should fail");
+        expect_mut_semantic_code(edge_meta_on_node, GqlSemanticErrorCode::InvalidPropertyAccess);
+
+        let node_meta_on_edge = bind_mut(
+            "CREATE (a:Person {elementKey: 'a'})-[r:R {elementKey: 'x'}]->(b:Person {elementKey: 'b'})",
+        )
+        .expect_err("node-only metadata key on edge map should fail");
+        expect_mut_semantic_code(node_meta_on_edge, GqlSemanticErrorCode::InvalidPropertyAccess);
     }
 
     #[test]
     fn mutation_validates_relationship_create_shape() {
         for source in [
-            "CREATE (a:Person {key: 'a'})-[r]-(b:Person {key: 'b'})",
-            "CREATE (a:Person {key: 'a'})-[r*1..1]->(b:Person {key: 'b'})",
-            "CREATE (a:Person {key: 'a'})-[r:A|B]->(b:Person {key: 'b'})",
-            "CREATE (a:Person {key: 'a'})-[r]->(b:Person {key: 'b'})",
+            "CREATE (a:Person {elementKey: 'a'})-[r]-(b:Person {elementKey: 'b'})",
+            "CREATE (a:Person {elementKey: 'a'})-[r*1..1]->(b:Person {elementKey: 'b'})",
+            "CREATE (a:Person {elementKey: 'a'})-[r:A|B]->(b:Person {elementKey: 'b'})",
+            "CREATE (a:Person {elementKey: 'a'})-[r]->(b:Person {elementKey: 'b'})",
         ] {
             assert!(
                 bind_mut(source).is_err(),
                 "invalid relationship CREATE should fail: {source}"
             );
         }
-        let ok = bind_mut("CREATE (a:Person {key: 'a'})-[r:KNOWS]->(b:Person {key: 'b'})").unwrap();
+        let ok =
+            bind_mut("CREATE (a:Person {elementKey: 'a'})-[r:KNOWS]->(b:Person {elementKey: 'b'})")
+                .unwrap();
         assert_eq!(ok.aliases.get("r").unwrap().kind, GqlAliasKind::Edge);
 
         let duplicate_edge = bind_mut(
-            "CREATE (a:Person {key: 'a'})-[r:R]->(b:Person {key: 'b'})-[r:S]->(c:Person {key: 'c'})",
+            "CREATE (a:Person {elementKey: 'a'})-[r:R]->(b:Person {elementKey: 'b'})-[r:S]->(c:Person {elementKey: 'c'})",
         )
         .expect_err("duplicate relationship CREATE alias should fail");
         expect_mut_semantic_code(duplicate_edge, GqlSemanticErrorCode::DuplicateAlias);
@@ -4479,10 +4653,10 @@ mod tests {
 
     #[test]
     fn mutation_rejects_created_alias_rhs_sources_but_allows_targets_and_return() {
-        let ok = bind_mut("CREATE (n:Person {key: 'a'}) SET n.name = 'Ada' RETURN n").unwrap();
+        let ok = bind_mut("CREATE (n:Person {elementKey: 'a'}) SET n.name = 'Ada' RETURN n").unwrap();
         assert!(ok.aliases.contains_key("n"));
 
-        let rhs = bind_mut("CREATE (n:Person {key: 'a'}) SET n.name = n.key")
+        let rhs = bind_mut("CREATE (n:Person {elementKey: 'a'}) SET n.name = n.key")
             .expect_err("created alias RHS should fail");
         expect_mut_semantic_code(rhs, GqlSemanticErrorCode::InvalidReturnExpression);
 
@@ -4512,13 +4686,14 @@ mod tests {
 
         bind_mut("MATCH (a)-[r:KNOWS]->(b) DELETE r").unwrap();
         bind_mut("MATCH (a)-[r:KNOWS]->(b) DELETE r DELETE r").unwrap();
-        bind_mut("MATCH (n:Person {key: 'a'}) DETACH DELETE n").unwrap();
+        bind_mut("MATCH (n:Person {elementKey: 'a'}) DETACH DELETE n").unwrap();
 
         let set_deleted = bind_mut("MATCH (a)-[r:KNOWS]->(b) DELETE r SET r.weight = 1")
             .expect_err("SET after DELETE of same alias should fail");
         expect_mut_semantic_code(set_deleted, GqlSemanticErrorCode::InvalidReturnExpression);
 
-        let remove_deleted = bind_mut("MATCH (n:Person {key: 'a'}) DETACH DELETE n REMOVE n.name")
+        let remove_deleted =
+            bind_mut("MATCH (n:Person {elementKey: 'a'}) DETACH DELETE n REMOVE n.name")
             .expect_err("REMOVE after DETACH DELETE of same alias should fail");
         expect_mut_semantic_code(
             remove_deleted,
@@ -4526,7 +4701,7 @@ mod tests {
         );
 
         let detach_then_set_incident =
-            bind_mut("MATCH (a)-[r:KNOWS]->(b) DETACH DELETE a SET r.weight = 1")
+            bind_mut("MATCH (a)-[r:KNOWS]->(b) DETACH DELETE a SET weight(r) = 1")
                 .expect_err("SET after DETACH DELETE of incident edge should fail");
         expect_mut_semantic_code(
             detach_then_set_incident,
@@ -4544,7 +4719,7 @@ mod tests {
         bind_mut("MATCH (a)-[r:KNOWS]->(b) DETACH DELETE a DELETE r").unwrap();
 
         let detach_then_create_from_deleted = bind_mut(
-            "MATCH (a)-[r:KNOWS]->(b) DETACH DELETE a CREATE (a)-[:NEXT]->(c:Person {key: 'c'})",
+            "MATCH (a)-[r:KNOWS]->(b) DETACH DELETE a CREATE (a)-[:NEXT]->(c:Person {elementKey: 'c'})",
         )
         .expect_err("CREATE endpoint deleted earlier should fail");
         expect_mut_semantic_code(
@@ -4553,7 +4728,7 @@ mod tests {
         );
 
         let created_incident_deleted = bind_mut(
-            "CREATE (a:Person {key: 'a'})-[r:R]->(b:Person {key: 'b'}) DETACH DELETE a SET r.weight = 1",
+            "CREATE (a:Person {elementKey: 'a'})-[r:R]->(b:Person {elementKey: 'b'}) DETACH DELETE a SET r.weight = 1",
         )
         .expect_err("SET created edge after DETACH DELETE of endpoint should fail");
         expect_mut_semantic_code(
@@ -4561,7 +4736,7 @@ mod tests {
             GqlSemanticErrorCode::InvalidReturnExpression,
         );
 
-        let delete_node = bind_mut("MATCH (n:Person {key: 'a'}) DELETE n")
+        let delete_node = bind_mut("MATCH (n:Person {elementKey: 'a'}) DELETE n")
             .expect_err("DELETE node without DETACH should fail");
         expect_mut_semantic_code(delete_node, GqlSemanticErrorCode::InvalidReturnExpression);
 
@@ -4578,27 +4753,83 @@ mod tests {
     }
 
     #[test]
-    fn mutation_validates_set_remove_reserved_fields_and_optional_targets() {
+    fn mutation_set_remove_lifted_reservations_and_metadata_lvalues() {
+        // Property-name reservations are lifted: every dot SET/REMOVE target is a plain
+        // user property, regardless of name.
         for source in [
-            "MATCH (n:Person {key: 'a'}) SET n.id = 1",
-            "MATCH (n:Person {key: 'a'}) SET n.key = 'b'",
-            "MATCH (n:Person {key: 'a'}) SET n.dense_vector = []",
+            "MATCH (n:Person {elementKey: 'a'}) SET n.id = 1",
+            "MATCH (n:Person {elementKey: 'a'}) SET n.key = 'b'",
+            "MATCH (n:Person {elementKey: 'a'}) SET n.dense_vector = []",
+            "MATCH (n:Person {elementKey: 'a'}) SET n.weight = 1.0",
+            "MATCH (n:Person {elementKey: 'a'}) SET n.updated_at = 5",
             "MATCH (a)-[r:KNOWS]->(b) SET r.from = 1",
             "MATCH (a)-[r:KNOWS]->(b) SET r.type = 'X'",
-            "MATCH (n:Person {key: 'a'}) REMOVE n.id",
+            "MATCH (a)-[r:KNOWS]->(b) SET r.valid_from = 1",
+            "MATCH (n:Person {elementKey: 'a'}) REMOVE n.id",
             "MATCH (a)-[r:KNOWS]->(b) REMOVE r.weight",
             "MATCH (a)-[r:KNOWS]->(b) REMOVE r.valid_from",
         ] {
-            let err = bind_mut(source).expect_err("reserved field should fail");
+            bind_mut(source).unwrap_or_else(|err| {
+                panic!("lifted property reservation should bind: {source}: {err:?}")
+            });
+        }
+
+        // Writable metadata uses function l-values.
+        bind_mut("MATCH (n:Person {elementKey: 'a'}) SET weight(n) = 1.0").unwrap();
+        bind_mut("MATCH (a)-[r:KNOWS]->(b) SET weight(r) = 1.0").unwrap();
+        bind_mut("MATCH (a)-[r:KNOWS]->(b) SET validFrom(r) = 1").unwrap();
+        bind_mut("MATCH (a)-[r:KNOWS]->(b) SET validTo(r) = 2").unwrap();
+
+        // Read-only metadata functions are rejected as SET targets.
+        for source in [
+            "MATCH (n:Person {elementKey: 'a'}) SET id(n) = 1",
+            "MATCH (n:Person {elementKey: 'a'}) SET elementKey(n) = 'b'",
+            "MATCH (n:Person {elementKey: 'a'}) SET createdAt(n) = 1",
+            "MATCH (n:Person {elementKey: 'a'}) SET updatedAt(n) = 1",
+            "MATCH (a)-[r:KNOWS]->(b) SET id(r) = 1",
+            "MATCH (a)-[r:KNOWS]->(b) SET createdAt(r) = 1",
+            "MATCH (a)-[r:KNOWS]->(b) SET updatedAt(r) = 1",
+        ] {
+            match bind_mut(source).expect_err("read-only metadata SET target should fail") {
+                EngineError::GqlSemantic {
+                    code: GqlSemanticErrorCode::InvalidPropertyAccess,
+                    message,
+                    ..
+                } => assert!(
+                    message.contains("read-only metadata"),
+                    "source: {source}, message: {message}"
+                ),
+                other => panic!("expected read-only metadata error for {source}, got {other:?}"),
+            }
+        }
+
+        // Kind-invalid metadata SET targets are rejected.
+        for source in [
+            "MATCH (n:Person {elementKey: 'a'}) SET validFrom(n) = 1",
+            "MATCH (n:Person {elementKey: 'a'}) SET validTo(n) = 1",
+            "MATCH (a)-[r:KNOWS]->(b) SET elementKey(r) = 'x'",
+        ] {
+            let err = bind_mut(source).expect_err("kind-invalid metadata SET target should fail");
             expect_mut_semantic_code(err, GqlSemanticErrorCode::InvalidPropertyAccess);
         }
 
-        bind_mut("MATCH (n:Person {key: 'a'}) SET n.weight = 1.0").unwrap();
-        bind_mut("MATCH (a)-[r:KNOWS]->(b) SET r.weight = 1.0").unwrap();
-        bind_mut("MATCH (a)-[r:KNOWS]->(b) SET r.valid_from = 1").unwrap();
-        bind_mut("MATCH (a)-[r:KNOWS]->(b) SET r.valid_to = 2").unwrap();
+        // Unknown functions as SET targets are rejected.
+        match bind_mut("MATCH (n:Person {elementKey: 'a'}) SET foo(n) = 1")
+            .expect_err("unknown metadata function SET target should fail")
+        {
+            EngineError::GqlSemantic {
+                code: GqlSemanticErrorCode::InvalidPropertyAccess,
+                message,
+                ..
+            } => assert!(
+                message.contains("unknown metadata function"),
+                "message: {message}"
+            ),
+            other => panic!("expected unknown metadata function error, got {other:?}"),
+        }
+
         bind_mut(
-            "MATCH (a:Person {key: 'a'}) OPTIONAL MATCH (a)-[r:KNOWS]->(b) SET b.name = 'optional'",
+            "MATCH (a:Person {elementKey: 'a'}) OPTIONAL MATCH (a)-[r:KNOWS]->(b) SET b.name = 'optional'",
         )
         .unwrap();
     }

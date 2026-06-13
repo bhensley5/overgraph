@@ -191,11 +191,11 @@ export declare class OverGraph {
   explainGraphPipeline(request: import('./query-types').GraphPipelineRequest): import('./query-types').GraphPipelineExplain
   executeGql(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null): import('./query-types').GqlExecutionResult
   explainGql(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null): import('./query-types').GqlExecutionExplain
-  ensureNodePropertyIndex(label: string, propKey: string, kind: string): NodePropertyIndexInfo
-  dropNodePropertyIndex(label: string, propKey: string, kind: string): boolean
+  ensureNodePropertyIndex(label: string, spec: SecondaryIndexSpec): NodePropertyIndexInfo
+  dropNodePropertyIndex(label: string, spec: SecondaryIndexSpec): boolean
   listNodePropertyIndexes(): Array<NodePropertyIndexInfo>
-  ensureEdgePropertyIndex(label: string, propKey: string, kind: string): EdgePropertyIndexInfo
-  dropEdgePropertyIndex(label: string, propKey: string, kind: string): boolean
+  ensureEdgePropertyIndex(label: string, spec: SecondaryIndexSpec): EdgePropertyIndexInfo
+  dropEdgePropertyIndex(label: string, spec: SecondaryIndexSpec): boolean
   listEdgePropertyIndexes(): Array<EdgePropertyIndexInfo>
   /** Return all node IDs containing every supplied node label (unpaged). */
   nodesByLabels(labels: string | string[]): Float64Array
@@ -300,11 +300,11 @@ export declare class OverGraph {
   explainGraphPipelineAsync(request: import('./query-types').GraphPipelineRequest): Promise<import('./query-types').GraphPipelineExplain>
   executeGqlAsync(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null): Promise<import('./query-types').GqlExecutionResult>
   explainGqlAsync(query: string, params?: import('./query-types').GqlParams | null, options?: import('./query-types').GqlExecutionOptions | null): Promise<import('./query-types').GqlExecutionExplain>
-  ensureNodePropertyIndexAsync(label: string, propKey: string, kind: string): Promise<NodePropertyIndexInfo>
-  dropNodePropertyIndexAsync(label: string, propKey: string, kind: string): Promise<boolean>
+  ensureNodePropertyIndexAsync(label: string, spec: SecondaryIndexSpec): Promise<NodePropertyIndexInfo>
+  dropNodePropertyIndexAsync(label: string, spec: SecondaryIndexSpec): Promise<boolean>
   listNodePropertyIndexesAsync(): Promise<Array<NodePropertyIndexInfo>>
-  ensureEdgePropertyIndexAsync(label: string, propKey: string, kind: string): Promise<EdgePropertyIndexInfo>
-  dropEdgePropertyIndexAsync(label: string, propKey: string, kind: string): Promise<boolean>
+  ensureEdgePropertyIndexAsync(label: string, spec: SecondaryIndexSpec): Promise<EdgePropertyIndexInfo>
+  dropEdgePropertyIndexAsync(label: string, spec: SecondaryIndexSpec): Promise<boolean>
   listEdgePropertyIndexesAsync(): Promise<Array<EdgePropertyIndexInfo>>
   findNodesRangeAsync(label: string, propKey: string, lower?: PropertyRangeBound | undefined | null, upper?: PropertyRangeBound | undefined | null): Promise<Float64Array>
   findNodesRangePagedAsync(label: string, propKey: string, lower?: PropertyRangeBound | undefined | null, upper?: PropertyRangeBound | undefined | null, options?: FindNodesRangePagedOptions | undefined | null): Promise<PropertyRangePageResult>
@@ -556,10 +556,11 @@ export interface EdgeLabelInfo {
 export interface EdgePropertyIndexInfo {
   indexId: number
   label: string
-  propKey: string
-  kind: string
-  state: string
-  lastError?: string
+  fields: Array<SecondaryIndexField>
+  kind: SecondaryIndexKind
+  state: 'building' | 'ready' | 'failed'
+  lastError: string | null
+  compound: boolean
 }
 
 export interface ExportOptions {
@@ -712,10 +713,11 @@ export interface NodeLabelInfo {
 export interface NodePropertyIndexInfo {
   indexId: number
   label: string
-  propKey: string
-  kind: string
-  state: string
-  lastError?: string
+  fields: Array<SecondaryIndexField>
+  kind: SecondaryIndexKind
+  state: 'building' | 'ready' | 'failed'
+  lastError: string | null
+  compound: boolean
 }
 
 export interface PatchResult {
@@ -800,6 +802,34 @@ export interface ScrubReport {
   totalComponentsFailed: number
   totalBytesDigested: number
   durationMs: number
+}
+
+export type SecondaryIndexKind = 'equality' | 'range'
+export type NodeMetadataIndexField = 'id' | 'key' | 'weight' | 'created_at' | 'updated_at'
+export type EdgeMetadataIndexField =
+  | 'id'
+  | 'from'
+  | 'to'
+  | 'weight'
+  | 'created_at'
+  | 'updated_at'
+  | 'valid_from'
+  | 'valid_to'
+export interface SecondaryIndexPropertyField {
+  source: 'property'
+  key: string
+}
+export interface SecondaryIndexMetadataField {
+  source: 'metadata'
+  field: NodeMetadataIndexField | EdgeMetadataIndexField
+}
+export type SecondaryIndexField =
+  | SecondaryIndexPropertyField
+  | SecondaryIndexMetadataField
+
+export interface SecondaryIndexSpec {
+  fields: Array<SecondaryIndexField>
+  kind: SecondaryIndexKind
 }
 
 export interface SegmentScrubResult {

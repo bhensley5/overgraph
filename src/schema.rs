@@ -25,16 +25,11 @@ pub(crate) const MAX_SCHEMA_ENUM_LITERAL_BYTES_PER_PROPERTY: usize = 64 * 1024;
 pub(crate) const MAX_SCHEMA_REFERENCED_LABELS_PER_RULE: usize = 64;
 pub(crate) const MAX_SCHEMA_MANIFEST_BYTES_PER_ENTRY: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SchemaAdditionalProperties {
+    #[default]
     Allow,
     Reject,
-}
-
-impl Default for SchemaAdditionalProperties {
-    fn default() -> Self {
-        Self::Allow
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,17 +45,12 @@ pub enum SchemaValueType {
     Map,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SchemaVectorPresence {
+    #[default]
     Optional,
     Required,
     Forbidden,
-}
-
-impl Default for SchemaVectorPresence {
-    fn default() -> Self {
-        Self::Optional
-    }
 }
 
 fn default_true() -> bool {
@@ -3446,7 +3436,7 @@ mod tests {
 
     #[test]
     fn graph_schema_operation_supports_node_and_edge_set_and_drop() {
-        let operations = vec![
+        let operations = [
             GraphSchemaOperation::SetNode {
                 label: "Person".to_string(),
                 schema: NodeSchema::default(),
@@ -4219,15 +4209,17 @@ mod tests {
 
     #[test]
     fn edge_validity_shape_rejects_impossible_ranges() {
-        let mut public_schema = EdgeSchema::default();
-        public_schema.validity = Some(EdgeValiditySchema {
-            require_valid_from_before_valid_to: true,
-            valid_from_min: Some(10),
-            valid_from_max: None,
-            valid_to_min: None,
-            valid_to_max: Some(10),
-            allow_open_ended_valid_to: true,
-        });
+        let mut public_schema = EdgeSchema {
+            validity: Some(EdgeValiditySchema {
+                require_valid_from_before_valid_to: true,
+                valid_from_min: Some(10),
+                valid_from_max: None,
+                valid_to_min: None,
+                valid_to_max: Some(10),
+                allow_open_ended_valid_to: true,
+            }),
+            ..Default::default()
+        };
         assert!(matches!(
             validate_edge_schema_shape(&public_schema),
             Err(EngineError::InvalidOperation(message))
@@ -4430,12 +4422,14 @@ mod tests {
 
     #[test]
     fn string_field_enum_shape_limits_are_validated() {
-        let mut public_schema = NodeSchema::default();
-        public_schema.key = Some(StringFieldSchema {
-            min_bytes: None,
-            max_bytes: None,
-            enum_values: vec!["x".to_string(); MAX_SCHEMA_ENUM_VALUES_PER_PROPERTY + 1],
-        });
+        let public_schema = NodeSchema {
+            key: Some(StringFieldSchema {
+                min_bytes: None,
+                max_bytes: None,
+                enum_values: vec!["x".to_string(); MAX_SCHEMA_ENUM_VALUES_PER_PROPERTY + 1],
+            }),
+            ..Default::default()
+        };
         assert!(matches!(
             validate_node_schema_shape(&public_schema),
             Err(EngineError::InvalidOperation(message))

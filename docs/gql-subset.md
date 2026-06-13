@@ -1,9 +1,9 @@
-# GQL Beta
+# GQL
 
-OverGraph ships **GQL Beta**, a GQL/Cypher-style query surface for graph reads and writes. Use it
+OverGraph ships **GQL**, a GQL/Cypher-style query surface for graph reads and writes. Use it
 when a query or mutation reads better as text than as a request object.
 
-The authoritative public reference is the [GQL Beta section in the API docs](api-reference.md#gql-beta).
+The authoritative public reference is the [GQL section in the API docs](api-reference.md#gql).
 This page is the compact syntax companion.
 
 Connector calls:
@@ -82,20 +82,84 @@ Pattern shapes:
 Shortest path uses pre-bound endpoint aliases:
 
 ```gql
-MATCH (a:Person {key: $from})
+MATCH (a:Person {elementKey: $from})
 WITH a
-MATCH (b:Person {key: $to})
+MATCH (b:Person {elementKey: $to})
 WITH a, b
 MATCH p = shortestPath((a)-[:KNOWS*1..4]->(b))
-RETURN p, node_ids(p) AS node_ids, edge_ids(p) AS edge_ids, length(p) AS hops
+RETURN p, nodeIds(p) AS node_ids, edgeIds(p) AS edge_ids, length(p) AS hops
 ```
 
-Expressions include variables, `id(n)`, `id(r)`, `labels(n)`, `type(r)`, path functions, path
-fields, property access, literals, params, boolean predicates, comparisons, null checks, `IN`,
-arithmetic, string predicates, `CASE`, and `RETURN *`.
+Expressions include variables, metadata functions, path functions, property access, literals,
+params, boolean predicates, comparisons, null checks, `IN`, arithmetic, string predicates, `CASE`,
+and `RETURN *`.
 
-Scalar functions include `coalesce`, `to_string`, `to_integer`, `to_float`, `abs`, `floor`, `ceil`,
+Scalar functions include `coalesce`, `toString`, `toInteger`, `toFloat`, `abs`, `floor`, `ceil`,
 `round`, `lower`, `upper`, `trim`, `substring`, `size`, `head`, and `last`.
+
+## Properties And Metadata
+
+GQL has one rule for telling user data apart from engine bookkeeping:
+
+> **A function call is engine metadata. A dot access or map key is a user property.**
+
+Metadata read functions (usable in `WHERE`, `RETURN`, `ORDER BY`, `WITH`, aggregates, and `CASE`):
+
+| Function | Target | Reads |
+|---|---|---|
+| `id(n)`, `id(r)` | node, edge | element ID |
+| `labels(n)` | node | label list |
+| `type(r)` | edge | edge label |
+| `elementKey(n)` | node | node key |
+| `weight(n)`, `weight(r)` | node, edge | weight |
+| `createdAt(n)`, `createdAt(r)` | node, edge | created timestamp |
+| `updatedAt(n)`, `updatedAt(r)` | node, edge | updated timestamp |
+| `validFrom(r)`, `validTo(r)` | edge | validity bounds |
+| `id(startNode(r))`, `id(endNode(r))` | edge | endpoint node IDs |
+
+Function names match case-insensitively; the canonical spelling is camelCase. On an edge alias,
+`startNode(r)` / `endNode(r)` are valid only as the direct argument of `id(...)`.
+
+Path functions: `length(p)`, `nodes(p)`, `relationships(p)`, `nodeIds(p)`, `edgeIds(p)`,
+`startNode(p)`, `endNode(p)`. Paths have no dot fields.
+
+Dot access is always a plain user-property lookup, and NO property name is reserved. `n.weight`,
+`n.key`, `n.updated_at`, and `r.valid_from` read ordinary properties with those names (null when
+absent) and never touch metadata; `updatedAt(n)` reads the engine timestamp. `SET`, `REMOVE`, and
+`SET += ` maps follow the same rule: `SET n.updated_at = 5` writes a user property named
+`updated_at`.
+
+Writable metadata uses function l-values in `SET` (including `ON CREATE SET` / `ON MATCH SET`):
+
+```gql
+SET weight(n) = 2.5
+SET weight(r) = 0.5
+SET validFrom(r) = 10
+SET validTo(r) = 20
+```
+
+All other metadata functions are read-only `SET` targets, and `REMOVE` never accepts metadata
+functions.
+
+Element maps in `CREATE`, `MERGE`, and `MATCH` patterns describe the element itself, so they carry
+metadata under the exact camelCase function names:
+
+- Node maps: `elementKey` (required in `CREATE` node maps; the `MERGE` node identity entry),
+  optional `weight`.
+- Edge maps: optional `weight`, `validFrom`, `validTo` (with `validFrom < validTo`).
+- `MATCH` pattern maps filter on the same vocabulary: `MATCH (n:Person {elementKey: 'ada'})`
+  matches the node key.
+- Every other map key is a user property, with no name restrictions.
+- `SET x += {...}` maps are pure user properties; no map key is treated as metadata there.
+
+One wart follows from the element-map rule: a user property literally named `weight`,
+`elementKey`, `validFrom`, or `validTo` cannot be set through a `CREATE`/`MERGE` element map,
+because those map keys mean metadata there. Set it with `SET` after creation:
+
+```gql
+CREATE (n:Part {elementKey: 'p1'})
+SET n.weight = 'heavy'
+```
 
 Aggregation example:
 
@@ -130,9 +194,9 @@ OPTIONAL MATCH <pattern> [WHERE <predicate>]
 WITH [DISTINCT] <items> [WHERE <predicate>] [ORDER BY ...] [SKIP ...] [LIMIT ...]
 CALL { <read clauses ending in RETURN> }
 CREATE <pattern> [, <pattern>...]
-MERGE (n:Label {key: expr}) [ON CREATE SET ...] [ON MATCH SET ...]
+MERGE (n:Label {elementKey: expr}) [ON CREATE SET ...] [ON MATCH SET ...]
 MERGE (a)-[r:TYPE]->(b) [ON CREATE SET ...] [ON MATCH SET ...]
-SET <assignment>
+SET <alias>.<property> = <expr> | <alias> += <map> | <alias>:<Label> | <metadata-function>(<alias>) = <expr>
 REMOVE <target>
 DELETE <edge-alias>
 DETACH DELETE <node-alias>
@@ -147,24 +211,28 @@ Read prefixes go before the first write clause. Create-only statements do not ne
 
 Mutation forms:
 
-- `CREATE (n:Person {key: 'ada', name: 'Ada'})`
-- `CREATE (a:Person {key: 'a'})-[r:KNOWS {since: 2026}]->(b:Person {key: 'b'})`
-- `MERGE (n:Person {key: $key}) ON CREATE SET n.created = true ON MATCH SET n.seen = true`
-- `MATCH (a:Person {key: $a}) MATCH (b:Person {key: $b}) MERGE (a)-[r:KNOWS]->(b)`
-- `MATCH (n:Person) WHERE n.key = 'ada' SET n.status = 'active'`
-- `MATCH (n:Person) WHERE n.key = 'ada' SET n += $props`
-- `MATCH (n:Person) WHERE n.key = 'ada' SET n:Engineer`
-- `MATCH (n:Person) WHERE n.key = 'ada' REMOVE n.status`
-- `MATCH (n:Person) WHERE n.key = 'ada' REMOVE n:Engineer`
+- `CREATE (n:Person {elementKey: 'ada', name: 'Ada'})`
+- `CREATE (a:Person {elementKey: 'a'})-[r:KNOWS {since: 2026}]->(b:Person {elementKey: 'b'})`
+- `MERGE (n:Person {elementKey: $key}) ON CREATE SET n.created = true ON MATCH SET n.seen = true`
+- `MATCH (a:Person {elementKey: $a}) MATCH (b:Person {elementKey: $b}) MERGE (a)-[r:KNOWS]->(b)`
+- `MATCH (n:Person) WHERE elementKey(n) = 'ada' SET n.status = 'active'`
+- `MATCH (n:Person {elementKey: 'ada'})-[r:KNOWS]->(b) SET weight(r) = 0.5`
+- `MATCH (n:Person) WHERE elementKey(n) = 'ada' SET n += $props`
+- `MATCH (n:Person) WHERE elementKey(n) = 'ada' SET n:Engineer`
+- `MATCH (n:Person) WHERE elementKey(n) = 'ada' REMOVE n.status`
+- `MATCH (n:Person) WHERE elementKey(n) = 'ada' REMOVE n:Engineer`
 - `MATCH (a)-[r:KNOWS]->(b) DELETE r`
-- `MATCH (n:Person) WHERE n.key = 'ada' DETACH DELETE n`
+- `MATCH (n:Person) WHERE elementKey(n) = 'ada' DETACH DELETE n`
+
+`SET` metadata l-values are limited to `weight(n)`, `weight(r)`, `validFrom(r)`, and `validTo(r)`;
+every other metadata function is read-only, and `REMOVE` does not accept metadata functions.
 
 Mutation return example:
 
 ```gql
-MATCH (n:Person) WHERE n.key = 'ada'
+MATCH (n:Person) WHERE elementKey(n) = 'ada'
 SET n.status = 'active'
-RETURN DISTINCT n.key AS key, n.status AS status
+RETURN DISTINCT elementKey(n) AS key, n.status AS status
 ORDER BY key
 LIMIT 1
 ```
@@ -174,15 +242,15 @@ MERGE example:
 ```gql
 MATCH (s:Source)
 WITH s.target_key AS key
-MERGE (a:Account {key: key})
+MERGE (a:Account {elementKey: key})
 ON CREATE SET a.status = 'created', a.count = 1
 ON MATCH SET a.status = 'matched', a.count = coalesce(a.count, 0) + 1
-RETURN DISTINCT a.key AS key, a.status AS status, a.count AS count
+RETURN DISTINCT elementKey(a) AS key, a.status AS status, a.count AS count
 ```
 
 ## Schema DDL Syntax
 
-GQL Beta manages OverGraph's current graph type, which is the active node/edge schema catalog.
+GQL manages OverGraph's current graph type, which is the active node/edge schema catalog.
 These statements call the same Rust core schema-management APIs as the Rust, Node.js, and Python
 bulk graph-schema methods.
 
@@ -360,7 +428,7 @@ Returning a path alias yields a path value:
 | Hydrated nodes | `nodes` | `nodes` | `nodes` |
 | Hydrated edges | `edges` | `edges` | `edges` |
 
-`length(p)` returns hop count. `node_ids(p)` and `edge_ids(p)` return ID lists. Returning `p`
+`length(p)` returns hop count. `nodeIds(p)` and `edgeIds(p)` return ID lists. Returning `p`
 directly returns the path value shape above.
 
 ## Cursors
@@ -409,9 +477,9 @@ Node.js:
 
 ```js
 db.executeGql(
-  `CREATE (p:Person {key: $personKey, name: $personName, status: 'active'})
+  `CREATE (p:Person {elementKey: $personKey, name: $personName, status: 'active'})
           -[r:WORKS_AT {role: $role, since: $since}]->
-          (c:Company {key: $companyKey, name: $companyName})
+          (c:Company {elementKey: $companyKey, name: $companyName})
    RETURN p.name AS person, c.name AS company, r.role AS role`,
   {
     personKey: 'ada',
@@ -438,10 +506,10 @@ Python:
 ```python
 created = db.execute_gql(
     """
-    MERGE (p:Person {key: $key})
+    MERGE (p:Person {elementKey: $key})
     ON CREATE SET p.name = $name, p.status = 'active'
     ON MATCH SET p.seen = true
-    RETURN p.key AS key, p.name AS name
+    RETURN elementKey(p) AS key, p.name AS name
     """,
     {"key": "ada", "name": "Ada"},
 )
@@ -462,12 +530,12 @@ Rust:
 
 ```rust
 let result = engine.execute_gql(
-    "MATCH (a:Person {key: 'ada'}) \
+    "MATCH (a:Person {elementKey: 'ada'}) \
      WITH a \
-     MATCH (b:Person {key: 'ben'}) \
+     MATCH (b:Person {elementKey: 'ben'}) \
      WITH a, b \
      MATCH p = shortestPath((a)-[:KNOWS*1..4]->(b)) \
-     RETURN p, node_ids(p) AS ids, length(p) AS hops",
+     RETURN p, nodeIds(p) AS ids, length(p) AS hops",
     &GqlParams::new(),
     &GqlExecutionOptions::default(),
 )?;

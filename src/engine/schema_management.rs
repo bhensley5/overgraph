@@ -609,7 +609,7 @@ fn validate_existing_edges_for_schema(
             endpoint_ids.dedup();
             let endpoint_states = view.sources().find_node_visibility_meta(&endpoint_ids)?;
             let mut labels_by_id: NodeIdMap<NodeLabelSet> = NodeIdMap::default();
-            for (node_id, state) in endpoint_ids.into_iter().zip(endpoint_states.into_iter()) {
+            for (node_id, state) in endpoint_ids.into_iter().zip(endpoint_states) {
                 if let NodeVisibilityState::Live(meta) = state {
                     labels_by_id.insert(node_id, meta.label_ids);
                 }

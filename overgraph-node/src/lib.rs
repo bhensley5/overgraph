@@ -4,7 +4,9 @@ use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 use napi::JsString;
 use napi_derive::napi;
-use overgraph::types::{GqlPath, GraphAggregateFunction};
+use overgraph::types::{
+    CompoundIndexPlanDetails, GqlPath, GraphAggregateFunction, QueryPlanCompoundTargetKind,
+};
 use overgraph::{
     gql_referenced_param_names, AdjacencyExport as CoreAdjacencyExport,
     AllShortestPathsOptions as CoreAllShortestPathsOptions, CompactionPhase,
@@ -13,6 +15,7 @@ use overgraph::{
     DenseMetric, DenseVectorConfig as CoreDenseVectorConfig,
     DenseVectorSchema as CoreDenseVectorSchema, Direction, EdgeFilterExpr,
     EdgeInput as CoreEdgeInput, EdgeLabelInfo as CoreEdgeLabelInfo,
+    EdgeMetadataIndexField as CoreEdgeMetadataIndexField,
     EdgePropertyIndexInfo as CoreEdgePropertyIndexInfo, EdgeQuery, EdgeQueryOrder,
     EdgeSchema as CoreEdgeSchema, EdgeSchemaInfo as CoreEdgeSchemaInfo,
     EdgeValiditySchema as CoreEdgeValiditySchema, EdgeView as CoreEdgeView,
@@ -50,6 +53,7 @@ use overgraph::{
     NodeInput as CoreNodeInput, NodeKeyQuery,
     NodeLabelConstraintSchema as CoreNodeLabelConstraintSchema,
     NodeLabelFilter as CoreNodeLabelFilter, NodeLabelInfo as CoreNodeLabelInfo,
+    NodeMetadataIndexField as CoreNodeMetadataIndexField,
     NodePropertyIndexInfo as CoreNodePropertyIndexInfo, NodeQuery, NodeQueryOrder,
     NodeSchema as CoreNodeSchema, NodeSchemaInfo as CoreNodeSchemaInfo, NodeView as CoreNodeView,
     NumericFieldSchema as CoreNumericFieldSchema, PageRequest, PageResult, PprAlgorithm,
@@ -65,7 +69,8 @@ use overgraph::{
     SchemaValidationReport as CoreSchemaValidationReport, SchemaValueType as CoreSchemaValueType,
     SchemaVectorPresence as CoreSchemaVectorPresence, SchemaViolation as CoreSchemaViolation,
     SchemaViolationTarget as CoreSchemaViolationTarget, ScoringMode,
-    ScrubReport as CoreScrubReport, SecondaryIndexKind as CoreSecondaryIndexKind,
+    ScrubReport as CoreScrubReport, SecondaryIndexField as CoreSecondaryIndexField,
+    SecondaryIndexKind as CoreSecondaryIndexKind, SecondaryIndexSpec as CoreSecondaryIndexSpec,
     SecondaryIndexState, ShortestPath as CoreShortestPath,
     ShortestPathOptions as CoreShortestPathOptions, SparseVectorSchema as CoreSparseVectorSchema,
     StringFieldSchema as CoreStringFieldSchema, Subgraph, SubgraphOptions, TopKOptions,
@@ -1512,12 +1517,11 @@ impl OverGraph {
     pub fn ensure_node_property_index(
         &self,
         label: String,
-        prop_key: String,
-        kind: String,
+        spec: SecondaryIndexSpec,
     ) -> Result<NodePropertyIndexInfo> {
-        let kind = js_secondary_index_kind_to_rust(&kind)?;
+        let spec = js_secondary_index_spec_to_rust(spec, JsSecondaryIndexTargetKind::Node)?;
         let info = with_engine(self, |eng| {
-            eng.ensure_node_property_index(&label, &prop_key, kind.clone())
+            eng.ensure_node_property_index(&label, spec.clone())
         })?;
         node_property_index_info_to_js(info)
     }
@@ -1526,12 +1530,11 @@ impl OverGraph {
     pub fn drop_node_property_index(
         &self,
         label: String,
-        prop_key: String,
-        kind: String,
+        spec: SecondaryIndexSpec,
     ) -> Result<bool> {
-        let kind = js_secondary_index_kind_to_rust(&kind)?;
+        let spec = js_secondary_index_spec_to_rust(spec, JsSecondaryIndexTargetKind::Node)?;
         with_engine(self, |eng| {
-            eng.drop_node_property_index(&label, &prop_key, kind.clone())
+            eng.drop_node_property_index(&label, spec.clone())
         })
     }
 
@@ -1548,12 +1551,11 @@ impl OverGraph {
     pub fn ensure_edge_property_index(
         &self,
         label: String,
-        prop_key: String,
-        kind: String,
+        spec: SecondaryIndexSpec,
     ) -> Result<EdgePropertyIndexInfo> {
-        let kind = js_secondary_index_kind_to_rust(&kind)?;
+        let spec = js_secondary_index_spec_to_rust(spec, JsSecondaryIndexTargetKind::Edge)?;
         let info = with_engine(self, |eng| {
-            eng.ensure_edge_property_index(&label, &prop_key, kind.clone())
+            eng.ensure_edge_property_index(&label, spec.clone())
         })?;
         edge_property_index_info_to_js(info)
     }
@@ -1562,12 +1564,11 @@ impl OverGraph {
     pub fn drop_edge_property_index(
         &self,
         label: String,
-        prop_key: String,
-        kind: String,
+        spec: SecondaryIndexSpec,
     ) -> Result<bool> {
-        let kind = js_secondary_index_kind_to_rust(&kind)?;
+        let spec = js_secondary_index_spec_to_rust(spec, JsSecondaryIndexTargetKind::Edge)?;
         with_engine(self, |eng| {
-            eng.drop_edge_property_index(&label, &prop_key, kind.clone())
+            eng.drop_edge_property_index(&label, spec.clone())
         })
     }
 
@@ -3148,13 +3149,12 @@ impl OverGraph {
     pub fn ensure_node_property_index_async(
         &self,
         label: String,
-        prop_key: String,
-        kind: String,
+        spec: SecondaryIndexSpec,
     ) -> Result<AsyncTask<EngineOp<CoreNodePropertyIndexInfo, NodePropertyIndexInfo>>> {
-        let kind = js_secondary_index_kind_to_rust(&kind)?;
+        let spec = js_secondary_index_spec_to_rust(spec, JsSecondaryIndexTargetKind::Node)?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
-            move |eng| eng.ensure_node_property_index(&label, &prop_key, kind.clone()),
+            move |eng| eng.ensure_node_property_index(&label, spec.clone()),
             node_property_index_info_to_js,
         )))
     }
@@ -3163,13 +3163,12 @@ impl OverGraph {
     pub fn drop_node_property_index_async(
         &self,
         label: String,
-        prop_key: String,
-        kind: String,
+        spec: SecondaryIndexSpec,
     ) -> Result<AsyncTask<EngineOp<bool, bool>>> {
-        let kind = js_secondary_index_kind_to_rust(&kind)?;
+        let spec = js_secondary_index_spec_to_rust(spec, JsSecondaryIndexTargetKind::Node)?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
-            move |eng| eng.drop_node_property_index(&label, &prop_key, kind.clone()),
+            move |eng| eng.drop_node_property_index(&label, spec.clone()),
             Ok,
         )))
     }
@@ -3189,13 +3188,12 @@ impl OverGraph {
     pub fn ensure_edge_property_index_async(
         &self,
         label: String,
-        prop_key: String,
-        kind: String,
+        spec: SecondaryIndexSpec,
     ) -> Result<AsyncTask<EngineOp<CoreEdgePropertyIndexInfo, EdgePropertyIndexInfo>>> {
-        let kind = js_secondary_index_kind_to_rust(&kind)?;
+        let spec = js_secondary_index_spec_to_rust(spec, JsSecondaryIndexTargetKind::Edge)?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
-            move |eng| eng.ensure_edge_property_index(&label, &prop_key, kind.clone()),
+            move |eng| eng.ensure_edge_property_index(&label, spec.clone()),
             edge_property_index_info_to_js,
         )))
     }
@@ -3204,13 +3202,12 @@ impl OverGraph {
     pub fn drop_edge_property_index_async(
         &self,
         label: String,
-        prop_key: String,
-        kind: String,
+        spec: SecondaryIndexSpec,
     ) -> Result<AsyncTask<EngineOp<bool, bool>>> {
-        let kind = js_secondary_index_kind_to_rust(&kind)?;
+        let spec = js_secondary_index_spec_to_rust(spec, JsSecondaryIndexTargetKind::Edge)?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
-            move |eng| eng.drop_edge_property_index(&label, &prop_key, kind.clone()),
+            move |eng| eng.drop_edge_property_index(&label, spec.clone()),
             Ok,
         )))
     }
@@ -4768,23 +4765,38 @@ pub struct FindNodesPagedOptions {
 }
 
 #[napi(object)]
+pub struct SecondaryIndexField {
+    pub source: String,
+    pub key: Option<String>,
+    pub field: Option<String>,
+}
+
+#[napi(object)]
+pub struct SecondaryIndexSpec {
+    pub fields: Option<serde_json::Value>,
+    pub kind: Option<serde_json::Value>,
+}
+
+#[napi(object)]
 pub struct NodePropertyIndexInfo {
     pub index_id: f64,
     pub label: String,
-    pub prop_key: String,
+    pub fields: Vec<SecondaryIndexField>,
     pub kind: String,
     pub state: String,
-    pub last_error: Option<String>,
+    pub last_error: serde_json::Value,
+    pub compound: bool,
 }
 
 #[napi(object)]
 pub struct EdgePropertyIndexInfo {
     pub index_id: f64,
     pub label: String,
-    pub prop_key: String,
+    pub fields: Vec<SecondaryIndexField>,
     pub kind: String,
     pub state: String,
-    pub last_error: Option<String>,
+    pub last_error: serde_json::Value,
+    pub compound: bool,
 }
 
 #[napi(object)]
@@ -6348,6 +6360,12 @@ pub struct PropertyRangePageResult {
     pub next_cursor: Option<PropertyRangeCursor>,
 }
 
+fn optional_string_to_json_null(value: Option<String>) -> serde_json::Value {
+    value
+        .map(serde_json::Value::String)
+        .unwrap_or(serde_json::Value::Null)
+}
+
 fn node_property_index_info_to_js(
     info: CoreNodePropertyIndexInfo,
 ) -> Result<NodePropertyIndexInfo> {
@@ -6355,10 +6373,15 @@ fn node_property_index_info_to_js(
     Ok(NodePropertyIndexInfo {
         index_id: u64_to_f64(info.index_id)?,
         label: info.label,
-        prop_key: info.prop_key,
+        fields: info
+            .fields
+            .into_iter()
+            .map(secondary_index_field_to_js)
+            .collect(),
         kind,
         state: secondary_index_state_to_js(info.state).to_string(),
-        last_error: info.last_error,
+        last_error: optional_string_to_json_null(info.last_error),
+        compound: info.compound,
     })
 }
 
@@ -6378,10 +6401,15 @@ fn edge_property_index_info_to_js(
     Ok(EdgePropertyIndexInfo {
         index_id: u64_to_f64(info.index_id)?,
         label: info.label,
-        prop_key: info.prop_key,
+        fields: info
+            .fields
+            .into_iter()
+            .map(secondary_index_field_to_js)
+            .collect(),
         kind,
         state: secondary_index_state_to_js(info.state).to_string(),
-        last_error: info.last_error,
+        last_error: optional_string_to_json_null(info.last_error),
+        compound: info.compound,
     })
 }
 
@@ -7451,13 +7479,21 @@ fn gql_schema_explain_to_json(explain: overgraph::GqlSchemaExplain) -> serde_jso
 fn gql_index_explain_to_json(explain: overgraph::GqlIndexExplain) -> serde_json::Value {
     serde_json::json!({
         "operation": explain.operation,
-        "targets": explain.targets.into_iter().map(|target| serde_json::json!({
-            "targetKind": target.target_kind,
-            "label": target.label,
-            "propKey": target.prop_key,
-            "kind": target.kind,
-            "action": target.action,
-        })).collect::<Vec<_>>(),
+        "targets": explain.targets.into_iter().map(|target| {
+            let fields = target.fields.into_iter().map(|field| serde_json::json!({
+                "source": field.source,
+                "key": field.key,
+                "field": field.field,
+            })).collect::<Vec<_>>();
+            serde_json::json!({
+                "targetKind": target.target_kind,
+                "label": target.label,
+                "fields": fields,
+                "kind": target.kind,
+                "action": target.action,
+                "compound": target.compound,
+            })
+        }).collect::<Vec<_>>(),
         "usesCoreWriteQueue": explain.uses_core_write_queue,
         "publishesManifest": explain.publishes_manifest,
         "createsLabels": explain.creates_labels,
@@ -7580,6 +7616,14 @@ fn query_plan_node_to_js(node: QueryPlanNode) -> serde_json::Value {
         QueryPlanNode::KeyLookup => serde_json::json!({ "kind": "key_lookup" }),
         QueryPlanNode::NodeLabelIndex => serde_json::json!({ "kind": "node_label_index" }),
         QueryPlanNode::NodeLabelAnyIndex => serde_json::json!({ "kind": "node_label_any_index" }),
+        QueryPlanNode::CompoundEqualityIndex { details } => serde_json::json!({
+            "kind": "compound_equality_index",
+            "details": compound_index_plan_details_to_json(details),
+        }),
+        QueryPlanNode::CompoundRangeIndex { details } => serde_json::json!({
+            "kind": "compound_range_index",
+            "details": compound_index_plan_details_to_json(details),
+        }),
         QueryPlanNode::PropertyEqualityIndex => {
             serde_json::json!({ "kind": "property_equality_index" })
         }
@@ -7700,9 +7744,49 @@ fn query_plan_warning_to_js(warning: &QueryPlanWarning) -> &'static str {
         QueryPlanWarning::VerifyOnlyFilter => "verify_only_filter",
         QueryPlanWarning::BooleanBranchFallback => "boolean_branch_fallback",
         QueryPlanWarning::PlanningProbeBudgetExceeded => "planning_probe_budget_exceeded",
+        QueryPlanWarning::CompoundIndexPrefixNotSatisfied => "compound_index_prefix_not_satisfied",
         QueryPlanWarning::UnknownNodeLabel => "unknown_node_label",
         QueryPlanWarning::UnknownEdgeLabel => "unknown_edge_label",
     }
+}
+
+fn compound_index_plan_details_to_json(details: CompoundIndexPlanDetails) -> serde_json::Value {
+    serde_json::json!({
+        "indexId": details.index_id as f64,
+        "targetKind": query_plan_compound_target_kind_to_js(details.target_kind),
+        "label": details.label,
+        "kind": secondary_index_kind_to_js(&details.kind),
+        "fields": details
+            .fields
+            .into_iter()
+            .map(secondary_index_field_to_json)
+            .collect::<Vec<_>>(),
+        "compound": details.compound,
+        "matchedPrefixLen": details.matched_prefix_len as f64,
+        "rangeField": details.range_field.map(secondary_index_field_to_json),
+        "inExpansions": details.in_expansions as f64,
+        "estimatedCandidates": details.estimated_candidates.map(|count| count as f64),
+        "coverage": details.coverage,
+        "residualPredicates": details.residual_predicates as f64,
+        "finalVerification": details.final_verification,
+        "fallbackReason": details.fallback_reason,
+    })
+}
+
+fn query_plan_compound_target_kind_to_js(kind: QueryPlanCompoundTargetKind) -> &'static str {
+    match kind {
+        QueryPlanCompoundTargetKind::Node => "node",
+        QueryPlanCompoundTargetKind::Edge => "edge",
+    }
+}
+
+fn secondary_index_field_to_json(field: CoreSecondaryIndexField) -> serde_json::Value {
+    let field = secondary_index_field_to_js(field);
+    serde_json::json!({
+        "source": field.source,
+        "key": field.key,
+        "field": field.field,
+    })
 }
 
 fn parse_js_gql_options(
@@ -12188,13 +12272,165 @@ fn secondary_index_kind_to_js(kind: &CoreSecondaryIndexKind) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
+enum JsSecondaryIndexTargetKind {
+    Node,
+    Edge,
+}
+
+fn secondary_index_field_to_js(field: CoreSecondaryIndexField) -> SecondaryIndexField {
+    match field {
+        CoreSecondaryIndexField::Property { key } => SecondaryIndexField {
+            source: "property".to_string(),
+            key: Some(key),
+            field: None,
+        },
+        CoreSecondaryIndexField::NodeMetadata(field) => SecondaryIndexField {
+            source: "metadata".to_string(),
+            key: None,
+            field: Some(node_metadata_index_field_to_js(field).to_string()),
+        },
+        CoreSecondaryIndexField::EdgeMetadata(field) => SecondaryIndexField {
+            source: "metadata".to_string(),
+            key: None,
+            field: Some(edge_metadata_index_field_to_js(field).to_string()),
+        },
+    }
+}
+
+fn js_secondary_index_spec_to_rust(
+    spec: SecondaryIndexSpec,
+    target_kind: JsSecondaryIndexTargetKind,
+) -> Result<CoreSecondaryIndexSpec> {
+    let kind_value = spec.kind.ok_or_else(|| {
+        napi::Error::from_reason("invalid secondary index: kind is required".to_string())
+    })?;
+    let kind = js_secondary_index_value_string(&kind_value, "kind")?;
+    let kind = js_secondary_index_kind_to_rust(&kind)?;
+    let fields_value = spec.fields.ok_or_else(|| {
+        napi::Error::from_reason("invalid secondary index: fields are required".to_string())
+    })?;
+    let field_values = fields_value.as_array().ok_or_else(|| {
+        napi::Error::from_reason("invalid secondary index: fields must be an array".to_string())
+    })?;
+    let fields = field_values
+        .iter()
+        .map(|field| js_secondary_index_field_to_rust(field, target_kind))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(CoreSecondaryIndexSpec { fields, kind })
+}
+
+fn js_secondary_index_field_to_rust(
+    field: &serde_json::Value,
+    target_kind: JsSecondaryIndexTargetKind,
+) -> Result<CoreSecondaryIndexField> {
+    let field = field.as_object().ok_or_else(|| {
+        napi::Error::from_reason("invalid secondary index: field must be an object".to_string())
+    })?;
+    let source = js_secondary_index_required_string(field, "source", "field source")?;
+    match source.as_str() {
+        "property" => {
+            let key = js_secondary_index_required_string(field, "key", "property key")?;
+            Ok(CoreSecondaryIndexField::property(key))
+        }
+        "metadata" => {
+            let metadata_field =
+                js_secondary_index_required_string(field, "field", "metadata field")?;
+            match target_kind {
+                JsSecondaryIndexTargetKind::Node => Ok(CoreSecondaryIndexField::node_meta(
+                    js_node_metadata_index_field_to_rust(&metadata_field)?,
+                )),
+                JsSecondaryIndexTargetKind::Edge => Ok(CoreSecondaryIndexField::edge_meta(
+                    js_edge_metadata_index_field_to_rust(&metadata_field)?,
+                )),
+            }
+        }
+        other => Err(napi::Error::from_reason(format!(
+            "invalid secondary index: field source must be 'property' or 'metadata', got '{other}'"
+        ))),
+    }
+}
+
+fn js_secondary_index_required_string(
+    field: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    display: &str,
+) -> Result<String> {
+    let value = field
+        .get(key)
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| {
+            napi::Error::from_reason(format!("invalid secondary index: {display} is required"))
+        })?;
+    js_secondary_index_value_string(value, display)
+}
+
+fn js_secondary_index_value_string(value: &serde_json::Value, display: &str) -> Result<String> {
+    value.as_str().map(str::to_string).ok_or_else(|| {
+        napi::Error::from_reason(format!(
+            "invalid secondary index: {display} must be a string"
+        ))
+    })
+}
+
+fn node_metadata_index_field_to_js(field: CoreNodeMetadataIndexField) -> &'static str {
+    match field {
+        CoreNodeMetadataIndexField::Id => "id",
+        CoreNodeMetadataIndexField::Key => "key",
+        CoreNodeMetadataIndexField::Weight => "weight",
+        CoreNodeMetadataIndexField::CreatedAt => "created_at",
+        CoreNodeMetadataIndexField::UpdatedAt => "updated_at",
+    }
+}
+
+fn edge_metadata_index_field_to_js(field: CoreEdgeMetadataIndexField) -> &'static str {
+    match field {
+        CoreEdgeMetadataIndexField::Id => "id",
+        CoreEdgeMetadataIndexField::From => "from",
+        CoreEdgeMetadataIndexField::To => "to",
+        CoreEdgeMetadataIndexField::Weight => "weight",
+        CoreEdgeMetadataIndexField::CreatedAt => "created_at",
+        CoreEdgeMetadataIndexField::UpdatedAt => "updated_at",
+        CoreEdgeMetadataIndexField::ValidFrom => "valid_from",
+        CoreEdgeMetadataIndexField::ValidTo => "valid_to",
+    }
+}
+
+fn js_node_metadata_index_field_to_rust(field: &str) -> Result<CoreNodeMetadataIndexField> {
+    match field {
+        "id" => Ok(CoreNodeMetadataIndexField::Id),
+        "key" => Ok(CoreNodeMetadataIndexField::Key),
+        "weight" => Ok(CoreNodeMetadataIndexField::Weight),
+        "created_at" => Ok(CoreNodeMetadataIndexField::CreatedAt),
+        "updated_at" => Ok(CoreNodeMetadataIndexField::UpdatedAt),
+        other => Err(napi::Error::from_reason(format!(
+            "invalid secondary index: unsupported node metadata field '{other}'"
+        ))),
+    }
+}
+
+fn js_edge_metadata_index_field_to_rust(field: &str) -> Result<CoreEdgeMetadataIndexField> {
+    match field {
+        "id" => Ok(CoreEdgeMetadataIndexField::Id),
+        "from" => Ok(CoreEdgeMetadataIndexField::From),
+        "to" => Ok(CoreEdgeMetadataIndexField::To),
+        "weight" => Ok(CoreEdgeMetadataIndexField::Weight),
+        "created_at" => Ok(CoreEdgeMetadataIndexField::CreatedAt),
+        "updated_at" => Ok(CoreEdgeMetadataIndexField::UpdatedAt),
+        "valid_from" => Ok(CoreEdgeMetadataIndexField::ValidFrom),
+        "valid_to" => Ok(CoreEdgeMetadataIndexField::ValidTo),
+        other => Err(napi::Error::from_reason(format!(
+            "invalid secondary index: unsupported edge metadata field '{other}'"
+        ))),
+    }
+}
+
 fn js_secondary_index_kind_to_rust(kind: &str) -> Result<CoreSecondaryIndexKind> {
     match kind {
         "equality" => Ok(CoreSecondaryIndexKind::Equality),
         "range" => Ok(CoreSecondaryIndexKind::Range),
         other => Err(napi::Error::from_reason(format!(
-            "Invalid index kind '{}'. Must be 'equality' or 'range'.",
-            other
+            "invalid secondary index: kind must be 'equality' or 'range', got '{other}'"
         ))),
     }
 }

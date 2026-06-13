@@ -1,5 +1,5 @@
 """
-OverGraph Example: GQL Beta
+OverGraph Example: GQL
 
 Run: python examples/python/gql_readonly.py
 (Requires: maturin develop in overgraph-python/ first)

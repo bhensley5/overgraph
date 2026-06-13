@@ -2705,7 +2705,7 @@ fn schema_enforcement_gql_mutations_route_through_shared_validator() {
     let next_node_before = engine.next_node_id().unwrap();
     let err = engine
         .execute_gql(
-            "CREATE (n:GqlSchemaCreate {key: 'bad'}) RETURN n",
+            "CREATE (n:GqlSchemaCreate {elementKey: 'bad'}) RETURN n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -2732,7 +2732,7 @@ fn schema_enforcement_gql_mutations_route_through_shared_validator() {
         .unwrap();
     let err = engine
         .execute_gql(
-            "MATCH (n:GqlSchemaSet) WHERE n.key = 'n' REMOVE n.name",
+            "MATCH (n:GqlSchemaSet) WHERE elementKey(n) = 'n' REMOVE n.name",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -2759,7 +2759,7 @@ fn schema_enforcement_gql_mutations_route_through_shared_validator() {
         .unwrap();
     let err = engine
         .execute_gql(
-            "MATCH (n:GqlSchemaSetClosed) WHERE n.key = 'n' SET n.extra = 'x'",
+            "MATCH (n:GqlSchemaSetClosed) WHERE elementKey(n) = 'n' SET n.extra = 'x'",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -2799,8 +2799,8 @@ fn schema_enforcement_gql_set_remove_labels_revalidate_endpoint_edges() {
 
     engine
         .execute_gql(
-            "MATCH (a:GqlEndpointFrom) WHERE a.key = 'from' \
-             MATCH (b:GqlEndpointTo) WHERE b.key = 'to' \
+            "MATCH (a:GqlEndpointFrom) WHERE elementKey(a) = 'from' \
+             MATCH (b:GqlEndpointTo) WHERE elementKey(b) = 'to' \
              SET a:GqlRequiredFrom CREATE (a)-[:Gql_ENDPOINT_RULES]->(b)",
             &GqlParams::new(),
             &gql_opts(),
@@ -2817,7 +2817,7 @@ fn schema_enforcement_gql_set_remove_labels_revalidate_endpoint_edges() {
 
     let err = engine
         .execute_gql(
-            "MATCH (a:GqlEndpointFrom) WHERE a.key = 'from' SET a:GqlForbiddenFrom",
+            "MATCH (a:GqlEndpointFrom) WHERE elementKey(a) = 'from' SET a:GqlForbiddenFrom",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -2833,7 +2833,7 @@ fn schema_enforcement_gql_set_remove_labels_revalidate_endpoint_edges() {
 
     let err = engine
         .execute_gql(
-            "MATCH (a:GqlEndpointFrom) WHERE a.key = 'from' REMOVE a:GqlRequiredFrom",
+            "MATCH (a:GqlEndpointFrom) WHERE elementKey(a) = 'from' REMOVE a:GqlRequiredFrom",
             &GqlParams::new(),
             &gql_opts(),
         )

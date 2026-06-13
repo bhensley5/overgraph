@@ -75,7 +75,7 @@ Each segment is a directory containing a small manifest plus a packed immutable 
 |---|---|
 | `segment_manifest.dat` | Component table of contents with identity/dependency records |
 | `segment.core` | Packed immutable core payloads and maintained indexes |
-| `secondary_indexes/` | Optional declared equality/range property-index sidecars |
+| `secondary_indexes/` | Optional declared single-field/compound property-index sidecars |
 | `degree_delta.dat` | Optional signed degree delta sidecar for degree/weight fast paths |
 | `planner_stats.dat` | Optional advisory planner statistics for private query costing |
 | `dense_hnsw_meta.dat` / `dense_hnsw_graph.dat` | Optional dense-vector HNSW accelerator |
@@ -88,7 +88,7 @@ indexes. The segment manifest records each logical component as a range inside `
 so readers still expose payload-local byte slices to the same parsers while only mapping the
 core container once.
 
-Refreshable optional sidecars remain separate files. Declared property indexes, planner stats,
+Refreshable optional sidecars remain separate files. Declared single-field and compound property indexes, planner stats,
 degree deltas, dense HNSW, and sparse postings can be missing, rebuilt, or refreshed without
 rewriting `segment.core`; query correctness falls back to scans or exact vector search when an
 optional accelerator is unavailable.
@@ -142,7 +142,7 @@ For operations that need to traverse from many nodes at once (PPR, subgraph extr
 
 ### Vector indexes
 
-OverGraph embeds two kinds of vector indexes directly in the storage engine, following the same per-segment immutable index model as adjacency indexes and declared property-index sidecars.
+OverGraph embeds two kinds of vector indexes directly in the storage engine, following the same per-segment immutable index model as adjacency indexes and declared single-field/compound property-index sidecars.
 
 **Dense HNSW index.** Each segment containing dense vectors gets an HNSW (Hierarchical Navigable Small World) graph built at flush time. The HNSW implementation is owned by OverGraph (not delegated to an external ANN library), so the on-disk format, reopen path, and segment lifecycle are fully controlled. The DB is configured with one dense vector space (fixed dimension + distance metric: cosine, Euclidean, or dot-product). HNSW parameters (`m` and `ef_construction`) are configurable.
 

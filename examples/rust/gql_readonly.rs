@@ -1,4 +1,4 @@
-//! OverGraph Example: GQL Beta
+//! OverGraph Example: GQL
 //!
 //! Run: cargo run --example gql_readonly
 

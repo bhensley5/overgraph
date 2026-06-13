@@ -55,6 +55,22 @@ async def seed_async(db):
     return {"ada": ada, "ben": ben, "cy": cy, "acme": acme, "works_at": works_at}
 
 
+def property_index_row_field(key):
+    return {"source": "property", "key": key}
+
+
+def metadata_index_row_field(field):
+    return {"source": "metadata", "field": field}
+
+
+def property_index_explain_field(key):
+    return {"source": "property", "key": key, "field": None}
+
+
+def metadata_index_explain_field(field):
+    return {"source": "metadata", "key": None, "field": field}
+
+
 def seed_phase34(db, person_label="PyPhase34Person"):
     ada = db.upsert_node(
         person_label,
@@ -232,13 +248,13 @@ def test_gql_schema_execute_explain_and_tagged_rows(tmp_dir):
         assert explain["schema"]["operation"] == "check_graph_type_set"
         assert explain["schema"]["side_effect_free"] is True
 
-        read = db.execute_gql("MATCH (n:PyNeedsName) RETURN n.key AS key")
+        read = db.execute_gql("MATCH (n:PyNeedsName) RETURN elementKey(n) AS key")
         assert read["kind"] == "query"
         assert read["schema_stats"] is None
         assert read["index_stats"] is None
 
         mutation = db.execute_gql(
-            "CREATE (n:PyUnconstrained {key: 'one'}) RETURN n.key AS key"
+            "CREATE (n:PyUnconstrained {elementKey: 'one'}) RETURN elementKey(n) AS key"
         )
         assert mutation["kind"] == "mutation"
         assert mutation["schema_stats"] is None
@@ -255,6 +271,9 @@ def test_gql_property_index_connector_payloads(tmp_dir):
         edge_index = (
             "CREATE PROPERTY INDEX FOR ()-[r:PY_INDEX_WORKS_AT]-() ON (r.since) KIND RANGE"
         )
+        compound_index = (
+            "CREATE PROPERTY INDEX FOR (n:PyIndexPerson) ON (n.group, updatedAt(n)) KIND RANGE"
+        )
         drop_edge = (
             "DROP PROPERTY INDEX FOR ()-[r:PY_INDEX_WORKS_AT]-() ON (r.since) KIND RANGE"
         )
@@ -265,12 +284,14 @@ def test_gql_property_index_connector_payloads(tmp_dir):
             "operation",
             "target_kind",
             "label",
-            "prop_key",
+            "fields",
             "kind",
             "action",
             "state",
             "index_id",
             "last_error",
+            "compound",
+            "field_count",
         ]
         assert create["mutation_stats"] is None
         assert create["schema_stats"] is None
@@ -283,12 +304,14 @@ def test_gql_property_index_connector_payloads(tmp_dir):
         assert create["rows"][0]["operation"] == "create_property_index"
         assert create["rows"][0]["target_kind"] == "node"
         assert create["rows"][0]["label"] == "PyIndexPerson"
-        assert create["rows"][0]["prop_key"] == "status"
+        assert create["rows"][0]["fields"] == [property_index_row_field("status")]
         assert create["rows"][0]["kind"] == "equality"
         assert create["rows"][0]["action"] == "ensured"
         assert create["rows"][0]["state"] in {"building", "ready", "failed"}
         assert isinstance(create["rows"][0]["index_id"], int)
         assert create["rows"][0]["last_error"] is None
+        assert create["rows"][0]["compound"] is False
+        assert create["rows"][0]["field_count"] == 1
 
         planned = db.execute_gql(person_index, include_plan=True, profile=True)
         assert isinstance(planned["index_stats"]["elapsed_us"], int)
@@ -301,9 +324,10 @@ def test_gql_property_index_connector_payloads(tmp_dir):
             {
                 "target_kind": "node",
                 "label": "PyIndexPerson",
-                "prop_key": "status",
+                "fields": [property_index_explain_field("status")],
                 "kind": "equality",
                 "action": "ensure",
+                "compound": False,
             }
         ]
         assert planned["plan"]["index"]["uses_core_write_queue"] is True
@@ -328,16 +352,53 @@ def test_gql_property_index_connector_payloads(tmp_dir):
         assert edge_create["mutation_stats"] is None
         assert edge_create["schema_stats"] is None
 
+        compound_create = db.execute_gql(compound_index)
+        assert compound_create["kind"] == "index"
+        assert compound_create["rows"][0]["fields"] == [
+            property_index_row_field("group"),
+            metadata_index_row_field("updatedAt"),
+        ]
+        assert compound_create["rows"][0]["compound"] is True
+        assert compound_create["rows"][0]["field_count"] == 2
+
+        compound_explain = db.explain_gql(compound_index)
+        assert compound_explain["index"]["targets"][0] == {
+            "target_kind": "node",
+            "label": "PyIndexPerson",
+            "fields": [
+                property_index_explain_field("group"),
+                metadata_index_explain_field("updatedAt"),
+            ],
+            "kind": "range",
+            "action": "ensure",
+            "compound": True,
+        }
+
         show = db.execute_gql("SHOW PROPERTY INDEXES")
         assert show["kind"] == "index"
         assert show["index_stats"]["operation"] == "show_property_indexes"
-        assert show["index_stats"]["indexes_returned"] == 2
+        assert show["index_stats"]["indexes_returned"] == 3
         assert [
-            (row["target_kind"], row["label"], row["prop_key"], row["kind"])
+            (
+                row["target_kind"],
+                row["label"],
+                row["fields"],
+                row["kind"],
+                row["compound"],
+                row["field_count"],
+            )
             for row in show["rows"]
         ] == [
-            ("node", "PyIndexPerson", "status", "equality"),
-            ("edge", "PY_INDEX_WORKS_AT", "since", "range"),
+            (
+                "node",
+                "PyIndexPerson",
+                [property_index_row_field("group"), metadata_index_row_field("updatedAt")],
+                "range",
+                True,
+                2,
+            ),
+            ("node", "PyIndexPerson", [property_index_row_field("status")], "equality", False, 1),
+            ("edge", "PY_INDEX_WORKS_AT", [property_index_row_field("since")], "range", False, 1),
         ]
         assert all(row["state"] in {"building", "ready", "failed"} for row in show["rows"])
         assert all(row["last_error"] is None for row in show["rows"])
@@ -348,9 +409,10 @@ def test_gql_property_index_connector_payloads(tmp_dir):
             {
                 "target_kind": "property_index_catalog",
                 "label": None,
-                "prop_key": None,
+                "fields": [],
                 "kind": None,
                 "action": "show",
+                "compound": False,
             }
         ]
         assert show_explain["index"]["uses_core_write_queue"] is False
@@ -366,9 +428,10 @@ def test_gql_property_index_connector_payloads(tmp_dir):
             {
                 "target_kind": "edge",
                 "label": "PY_INDEX_WORKS_AT",
-                "prop_key": "since",
+                "fields": [property_index_explain_field("since")],
                 "kind": "range",
                 "action": "drop",
+                "compound": False,
             }
         ]
         assert drop_explain["index"]["uses_core_write_queue"] is True
@@ -383,7 +446,7 @@ def test_gql_property_index_connector_payloads(tmp_dir):
         with pytest.raises(Exception, match="GQL index management is not allowed in ReadOnly mode"):
             db.execute_gql(drop_edge, mode="read_only")
         read_only_show = db.execute_gql("SHOW PROPERTY INDEXES", mode="read_only")
-        assert len(read_only_show["rows"]) == 2
+        assert len(read_only_show["rows"]) == 3
         with pytest.raises(Exception, match="GQL index statements do not accept cursors"):
             db.execute_gql("SHOW PROPERTY INDEXES", cursor="locked")
     finally:
@@ -731,13 +794,13 @@ def test_gql_phase34_shortest_path_and_nested_value_conversion(db):
         WITH a, b
         MATCH p = shortestPath((a)-[:PY34_KNOWS*1..3]->(b))
         RETURN p,
-               node_ids(p) AS node_ids,
-               edge_ids(p) AS edge_ids,
+               nodeIds(p) AS node_ids,
+               edgeIds(p) AS edge_ids,
                length(p) AS length,
                nodes(p) AS nodes,
                relationships(p) AS relationships,
                [p] AS path_list,
-               {{path: p, nested: [node_ids(p), {{edges: edge_ids(p)}}]}} AS wrapped
+               {{path: p, nested: [nodeIds(p), {{edges: edgeIds(p)}}]}} AS wrapped
         """,
         include_plan=True,
     )
@@ -766,10 +829,10 @@ def test_gql_phase34_keyed_merge_on_create_on_match_stats(db):
     query = """
         MATCH (s:PyPhase34MergeSource)
         WITH s.target AS target
-        MERGE (a:PyPhase34Account {key: target})
+        MERGE (a:PyPhase34Account {elementKey: target})
         ON CREATE SET a.status = 'created', a.count = 1
         ON MATCH SET a.status = 'matched', a.count = coalesce(a.count, 0) + 1
-        RETURN a.key AS key, a.status AS status, a.count AS count
+        RETURN elementKey(a) AS key, a.status AS status, a.count AS count
         """
     created = db.execute_gql(query, include_plan=True)
     assert created["kind"] == "mutation"
@@ -877,8 +940,8 @@ def test_gql_phase34_cap_forwarding_and_explain_fields(db):
 def test_gql_sync_create_return_mutation_stats_bytes_and_plan(db):
     result = db.execute_gql(
         """
-        CREATE (n:PyCreateReturn {key: 'created-one', name: $name, payload: $payload})
-        RETURN n.key AS key, n.name AS name, n.payload AS payload, n
+        CREATE (n:PyCreateReturn {elementKey: 'created-one', name: $name, payload: $payload})
+        RETURN elementKey(n) AS key, n.name AS name, n.payload AS payload, n
         """,
         {"name": "Created", "payload": b"\x09\x08\x07"},
         include_plan=True,
@@ -912,13 +975,13 @@ def test_gql_schema_mutation_failures_are_rejected(db):
     )
 
     with pytest.raises(Exception, match="schema violation"):
-        db.execute_gql("CREATE (n:PyGqlSchemaPerson {key: 'bad'}) RETURN n")
+        db.execute_gql("CREATE (n:PyGqlSchemaPerson {elementKey: 'bad'}) RETURN n")
     assert db.get_node_by_key("PyGqlSchemaPerson", "bad") is None
 
     db.upsert_node("PyGqlSchemaPerson", "good", props={"name": "Ada"})
     with pytest.raises(Exception, match="schema violation"):
         db.execute_gql(
-            "MATCH (n:PyGqlSchemaPerson) WHERE n.key = 'good' REMOVE n.name"
+            "MATCH (n:PyGqlSchemaPerson) WHERE elementKey(n) = 'good' REMOVE n.name"
         )
     assert db.get_node_by_key("PyGqlSchemaPerson", "good").props["name"] == "Ada"
 
@@ -933,7 +996,7 @@ def test_gql_sync_set_remove_return_row_ops(db):
         MATCH (n:PySetRemoveReturn)
         SET n.status = $status
         REMOVE n.group
-        RETURN n.key AS key, n.status AS status, n.group AS group
+        RETURN elementKey(n) AS key, n.status AS status, n.group AS group
         ORDER BY n.rank SKIP 1 LIMIT 1
         """,
         {"status": "new"},
@@ -971,7 +1034,7 @@ def test_gql_delete_and_detach_delete_no_return_stats(db):
     detach_delete = db.execute_gql(
         """
         MATCH (n:PyDetachDelete)
-        WHERE n.key = 'hub'
+        WHERE elementKey(n) = 'hub'
         DETACH DELETE n
         """
     )
@@ -992,7 +1055,7 @@ def test_gql_read_only_mode_and_mode_validation(db):
     assert read["rows"] == [{"name": "Ben"}]
 
     with pytest.raises(Exception, match="read.?only|ReadOnly"):
-        db.execute_gql("CREATE (n:PyReadOnly {key: 'blocked'})", mode="read_only")
+        db.execute_gql("CREATE (n:PyReadOnly {elementKey: 'blocked'})", mode="read_only")
 
     with pytest.raises(Exception, match="mode.*auto.*read_only"):
         db.execute_gql("MATCH (n:Person) RETURN n LIMIT 1", mode="readonly")
@@ -1004,8 +1067,8 @@ def test_gql_mutation_compact_rows_and_include_vectors(tmp_dir):
         seed(db, include_vectors=True)
         compact = db.execute_gql(
             """
-            CREATE (n:PyCompactMutation {key: 'compact', name: 'Compact'})
-            RETURN n.key AS key, n.name AS name
+            CREATE (n:PyCompactMutation {elementKey: 'compact', name: 'Compact'})
+            RETURN elementKey(n) AS key, n.name AS name
             """,
             compact_rows=True,
         )
@@ -1053,7 +1116,7 @@ def test_gql_mutation_explain_is_side_effect_free(db):
 async def test_async_execute_gql_mutation_and_explain(async_db):
     result = await async_db.execute_gql(
         """
-        CREATE (n:PyAsyncMutation {key: 'once', name: 'Async'})
+        CREATE (n:PyAsyncMutation {elementKey: 'once', name: 'Async'})
         RETURN n.name AS name
         """
     )
@@ -1062,7 +1125,7 @@ async def test_async_execute_gql_mutation_and_explain(async_db):
     assert result["mutation_stats"]["nodes_created"] == 1
 
     read_back = await async_db.execute_gql(
-        "MATCH (n:PyAsyncMutation) WHERE n.key = 'once' RETURN n.name AS name"
+        "MATCH (n:PyAsyncMutation) WHERE elementKey(n) = 'once' RETURN n.name AS name"
     )
     assert read_back["rows"] == [{"name": "Async"}]
 
@@ -1074,7 +1137,7 @@ async def test_async_execute_gql_mutation_and_explain(async_db):
     update = await async_db.execute_gql(
         """
         MATCH (n:PyAsyncUpdate)
-        WHERE n.key = 'target'
+        WHERE elementKey(n) = 'target'
         SET n.status = 'new'
         REMOVE n.drop
         RETURN n.status AS status, n.drop AS dropped
@@ -1092,7 +1155,7 @@ async def test_async_execute_gql_mutation_and_explain(async_db):
     detached = await async_db.execute_gql(
         """
         MATCH (n:PyAsyncDetach)
-        WHERE n.key = 'hub'
+        WHERE elementKey(n) = 'hub'
         DETACH DELETE n
         """
     )
@@ -1103,12 +1166,12 @@ async def test_async_execute_gql_mutation_and_explain(async_db):
 
     with pytest.raises(Exception, match="read.?only|ReadOnly"):
         await async_db.execute_gql(
-            "CREATE (n:PyAsyncReadOnly {key: 'blocked'})",
+            "CREATE (n:PyAsyncReadOnly {elementKey: 'blocked'})",
             mode="read_only",
         )
 
     explain = await async_db.explain_gql(
-        "CREATE (n:PyAsyncExplain {key: 'planned'}) RETURN n.key AS key"
+        "CREATE (n:PyAsyncExplain {elementKey: 'planned'}) RETURN elementKey(n) AS key"
     )
     assert explain["kind"] == "mutation"
     assert explain["read"] is None
@@ -1117,16 +1180,16 @@ async def test_async_execute_gql_mutation_and_explain(async_db):
 
 def test_gql_volatile_metadata_order_by_rejection_surfaces(db):
     with pytest.raises(Exception, match="ORDER BY|commit|metadata|before commit|volatile"):
-        db.execute_gql("CREATE (n:PyVolatileOrder {key: 'bad-order'}) RETURN n.key ORDER BY n.id")
+        db.execute_gql("CREATE (n:PyVolatileOrder {elementKey: 'bad-order'}) RETURN elementKey(n) ORDER BY id(n)")
 
 
 def test_gql_forwards_mutation_order_and_path_caps(db):
     seed(db)
     with pytest.raises(Exception, match="max_mutation_rows"):
-        db.execute_gql("CREATE (n:PyCapMutationRows {key: 'row-cap'})", max_mutation_rows=0)
+        db.execute_gql("CREATE (n:PyCapMutationRows {elementKey: 'row-cap'})", max_mutation_rows=0)
 
     with pytest.raises(Exception, match="max_mutation_ops"):
-        db.execute_gql("CREATE (n:PyCapMutationOps {key: 'op-cap'})", max_mutation_ops=0)
+        db.execute_gql("CREATE (n:PyCapMutationOps {elementKey: 'op-cap'})", max_mutation_ops=0)
 
     with pytest.raises(
         Exception,
@@ -1175,7 +1238,7 @@ def test_gql_optional_vlp_paths_and_cursor_through_python(db):
         f"""
         MATCH path = (a)-[:KNOWS*1..1]->(b)
         WHERE id(a) = {ids["ada"]}
-        RETURN path, node_ids(path) AS node_ids, edge_ids(path) AS edge_ids
+        RETURN path, nodeIds(path) AS node_ids, edgeIds(path) AS edge_ids
         """
     )
     row = path["rows"][0]
@@ -1228,6 +1291,12 @@ def test_gql_stub_and_signature_smoke():
     assert "max_subquery_invocations: int | None" in text
     assert "max_subquery_depth: int | None" in text
     assert "max_shortest_path_pairs: int | None" in text
+    assert "class QueryPlanCompoundIndexDetails" in text
+    assert "compound_index_prefix_not_satisfied" in text
+    assert "compound_equality_index" in text
+    assert "compound_range_index" in text
+    assert "fields: list[GqlIndexExplainField]" in text
+    assert "compound: bool" in text
     assert "class GqlExecutionResult" in text
     assert "class GqlExecutionExplain" in text
     assert "class GqlMutationStats" in text

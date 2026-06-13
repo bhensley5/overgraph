@@ -6,7 +6,7 @@ use overgraph::{
     GraphOrderItem, GraphOutputOptions, GraphPageRequest, GraphParamValue, GraphPatternPiece,
     GraphQueryOptions, GraphReturnItem, GraphReturnProjection, LabelMatchMode, NodeFilterExpr,
     NodeInput, NodeLabelFilter, NodeQuery, PageRequest, PropValue, PropertyRangeBound,
-    SecondaryIndexKind, SecondaryIndexState,
+    SecondaryIndexField, SecondaryIndexSpec, SecondaryIndexState,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,6 +18,12 @@ const QUERY_LIMIT: usize = 100;
 const QUERY_LARGE_UNIVERSE_COUNT: usize = 25_000;
 const QUERY_SMALL_LABEL_COUNT: usize = 128;
 const QUERY_LARGE_IN_VALUE_COUNT: usize = 512;
+const GRAPH_ROW_PLANNER_EDGE_COUNT: usize = 6;
+const MEMTABLE_PLANNER_STRESS_COUNT: usize = 20_000;
+const MEMTABLE_PLANNER_SEGMENT_COUNT: usize = 512;
+const ENDPOINT_ESTIMATE_PLANNER_NODE_COUNT: usize = 1_024;
+const LARGE_ENDPOINT_PLANNER_NODE_COUNT: usize = 8_192;
+const COMPOUND_BENCH_NODE_COUNT: usize = 2_000;
 
 macro_rules! filter_and {
     [] => {
@@ -135,6 +141,25 @@ fn query_nodes_with_label_id(
         .collect()
 }
 
+fn query_nodes_with_props(
+    label_id: u32,
+    prefix: &str,
+    start: usize,
+    count: usize,
+    props: BTreeMap<String, PropValue>,
+) -> Vec<NodeInput> {
+    (start..start + count)
+        .map(|i| NodeInput {
+            labels: vec![bench_node_label(label_id)],
+            key: format!("{prefix}-{i}"),
+            props: props.clone(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect()
+}
+
 fn wait_for_property_index_state(
     engine: &DatabaseEngine,
     index_id: u64,
@@ -188,22 +213,34 @@ fn wait_for_edge_property_index_state(
 fn ensure_query_indexes(engine: &mut DatabaseEngine) {
     let label = bench_node_label(1);
     let status = engine
-        .ensure_node_property_index(&label, "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index(
+            &label,
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
         .unwrap();
     wait_for_property_index_state(engine, status.index_id, SecondaryIndexState::Ready);
 
     let tier = engine
-        .ensure_node_property_index(&label, "tier", SecondaryIndexKind::Equality)
+        .ensure_node_property_index(
+            &label,
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("tier")]),
+        )
         .unwrap();
     wait_for_property_index_state(engine, tier.index_id, SecondaryIndexState::Ready);
 
     let tenant = engine
-        .ensure_node_property_index(&label, "tenant", SecondaryIndexKind::Equality)
+        .ensure_node_property_index(
+            &label,
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("tenant")]),
+        )
         .unwrap();
     wait_for_property_index_state(engine, tenant.index_id, SecondaryIndexState::Ready);
 
     let score = engine
-        .ensure_node_property_index(&label, "score", SecondaryIndexKind::Range)
+        .ensure_node_property_index(
+            &label,
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
         .unwrap();
     wait_for_property_index_state(engine, score.index_id, SecondaryIndexState::Ready);
 }
@@ -231,6 +268,26 @@ fn load_query_mixed_sources(engine: &DatabaseEngine, prefix: &str) {
 fn build_fallback_query_engine() -> (tempfile::TempDir, DatabaseEngine) {
     let (dir, engine) = temp_db();
     load_query_mixed_sources(&engine, "fallback");
+    (dir, engine)
+}
+
+fn build_compound_query_engine() -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, engine) = temp_db();
+    let nodes = query_nodes("compound", 0, COMPOUND_BENCH_NODE_COUNT);
+    engine.batch_upsert_nodes(nodes.clone()).unwrap();
+    engine.flush().unwrap();
+
+    let label = bench_node_label(1);
+    let compound = engine
+        .ensure_node_property_index(
+            &label,
+            SecondaryIndexSpec::range(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("score"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, compound.index_id, SecondaryIndexState::Ready);
     (dir, engine)
 }
 
@@ -304,6 +361,28 @@ fn equality_and_range_query(limit: Option<usize>) -> NodeQuery {
             NodeFilterExpr::PropertyRange {
                 key: "score".to_string(),
                 lower: Some(PropertyRangeBound::Included(PropValue::Int(50))),
+                upper: None,
+            },
+        ],
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn compound_tenant_score_query(limit: Option<usize>) -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("t77".to_string()),
+            },
+            NodeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(75))),
                 upper: None,
             },
         ],
@@ -670,6 +749,117 @@ fn full_scan_limit_one_query() -> NodeQuery {
     }
 }
 
+fn label_and_full_scan_explain_query() -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
+        filter: filter_and![NodeFilterExpr::PropertyEquals {
+            key: "region".to_string(),
+            value: PropValue::String("r03".to_string()),
+        }],
+        page: PageRequest {
+            limit: Some(QUERY_LIMIT),
+            after: None,
+        },
+        allow_full_scan: true,
+        ..Default::default()
+    }
+}
+
+fn build_hot_memtable_equality_planner_engine() -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, engine) = temp_db();
+    let label = bench_node_label(40);
+    let status = engine
+        .ensure_node_property_index(
+            &label,
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready);
+
+    let props = BTreeMap::from([("status".to_string(), PropValue::String("hot".to_string()))]);
+    engine
+        .batch_upsert_nodes(query_nodes_with_props(
+            40,
+            "hot-eq-segment",
+            0,
+            MEMTABLE_PLANNER_SEGMENT_COUNT,
+            props.clone(),
+        ))
+        .unwrap();
+    engine.flush().unwrap();
+    engine
+        .batch_upsert_nodes(query_nodes_with_props(
+            40,
+            "hot-eq-active",
+            MEMTABLE_PLANNER_SEGMENT_COUNT,
+            MEMTABLE_PLANNER_STRESS_COUNT,
+            props,
+        ))
+        .unwrap();
+    (dir, engine)
+}
+
+fn hot_memtable_equality_explain_query() -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(40)],
+            mode: LabelMatchMode::All,
+        }),
+        filter: filter_and![NodeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("hot".to_string()),
+        }],
+        page: PageRequest {
+            limit: Some(QUERY_LIMIT),
+            after: None,
+        },
+        ..Default::default()
+    }
+}
+
+fn build_memtable_timestamp_planner_engine() -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, engine) = temp_db();
+    engine
+        .batch_upsert_nodes(query_nodes_with_label_id(
+            41,
+            "timestamp-segment",
+            0,
+            MEMTABLE_PLANNER_SEGMENT_COUNT,
+        ))
+        .unwrap();
+    engine.flush().unwrap();
+    engine
+        .batch_upsert_nodes(query_nodes_with_label_id(
+            41,
+            "timestamp-active",
+            MEMTABLE_PLANNER_SEGMENT_COUNT,
+            MEMTABLE_PLANNER_STRESS_COUNT,
+        ))
+        .unwrap();
+    (dir, engine)
+}
+
+fn memtable_timestamp_explain_query() -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(41)],
+            mode: LabelMatchMode::All,
+        }),
+        filter: filter_and![NodeFilterExpr::UpdatedAtRange {
+            lower_ms: Some(0),
+            upper_ms: Some(i64::MAX),
+        }],
+        page: PageRequest {
+            limit: Some(QUERY_LIMIT),
+            after: None,
+        },
+        ..Default::default()
+    }
+}
+
 fn explicit_ids_query(ids: &[u64]) -> NodeQuery {
     NodeQuery {
         ids: ids.to_vec(),
@@ -807,6 +997,13 @@ fn bench_node_queries(c: &mut Criterion) {
         b.iter(|| black_box(engine.query_node_ids(black_box(&query)).unwrap()));
     });
 
+    group.bench_function("explain_node_query_large_explicit_ids", |b| {
+        let (_dir, engine) = build_small_label_universe_engine();
+        let ids = (1..=(QUERY_LARGE_UNIVERSE_COUNT + QUERY_SMALL_LABEL_COUNT) as u64).collect();
+        let query = label_with_large_explicit_ids_query(ids);
+        b.iter(|| black_box(engine.explain_node_query(black_box(&query)).unwrap()));
+    });
+
     group.bench_function("query_node_ids_label_vs_large_keys", |b| {
         let (_dir, engine) = build_small_label_universe_engine();
         let mut keys: Vec<String> = (0..QUERY_LARGE_UNIVERSE_COUNT)
@@ -852,6 +1049,24 @@ fn bench_node_queries(c: &mut Criterion) {
     group.bench_function("explain_node_query_broad_equality", |b| {
         let (_dir, engine) = build_indexed_query_engine();
         let query = broad_equality_query(Some(QUERY_LIMIT));
+        b.iter(|| black_box(engine.explain_node_query(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("explain_node_query_legal_universe_reuse", |b| {
+        let (_dir, engine) = build_fallback_query_engine();
+        let query = label_and_full_scan_explain_query();
+        b.iter(|| black_box(engine.explain_node_query(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("explain_node_query_hot_memtable_equality_estimate", |b| {
+        let (_dir, engine) = build_hot_memtable_equality_planner_engine();
+        let query = hot_memtable_equality_explain_query();
+        b.iter(|| black_box(engine.explain_node_query(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("explain_node_query_memtable_timestamp_estimate", |b| {
+        let (_dir, engine) = build_memtable_timestamp_planner_engine();
+        let query = memtable_timestamp_explain_query();
         b.iter(|| black_box(engine.explain_node_query(black_box(&query)).unwrap()));
     });
 
@@ -964,6 +1179,39 @@ fn bench_node_queries(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_compound_index_queries(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compound_index_queries");
+    group.sample_size(20);
+
+    group.bench_function("native_prefix_range_declared", |b| {
+        let (_dir, engine) = build_compound_query_engine();
+        let query = compound_tenant_score_query(Some(QUERY_LIMIT));
+        b.iter(|| {
+            let result = engine.query_node_ids(black_box(&query)).unwrap();
+            assert_eq!(result.items.len(), 20);
+            black_box(result)
+        });
+    });
+
+    group.bench_function("gql_prefix_range_declared", |b| {
+        let (_dir, engine) = build_compound_query_engine();
+        let params = GqlParams::new();
+        let options = GqlExecutionOptions::default();
+        let query =
+            "MATCH (n:BenchNode1) WHERE n.tenant = 't77' AND n.score >= 75 RETURN id(n) LIMIT 100";
+        b.iter(|| {
+            let result = engine
+                .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                .unwrap();
+            assert_eq!(result.kind, GqlStatementKind::Query);
+            assert_eq!(result.rows.len(), 20);
+            black_box(result)
+        });
+    });
+
+    group.finish();
+}
+
 fn edge_query_props(i: usize) -> BTreeMap<String, PropValue> {
     let mut props = BTreeMap::new();
     props.insert(
@@ -1038,11 +1286,17 @@ fn build_edge_query_indexed_engine() -> (tempfile::TempDir, DatabaseEngine, u64,
     let (dir, engine, source_id, edge_ids, valid_epoch) = build_edge_query_engine();
     let label = "BenchEdge10".to_string();
     let role = engine
-        .ensure_edge_property_index(&label, "role", SecondaryIndexKind::Equality)
+        .ensure_edge_property_index(
+            &label,
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("role")]),
+        )
         .unwrap();
     wait_for_edge_property_index_state(&engine, role.index_id, SecondaryIndexState::Ready);
     let score = engine
-        .ensure_edge_property_index(&label, "score", SecondaryIndexKind::Range)
+        .ensure_edge_property_index(
+            &label,
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
         .unwrap();
     wait_for_edge_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready);
     (dir, engine, source_id, edge_ids, valid_epoch)
@@ -1053,6 +1307,154 @@ fn edge_query_with_filter(source_id: u64, filter: Option<EdgeFilterExpr>) -> Edg
         label: Some("BenchEdge10".to_string()),
         from_ids: vec![source_id],
         filter,
+        page: PageRequest {
+            limit: Some(QUERY_LIMIT),
+            after: None,
+        },
+        ..Default::default()
+    }
+}
+
+fn edge_legal_universe_explain_query(source_id: u64) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("BenchEdge10".to_string()),
+        from_ids: vec![source_id],
+        filter: Some(EdgeFilterExpr::PropertyRange {
+            key: "score".to_string(),
+            lower: Some(PropertyRangeBound::Included(PropValue::Int(80))),
+            upper: None,
+        }),
+        page: PageRequest {
+            limit: Some(QUERY_LIMIT),
+            after: None,
+        },
+        allow_full_scan: true,
+        ..Default::default()
+    }
+}
+
+fn build_memtable_edge_metadata_planner_engine() -> (tempfile::TempDir, DatabaseEngine, u64) {
+    let (dir, engine) = temp_db();
+    let edge_count = MEMTABLE_PLANNER_SEGMENT_COUNT + MEMTABLE_PLANNER_STRESS_COUNT;
+    let mut nodes = Vec::with_capacity(edge_count + 1);
+    nodes.push(NodeInput {
+        labels: vec![bench_node_label(42)],
+        key: "edge-metadata-source".to_string(),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    });
+    nodes.extend((0..edge_count).map(|i| NodeInput {
+        labels: vec![bench_node_label(43)],
+        key: format!("edge-metadata-target-{i}"),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }));
+    let node_ids = engine.batch_upsert_nodes(nodes).unwrap();
+    let source_id = node_ids[0];
+    let target_ids = &node_ids[1..];
+    engine.flush().unwrap();
+
+    let make_edges = |start: usize, count: usize| -> Vec<EdgeInput> {
+        (start..start + count)
+            .map(|i| EdgeInput {
+                from: source_id,
+                to: target_ids[i],
+                label: "BenchEdge42".to_string(),
+                props: edge_query_props(i),
+                weight: if i.is_multiple_of(2) { 2.0 } else { 0.5 },
+                valid_from: Some(1_700_000_000_000),
+                valid_to: Some(1_700_000_010_000),
+            })
+            .collect()
+    };
+    engine
+        .batch_upsert_edges(make_edges(0, MEMTABLE_PLANNER_SEGMENT_COUNT))
+        .unwrap();
+    engine.flush().unwrap();
+    engine
+        .batch_upsert_edges(make_edges(
+            MEMTABLE_PLANNER_SEGMENT_COUNT,
+            MEMTABLE_PLANNER_STRESS_COUNT,
+        ))
+        .unwrap();
+
+    (dir, engine, source_id)
+}
+
+fn memtable_edge_metadata_explain_query(source_id: u64) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("BenchEdge42".to_string()),
+        from_ids: vec![source_id],
+        filter: Some(EdgeFilterExpr::UpdatedAtRange {
+            lower_ms: Some(0),
+            upper_ms: Some(i64::MAX),
+        }),
+        page: PageRequest {
+            limit: Some(QUERY_LIMIT),
+            after: None,
+        },
+        ..Default::default()
+    }
+}
+
+fn build_many_endpoint_estimate_planner_engine(
+    source_count: usize,
+) -> (tempfile::TempDir, DatabaseEngine, Vec<u64>) {
+    let (dir, engine) = temp_db();
+    let mut nodes = Vec::with_capacity(source_count * 2);
+    nodes.extend((0..source_count).map(|index| NodeInput {
+        labels: vec![bench_node_label(60)],
+        key: format!("endpoint-estimate-source-{index}"),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }));
+    nodes.extend((0..source_count).map(|index| NodeInput {
+        labels: vec![bench_node_label(61)],
+        key: format!("endpoint-estimate-target-{index}"),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }));
+    let ids = engine.batch_upsert_nodes(nodes).unwrap();
+    let source_ids = ids[..source_count].to_vec();
+    let target_ids = &ids[source_count..];
+    let make_edges = |start: usize, count: usize| -> Vec<EdgeInput> {
+        (start..start + count)
+            .map(|index| EdgeInput {
+                from: source_ids[index],
+                to: target_ids[index],
+                label: "BenchEdge60".to_string(),
+                props: BTreeMap::new(),
+                weight: if index.is_multiple_of(2) { 2.0 } else { 1.0 },
+                valid_from: None,
+                valid_to: None,
+            })
+            .collect()
+    };
+    let half = source_count / 2;
+    engine.batch_upsert_edges(make_edges(0, half)).unwrap();
+    engine.flush().unwrap();
+    engine
+        .batch_upsert_edges(make_edges(half, source_count - half))
+        .unwrap();
+    (dir, engine, source_ids)
+}
+
+fn many_endpoint_estimate_explain_query(source_ids: &[u64]) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("BenchEdge60".to_string()),
+        from_ids: source_ids.to_vec(),
+        filter: Some(EdgeFilterExpr::WeightRange {
+            lower: Some(1.0),
+            upper: None,
+        }),
         page: PageRequest {
             limit: Some(QUERY_LIMIT),
             after: None,
@@ -1197,6 +1599,32 @@ fn bench_edge_queries(c: &mut Criterion) {
             }),
         );
         b.iter(|| black_box(engine.query_edges(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("explain_edge_query_legal_universe_reuse", |b| {
+        let (_dir, engine, source_id, _edge_ids, _valid_epoch) = build_edge_query_engine();
+        let query = edge_legal_universe_explain_query(source_id);
+        b.iter(|| black_box(engine.explain_edge_query(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("explain_edge_query_memtable_metadata_estimates", |b| {
+        let (_dir, engine, source_id) = build_memtable_edge_metadata_planner_engine();
+        let query = memtable_edge_metadata_explain_query(source_id);
+        b.iter(|| black_box(engine.explain_edge_query(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("explain_edge_query_many_endpoint_estimates", |b| {
+        let (_dir, engine, source_ids) =
+            build_many_endpoint_estimate_planner_engine(ENDPOINT_ESTIMATE_PLANNER_NODE_COUNT);
+        let query = many_endpoint_estimate_explain_query(&source_ids);
+        b.iter(|| black_box(engine.explain_edge_query(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("explain_edge_query_large_endpoint_ids", |b| {
+        let (_dir, engine, source_ids) =
+            build_many_endpoint_estimate_planner_engine(LARGE_ENDPOINT_PLANNER_NODE_COUNT);
+        let query = many_endpoint_estimate_explain_query(&source_ids);
+        b.iter(|| black_box(engine.explain_edge_query(black_box(&query)).unwrap()));
     });
 
     group.finish();
@@ -1477,6 +1905,220 @@ fn graph_row_optional_query(source_id: u64, limit: usize) -> overgraph::GraphRow
     query
 }
 
+fn build_graph_row_planner_memo_engine() -> (tempfile::TempDir, DatabaseEngine, Vec<u64>) {
+    let (dir, engine) = temp_db();
+    let mut nodes = Vec::with_capacity(GRAPH_ROW_PLANNER_EDGE_COUNT + 1);
+    nodes.push(NodeInput {
+        labels: vec![bench_node_label(10)],
+        key: "graph-row-planner-hub".to_string(),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    });
+    nodes.extend((0..GRAPH_ROW_PLANNER_EDGE_COUNT).map(|index| NodeInput {
+        labels: vec![bench_node_label(11)],
+        key: format!("graph-row-planner-leaf-{index}"),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }));
+    let node_ids = engine.batch_upsert_nodes(nodes).unwrap();
+    let hub_id = node_ids[0];
+    let edge_inputs = node_ids
+        .iter()
+        .skip(1)
+        .enumerate()
+        .map(|(index, &leaf_id)| {
+            let mut props = BTreeMap::new();
+            props.insert(
+                "status".to_string(),
+                PropValue::String("active".to_string()),
+            );
+            props.insert("rank".to_string(), PropValue::Int(index as i64));
+            EdgeInput {
+                from: hub_id,
+                to: leaf_id,
+                label: "BenchEdge30".to_string(),
+                props,
+                weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    engine.batch_upsert_edges(edge_inputs).unwrap();
+    engine.flush().unwrap();
+
+    let status = engine
+        .ensure_edge_property_index(
+            "BenchEdge30",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready);
+    let rank = engine
+        .ensure_edge_property_index(
+            "BenchEdge30",
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("rank")]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, rank.index_id, SecondaryIndexState::Ready);
+
+    (dir, engine, node_ids)
+}
+
+fn graph_row_planner_memo_query(node_ids: &[u64]) -> overgraph::GraphRowQuery {
+    let mut nodes = Vec::with_capacity(GRAPH_ROW_PLANNER_EDGE_COUNT + 1);
+    nodes.push(GraphNodePattern {
+        alias: "hub".to_string(),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(10)],
+            mode: LabelMatchMode::All,
+        }),
+        ids: vec![node_ids[0]],
+        keys: Vec::new(),
+        filter: None,
+    });
+    for index in 0..GRAPH_ROW_PLANNER_EDGE_COUNT {
+        nodes.push(GraphNodePattern {
+            alias: format!("leaf{index}"),
+            label_filter: Some(NodeLabelFilter {
+                labels: vec![bench_node_label(11)],
+                mode: LabelMatchMode::All,
+            }),
+            ids: vec![node_ids[index + 1]],
+            keys: Vec::new(),
+            filter: None,
+        });
+    }
+
+    let pieces = (0..GRAPH_ROW_PLANNER_EDGE_COUNT)
+        .map(|index| {
+            GraphPatternPiece::Edge(GraphEdgePattern {
+                alias: Some(format!("edge{index}")),
+                from_alias: "hub".to_string(),
+                to_alias: format!("leaf{index}"),
+                direction: Direction::Outgoing,
+                label_filter: vec!["BenchEdge30".to_string()],
+                filter: Some(EdgeFilterExpr::PropertyEquals {
+                    key: "status".to_string(),
+                    value: PropValue::String("active".to_string()),
+                }),
+            })
+        })
+        .collect();
+
+    overgraph::GraphRowQuery {
+        nodes,
+        pieces,
+        where_: None,
+        return_items: Some(vec![graph_row_return_binding("hub")]),
+        order_by: Vec::new(),
+        page: GraphPageRequest {
+            skip: 0,
+            limit: QUERY_LIMIT,
+            cursor: None,
+        },
+        at_epoch: None,
+        params: BTreeMap::new(),
+        output: GraphOutputOptions::default(),
+        options: GraphQueryOptions::default(),
+    }
+}
+
+fn build_graph_row_active_memtable_planner_engine() -> (tempfile::TempDir, DatabaseEngine, Vec<u64>)
+{
+    let (dir, engine) = temp_db();
+    let filler_count = MEMTABLE_PLANNER_STRESS_COUNT;
+    let mut nodes = Vec::with_capacity(GRAPH_ROW_PLANNER_EDGE_COUNT + filler_count + 1);
+    nodes.push(NodeInput {
+        labels: vec![bench_node_label(50)],
+        key: "graph-row-active-hub".to_string(),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    });
+    nodes.extend((0..GRAPH_ROW_PLANNER_EDGE_COUNT).map(|index| NodeInput {
+        labels: vec![bench_node_label(51)],
+        key: format!("graph-row-active-leaf-{index}"),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }));
+    nodes.extend((0..filler_count).map(|index| NodeInput {
+        labels: vec![bench_node_label(52)],
+        key: format!("graph-row-active-filler-{index}"),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }));
+    let node_ids = engine.batch_upsert_nodes(nodes).unwrap();
+    let hub_id = node_ids[0];
+    let mut edge_inputs = Vec::with_capacity(GRAPH_ROW_PLANNER_EDGE_COUNT + filler_count);
+    edge_inputs.extend((0..GRAPH_ROW_PLANNER_EDGE_COUNT).map(|index| EdgeInput {
+        from: hub_id,
+        to: node_ids[index + 1],
+        label: "BenchEdge50".to_string(),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        valid_from: None,
+        valid_to: None,
+    }));
+    edge_inputs.extend((0..filler_count).map(|index| EdgeInput {
+        from: hub_id,
+        to: node_ids[GRAPH_ROW_PLANNER_EDGE_COUNT + 1 + index],
+        label: "BenchEdge51".to_string(),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        valid_from: None,
+        valid_to: None,
+    }));
+    engine.batch_upsert_edges(edge_inputs).unwrap();
+    (
+        dir,
+        engine,
+        node_ids[..=GRAPH_ROW_PLANNER_EDGE_COUNT].to_vec(),
+    )
+}
+
+fn graph_row_active_memtable_planner_query(node_ids: &[u64]) -> overgraph::GraphRowQuery {
+    let mut query = graph_row_planner_memo_query(node_ids);
+    for piece in &mut query.pieces {
+        if let GraphPatternPiece::Edge(edge) = piece {
+            edge.label_filter = vec!["BenchEdge50".to_string()];
+            edge.filter = None;
+        }
+    }
+    query.nodes[0].label_filter = Some(NodeLabelFilter {
+        labels: vec![bench_node_label(50)],
+        mode: LabelMatchMode::All,
+    });
+    for node in query.nodes.iter_mut().skip(1) {
+        node.label_filter = Some(NodeLabelFilter {
+            labels: vec![bench_node_label(51)],
+            mode: LabelMatchMode::All,
+        });
+    }
+    query
+}
+
+fn graph_row_no_plan_many_alternatives_query(node_ids: &[u64]) -> overgraph::GraphRowQuery {
+    let mut query = graph_row_planner_memo_query(node_ids);
+    query.page.limit = 1;
+    query.options.include_plan = false;
+    if let Some(hub) = query.nodes.first_mut() {
+        // Keep the physical planner's alternatives but make execution finish
+        // quickly once the chosen explicit node source is materialized.
+        hub.ids = vec![u64::MAX - 17];
+    }
+    query
+}
+
 fn graph_row_order_by_score_then_target() -> Vec<GraphOrderItem> {
     vec![
         GraphOrderItem {
@@ -1705,6 +2347,24 @@ fn bench_gql_queries(c: &mut Criterion) {
         });
     });
 
+    graph_group.bench_function("explain_graph_row_bound_edge_source_memo", |b| {
+        let (_dir, engine, node_ids) = build_graph_row_planner_memo_engine();
+        let query = graph_row_planner_memo_query(&node_ids);
+        b.iter(|| black_box(engine.explain_graph_rows(black_box(&query)).unwrap()));
+    });
+
+    graph_group.bench_function("explain_graph_row_active_memtable_planning_memo", |b| {
+        let (_dir, engine, node_ids) = build_graph_row_active_memtable_planner_engine();
+        let query = graph_row_active_memtable_planner_query(&node_ids);
+        b.iter(|| black_box(engine.explain_graph_rows(black_box(&query)).unwrap()));
+    });
+
+    graph_group.bench_function("query_graph_row_many_alternatives_no_plan", |b| {
+        let (_dir, engine, node_ids) = build_graph_row_planner_memo_engine();
+        let query = graph_row_no_plan_many_alternatives_query(&node_ids);
+        b.iter(|| black_box(engine.query_graph_rows(black_box(&query)).unwrap()));
+    });
+
     graph_group.finish();
 
     let mut group = c.benchmark_group("execute_gql");
@@ -1891,9 +2551,9 @@ fn bench_gql_queries(c: &mut Criterion) {
         let (_dir, engine, _company_id) = build_pattern_engine();
         let params = GqlParams::new();
         let options = GqlExecutionOptions::default();
-        let query = "MATCH (a:BenchNode1) WHERE a.key = 'acct-0' \
+        let query = "MATCH (a:BenchNode1) WHERE elementKey(a) = 'acct-0' \
                      WITH a \
-                     MATCH (b:BenchNode2) WHERE b.key = 'company-0' \
+                     MATCH (b:BenchNode2) WHERE elementKey(b) = 'company-0' \
                      WITH a, b \
                      MATCH p = shortestPath((a)-[:BenchEdge10*1..1]->(b)) \
                      RETURN length(p)";
@@ -2008,7 +2668,7 @@ fn bench_gql_queries(c: &mut Criterion) {
     group.bench_function("gql_mutation_create_smoke", |b| {
         let params = GqlParams::new();
         let options = GqlExecutionOptions::default();
-        let query = "CREATE (n:GqlBenchCreate {key: 'n', status: 'new'})";
+        let query = "CREATE (n:GqlBenchCreate {elementKey: 'n', status: 'new'})";
         b.iter_batched(
             temp_gql_mutation_bench_db,
             |(_dir, engine)| {
@@ -2028,7 +2688,7 @@ fn bench_gql_queries(c: &mut Criterion) {
     group.bench_function("gql_mutation_match_set_smoke", |b| {
         let params = GqlParams::new();
         let options = GqlExecutionOptions::default();
-        let query = "MATCH (n:GqlBenchSet) WHERE n.key = 'n' SET n.status = 'new'";
+        let query = "MATCH (n:GqlBenchSet) WHERE elementKey(n) = 'n' SET n.status = 'new'";
         b.iter_batched(
             setup_gql_set_smoke_db,
             |(_dir, engine)| {
@@ -2048,7 +2708,7 @@ fn bench_gql_queries(c: &mut Criterion) {
     group.bench_function("gql_mutation_merge_create_smoke", |b| {
         let params = GqlParams::new();
         let options = GqlExecutionOptions::default();
-        let query = "MERGE (n:GqlBenchMerge {key: 'n'}) ON CREATE SET n.status = 'created'";
+        let query = "MERGE (n:GqlBenchMerge {elementKey: 'n'}) ON CREATE SET n.status = 'created'";
         b.iter_batched(
             temp_gql_mutation_bench_db,
             |(_dir, engine)| {
@@ -2068,7 +2728,7 @@ fn bench_gql_queries(c: &mut Criterion) {
     group.bench_function("gql_mutation_merge_match_smoke", |b| {
         let params = GqlParams::new();
         let options = GqlExecutionOptions::default();
-        let query = "MERGE (n:GqlBenchMerge {key: 'n'}) ON MATCH SET n.status = 'matched'";
+        let query = "MERGE (n:GqlBenchMerge {elementKey: 'n'}) ON MATCH SET n.status = 'matched'";
         b.iter_batched(
             setup_gql_merge_match_smoke_db,
             |(_dir, engine)| {
@@ -2088,7 +2748,7 @@ fn bench_gql_queries(c: &mut Criterion) {
     group.bench_function("gql_mutation_detach_delete_smoke", |b| {
         let params = GqlParams::new();
         let options = GqlExecutionOptions::default();
-        let query = "MATCH (n:GqlBenchDetach) WHERE n.key = 'hub' DETACH DELETE n";
+        let query = "MATCH (n:GqlBenchDetach) WHERE elementKey(n) = 'hub' DETACH DELETE n";
         b.iter_batched(
             setup_gql_detach_delete_smoke_db,
             |(_dir, engine)| {
@@ -2108,7 +2768,7 @@ fn bench_gql_queries(c: &mut Criterion) {
     group.bench_function("gql_mutation_return_smoke", |b| {
         let params = GqlParams::new();
         let options = GqlExecutionOptions::default();
-        let query = "MATCH (n:GqlBenchReturn) SET n.touched = true RETURN n.key AS key ORDER BY n.rank LIMIT 2";
+        let query = "MATCH (n:GqlBenchReturn) SET n.touched = true RETURN elementKey(n) AS key ORDER BY n.rank LIMIT 2";
         b.iter_batched(
             setup_gql_mutation_return_smoke_db,
             |(_dir, engine)| {
@@ -2132,6 +2792,7 @@ criterion_group!(
     benches,
     bench_node_queries,
     bench_edge_queries,
+    bench_compound_index_queries,
     bench_gql_queries
 );
 criterion_main!(benches);

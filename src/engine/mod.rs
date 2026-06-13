@@ -35,20 +35,24 @@ use crate::schema::{
     SchemaCheckOptions, SchemaSetOptions, SchemaTargetKind, SchemaValidationFailure,
     SchemaValidationReport, SchemaViolation, SchemaViolationTarget,
 };
+use crate::secondary_index_key::{
+    compound_secondary_failure_message, compound_secondary_failure_message_from_str,
+};
 use crate::segment_components::{ComponentAvailability, SegmentComponentKind};
 use crate::segment_reader::{SegmentLabelPosting, SegmentReader};
 use crate::segment_writer::{
+    build_edge_compound_entries_from_metadata, build_node_compound_entries_from_metadata,
     cleanup_orphan_optional_component_files, create_compaction_core_writer,
     finalize_compaction_segment, finish_compaction_core_writer,
     is_optional_component_publication_conflict,
-    maintained_secondary_index_ids_from_segment_manifest, publish_edge_prop_eq_sidecar_component,
-    publish_edge_prop_range_sidecar_component, publish_node_prop_eq_sidecar_component,
-    publish_node_prop_range_sidecar_component, remove_secondary_index_component_records,
-    secondary_index_sidecar_paths_for_entry, segment_dir, segment_tmp_dir,
-    write_compaction_source_components, write_indexes_from_metadata_with_secondary_indexes,
-    write_merged_edges_dat, write_merged_nodes_dat,
-    write_segment_with_degree_overlay_and_secondary_indexes, write_v3_edges_dat,
-    write_v3_nodes_dat, CompactEdgeMeta, CompactNodeMeta, FastMergeCopyInfo,
+    maintained_secondary_index_ids_from_segment_manifest, publish_compound_sidecar_component,
+    publish_edge_prop_eq_sidecar_component, publish_edge_prop_range_sidecar_component,
+    publish_node_prop_eq_sidecar_component, publish_node_prop_range_sidecar_component,
+    remove_secondary_index_component_records, secondary_index_sidecar_paths_for_entry, segment_dir,
+    segment_tmp_dir, write_compaction_source_components,
+    write_indexes_from_metadata_with_secondary_indexes, write_merged_edges_dat,
+    write_merged_nodes_dat, write_segment_with_degree_overlay_and_secondary_indexes,
+    write_v3_edges_dat, write_v3_nodes_dat, CompactEdgeMeta, CompactNodeMeta, FastMergeCopyInfo,
     SecondaryIndexMaintenanceReport,
 };
 use crate::source_list::SourceList;
@@ -81,23 +85,33 @@ fn secondary_index_target_discriminant(
     target: &SecondaryIndexTarget,
 ) -> SecondaryIndexTargetDiscriminant {
     match target {
-        SecondaryIndexTarget::NodeProperty { .. } => SecondaryIndexTargetDiscriminant::Node,
-        SecondaryIndexTarget::EdgeProperty { .. } => SecondaryIndexTargetDiscriminant::Edge,
+        SecondaryIndexTarget::NodeProperty { .. } | SecondaryIndexTarget::NodeFieldIndex { .. } => {
+            SecondaryIndexTargetDiscriminant::Node
+        }
+        SecondaryIndexTarget::EdgeProperty { .. } | SecondaryIndexTarget::EdgeFieldIndex { .. } => {
+            SecondaryIndexTargetDiscriminant::Edge
+        }
     }
 }
 
 fn secondary_index_target_label_id(target: &SecondaryIndexTarget) -> u32 {
-    match target {
-        SecondaryIndexTarget::NodeProperty { label_id, .. } => *label_id,
-        SecondaryIndexTarget::EdgeProperty { label_id, .. } => *label_id,
-    }
+    target.label_id()
 }
 
 fn secondary_index_target_prop_key(target: &SecondaryIndexTarget) -> &str {
-    match target {
-        SecondaryIndexTarget::NodeProperty { prop_key, .. }
-        | SecondaryIndexTarget::EdgeProperty { prop_key, .. } => prop_key,
-    }
+    target
+        .single_property_key()
+        .expect("single-property secondary index target")
+}
+
+fn secondary_index_target_requires_sidecar_build(target: &SecondaryIndexTarget) -> bool {
+    matches!(
+        target,
+        SecondaryIndexTarget::NodeProperty { .. }
+            | SecondaryIndexTarget::EdgeProperty { .. }
+            | SecondaryIndexTarget::NodeFieldIndex { .. }
+            | SecondaryIndexTarget::EdgeFieldIndex { .. }
+    )
 }
 
 fn secondary_index_kind_rank(kind: &SecondaryIndexKind) -> (u8, u8) {
@@ -107,10 +121,172 @@ fn secondary_index_kind_rank(kind: &SecondaryIndexKind) -> (u8, u8) {
     }
 }
 
-type SecondaryIndexCatalog = HashMap<
-    (SecondaryIndexTargetDiscriminant, u32),
-    HashMap<String, HashMap<SecondaryIndexKind, SecondaryIndexManifestEntry>>,
->;
+fn secondary_index_component_kind_for_recovery(
+    entry: &SecondaryIndexManifestEntry,
+) -> SegmentComponentKind {
+    match (&entry.target, &entry.kind) {
+        (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Equality) => {
+            SegmentComponentKind::NodePropertyEqualityIndex {
+                index_id: entry.index_id,
+            }
+        }
+        (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Range) => {
+            SegmentComponentKind::NodePropertyRangeIndex {
+                index_id: entry.index_id,
+            }
+        }
+        (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Equality) => {
+            SegmentComponentKind::EdgePropertyEqualityIndex {
+                index_id: entry.index_id,
+            }
+        }
+        (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range) => {
+            SegmentComponentKind::EdgePropertyRangeIndex {
+                index_id: entry.index_id,
+            }
+        }
+        (SecondaryIndexTarget::NodeFieldIndex { .. }, SecondaryIndexKind::Equality) => {
+            SegmentComponentKind::NodeCompoundEqualityIndex {
+                index_id: entry.index_id,
+            }
+        }
+        (SecondaryIndexTarget::NodeFieldIndex { .. }, SecondaryIndexKind::Range) => {
+            SegmentComponentKind::NodeCompoundRangeIndex {
+                index_id: entry.index_id,
+            }
+        }
+        (SecondaryIndexTarget::EdgeFieldIndex { .. }, SecondaryIndexKind::Equality) => {
+            SegmentComponentKind::EdgeCompoundEqualityIndex {
+                index_id: entry.index_id,
+            }
+        }
+        (SecondaryIndexTarget::EdgeFieldIndex { .. }, SecondaryIndexKind::Range) => {
+            SegmentComponentKind::EdgeCompoundRangeIndex {
+                index_id: entry.index_id,
+            }
+        }
+    }
+}
+
+fn secondary_index_fields_sort_key(target: &SecondaryIndexTarget) -> Vec<(u8, String)> {
+    target
+        .public_fields()
+        .into_iter()
+        .map(|field| match field {
+            SecondaryIndexField::Property { key } => (0, key),
+            SecondaryIndexField::NodeMetadata(field) => {
+                (1, node_metadata_index_field_name(field).to_string())
+            }
+            SecondaryIndexField::EdgeMetadata(field) => {
+                (2, edge_metadata_index_field_name(field).to_string())
+            }
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct SecondaryIndexCatalog {
+    by_identity: HashMap<SecondaryIndexLookupKey, SecondaryIndexManifestEntry>,
+    node_property: PropertyIndexCatalog,
+    edge_property: PropertyIndexCatalog,
+    node_field: FieldIndexCatalog,
+    edge_field: FieldIndexCatalog,
+}
+
+#[derive(Default)]
+struct PropertyIndexCatalog {
+    equality: HashMap<u32, HashMap<String, SecondaryIndexManifestEntry>>,
+    range: HashMap<u32, HashMap<String, SecondaryIndexManifestEntry>>,
+}
+
+#[derive(Default)]
+struct FieldIndexCatalog {
+    equality: HashMap<u32, Vec<SecondaryIndexManifestEntry>>,
+    range: HashMap<u32, Vec<SecondaryIndexManifestEntry>>,
+}
+
+impl FieldIndexCatalog {
+    fn insert(
+        &mut self,
+        label_id: u32,
+        kind: &SecondaryIndexKind,
+        entry: SecondaryIndexManifestEntry,
+    ) {
+        self.by_kind_mut(kind)
+            .entry(label_id)
+            .or_default()
+            .push(entry);
+    }
+
+    fn get(&self, label_id: u32, kind: &SecondaryIndexKind) -> &[SecondaryIndexManifestEntry] {
+        self.by_kind(kind).get(&label_id).map_or(&[], Vec::as_slice)
+    }
+
+    fn by_kind(
+        &self,
+        kind: &SecondaryIndexKind,
+    ) -> &HashMap<u32, Vec<SecondaryIndexManifestEntry>> {
+        match kind {
+            SecondaryIndexKind::Equality => &self.equality,
+            SecondaryIndexKind::Range => &self.range,
+        }
+    }
+
+    fn by_kind_mut(
+        &mut self,
+        kind: &SecondaryIndexKind,
+    ) -> &mut HashMap<u32, Vec<SecondaryIndexManifestEntry>> {
+        match kind {
+            SecondaryIndexKind::Equality => &mut self.equality,
+            SecondaryIndexKind::Range => &mut self.range,
+        }
+    }
+}
+
+impl PropertyIndexCatalog {
+    fn insert(
+        &mut self,
+        label_id: u32,
+        prop_key: String,
+        kind: &SecondaryIndexKind,
+        entry: SecondaryIndexManifestEntry,
+    ) {
+        self.by_kind_mut(kind)
+            .entry(label_id)
+            .or_default()
+            .insert(prop_key, entry);
+    }
+
+    fn get(
+        &self,
+        label_id: u32,
+        prop_key: &str,
+        kind: &SecondaryIndexKind,
+    ) -> Option<SecondaryIndexManifestEntry> {
+        self.by_kind(kind).get(&label_id)?.get(prop_key).cloned()
+    }
+
+    fn by_kind(
+        &self,
+        kind: &SecondaryIndexKind,
+    ) -> &HashMap<u32, HashMap<String, SecondaryIndexManifestEntry>> {
+        match kind {
+            SecondaryIndexKind::Equality => &self.equality,
+            SecondaryIndexKind::Range => &self.range,
+        }
+    }
+
+    fn by_kind_mut(
+        &mut self,
+        kind: &SecondaryIndexKind,
+    ) -> &mut HashMap<u32, HashMap<String, SecondaryIndexManifestEntry>> {
+        match kind {
+            SecondaryIndexKind::Equality => &mut self.equality,
+            SecondaryIndexKind::Range => &mut self.range,
+        }
+    }
+}
+
 type SecondaryIndexEntries = Vec<SecondaryIndexManifestEntry>;
 
 /// Generic K-way merge across already-sorted sources with early termination
@@ -272,7 +448,7 @@ fn secondary_index_lookup_key(entry: &SecondaryIndexManifestEntry) -> SecondaryI
     SecondaryIndexLookupKey {
         discriminant: secondary_index_target_discriminant(&entry.target),
         target_label_id: secondary_index_target_label_id(&entry.target),
-        prop_key: secondary_index_target_prop_key(&entry.target).to_string(),
+        fields: entry.target.public_fields(),
         kind: entry.kind.clone(),
     }
 }
@@ -281,10 +457,10 @@ fn normalize_secondary_index_manifest(manifest: &mut ManifestState) -> Result<bo
     let mut dirty = false;
     let mut seen_ids = HashSet::new();
     let mut seen_keys = HashSet::new();
-    let mut seen_range_targets = HashSet::new();
     let mut max_index_id = 0u64;
 
     for entry in &mut manifest.secondary_indexes {
+        validate_secondary_index_target(&entry.target)?;
         if !seen_ids.insert(entry.index_id) {
             return Err(EngineError::ManifestError(format!(
                 "duplicate secondary index id {} in manifest",
@@ -296,21 +472,6 @@ fn normalize_secondary_index_manifest(manifest: &mut ManifestState) -> Result<bo
                 "duplicate secondary index declaration for {:?}",
                 entry.target
             )));
-        }
-        if matches!(entry.kind, SecondaryIndexKind::Range) {
-            let disc = secondary_index_target_discriminant(&entry.target);
-            let target_label_id = secondary_index_target_label_id(&entry.target);
-            let prop_key = secondary_index_target_prop_key(&entry.target);
-            if !seen_range_targets.insert((disc, target_label_id, prop_key.to_string())) {
-                let target_label = match disc {
-                    SecondaryIndexTargetDiscriminant::Node => "node",
-                    SecondaryIndexTargetDiscriminant::Edge => "edge",
-                };
-                return Err(EngineError::ManifestError(format!(
-                    "duplicate range declaration for {} property ({}, {})",
-                    target_label, target_label_id, prop_key
-                )));
-            }
         }
         max_index_id = max_index_id.max(entry.index_id);
     }
@@ -333,35 +494,62 @@ fn normalize_secondary_index_manifest(manifest: &mut ManifestState) -> Result<bo
 fn build_secondary_index_catalog(
     entries: &[SecondaryIndexManifestEntry],
 ) -> Result<SecondaryIndexCatalog, EngineError> {
-    let mut catalog: SecondaryIndexCatalog = HashMap::with_capacity(entries.len());
-    let mut seen_range_targets = HashSet::new();
+    let mut catalog = SecondaryIndexCatalog {
+        by_identity: HashMap::with_capacity(entries.len()),
+        node_property: PropertyIndexCatalog::default(),
+        edge_property: PropertyIndexCatalog::default(),
+        node_field: FieldIndexCatalog::default(),
+        edge_field: FieldIndexCatalog::default(),
+    };
     for entry in entries {
-        let disc = secondary_index_target_discriminant(&entry.target);
-        let target_label_id = secondary_index_target_label_id(&entry.target);
-        let prop_key = secondary_index_target_prop_key(&entry.target);
-        if matches!(entry.kind, SecondaryIndexKind::Range)
-            && !seen_range_targets.insert((disc, target_label_id, prop_key.to_string()))
-        {
-            let target_label = match disc {
-                SecondaryIndexTargetDiscriminant::Node => "node",
-                SecondaryIndexTargetDiscriminant::Edge => "edge",
-            };
-            return Err(EngineError::ManifestError(format!(
-                "duplicate range declaration loaded from manifest for {} property ({}, {})",
-                target_label, target_label_id, prop_key
-            )));
-        }
-        let kind_map = catalog
-            .entry((disc, target_label_id))
-            .or_default()
-            .entry(prop_key.to_string())
-            .or_default();
-        if kind_map.insert(entry.kind.clone(), entry.clone()).is_some() {
+        validate_secondary_index_target(&entry.target)?;
+        let key = secondary_index_lookup_key(entry);
+        if catalog.by_identity.insert(key, entry.clone()).is_some() {
             return Err(EngineError::ManifestError(format!(
                 "duplicate secondary index declaration loaded from manifest: {:?}",
                 entry.target
             )));
         }
+        match &entry.target {
+            SecondaryIndexTarget::NodeProperty { label_id, prop_key } => {
+                catalog.node_property.insert(
+                    *label_id,
+                    prop_key.clone(),
+                    &entry.kind,
+                    entry.clone(),
+                );
+            }
+            SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => {
+                catalog.edge_property.insert(
+                    *label_id,
+                    prop_key.clone(),
+                    &entry.kind,
+                    entry.clone(),
+                );
+            }
+            SecondaryIndexTarget::NodeFieldIndex { label_id, .. } => {
+                catalog
+                    .node_field
+                    .insert(*label_id, &entry.kind, entry.clone());
+            }
+            SecondaryIndexTarget::EdgeFieldIndex { label_id, .. } => {
+                catalog
+                    .edge_field
+                    .insert(*label_id, &entry.kind, entry.clone());
+            }
+        }
+    }
+    for entries in catalog.node_field.equality.values_mut() {
+        entries.sort_by_key(|entry| entry.index_id);
+    }
+    for entries in catalog.node_field.range.values_mut() {
+        entries.sort_by_key(|entry| entry.index_id);
+    }
+    for entries in catalog.edge_field.equality.values_mut() {
+        entries.sort_by_key(|entry| entry.index_id);
+    }
+    for entries in catalog.edge_field.range.values_mut() {
+        entries.sort_by_key(|entry| entry.index_id);
     }
     Ok(catalog)
 }
@@ -1078,6 +1266,7 @@ fn reconcile_background_output_equality_declarations(
     for entry in &mut manifest.secondary_indexes {
         if !matches!(entry.kind, SecondaryIndexKind::Equality)
             || maintained_equality_index_ids.contains(&entry.index_id)
+            || !secondary_index_target_requires_sidecar_build(&entry.target)
         {
             continue;
         }
@@ -1108,6 +1297,7 @@ fn reconcile_background_output_range_declarations(
     for entry in &mut manifest.secondary_indexes {
         if !matches!(entry.kind, SecondaryIndexKind::Range)
             || maintained_range_index_ids.contains(&entry.index_id)
+            || !secondary_index_target_requires_sidecar_build(&entry.target)
         {
             continue;
         }
@@ -1143,7 +1333,7 @@ fn mark_secondary_index_failed(
     index_id: u64,
     error: &EngineError,
 ) {
-    let message = error.to_string();
+    let raw_message = error.to_string();
     let _ = update_secondary_index_manifest_runtime(
         db_dir,
         manifest_write_lock,
@@ -1160,8 +1350,9 @@ fn mark_secondary_index_failed(
                 .iter_mut()
                 .find(|entry| entry.index_id == index_id)
             {
+                let message = secondary_index_failure_message_for_entry(entry, raw_message.clone());
                 entry.state = SecondaryIndexState::Failed;
-                entry.last_error = Some(message.clone());
+                entry.last_error = Some(message);
             }
             Ok(())
         },
@@ -1389,6 +1580,30 @@ enum SecondaryRangeFinalizeOutcome {
     Inactive,
 }
 
+#[derive(Clone)]
+struct CompoundSecondaryBuildSnapshot {
+    dense_config: Option<DenseVectorConfig>,
+    entry: SecondaryIndexManifestEntry,
+    target_label_id: u32,
+    segment_ids: Vec<u64>,
+    segment_infos: Vec<SegmentInfo>,
+    secondary_indexes: Vec<SecondaryIndexManifestEntry>,
+}
+
+enum CompoundSecondaryCoverageStatus {
+    Covered,
+    Incomplete,
+    Failed(String),
+    Cancelled,
+}
+
+enum CompoundSecondaryFinalizeOutcome {
+    ReadyApplied(SecondaryIndexReadyApplied),
+    Applied,
+    Retry,
+    Inactive,
+}
+
 fn segment_info_for_id(segment_infos: &[SegmentInfo], segment_id: u64) -> Option<&SegmentInfo> {
     segment_infos
         .iter()
@@ -1410,7 +1625,6 @@ struct SecondaryIndexReadyApplied {
     target: SecondaryIndexTarget,
     kind: SecondaryIndexKind,
     target_label_id: u32,
-    prop_key: String,
     declaration_fingerprint: u64,
     snapshot_segment_ids: Vec<u64>,
 }
@@ -1424,13 +1638,11 @@ impl SecondaryIndexReadyApplied {
             return None;
         }
         let target_label_id = secondary_index_target_label_id(&entry.target);
-        let prop_key = secondary_index_target_prop_key(&entry.target);
         Some(Self {
             index_id: entry.index_id,
             target: entry.target.clone(),
             kind: entry.kind.clone(),
             target_label_id,
-            prop_key: prop_key.to_string(),
             declaration_fingerprint: planner_stats_declaration_fingerprint_for_entry(entry),
             snapshot_segment_ids,
         })
@@ -1445,9 +1657,7 @@ impl SecondaryIndexReadyApplied {
             return false;
         }
         let target_label_id = secondary_index_target_label_id(&entry.target);
-        let prop_key = secondary_index_target_prop_key(&entry.target);
         target_label_id == self.target_label_id
-            && prop_key == self.prop_key
             && planner_stats_declaration_fingerprint_for_entry(entry)
                 == self.declaration_fingerprint
     }
@@ -1472,6 +1682,12 @@ fn load_secondary_eq_build_snapshot(
     if entry.state != SecondaryIndexState::Building
         || !matches!(entry.kind, SecondaryIndexKind::Equality)
     {
+        return Ok(None);
+    }
+    if !matches!(
+        &entry.target,
+        SecondaryIndexTarget::NodeProperty { .. } | SecondaryIndexTarget::EdgeProperty { .. }
+    ) {
         return Ok(None);
     }
 
@@ -1784,6 +2000,12 @@ fn load_secondary_range_build_snapshot(
     if !matches!(&entry.kind, SecondaryIndexKind::Range) {
         return Ok(None);
     }
+    if !matches!(
+        &entry.target,
+        SecondaryIndexTarget::NodeProperty { .. } | SecondaryIndexTarget::EdgeProperty { .. }
+    ) {
+        return Ok(None);
+    }
     let target = secondary_index_target_discriminant(&entry.target);
     let target_label_id = secondary_index_target_label_id(&entry.target);
     let prop_key = secondary_index_target_prop_key(&entry.target).to_string();
@@ -2070,6 +2292,334 @@ fn finalize_secondary_range_build_snapshot(
     Ok(outcome)
 }
 
+fn secondary_index_failure_message_for_entry(
+    entry: &SecondaryIndexManifestEntry,
+    message: String,
+) -> String {
+    if matches!(
+        &entry.target,
+        SecondaryIndexTarget::NodeFieldIndex { .. } | SecondaryIndexTarget::EdgeFieldIndex { .. }
+    ) {
+        compound_secondary_failure_message_from_str(&message)
+    } else {
+        message
+    }
+}
+
+/// Materialize compact node metas for a compound sidecar build over a single
+/// segment, scoped to the declaration's target label. Vector metadata is
+/// never read on this path — compound tuples cannot reference vectors, so
+/// those fields stay zeroed.
+fn compound_node_metas_for_single_segment(
+    segment: &SegmentReader,
+    target_label_id: u32,
+) -> Result<Vec<CompactNodeMeta>, EngineError> {
+    let mut metas = Vec::new();
+    for index in 0..segment.node_meta_count() as usize {
+        let meta = segment.node_meta_at(index)?;
+        if !meta.label_ids.contains(target_label_id) {
+            continue;
+        }
+        metas.push(CompactNodeMeta {
+            node_id: meta.node_id,
+            new_data_offset: meta.data_offset,
+            data_len: meta.data_len,
+            label_ids: meta.label_ids,
+            updated_at: meta.updated_at,
+            weight: meta.weight,
+            key_len: meta.key_len,
+            dense_vector_offset: 0,
+            dense_vector_len: 0,
+            sparse_vector_offset: 0,
+            sparse_vector_len: 0,
+            src_seg_idx: 0,
+            src_data_offset: meta.data_offset,
+            last_write_seq: meta.last_write_seq,
+        });
+    }
+    Ok(metas)
+}
+
+/// Edge counterpart of [`compound_node_metas_for_single_segment`].
+fn compound_edge_metas_for_single_segment(
+    segment: &SegmentReader,
+    target_label_id: u32,
+) -> Result<Vec<CompactEdgeMeta>, EngineError> {
+    let mut metas = Vec::new();
+    for index in 0..segment.edge_meta_count() as usize {
+        let (
+            edge_id,
+            data_offset,
+            data_len,
+            from,
+            to,
+            label_id,
+            updated_at,
+            weight,
+            valid_from,
+            valid_to,
+            last_write_seq,
+        ) = segment.edge_meta_at(index)?;
+        if label_id != target_label_id {
+            continue;
+        }
+        metas.push(CompactEdgeMeta {
+            edge_id,
+            new_data_offset: data_offset,
+            data_len,
+            from,
+            to,
+            label_id,
+            updated_at,
+            weight,
+            valid_from,
+            valid_to,
+            src_seg_idx: 0,
+            src_data_offset: data_offset,
+            last_write_seq,
+        });
+    }
+    Ok(metas)
+}
+
+fn load_compound_secondary_build_snapshot(
+    db_dir: &Path,
+    manifest_write_lock: &Arc<Mutex<()>>,
+    index_id: u64,
+) -> Result<Option<CompoundSecondaryBuildSnapshot>, EngineError> {
+    let _guard = manifest_write_lock.lock().unwrap();
+    let manifest = load_manifest_readonly(db_dir)?
+        .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
+    let Some(entry) = manifest
+        .secondary_indexes
+        .iter()
+        .find(|entry| entry.index_id == index_id)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    if entry.state != SecondaryIndexState::Building
+        || !matches!(
+            &entry.target,
+            SecondaryIndexTarget::NodeFieldIndex { .. }
+                | SecondaryIndexTarget::EdgeFieldIndex { .. }
+        )
+    {
+        return Ok(None);
+    }
+
+    let target_label_id = secondary_index_target_label_id(&entry.target);
+    let mut segment_ids: Vec<u64> = manifest.segments.iter().map(|segment| segment.id).collect();
+    segment_ids.sort_unstable();
+    let mut segment_infos = manifest.segments.clone();
+    segment_infos.sort_by_key(|segment| segment.id);
+    Ok(Some(CompoundSecondaryBuildSnapshot {
+        dense_config: manifest.dense_vector.clone(),
+        entry,
+        target_label_id,
+        segment_ids,
+        segment_infos,
+        secondary_indexes: manifest.secondary_indexes.clone(),
+    }))
+}
+
+fn build_compound_sidecars_for_snapshot(
+    db_dir: &Path,
+    snapshot: &CompoundSecondaryBuildSnapshot,
+    cancel: &AtomicBool,
+) -> Result<(), EngineError> {
+    for &segment_id in &snapshot.segment_ids {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let seg_path = segment_dir(db_dir, segment_id);
+        if !seg_path.exists() {
+            continue;
+        }
+        let Some(seg_info) = segment_info_for_id(&snapshot.segment_infos, segment_id) else {
+            continue;
+        };
+        let segment = match SegmentReader::open_with_info(
+            &seg_path,
+            seg_info,
+            snapshot.dense_config.as_ref(),
+            &snapshot.secondary_indexes,
+        ) {
+            Ok(segment) => Arc::new(segment),
+            Err(error) if is_not_found_io_error(&error) => continue,
+            Err(error) => return Err(error),
+        };
+
+        if let Ok(true) = segment.validate_compound_sidecar_for_entry(&snapshot.entry) {
+            continue;
+        }
+
+        let source_segments = vec![Arc::clone(&segment)];
+        let sidecar_entries = match &snapshot.entry.target {
+            SecondaryIndexTarget::NodeFieldIndex { .. } => {
+                let node_metas =
+                    compound_node_metas_for_single_segment(&segment, snapshot.target_label_id)?;
+                build_node_compound_entries_from_metadata(
+                    &source_segments,
+                    &node_metas,
+                    &snapshot.entry,
+                )?
+            }
+            SecondaryIndexTarget::EdgeFieldIndex { .. } => {
+                let edge_metas =
+                    compound_edge_metas_for_single_segment(&segment, snapshot.target_label_id)?;
+                build_edge_compound_entries_from_metadata(
+                    &source_segments,
+                    &edge_metas,
+                    &snapshot.entry,
+                )?
+            }
+            SecondaryIndexTarget::NodeProperty { .. }
+            | SecondaryIndexTarget::EdgeProperty { .. } => {
+                continue;
+            }
+        };
+        match publish_compound_sidecar_component(&seg_path, &snapshot.entry, &sidecar_entries) {
+            Ok(()) => {}
+            Err(error) if is_not_found_io_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn validate_compound_secondary_snapshot_coverage(
+    db_dir: &Path,
+    snapshot: &CompoundSecondaryBuildSnapshot,
+    cancel: &AtomicBool,
+) -> Result<CompoundSecondaryCoverageStatus, EngineError> {
+    let mut all_present = true;
+    for &segment_id in &snapshot.segment_ids {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(CompoundSecondaryCoverageStatus::Cancelled);
+        }
+        let seg_path = segment_dir(db_dir, segment_id);
+        if !seg_path.exists() {
+            all_present = false;
+            continue;
+        }
+        let Some(seg_info) = segment_info_for_id(&snapshot.segment_infos, segment_id) else {
+            all_present = false;
+            continue;
+        };
+        let segment = match SegmentReader::open_with_info(
+            &seg_path,
+            seg_info,
+            snapshot.dense_config.as_ref(),
+            &snapshot.secondary_indexes,
+        ) {
+            Ok(segment) => segment,
+            Err(error) if is_not_found_io_error(&error) => {
+                all_present = false;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        match segment.validate_compound_sidecar_for_entry(&snapshot.entry) {
+            Ok(true) => {}
+            Ok(false) => all_present = false,
+            Err(error) => {
+                return Ok(CompoundSecondaryCoverageStatus::Failed(
+                    compound_secondary_failure_message(&error),
+                ));
+            }
+        }
+    }
+    Ok(if all_present {
+        CompoundSecondaryCoverageStatus::Covered
+    } else {
+        CompoundSecondaryCoverageStatus::Incomplete
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_compound_secondary_build_snapshot(
+    db_dir: &Path,
+    manifest_write_lock: &Arc<Mutex<()>>,
+    catalog_lock: &Arc<RwLock<SecondaryIndexCatalog>>,
+    entries_lock: &Arc<RwLock<SecondaryIndexEntries>>,
+    next_node_id_seen: &AtomicU64,
+    next_edge_id_seen: &AtomicU64,
+    engine_seq_seen: &AtomicU64,
+    label_catalog: &Arc<RwLock<RuntimeLabelCatalog>>,
+    index_id: u64,
+    snapshot: &CompoundSecondaryBuildSnapshot,
+    coverage: &CompoundSecondaryCoverageStatus,
+) -> Result<CompoundSecondaryFinalizeOutcome, EngineError> {
+    let mut outcome = CompoundSecondaryFinalizeOutcome::Applied;
+    update_secondary_index_manifest_runtime(
+        db_dir,
+        manifest_write_lock,
+        catalog_lock,
+        entries_lock,
+        next_node_id_seen,
+        next_edge_id_seen,
+        engine_seq_seen,
+        Some(label_catalog),
+        None,
+        |manifest| {
+            let Some(entry_pos) = manifest
+                .secondary_indexes
+                .iter()
+                .position(|entry| entry.index_id == index_id)
+            else {
+                outcome = CompoundSecondaryFinalizeOutcome::Inactive;
+                return Ok(());
+            };
+            let mut current_segment_ids: Vec<u64> =
+                manifest.segments.iter().map(|segment| segment.id).collect();
+            current_segment_ids.sort_unstable();
+            if current_segment_ids != snapshot.segment_ids {
+                outcome = CompoundSecondaryFinalizeOutcome::Retry;
+                return Ok(());
+            }
+            let entry = &mut manifest.secondary_indexes[entry_pos];
+            if entry.state != SecondaryIndexState::Building
+                || !matches!(
+                    &entry.target,
+                    SecondaryIndexTarget::NodeFieldIndex { .. }
+                        | SecondaryIndexTarget::EdgeFieldIndex { .. }
+                )
+            {
+                outcome = CompoundSecondaryFinalizeOutcome::Inactive;
+                return Ok(());
+            }
+            match coverage {
+                CompoundSecondaryCoverageStatus::Covered => {
+                    entry.state = SecondaryIndexState::Ready;
+                    entry.last_error = None;
+                    let mut snapshot_segment_ids = snapshot.segment_ids.clone();
+                    snapshot_segment_ids.sort_unstable();
+                    if let Some(ready) =
+                        SecondaryIndexReadyApplied::from_ready_entry(entry, snapshot_segment_ids)
+                    {
+                        outcome = CompoundSecondaryFinalizeOutcome::ReadyApplied(ready);
+                    }
+                }
+                CompoundSecondaryCoverageStatus::Incomplete => {
+                    entry.state = SecondaryIndexState::Building;
+                    entry.last_error = None;
+                }
+                CompoundSecondaryCoverageStatus::Failed(message) => {
+                    entry.state = SecondaryIndexState::Failed;
+                    entry.last_error = Some(message.clone());
+                }
+                CompoundSecondaryCoverageStatus::Cancelled => {
+                    outcome = CompoundSecondaryFinalizeOutcome::Inactive;
+                }
+            }
+            Ok(())
+        },
+    )?;
+    Ok(outcome)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_secondary_index_build(
     db_dir: &Path,
@@ -2157,6 +2707,33 @@ fn process_secondary_index_build(
                 SecondaryRangeFinalizeOutcome::Applied
                 | SecondaryRangeFinalizeOutcome::Inactive => return Ok(None),
                 SecondaryRangeFinalizeOutcome::Retry => continue,
+            }
+        } else if let Some(snapshot) =
+            load_compound_secondary_build_snapshot(db_dir, manifest_write_lock, index_id)?
+        {
+            build_compound_sidecars_for_snapshot(db_dir, &snapshot, cancel)?;
+            let coverage =
+                validate_compound_secondary_snapshot_coverage(db_dir, &snapshot, cancel)?;
+            if matches!(coverage, CompoundSecondaryCoverageStatus::Cancelled) {
+                return Ok(None);
+            }
+            match finalize_compound_secondary_build_snapshot(
+                db_dir,
+                manifest_write_lock,
+                catalog_lock,
+                entries_lock,
+                next_node_id_seen,
+                next_edge_id_seen,
+                engine_seq_seen,
+                label_catalog,
+                index_id,
+                &snapshot,
+                &coverage,
+            )? {
+                CompoundSecondaryFinalizeOutcome::ReadyApplied(ready) => return Ok(Some(ready)),
+                CompoundSecondaryFinalizeOutcome::Applied
+                | CompoundSecondaryFinalizeOutcome::Inactive => return Ok(None),
+                CompoundSecondaryFinalizeOutcome::Retry => continue,
             }
         } else {
             return Ok(None);
@@ -2254,6 +2831,17 @@ fn target_secondary_sidecar_is_valid(
     let target = match &ready.target {
         SecondaryIndexTarget::NodeProperty { .. } => PlannerStatsDeclaredIndexTarget::NodeProperty,
         SecondaryIndexTarget::EdgeProperty { .. } => PlannerStatsDeclaredIndexTarget::EdgeProperty,
+        SecondaryIndexTarget::NodeFieldIndex { .. }
+        | SecondaryIndexTarget::EdgeFieldIndex { .. } => {
+            let entry = SecondaryIndexManifestEntry {
+                index_id: ready.index_id,
+                target: ready.target.clone(),
+                kind: ready.kind.clone(),
+                state: SecondaryIndexState::Ready,
+                last_error: None,
+            };
+            return segment.compound_sidecar_lightweight_available_for_entry(&entry);
+        }
     };
     match ready.kind {
         SecondaryIndexKind::Equality => {
@@ -2281,6 +2869,45 @@ fn refresh_ready_secondary_index_planner_stats(
         return Vec::new();
     };
     let mut refreshed = Vec::new();
+
+    if matches!(
+        ready.target,
+        SecondaryIndexTarget::NodeFieldIndex { .. } | SecondaryIndexTarget::EdgeFieldIndex { .. }
+    ) {
+        for segment_id in initial_snapshot.segment_ids {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let Some(snapshot) = targeted_refresh_snapshot_contains_segment(
+                db_dir,
+                manifest_write_lock,
+                ready,
+                segment_id,
+            )
+            .ok()
+            .flatten() else {
+                continue;
+            };
+            let Some(seg_info) = segment_info_for_id(&snapshot.segment_infos, segment_id) else {
+                continue;
+            };
+            let seg_dir = segment_dir(db_dir, segment_id);
+            let latest_segment = match SegmentReader::open_with_info(
+                &seg_dir,
+                seg_info,
+                snapshot.dense_config.as_ref(),
+                &snapshot.secondary_indexes,
+            ) {
+                Ok(segment) => segment,
+                Err(error) if is_not_found_io_error(&error) => continue,
+                Err(_) => continue,
+            };
+            if target_secondary_sidecar_is_valid(&latest_segment, ready).unwrap_or(false) {
+                refreshed.push((segment_id, Arc::new(latest_segment)));
+            }
+        }
+        return refreshed;
+    }
 
     for segment_id in initial_snapshot.segment_ids {
         if cancel.load(Ordering::Relaxed) {
@@ -3082,6 +3709,7 @@ impl DegreeQueryRouteTally {
     }
 }
 
+#[allow(clippy::enum_variant_names)] // The suffix documents the queued repair trigger explicitly.
 #[derive(Debug)]
 enum SecondaryIndexReadFollowup {
     EqualitySidecarFailure {
@@ -3089,6 +3717,14 @@ enum SecondaryIndexReadFollowup {
         error: Option<EngineError>,
     },
     RangeSidecarFailure {
+        index_id: u64,
+        error: Option<EngineError>,
+    },
+    CompoundEqualitySidecarFailure {
+        index_id: u64,
+        error: Option<EngineError>,
+    },
+    CompoundRangeSidecarFailure {
         index_id: u64,
         error: Option<EngineError>,
     },
@@ -3100,6 +3736,10 @@ enum SecondaryIndexReadFollowupKey {
     EqualityFailed { index_id: u64, message: String },
     RangeBuilding { index_id: u64 },
     RangeFailed { index_id: u64, message: String },
+    CompoundEqualityBuilding { index_id: u64 },
+    CompoundEqualityFailed { index_id: u64, message: String },
+    CompoundRangeBuilding { index_id: u64 },
+    CompoundRangeFailed { index_id: u64, message: String },
 }
 
 impl SecondaryIndexReadFollowup {
@@ -3127,6 +3767,32 @@ impl SecondaryIndexReadFollowup {
                     index_id: *index_id,
                 },
             },
+            SecondaryIndexReadFollowup::CompoundEqualitySidecarFailure { index_id, error } => {
+                match error {
+                    Some(error) if !is_not_found_io_error(error) => {
+                        SecondaryIndexReadFollowupKey::CompoundEqualityFailed {
+                            index_id: *index_id,
+                            message: compound_secondary_failure_message(error),
+                        }
+                    }
+                    _ => SecondaryIndexReadFollowupKey::CompoundEqualityBuilding {
+                        index_id: *index_id,
+                    },
+                }
+            }
+            SecondaryIndexReadFollowup::CompoundRangeSidecarFailure { index_id, error } => {
+                match error {
+                    Some(error) if !is_not_found_io_error(error) => {
+                        SecondaryIndexReadFollowupKey::CompoundRangeFailed {
+                            index_id: *index_id,
+                            message: compound_secondary_failure_message(error),
+                        }
+                    }
+                    _ => SecondaryIndexReadFollowupKey::CompoundRangeBuilding {
+                        index_id: *index_id,
+                    },
+                }
+            }
         }
     }
 }
@@ -3236,23 +3902,19 @@ enum CoreWriteRequest {
     DropGraphSchema,
     EnsureNodePropertyIndex {
         label: String,
-        prop_key: String,
-        kind: SecondaryIndexKind,
+        spec: SecondaryIndexSpec,
     },
     DropNodePropertyIndex {
         label: String,
-        prop_key: String,
-        kind: SecondaryIndexKind,
+        spec: SecondaryIndexSpec,
     },
     EnsureEdgePropertyIndex {
         label: String,
-        prop_key: String,
-        kind: SecondaryIndexKind,
+        spec: SecondaryIndexSpec,
     },
     DropEdgePropertyIndex {
         label: String,
-        prop_key: String,
-        kind: SecondaryIndexKind,
+        spec: SecondaryIndexSpec,
     },
     ApplySecondaryIndexReadFollowup {
         followup: SecondaryIndexReadFollowup,
@@ -3311,6 +3973,7 @@ struct QueuedCoreWrite {
     followup_key: Option<SecondaryIndexReadFollowupKey>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum QueuedWriteProgress {
     Complete {
         command: QueuedCoreWrite,
@@ -4058,38 +4721,30 @@ impl DbRuntime {
                 }
                 Err(err) => (Err(err), PublishImpact::NoPublish),
             },
-            CoreWriteRequest::EnsureNodePropertyIndex {
-                label,
-                prop_key,
-                kind,
-            } => match core.ensure_node_property_index(label, prop_key, kind.clone()) {
-                Ok((info, impact)) => (Ok(CoreWriteReply::NodePropertyIndexInfo(info)), impact),
-                Err(err) => (Err(err), PublishImpact::NoPublish),
-            },
-            CoreWriteRequest::DropNodePropertyIndex {
-                label,
-                prop_key,
-                kind,
-            } => match core.drop_node_property_index(label, prop_key, kind.clone()) {
-                Ok((removed, impact)) => (Ok(CoreWriteReply::Bool(removed)), impact),
-                Err(err) => (Err(err), PublishImpact::NoPublish),
-            },
-            CoreWriteRequest::EnsureEdgePropertyIndex {
-                label,
-                prop_key,
-                kind,
-            } => match core.ensure_edge_property_index(label, prop_key, kind.clone()) {
-                Ok((info, impact)) => (Ok(CoreWriteReply::EdgePropertyIndexInfo(info)), impact),
-                Err(err) => (Err(err), PublishImpact::NoPublish),
-            },
-            CoreWriteRequest::DropEdgePropertyIndex {
-                label,
-                prop_key,
-                kind,
-            } => match core.drop_edge_property_index(label, prop_key, kind.clone()) {
-                Ok((removed, impact)) => (Ok(CoreWriteReply::Bool(removed)), impact),
-                Err(err) => (Err(err), PublishImpact::NoPublish),
-            },
+            CoreWriteRequest::EnsureNodePropertyIndex { label, spec } => {
+                match core.ensure_node_property_index(label, spec.clone()) {
+                    Ok((info, impact)) => (Ok(CoreWriteReply::NodePropertyIndexInfo(info)), impact),
+                    Err(err) => (Err(err), PublishImpact::NoPublish),
+                }
+            }
+            CoreWriteRequest::DropNodePropertyIndex { label, spec } => {
+                match core.drop_node_property_index(label, spec.clone()) {
+                    Ok((removed, impact)) => (Ok(CoreWriteReply::Bool(removed)), impact),
+                    Err(err) => (Err(err), PublishImpact::NoPublish),
+                }
+            }
+            CoreWriteRequest::EnsureEdgePropertyIndex { label, spec } => {
+                match core.ensure_edge_property_index(label, spec.clone()) {
+                    Ok((info, impact)) => (Ok(CoreWriteReply::EdgePropertyIndexInfo(info)), impact),
+                    Err(err) => (Err(err), PublishImpact::NoPublish),
+                }
+            }
+            CoreWriteRequest::DropEdgePropertyIndex { label, spec } => {
+                match core.drop_edge_property_index(label, spec.clone()) {
+                    Ok((removed, impact)) => (Ok(CoreWriteReply::Bool(removed)), impact),
+                    Err(err) => (Err(err), PublishImpact::NoPublish),
+                }
+            }
             CoreWriteRequest::ApplySecondaryIndexReadFollowup { followup } => {
                 let impact = match followup {
                     SecondaryIndexReadFollowup::EqualitySidecarFailure { index_id, error } => core
@@ -4099,6 +4754,19 @@ impl DbRuntime {
                         ),
                     SecondaryIndexReadFollowup::RangeSidecarFailure { index_id, error } => core
                         .degrade_ready_range_index_after_sidecar_failure(*index_id, error.as_ref()),
+                    SecondaryIndexReadFollowup::CompoundEqualitySidecarFailure {
+                        index_id,
+                        error,
+                    } => core.degrade_ready_equality_index_after_sidecar_failure(
+                        *index_id,
+                        error.as_ref(),
+                    ),
+                    SecondaryIndexReadFollowup::CompoundRangeSidecarFailure { index_id, error } => {
+                        core.degrade_ready_range_index_after_sidecar_failure(
+                            *index_id,
+                            error.as_ref(),
+                        )
+                    }
                 };
                 (Ok(CoreWriteReply::Unit), impact)
             }
@@ -4623,10 +5291,8 @@ impl ReadView {
         kind: &SecondaryIndexKind,
     ) -> Option<SecondaryIndexManifestEntry> {
         self.secondary_index_catalog
-            .get(&(SecondaryIndexTargetDiscriminant::Node, label_id))?
-            .get(prop_key)?
-            .get(kind)
-            .cloned()
+            .node_property
+            .get(label_id, prop_key, kind)
     }
 
     fn edge_property_index_entry(
@@ -4636,10 +5302,24 @@ impl ReadView {
         kind: &SecondaryIndexKind,
     ) -> Option<SecondaryIndexManifestEntry> {
         self.secondary_index_catalog
-            .get(&(SecondaryIndexTargetDiscriminant::Edge, label_id))?
-            .get(prop_key)?
-            .get(kind)
-            .cloned()
+            .edge_property
+            .get(label_id, prop_key, kind)
+    }
+
+    fn node_field_index_entries(
+        &self,
+        label_id: u32,
+        kind: &SecondaryIndexKind,
+    ) -> &[SecondaryIndexManifestEntry] {
+        self.secondary_index_catalog.node_field.get(label_id, kind)
+    }
+
+    fn edge_field_index_entries(
+        &self,
+        label_id: u32,
+        kind: &SecondaryIndexKind,
+    ) -> &[SecondaryIndexManifestEntry] {
+        self.secondary_index_catalog.edge_field.get(label_id, kind)
     }
 
     fn get_node_raw(&self, id: u64) -> Result<Option<NodeRecord>, EngineError> {
@@ -4853,11 +5533,6 @@ impl EngineCore {
         } else {
             SecondaryIndexState::Building
         };
-        let next_last_error = if next_state == SecondaryIndexState::Failed {
-            error.map(ToString::to_string)
-        } else {
-            None
-        };
 
         let Some(current_entry) = self
             .secondary_index_entries_snapshot()
@@ -4869,8 +5544,17 @@ impl EngineCore {
         if !matches!(current_entry.kind, SecondaryIndexKind::Equality) {
             return PublishImpact::NoPublish;
         }
+        let next_last_error = if next_state == SecondaryIndexState::Failed {
+            error.map(|error| {
+                secondary_index_failure_message_for_entry(&current_entry, error.to_string())
+            })
+        } else {
+            None
+        };
         let should_queue_build = next_state == SecondaryIndexState::Building
             && current_entry.state != SecondaryIndexState::Building;
+        let should_queue_build = should_queue_build
+            && secondary_index_target_requires_sidecar_build(&current_entry.target);
         if current_entry.state == next_state && current_entry.last_error == next_last_error {
             return PublishImpact::NoPublish;
         }
@@ -4919,11 +5603,6 @@ impl EngineCore {
         } else {
             SecondaryIndexState::Building
         };
-        let next_last_error = if next_state == SecondaryIndexState::Failed {
-            error.map(ToString::to_string)
-        } else {
-            None
-        };
 
         let Some(current_entry) = self
             .secondary_index_entries_snapshot()
@@ -4935,8 +5614,17 @@ impl EngineCore {
         if !matches!(current_entry.kind, SecondaryIndexKind::Range) {
             return PublishImpact::NoPublish;
         }
+        let next_last_error = if next_state == SecondaryIndexState::Failed {
+            error.map(|error| {
+                secondary_index_failure_message_for_entry(&current_entry, error.to_string())
+            })
+        } else {
+            None
+        };
         let should_queue_build = next_state == SecondaryIndexState::Building
             && current_entry.state != SecondaryIndexState::Building;
+        let should_queue_build = should_queue_build
+            && secondary_index_target_requires_sidecar_build(&current_entry.target);
         if current_entry.state == next_state && current_entry.last_error == next_last_error {
             return PublishImpact::NoPublish;
         }
@@ -5288,15 +5976,13 @@ impl DatabaseEngine {
     pub fn ensure_node_property_index(
         &self,
         label: &str,
-        prop_key: &str,
-        kind: SecondaryIndexKind,
+        spec: SecondaryIndexSpec,
     ) -> Result<NodePropertyIndexInfo, EngineError> {
         match self
             .runtime
             .submit_core_write(CoreWriteRequest::EnsureNodePropertyIndex {
                 label: label.to_string(),
-                prop_key: prop_key.to_string(),
-                kind,
+                spec,
             })? {
             CoreWriteReply::NodePropertyIndexInfo(info) => Ok(info),
             _ => unreachable!("ensure_node_property_index must return index info"),
@@ -5306,15 +5992,13 @@ impl DatabaseEngine {
     pub fn drop_node_property_index(
         &self,
         label: &str,
-        prop_key: &str,
-        kind: SecondaryIndexKind,
+        spec: SecondaryIndexSpec,
     ) -> Result<bool, EngineError> {
         match self
             .runtime
             .submit_core_write(CoreWriteRequest::DropNodePropertyIndex {
                 label: label.to_string(),
-                prop_key: prop_key.to_string(),
-                kind,
+                spec,
             })? {
             CoreWriteReply::Bool(dropped) => Ok(dropped),
             _ => unreachable!("drop_node_property_index must return bool"),
@@ -5328,14 +6012,20 @@ impl DatabaseEngine {
             .view
             .secondary_index_entries
             .iter()
-            .filter(|e| matches!(&e.target, SecondaryIndexTarget::NodeProperty { .. }))
+            .filter(|e| {
+                matches!(
+                    &e.target,
+                    SecondaryIndexTarget::NodeProperty { .. }
+                        | SecondaryIndexTarget::NodeFieldIndex { .. }
+                )
+            })
             .collect();
         entries.sort_unstable_by(|left, right| {
             secondary_index_target_label_id(&left.target)
                 .cmp(&secondary_index_target_label_id(&right.target))
                 .then_with(|| {
-                    secondary_index_target_prop_key(&left.target)
-                        .cmp(secondary_index_target_prop_key(&right.target))
+                    secondary_index_fields_sort_key(&left.target)
+                        .cmp(&secondary_index_fields_sort_key(&right.target))
                 })
                 .then_with(|| {
                     secondary_index_kind_rank(&left.kind)
@@ -5352,15 +6042,13 @@ impl DatabaseEngine {
     pub fn ensure_edge_property_index(
         &self,
         label: &str,
-        prop_key: &str,
-        kind: SecondaryIndexKind,
+        spec: SecondaryIndexSpec,
     ) -> Result<EdgePropertyIndexInfo, EngineError> {
         match self
             .runtime
             .submit_core_write(CoreWriteRequest::EnsureEdgePropertyIndex {
                 label: label.to_string(),
-                prop_key: prop_key.to_string(),
-                kind,
+                spec,
             })? {
             CoreWriteReply::EdgePropertyIndexInfo(info) => Ok(info),
             _ => unreachable!("ensure_edge_property_index must return index info"),
@@ -5370,15 +6058,13 @@ impl DatabaseEngine {
     pub fn drop_edge_property_index(
         &self,
         label: &str,
-        prop_key: &str,
-        kind: SecondaryIndexKind,
+        spec: SecondaryIndexSpec,
     ) -> Result<bool, EngineError> {
         match self
             .runtime
             .submit_core_write(CoreWriteRequest::DropEdgePropertyIndex {
                 label: label.to_string(),
-                prop_key: prop_key.to_string(),
-                kind,
+                spec,
             })? {
             CoreWriteReply::Bool(dropped) => Ok(dropped),
             _ => unreachable!("drop_edge_property_index must return bool"),
@@ -5392,14 +6078,20 @@ impl DatabaseEngine {
             .view
             .secondary_index_entries
             .iter()
-            .filter(|e| matches!(&e.target, SecondaryIndexTarget::EdgeProperty { .. }))
+            .filter(|e| {
+                matches!(
+                    &e.target,
+                    SecondaryIndexTarget::EdgeProperty { .. }
+                        | SecondaryIndexTarget::EdgeFieldIndex { .. }
+                )
+            })
             .collect();
         entries.sort_unstable_by(|left, right| {
             secondary_index_target_label_id(&left.target)
                 .cmp(&secondary_index_target_label_id(&right.target))
                 .then_with(|| {
-                    secondary_index_target_prop_key(&left.target)
-                        .cmp(secondary_index_target_prop_key(&right.target))
+                    secondary_index_fields_sort_key(&left.target)
+                        .cmp(&secondary_index_fields_sort_key(&right.target))
                 })
                 .then_with(|| {
                     secondary_index_kind_rank(&left.kind)
@@ -6993,7 +7685,7 @@ struct EngineCore {
     active_wal_generation_id: u64,
     /// Handle for the persistent background flush worker thread.
     bg_flush: Option<BgFlushHandle>,
-    /// Runtime declaration catalog keyed by `(target_label_id, prop_key, kind)`.
+    /// Runtime declaration catalog keyed by logical target kind, label, ordered fields, and kind.
     secondary_index_catalog: Arc<RwLock<SecondaryIndexCatalog>>,
     /// Runtime declaration entries kept in sync with background state changes.
     secondary_index_entries: Arc<RwLock<SecondaryIndexEntries>>,
@@ -7130,7 +7822,7 @@ struct BgFlushHandle {
 struct SecondaryIndexLookupKey {
     discriminant: SecondaryIndexTargetDiscriminant,
     target_label_id: u32,
-    prop_key: String,
+    fields: Vec<SecondaryIndexField>,
     kind: SecondaryIndexKind,
 }
 
@@ -7637,7 +8329,7 @@ impl EngineCore {
             immutable_bytes_total: immutable_bytes_on_open,
             active_wal_generation_id,
             bg_flush: None,
-            secondary_index_catalog: Arc::new(RwLock::new(HashMap::new())),
+            secondary_index_catalog: Arc::new(RwLock::new(SecondaryIndexCatalog::default())),
             secondary_index_entries: Arc::new(RwLock::new(Vec::new())),
             published_read_sources: None,
             published_read_sources_generation: 0,
@@ -7920,58 +8612,43 @@ impl EngineCore {
 
             for segment in &self.segments {
                 let validation = match entry.kind {
-                    SecondaryIndexKind::Equality => segment
-                        .secondary_eq_sidecar_lightweight_available_for_target(
-                            entry.index_id,
-                            match &entry.target {
-                                SecondaryIndexTarget::NodeProperty { .. } => {
-                                    PlannerStatsDeclaredIndexTarget::NodeProperty
-                                }
-                                SecondaryIndexTarget::EdgeProperty { .. } => {
-                                    PlannerStatsDeclaredIndexTarget::EdgeProperty
-                                }
-                            },
-                        ),
-                    SecondaryIndexKind::Range => segment
-                        .secondary_range_sidecar_lightweight_available_for_target(
-                            entry.index_id,
-                            match &entry.target {
-                                SecondaryIndexTarget::NodeProperty { .. } => {
-                                    PlannerStatsDeclaredIndexTarget::NodeProperty
-                                }
-                                SecondaryIndexTarget::EdgeProperty { .. } => {
-                                    PlannerStatsDeclaredIndexTarget::EdgeProperty
-                                }
-                            },
-                        ),
+                    SecondaryIndexKind::Equality => match &entry.target {
+                        SecondaryIndexTarget::NodeProperty { .. } => segment
+                            .secondary_eq_sidecar_lightweight_available_for_target(
+                                entry.index_id,
+                                PlannerStatsDeclaredIndexTarget::NodeProperty,
+                            ),
+                        SecondaryIndexTarget::EdgeProperty { .. } => segment
+                            .secondary_eq_sidecar_lightweight_available_for_target(
+                                entry.index_id,
+                                PlannerStatsDeclaredIndexTarget::EdgeProperty,
+                            ),
+                        SecondaryIndexTarget::NodeFieldIndex { .. }
+                        | SecondaryIndexTarget::EdgeFieldIndex { .. } => {
+                            segment.compound_sidecar_lightweight_available_for_entry(entry)
+                        }
+                    },
+                    SecondaryIndexKind::Range => match &entry.target {
+                        SecondaryIndexTarget::NodeProperty { .. } => segment
+                            .secondary_range_sidecar_lightweight_available_for_target(
+                                entry.index_id,
+                                PlannerStatsDeclaredIndexTarget::NodeProperty,
+                            ),
+                        SecondaryIndexTarget::EdgeProperty { .. } => segment
+                            .secondary_range_sidecar_lightweight_available_for_target(
+                                entry.index_id,
+                                PlannerStatsDeclaredIndexTarget::EdgeProperty,
+                            ),
+                        SecondaryIndexTarget::NodeFieldIndex { .. }
+                        | SecondaryIndexTarget::EdgeFieldIndex { .. } => {
+                            segment.compound_sidecar_lightweight_available_for_entry(entry)
+                        }
+                    },
                 };
                 match validation {
                     Ok(true) => continue,
                     Ok(false) => {
-                        let is_edge =
-                            matches!(&entry.target, SecondaryIndexTarget::EdgeProperty { .. });
-                        let kind = match (&entry.kind, is_edge) {
-                            (SecondaryIndexKind::Equality, false) => {
-                                SegmentComponentKind::NodePropertyEqualityIndex {
-                                    index_id: entry.index_id,
-                                }
-                            }
-                            (SecondaryIndexKind::Range, false) => {
-                                SegmentComponentKind::NodePropertyRangeIndex {
-                                    index_id: entry.index_id,
-                                }
-                            }
-                            (SecondaryIndexKind::Equality, true) => {
-                                SegmentComponentKind::EdgePropertyEqualityIndex {
-                                    index_id: entry.index_id,
-                                }
-                            }
-                            (SecondaryIndexKind::Range, true) => {
-                                SegmentComponentKind::EdgePropertyRangeIndex {
-                                    index_id: entry.index_id,
-                                }
-                            }
-                        };
+                        let kind = secondary_index_component_kind_for_recovery(entry);
                         match segment.optional_component_availability(kind) {
                             ComponentAvailability::Missing | ComponentAvailability::Available => {
                                 entry.state = SecondaryIndexState::Building;
@@ -7981,7 +8658,8 @@ impl EngineCore {
                             | ComponentAvailability::CorruptIdentity { reason }
                             | ComponentAvailability::Unsupported { reason } => {
                                 entry.state = SecondaryIndexState::Failed;
-                                entry.last_error = Some(reason);
+                                entry.last_error =
+                                    Some(secondary_index_failure_message_for_entry(entry, reason));
                             }
                         }
                         dirty = true;
@@ -7989,7 +8667,10 @@ impl EngineCore {
                     }
                     Err(error) => {
                         entry.state = SecondaryIndexState::Failed;
-                        entry.last_error = Some(error.to_string());
+                        entry.last_error = Some(secondary_index_failure_message_for_entry(
+                            entry,
+                            error.to_string(),
+                        ));
                         dirty = true;
                         break;
                     }
@@ -8116,7 +8797,10 @@ impl EngineCore {
         let building_ids: Vec<u64> = self
             .secondary_index_entries_snapshot()
             .into_iter()
-            .filter(|entry| entry.state == SecondaryIndexState::Building)
+            .filter(|entry| {
+                entry.state == SecondaryIndexState::Building
+                    && secondary_index_target_requires_sidecar_build(&entry.target)
+            })
             .map(|entry| entry.index_id)
             .collect();
         for index_id in building_ids {
@@ -11743,6 +12427,10 @@ include!("query.rs");
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn property_index_fields(prop_key: &str) -> Vec<SecondaryIndexField> {
+        vec![SecondaryIndexField::property(prop_key)]
+    }
 
     fn internal_node_record(
         engine: &DatabaseEngine,

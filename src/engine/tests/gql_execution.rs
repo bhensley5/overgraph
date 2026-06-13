@@ -324,7 +324,7 @@ fn execute_gql_read_uses_unified_result_and_read_plan_wrapper() {
 #[test]
 fn execute_gql_create_mutation_preserves_cursor_and_readonly_ordering() {
     let (_dir, engine) = query_test_engine();
-    let source = "CREATE (n:GqlMutationNoSideEffect {key: 'n'}) RETURN n";
+    let source = "CREATE (n:GqlMutationNoSideEffect {elementKey: 'n'}) RETURN n";
 
     let cursor_first = engine
         .execute_gql(
@@ -382,7 +382,7 @@ fn execute_gql_create_mutation_preserves_cursor_and_readonly_ordering() {
 
     let planned = engine
         .execute_gql(
-            "CREATE (n:GqlMutationIncludePlan {key: 'n'}) RETURN n",
+            "CREATE (n:GqlMutationIncludePlan {elementKey: 'n'}) RETURN n",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 include_plan: true,
@@ -410,7 +410,7 @@ fn explain_gql_mutation_plan_is_side_effect_free() {
     let wal_path = wal_generation_path(&db_path, 0);
     let before_wal_len = std::fs::metadata(&wal_path).map(|metadata| metadata.len()).unwrap_or(0);
     let label = "GqlExplainNoSideEffect";
-    let source = format!("CREATE (n:{label} {{key: 'n'}}) RETURN n");
+    let source = format!("CREATE (n:{label} {{elementKey: 'n'}}) RETURN n");
     assert_eq!(engine.get_node_label_id(label).unwrap(), None);
 
     for options in [
@@ -476,7 +476,7 @@ fn mutation_errors_surface_before_execution_validation() {
 
     let missing = engine
         .execute_gql(
-            "CREATE (n:Person {key: $key}) RETURN n",
+            "CREATE (n:Person {elementKey: $key}) RETURN n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -541,18 +541,18 @@ fn mutation_referenced_params_validate_before_execution() {
         ..gql_opts()
     };
     for (source, missing_name) in [
-        ("MATCH (n:Person {key: $key}) SET n.name = 'Ada'", "key"),
-        ("CREATE (n:Person {key: $key})", "key"),
-        ("MATCH (n:Person {key: 'a'}) SET n.name = $name", "name"),
-        ("MATCH (n:Person {key: 'a'}) SET n += $props", "props"),
-        ("MATCH (n:Person {key: 'a'}) DELETE $target", "target"),
-        ("CREATE (n:Person {key: 'a'}) RETURN $value", "value"),
+        ("MATCH (n:Person {elementKey: $key}) SET n.name = 'Ada'", "key"),
+        ("CREATE (n:Person {elementKey: $key})", "key"),
+        ("MATCH (n:Person {elementKey: 'a'}) SET n.name = $name", "name"),
+        ("MATCH (n:Person {elementKey: 'a'}) SET n += $props", "props"),
+        ("MATCH (n:Person {elementKey: 'a'}) DELETE $target", "target"),
+        ("CREATE (n:Person {elementKey: 'a'}) RETURN $value", "value"),
         (
-            "CREATE (n:Person {key: 'a'}) RETURN n ORDER BY $order",
+            "CREATE (n:Person {elementKey: 'a'}) RETURN n ORDER BY $order",
             "order",
         ),
-        ("CREATE (n:Person {key: 'a'}) RETURN n SKIP $skip", "skip"),
-        ("CREATE (n:Person {key: 'a'}) RETURN n LIMIT $limit", "limit"),
+        ("CREATE (n:Person {elementKey: 'a'}) RETURN n SKIP $skip", "skip"),
+        ("CREATE (n:Person {elementKey: 'a'}) RETURN n LIMIT $limit", "limit"),
     ] {
         let err = engine
             .execute_gql(source, &GqlParams::new(), &options)
@@ -562,7 +562,7 @@ fn mutation_referenced_params_validate_before_execution() {
 
     let cap_err = engine
         .execute_gql(
-            "CREATE (n:Person {key: $key})",
+            "CREATE (n:Person {elementKey: $key})",
             &GqlParams::from([(
                 "key".to_string(),
                 GqlParamValue::String("too-long".to_string()),
@@ -577,7 +577,7 @@ fn mutation_referenced_params_validate_before_execution() {
 
     let ignored = engine
         .execute_gql(
-            "CREATE (n:Person {key: 'literal'})",
+            "CREATE (n:Person {elementKey: 'literal'})",
             &GqlParams::from([(
                 "unused".to_string(),
                 GqlParamValue::String("too-long".to_string()),
@@ -604,7 +604,7 @@ fn gql_create_node_executes_through_transaction_and_returns_created_values() {
     let (_dir, engine) = query_test_engine();
     let result = engine
         .execute_gql(
-            "CREATE (n:Person:Employee {key: 'gql-create-ada', name: 'Ada', age: 37, weight: 2.5, nullable: null}) RETURN n, id(n), n.name",
+            "CREATE (n:Person:Employee {elementKey: 'gql-create-ada', name: 'Ada', age: 37, weight: 2.5, nullable: null}) RETURN n, id(n), n.name",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -659,12 +659,12 @@ fn gql_create_node_executes_through_transaction_and_returns_created_values() {
 fn gql_create_node_properties_are_visible_to_gql_indexed_reads() {
     let (_dir, engine) = query_test_engine();
     engine
-        .ensure_node_property_index("GqlCreatedIndexed", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("GqlCreatedIndexed", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
 
     let created = engine
         .execute_gql(
-            "CREATE (n:GqlCreatedIndexed {key: 'n', status: 'ready', score: 7}) RETURN id(n)",
+            "CREATE (n:GqlCreatedIndexed {elementKey: 'n', status: 'ready', score: 7}) RETURN id(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -688,7 +688,7 @@ fn gql_merge_node_creates_matches_duplicates_and_actions_are_atomic() {
 
     let created = engine
         .execute_gql(
-            "MERGE (n:GqlMergeNode {key: 'n'}) ON CREATE SET n.status = 'created' ON MATCH SET n.status = 'matched' RETURN id(n), n.status",
+            "MERGE (n:GqlMergeNode {elementKey: 'n'}) ON CREATE SET n.status = 'created' ON MATCH SET n.status = 'matched' RETURN id(n), n.status",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 profile: true,
@@ -705,7 +705,7 @@ fn gql_merge_node_creates_matches_duplicates_and_actions_are_atomic() {
 
     let matched = engine
         .execute_gql(
-            "MERGE (n:GqlMergeNode {key: 'n'}) ON CREATE SET n.status = 'created-again' ON MATCH SET n.status = 'matched' RETURN id(n), n.status",
+            "MERGE (n:GqlMergeNode {elementKey: 'n'}) ON CREATE SET n.status = 'created-again' ON MATCH SET n.status = 'matched' RETURN id(n), n.status",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -725,7 +725,7 @@ fn gql_merge_node_creates_matches_duplicates_and_actions_are_atomic() {
     );
     let incremented = engine
         .execute_gql(
-            "MERGE (n:GqlMergeCounter {key: 'n'}) ON MATCH SET n.count = n.count + 1 RETURN n.count",
+            "MERGE (n:GqlMergeCounter {elementKey: 'n'}) ON MATCH SET n.count = n.count + 1 RETURN n.count",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -759,7 +759,7 @@ fn gql_merge_node_creates_matches_duplicates_and_actions_are_atomic() {
     );
     let duplicate = engine
         .execute_gql(
-            "MATCH (s:GqlMergeSource) MERGE (n:GqlMergeDupNode {key: s.target}) \
+            "MATCH (s:GqlMergeSource) MERGE (n:GqlMergeDupNode {elementKey: s.target}) \
              ON CREATE SET n.status = 'created', n.rank = s.rank \
              ON MATCH SET n.status = 'matched', n.rank = s.rank \
              RETURN n.status, n.rank ORDER BY s.rank",
@@ -789,7 +789,7 @@ fn gql_merge_node_creates_matches_duplicates_and_actions_are_atomic() {
 
     let distinct = engine
         .execute_gql(
-            "MATCH (s:GqlMergeSource) MERGE (n:GqlMergeDistinctNode {key: s.target}) RETURN DISTINCT n",
+            "MATCH (s:GqlMergeSource) MERGE (n:GqlMergeDistinctNode {elementKey: s.target}) RETURN DISTINCT n",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -810,7 +810,7 @@ fn gql_merge_node_creates_matches_duplicates_and_actions_are_atomic() {
     let local_counter = engine
         .execute_gql(
             "MATCH (s:GqlMergeSource) WITH s, s.rank AS delta \
-             MERGE (n:GqlMergeLocalCounter {key: s.target}) \
+             MERGE (n:GqlMergeLocalCounter {elementKey: s.target}) \
              ON CREATE SET n.count = delta \
              ON MATCH SET n.count = n.count + delta \
              RETURN n.count ORDER BY s.rank",
@@ -830,7 +830,7 @@ fn gql_merge_node_creates_matches_duplicates_and_actions_are_atomic() {
 
     let empty_key = engine
         .execute_gql(
-            "MERGE (n:GqlMergeEmptyKey {key: ''})",
+            "MERGE (n:GqlMergeEmptyKey {elementKey: ''})",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -841,7 +841,7 @@ fn gql_merge_node_creates_matches_duplicates_and_actions_are_atomic() {
 
     let bad_action = engine
         .execute_gql(
-            "MERGE (n:GqlMergeBadAction {key: 'n'}) ON CREATE SET n.bad = $bad",
+            "MERGE (n:GqlMergeBadAction {elementKey: 'n'}) ON CREATE SET n.bad = $bad",
             &GqlParams::from([("bad".to_string(), GqlParamValue::Float(f64::NAN))]),
             &gql_opts(),
         )
@@ -854,7 +854,7 @@ fn gql_merge_node_creates_matches_duplicates_and_actions_are_atomic() {
 
     let bad_local_metadata = engine
         .execute_gql(
-            "MERGE (n:GqlMergeBadMetadata {key: 'n'}) ON CREATE SET n.source_id = id(n)",
+            "MERGE (n:GqlMergeBadMetadata {elementKey: 'n'}) ON CREATE SET n.source_id = id(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -870,7 +870,7 @@ fn gql_merge_node_creates_matches_duplicates_and_actions_are_atomic() {
 
     let bad_match_metadata = engine
         .execute_gql(
-            "MERGE (n:GqlMergeBadMatchMetadata {key: 'n'}) ON MATCH SET n.source_id = id(n)",
+            "MERGE (n:GqlMergeBadMatchMetadata {elementKey: 'n'}) ON MATCH SET n.source_id = id(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -891,7 +891,7 @@ fn gql_merge_node_caps_explain_indexes_and_reopen_preserve_atomicity() {
     }
     let cap = engine
         .execute_gql(
-            "MATCH (s:GqlMergeCapSource) MERGE (n:GqlMergeCapTarget {key: s.key})",
+            "MATCH (s:GqlMergeCapSource) MERGE (n:GqlMergeCapTarget {elementKey: elementKey(s)})",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -912,7 +912,7 @@ fn gql_merge_node_caps_explain_indexes_and_reopen_preserve_atomicity() {
     let before_wal_len = std::fs::metadata(&wal_path).map(|metadata| metadata.len()).unwrap_or(0);
     let explain = engine
         .explain_gql(
-            "MERGE (n:GqlMergeExplain {key: 'n'}) ON CREATE SET n.status = 'planned' RETURN n",
+            "MERGE (n:GqlMergeExplain {elementKey: 'n'}) ON CREATE SET n.status = 'planned' RETURN n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -930,16 +930,16 @@ fn gql_merge_node_caps_explain_indexes_and_reopen_preserve_atomicity() {
         .is_none());
 
     engine
-        .ensure_node_property_index("GqlMergeIndexed", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("GqlMergeIndexed", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let inserted = execute_gql_ok(
         &engine,
-        "MERGE (n:GqlMergeIndexed {key: 'n'}) ON CREATE SET n.status = 'ready' RETURN id(n)",
+        "MERGE (n:GqlMergeIndexed {elementKey: 'n'}) ON CREATE SET n.status = 'ready' RETURN id(n)",
     );
     let node_id = gql_u64_column(&inserted, 0)[0];
     execute_gql_ok(
         &engine,
-        "MERGE (n:GqlMergeIndexed {key: 'n'}) ON MATCH SET n.status = 'updated' RETURN n",
+        "MERGE (n:GqlMergeIndexed {elementKey: 'n'}) ON MATCH SET n.status = 'updated' RETURN n",
     );
     let updated = execute_gql_ok(
         &engine,
@@ -973,7 +973,7 @@ fn gql_merge_relationship_creates_matches_duplicates_and_skips_null_endpoints() 
 
     let created = engine
         .execute_gql(
-            "MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' MATCH (b:GqlMergeRelNode) WHERE b.key = 'b' \
+            "MATCH (a:GqlMergeRelNode) WHERE elementKey(a) = 'a' MATCH (b:GqlMergeRelNode) WHERE elementKey(b) = 'b' \
              MERGE (a)-[r:Gql_MERGE_REL]->(b) ON CREATE SET r.status = 'created' RETURN id(r), r.status",
             &GqlParams::new(),
             &gql_opts(),
@@ -985,7 +985,7 @@ fn gql_merge_relationship_creates_matches_duplicates_and_skips_null_endpoints() 
 
     let matched = engine
         .execute_gql(
-            "MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' MATCH (b:GqlMergeRelNode) WHERE b.key = 'b' \
+            "MATCH (a:GqlMergeRelNode) WHERE elementKey(a) = 'a' MATCH (b:GqlMergeRelNode) WHERE elementKey(b) = 'b' \
              MERGE (a)-[r:Gql_MERGE_REL]->(b) ON MATCH SET r.status = 'matched' RETURN id(r), r.status",
             &GqlParams::new(),
             &gql_opts(),
@@ -997,7 +997,7 @@ fn gql_merge_relationship_creates_matches_duplicates_and_skips_null_endpoints() 
 
     let incremented = engine
         .execute_gql(
-            "MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' MATCH (b:GqlMergeRelNode) WHERE b.key = 'b' \
+            "MATCH (a:GqlMergeRelNode) WHERE elementKey(a) = 'a' MATCH (b:GqlMergeRelNode) WHERE elementKey(b) = 'b' \
              MERGE (a)-[r:Gql_MERGE_REL]->(b) ON MATCH SET r.visits = coalesce(r.visits, 0) + 1 RETURN r.visits",
             &GqlParams::new(),
             &gql_opts(),
@@ -1009,9 +1009,9 @@ fn gql_merge_relationship_creates_matches_duplicates_and_skips_null_endpoints() 
     insert_query_node(&engine, "GqlMergeRelSource", "b", &[], 1.0);
     let duplicate = engine
         .execute_gql(
-            "MATCH (s:GqlMergeRelSource) MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' MATCH (b:GqlMergeRelNode) WHERE b.key = 'b' \
+            "MATCH (s:GqlMergeRelSource) MATCH (a:GqlMergeRelNode) WHERE elementKey(a) = 'a' MATCH (b:GqlMergeRelNode) WHERE elementKey(b) = 'b' \
              MERGE (a)-[r:Gql_MERGE_REL_DUP]->(b) ON CREATE SET r.status = 'created' ON MATCH SET r.status = 'matched' \
-             RETURN r.status ORDER BY s.key",
+             RETURN r.status ORDER BY elementKey(s)",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -1042,9 +1042,9 @@ fn gql_merge_relationship_creates_matches_duplicates_and_skips_null_endpoints() 
 
     let duplicate_counter = engine
         .execute_gql(
-            "MATCH (s:GqlMergeRelSource) MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' MATCH (b:GqlMergeRelNode) WHERE b.key = 'b' \
+            "MATCH (s:GqlMergeRelSource) MATCH (a:GqlMergeRelNode) WHERE elementKey(a) = 'a' MATCH (b:GqlMergeRelNode) WHERE elementKey(b) = 'b' \
              MERGE (a)-[r:Gql_MERGE_REL_COUNT]->(b) ON CREATE SET r.count = 1 ON MATCH SET r.count = r.count + 1 \
-             RETURN r.count ORDER BY s.key",
+             RETURN r.count ORDER BY elementKey(s)",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -1069,7 +1069,7 @@ fn gql_merge_relationship_creates_matches_duplicates_and_skips_null_endpoints() 
 
     let skipped = engine
         .execute_gql(
-            "MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' OPTIONAL MATCH (a)-[:Gql_MISSING_REL]->(b) \
+            "MATCH (a:GqlMergeRelNode) WHERE elementKey(a) = 'a' OPTIONAL MATCH (a)-[:Gql_MISSING_REL]->(b) \
              MERGE (a)-[r:Gql_MERGE_NULL]->(b) RETURN r",
             &GqlParams::new(),
             &gql_opts(),
@@ -1083,7 +1083,7 @@ fn gql_merge_relationship_creates_matches_duplicates_and_skips_null_endpoints() 
 
     let bad_local_metadata = engine
         .execute_gql(
-            "MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' MATCH (b:GqlMergeRelNode) WHERE b.key = 'b' \
+            "MATCH (a:GqlMergeRelNode) WHERE elementKey(a) = 'a' MATCH (b:GqlMergeRelNode) WHERE elementKey(b) = 'b' \
              MERGE (a)-[r:Gql_MERGE_REL_BAD_META]->(b) ON CREATE SET r.source_id = id(r)",
             &GqlParams::new(),
             &gql_opts(),
@@ -1105,8 +1105,8 @@ fn gql_merge_relationship_creates_matches_duplicates_and_skips_null_endpoints() 
 
     let bad_endpoint_metadata = engine
         .execute_gql(
-            "MATCH (a:GqlMergeRelNode) WHERE a.key = 'a' MATCH (b:GqlMergeRelNode) WHERE b.key = 'b' \
-             MERGE (a)-[r:Gql_MERGE_REL_BAD_FROM]->(b) ON MATCH SET r.source_from = r.from",
+            "MATCH (a:GqlMergeRelNode) WHERE elementKey(a) = 'a' MATCH (b:GqlMergeRelNode) WHERE elementKey(b) = 'b' \
+             MERGE (a)-[r:Gql_MERGE_REL_BAD_FROM]->(b) ON MATCH SET r.source_from = id(startNode(r))",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1133,7 +1133,7 @@ fn gql_merge_relationship_rejects_without_edge_uniqueness() {
     insert_query_node(&engine, "GqlMergeNoUnique", "b", &[], 1.0);
     let err = engine
         .execute_gql(
-            "MATCH (a:GqlMergeNoUnique) WHERE a.key = 'a' MATCH (b:GqlMergeNoUnique) WHERE b.key = 'b' MERGE (a)-[r:Gql_NO_UNIQUE]->(b)",
+            "MATCH (a:GqlMergeNoUnique) WHERE elementKey(a) = 'a' MATCH (b:GqlMergeNoUnique) WHERE elementKey(b) = 'b' MERGE (a)-[r:Gql_NO_UNIQUE]->(b)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1154,7 +1154,7 @@ fn gql_merge_commit_conflicts_for_node_keys_and_edge_triples() {
     let (ready_rx, release_tx) = engine.set_gql_mutation_before_commit_pause();
     let node_handle = std::thread::spawn(move || {
         worker.execute_gql(
-            "MERGE (n:GqlMergeNodeConflict {key: 'n'}) ON CREATE SET n.status = 'worker'",
+            "MERGE (n:GqlMergeNodeConflict {elementKey: 'n'}) ON CREATE SET n.status = 'worker'",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1195,7 +1195,7 @@ fn gql_merge_commit_conflicts_for_node_keys_and_edge_triples() {
     let (ready_rx, release_tx) = engine.set_gql_mutation_before_commit_pause();
     let edge_handle = std::thread::spawn(move || {
         worker.execute_gql(
-            "MATCH (a:GqlMergeEdgeConflictNode) WHERE a.key = 'a' MATCH (b:GqlMergeEdgeConflictNode) WHERE b.key = 'b' \
+            "MATCH (a:GqlMergeEdgeConflictNode) WHERE elementKey(a) = 'a' MATCH (b:GqlMergeEdgeConflictNode) WHERE elementKey(b) = 'b' \
              MERGE (a)-[r:Gql_MERGE_EDGE_CONFLICT]->(b) ON CREATE SET r.status = 'worker'",
             &GqlParams::new(),
             &gql_opts(),
@@ -1243,7 +1243,7 @@ fn gql_merge_read_prefix_pipelines_support_with_call_union_and_exists() {
     insert_query_node(&engine, "GqlMergePrefixSeed", "with", &[], 1.0);
     let with_prefix = engine
         .execute_gql(
-            "MATCH (s:GqlMergePrefixSeed) WITH s MERGE (n:GqlMergeWithPrefix {key: s.key}) RETURN n.key",
+            "MATCH (s:GqlMergePrefixSeed) WITH s MERGE (n:GqlMergeWithPrefix {elementKey: elementKey(s)}) RETURN elementKey(n)",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -1258,7 +1258,7 @@ fn gql_merge_read_prefix_pipelines_support_with_call_union_and_exists() {
     let exists_prefix = engine
         .execute_gql(
             "MATCH (s:GqlMergeExistsSeed) WHERE EXISTS { MATCH (m:GqlMergeExistsMarker) RETURN m } \
-             MERGE (n:GqlMergeExistsPrefix {key: s.key}) RETURN n.key",
+             MERGE (n:GqlMergeExistsPrefix {elementKey: elementKey(s)}) RETURN elementKey(n)",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -1272,8 +1272,8 @@ fn gql_merge_read_prefix_pipelines_support_with_call_union_and_exists() {
     insert_query_node(&engine, "GqlMergeCallB", "b", &[], 1.0);
     let call_union_prefix = engine
         .execute_gql(
-            "CALL { MATCH (x:GqlMergeCallA) RETURN x.key AS k UNION MATCH (x:GqlMergeCallB) RETURN x.key AS k } \
-             MERGE (n:GqlMergeCallPrefix {key: k}) RETURN n.key ORDER BY n.key",
+            "CALL { MATCH (x:GqlMergeCallA) RETURN elementKey(x) AS k UNION MATCH (x:GqlMergeCallB) RETURN elementKey(x) AS k } \
+             MERGE (n:GqlMergeCallPrefix {elementKey: k}) RETURN elementKey(n) ORDER BY elementKey(n)",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -1294,7 +1294,7 @@ fn gql_create_node_strict_duplicates_reject_before_write() {
 
     let visible = engine
         .execute_gql(
-            "CREATE (n:Person {key: 'gql-create-existing', name: 'new'}) RETURN n",
+            "CREATE (n:Person {elementKey: 'gql-create-existing', name: 'new'}) RETURN n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1312,7 +1312,7 @@ fn gql_create_node_strict_duplicates_reject_before_write() {
 
     let duplicate = engine
         .execute_gql(
-            "CREATE (a:GqlCreateDup {key: 'dup'}), (b:GqlCreateDup {key: 'dup'}) RETURN a",
+            "CREATE (a:GqlCreateDup {elementKey: 'dup'}), (b:GqlCreateDup {elementKey: 'dup'}) RETURN a",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1332,7 +1332,7 @@ fn gql_create_node_strict_duplicates_reject_before_write() {
     );
     let final_label_visible = engine
         .execute_gql(
-            "CREATE (n:GqlCreateInitialOnly {key: 'final-key', name: 'new'}) SET n:GqlCreateFinalConflict RETURN n",
+            "CREATE (n:GqlCreateInitialOnly {elementKey: 'final-key', name: 'new'}) SET n:GqlCreateFinalConflict RETURN n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1354,7 +1354,7 @@ fn gql_create_node_strict_duplicates_reject_before_write() {
 
     let final_label_duplicate = engine
         .execute_gql(
-            "CREATE (a:GqlCreateFinalLeft {key: 'final-dup'}), (b:GqlCreateFinalRight {key: 'final-dup'}) SET a:GqlCreateFinalShared SET b:GqlCreateFinalShared RETURN a",
+            "CREATE (a:GqlCreateFinalLeft {elementKey: 'final-dup'}), (b:GqlCreateFinalRight {elementKey: 'final-dup'}) SET a:GqlCreateFinalShared SET b:GqlCreateFinalShared RETURN a",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1382,7 +1382,7 @@ fn gql_create_node_strict_duplicates_reject_before_write() {
     );
     let final_removed_old = engine
         .execute_gql(
-            "CREATE (n:GqlCreateRemovedOld {key: 'final-free', name: 'new'}) SET n:GqlCreateFinalNew REMOVE n:GqlCreateRemovedOld RETURN id(n), labels(n)",
+            "CREATE (n:GqlCreateRemovedOld {elementKey: 'final-free', name: 'new'}) SET n:GqlCreateFinalNew REMOVE n:GqlCreateRemovedOld RETURN id(n), labels(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1425,7 +1425,7 @@ fn gql_create_node_strict_duplicates_reject_before_write() {
     );
     let multi_row = engine
         .execute_gql(
-            "MATCH (s:GqlCreateSeed) CREATE (n:GqlCreateRollback {key: s.target}) RETURN n",
+            "MATCH (s:GqlCreateSeed) CREATE (n:GqlCreateRollback {elementKey: s.target}) RETURN n",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -1467,7 +1467,7 @@ fn gql_create_node_rejects_prune_hidden_existing_key_before_write() {
 
     let hidden_duplicate = engine
         .execute_gql(
-            "CREATE (n:GqlPruneHiddenCreate {key: 'hidden', name: 'new'}) RETURN n",
+            "CREATE (n:GqlPruneHiddenCreate {elementKey: 'hidden', name: 'new'}) RETURN n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1492,7 +1492,7 @@ fn gql_create_invalid_node_metadata_and_property_values_reject_before_write() {
 
     let bad_key = engine
         .execute_gql(
-            "CREATE (n:GqlBadKey {key: 42, name: 'bad'}) RETURN n",
+            "CREATE (n:GqlBadKey {elementKey: 42, name: 'bad'}) RETURN n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1505,7 +1505,7 @@ fn gql_create_invalid_node_metadata_and_property_values_reject_before_write() {
 
     let bad_weight = engine
         .execute_gql(
-            "CREATE (n:GqlBadWeight {key: 'n', weight: 'heavy'}) RETURN n",
+            "CREATE (n:GqlBadWeight {elementKey: 'n', weight: 'heavy'}) RETURN n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1520,7 +1520,7 @@ fn gql_create_invalid_node_metadata_and_property_values_reject_before_write() {
 
     let bad_property = engine
         .execute_gql(
-            "CREATE (n:GqlBadProp {key: 'n', score: $bad}) RETURN n",
+            "CREATE (n:GqlBadProp {elementKey: 'n', score: $bad}) RETURN n",
             &GqlParams::from([("bad".to_string(), GqlParamValue::Float(f64::NAN))]),
             &gql_opts(),
         )
@@ -1542,7 +1542,7 @@ fn gql_create_edge_executes_for_matched_and_created_endpoints() {
 
     let result = engine
         .execute_gql(
-            "MATCH (a:Person) WHERE a.key = 'gql-create-edge-a' MATCH (b:Person) WHERE b.key = 'gql-create-edge-b' CREATE (a)-[r:Gql_CREATED {since: 2026, weight: 0.8, valid_from: 10, valid_to: 20}]->(b) RETURN r, id(r), r.since",
+            "MATCH (a:Person) WHERE elementKey(a) = 'gql-create-edge-a' MATCH (b:Person) WHERE elementKey(b) = 'gql-create-edge-b' CREATE (a)-[r:Gql_CREATED {since: 2026, weight: 0.8, validFrom: 10, validTo: 20}]->(b) RETURN r, id(r), r.since",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1570,7 +1570,7 @@ fn gql_create_edge_executes_for_matched_and_created_endpoints() {
 
     let chain = engine
         .execute_gql(
-            "CREATE (a:GqlChain {key: 'a'})-[r:Gql_CHAIN {rank: 1}]->(b:GqlChain {key: 'b'}) RETURN id(a), id(r), id(b)",
+            "CREATE (a:GqlChain {elementKey: 'a'})-[r:Gql_CHAIN {rank: 1}]->(b:GqlChain {elementKey: 'b'}) RETURN id(a), id(r), id(b)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1592,13 +1592,13 @@ fn gql_create_invalid_edge_validity_and_metadata_return_behaviors() {
 
     let bad_valid_to = engine
         .execute_gql(
-            "CREATE (a:GqlBadEdgeWindow {key: 'a'})-[r:Gql_BAD_WINDOW {valid_to: 0}]->(b:GqlBadEdgeWindow {key: 'b'}) RETURN r",
+            "CREATE (a:GqlBadEdgeWindow {elementKey: 'a'})-[r:Gql_BAD_WINDOW {validTo: 0}]->(b:GqlBadEdgeWindow {elementKey: 'b'}) RETURN r",
             &GqlParams::new(),
             &gql_opts(),
         )
         .unwrap_err();
     assert!(
-        matches!(bad_valid_to, EngineError::InvalidOperation(message) if message.contains("valid_from < valid_to"))
+        matches!(bad_valid_to, EngineError::InvalidOperation(message) if message.contains("validFrom < validTo"))
     );
     assert!(engine
         .get_node_by_key("GqlBadEdgeWindow", "a")
@@ -1611,13 +1611,13 @@ fn gql_create_invalid_edge_validity_and_metadata_return_behaviors() {
 
     let bad_valid_from = engine
         .execute_gql(
-            "CREATE (a:GqlBadEdgeWindowMax {key: 'a'})-[r:Gql_BAD_WINDOW_MAX {valid_from: 9223372036854775807}]->(b:GqlBadEdgeWindowMax {key: 'b'}) RETURN r",
+            "CREATE (a:GqlBadEdgeWindowMax {elementKey: 'a'})-[r:Gql_BAD_WINDOW_MAX {validFrom: 9223372036854775807}]->(b:GqlBadEdgeWindowMax {elementKey: 'b'}) RETURN r",
             &GqlParams::new(),
             &gql_opts(),
         )
         .unwrap_err();
     assert!(
-        matches!(bad_valid_from, EngineError::InvalidOperation(message) if message.contains("valid_from < valid_to"))
+        matches!(bad_valid_from, EngineError::InvalidOperation(message) if message.contains("validFrom < validTo"))
     );
     assert!(engine
         .get_node_by_key("GqlBadEdgeWindowMax", "a")
@@ -1630,7 +1630,7 @@ fn gql_create_invalid_edge_validity_and_metadata_return_behaviors() {
 
     let node_metadata_return = engine
         .execute_gql(
-            "CREATE (n:GqlReturnNodeMetadata {key: 'n'}) RETURN n.created_at",
+            "CREATE (n:GqlReturnNodeMetadata {elementKey: 'n'}) RETURN createdAt(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1647,7 +1647,7 @@ fn gql_create_invalid_edge_validity_and_metadata_return_behaviors() {
 
     let edge_metadata_return = engine
         .execute_gql(
-            "CREATE (a:GqlReturnEdgeMetadata {key: 'a'})-[r:Gql_RETURN_META]->(b:GqlReturnEdgeMetadata {key: 'b'}) RETURN r.updated_at",
+            "CREATE (a:GqlReturnEdgeMetadata {elementKey: 'a'})-[r:Gql_RETURN_META]->(b:GqlReturnEdgeMetadata {elementKey: 'b'}) RETURN updatedAt(r)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1680,7 +1680,7 @@ fn gql_create_edge_strict_uniqueness_respects_engine_option() {
         .unwrap();
     let duplicate = unique_engine
         .execute_gql(
-            "MATCH (a:Person) WHERE a.key = 'gql-unique-a' MATCH (b:Person) WHERE b.key = 'gql-unique-b' CREATE (a)-[:Gql_UNIQUE]->(b)",
+            "MATCH (a:Person) WHERE elementKey(a) = 'gql-unique-a' MATCH (b:Person) WHERE elementKey(b) = 'gql-unique-b' CREATE (a)-[:Gql_UNIQUE]->(b)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1692,7 +1692,7 @@ fn gql_create_edge_strict_uniqueness_respects_engine_option() {
     insert_query_node(&parallel_engine, "Person", "gql-parallel-b", &[], 1.0);
     let parallel = parallel_engine
         .execute_gql(
-            "MATCH (a:Person) WHERE a.key = 'gql-parallel-a' MATCH (b:Person) WHERE b.key = 'gql-parallel-b' CREATE (a)-[:Gql_PARALLEL]->(b), (a)-[:Gql_PARALLEL]->(b)",
+            "MATCH (a:Person) WHERE elementKey(a) = 'gql-parallel-a' MATCH (b:Person) WHERE elementKey(b) = 'gql-parallel-b' CREATE (a)-[:Gql_PARALLEL]->(b), (a)-[:Gql_PARALLEL]->(b)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1709,7 +1709,7 @@ fn gql_create_match_backed_rows_caps_and_optional_null_skip_are_atomic() {
 
     let cap = engine
         .execute_gql(
-            "MATCH (s:GqlBatch) CREATE (n:GqlCapCreate {key: s.key}) RETURN n",
+            "MATCH (s:GqlBatch) CREATE (n:GqlCapCreate {elementKey: elementKey(s)}) RETURN n",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -1730,7 +1730,7 @@ fn gql_create_match_backed_rows_caps_and_optional_null_skip_are_atomic() {
 
     let cursor_cap = engine
         .execute_gql(
-            "MATCH (s:GqlBatch) CREATE (n:GqlCursorCapCreate {key: s.key}) RETURN n",
+            "MATCH (s:GqlBatch) CREATE (n:GqlCursorCapCreate {elementKey: elementKey(s)}) RETURN n",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -1756,7 +1756,7 @@ fn gql_create_match_backed_rows_caps_and_optional_null_skip_are_atomic() {
     let root = insert_query_node(&engine, "GqlOptionalRoot", "root", &[], 1.0);
     let skipped = engine
         .execute_gql(
-            "MATCH (a:GqlOptionalRoot) WHERE a.key = 'root' OPTIONAL MATCH (a)-[r:Gql_MISSING]->(b) CREATE (b)-[:Gql_SKIP]->(c:GqlSkipped {key: 'c'}) RETURN c",
+            "MATCH (a:GqlOptionalRoot) WHERE elementKey(a) = 'root' OPTIONAL MATCH (a)-[r:Gql_MISSING]->(b) CREATE (b)-[:Gql_SKIP]->(c:GqlSkipped {elementKey: 'c'}) RETURN c",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1789,7 +1789,7 @@ fn gql_create_cap_fails_during_materialization_without_writes() {
 
     let err = engine
         .execute_gql(
-            "MATCH (s:GqlCreateEarlyCapSource) CREATE (n:GqlCreateEarlyCap {key: s.key})",
+            "MATCH (s:GqlCreateEarlyCapSource) CREATE (n:GqlCreateEarlyCap {elementKey: elementKey(s)})",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -1812,7 +1812,7 @@ fn gql_create_return_order_by_id_and_later_delete_executes() {
     let (_dir, engine) = query_test_engine();
     let supported_return = engine
         .execute_gql(
-            "CREATE (n:GqlReturnSupportedOrder {key: 'n'}) RETURN n ORDER BY n.key",
+            "CREATE (n:GqlReturnSupportedOrder {elementKey: 'n'}) RETURN n ORDER BY elementKey(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1827,7 +1827,7 @@ fn gql_create_return_order_by_id_and_later_delete_executes() {
 
     let supported_set = engine
         .execute_gql(
-            "CREATE (n:GqlUnsupportedSet {key: 'n'}) SET n.name = 'Ada'",
+            "CREATE (n:GqlUnsupportedSet {elementKey: 'n'}) SET n.name = 'Ada'",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1845,7 +1845,7 @@ fn gql_create_return_order_by_id_and_later_delete_executes() {
 
     let delete = engine
         .execute_gql(
-            "MATCH (n:GqlUnsupportedSet) WHERE n.key = 'n' DETACH DELETE n",
+            "MATCH (n:GqlUnsupportedSet) WHERE elementKey(n) = 'n' DETACH DELETE n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1861,7 +1861,7 @@ fn gql_create_return_order_by_id_and_later_delete_executes() {
 fn gql_set_node_property_updates_existing_node_index_and_return() {
     let (_dir, engine) = query_test_engine();
     engine
-        .ensure_node_property_index("GqlSetIndexed", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("GqlSetIndexed", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let node_id = insert_query_node(
         &engine,
@@ -1877,7 +1877,7 @@ fn gql_set_node_property_updates_existing_node_index_and_return() {
 
     let result = engine
         .execute_gql(
-            "MATCH (n:GqlSetIndexed) WHERE n.key = 'n' SET n.status = 'new' RETURN n, id(n), n.status, n.weight",
+            "MATCH (n:GqlSetIndexed) WHERE elementKey(n) = 'n' SET n.status = 'new' RETURN n, id(n), n.status, weight(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1942,9 +1942,9 @@ fn gql_set_edge_property_and_metadata_preserves_edge_identity() {
 
     let result = engine
         .execute_gql(
-            "MATCH (a:GqlEdgeSetNode) WHERE a.key = 'a' MATCH (b:GqlEdgeSetNode) WHERE b.key = 'b' MATCH (a)-[r:Gql_SET_EDGE]->(b) \
-             SET r.since = 2026 SET r.weight = 2.5 SET r.valid_from = 10 SET r.valid_to = 20 \
-             RETURN id(r), r.since, r.weight, r.valid_from, r.valid_to",
+            "MATCH (a:GqlEdgeSetNode) WHERE elementKey(a) = 'a' MATCH (b:GqlEdgeSetNode) WHERE elementKey(b) = 'b' MATCH (a)-[r:Gql_SET_EDGE]->(b) \
+             SET r.since = 2026 SET weight(r) = 2.5 SET validFrom(r) = 10 SET validTo(r) = 20 \
+             RETURN id(r), r.since, weight(r), validFrom(r), validTo(r)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -1991,8 +1991,8 @@ fn gql_set_existing_edge_allows_same_statement_parallel_create_when_nonunique() 
 
     let result = engine
         .execute_gql(
-            "MATCH (a:GqlParallelRplNode) WHERE a.key = 'a' \
-             MATCH (b:GqlParallelRplNode) WHERE b.key = 'b' \
+            "MATCH (a:GqlParallelRplNode) WHERE elementKey(a) = 'a' \
+             MATCH (b:GqlParallelRplNode) WHERE elementKey(b) = 'b' \
              MATCH (a)-[r:Gql_PARALLEL_REPLACE]->(b) \
              CREATE (a)-[x:Gql_PARALLEL_REPLACE {kind: 'new'}]->(b) \
              SET r.kind = 'updated' RETURN id(r), r.kind",
@@ -2055,7 +2055,7 @@ fn gql_set_map_merge_handles_nulls_and_weight_as_property() {
 
     engine
         .execute_gql(
-            "MATCH (n:GqlMapMerge) WHERE n.key = 'n' SET n += $props RETURN n.keep, n.old, n.nested, n.weight",
+            "MATCH (n:GqlMapMerge) WHERE elementKey(n) = 'n' SET n += $props RETURN n.keep, n.old, n.nested, weight(n)",
             &params,
             &gql_opts(),
         )
@@ -2078,7 +2078,7 @@ fn gql_set_map_merge_handles_nulls_and_weight_as_property() {
 
     let non_map = engine
         .execute_gql(
-            "MATCH (n:GqlMapMerge) WHERE n.key = 'n' SET n += 1",
+            "MATCH (n:GqlMapMerge) WHERE elementKey(n) = 'n' SET n += 1",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -2087,7 +2087,7 @@ fn gql_set_map_merge_handles_nulls_and_weight_as_property() {
 }
 
 #[test]
-fn gql_set_map_merge_rejects_reserved_metadata_keys() {
+fn gql_set_map_merge_formerly_reserved_keys_write_plain_properties() {
     let (_dir, engine) = query_test_engine();
     let a = insert_query_node(
         &engine,
@@ -2111,8 +2111,9 @@ fn gql_set_map_merge_rejects_reserved_metadata_keys() {
             },
         )
         .unwrap();
+    let node_before = engine.get_node(a).unwrap().unwrap();
 
-    for key in [
+    let node_keys = [
         "id",
         "labels",
         "key",
@@ -2120,10 +2121,11 @@ fn gql_set_map_merge_rejects_reserved_metadata_keys() {
         "updated_at",
         "dense_vector",
         "sparse_vector",
-    ] {
-        let err = engine
+    ];
+    for key in node_keys {
+        engine
             .execute_gql(
-                "MATCH (n:GqlReservedMapMerge) WHERE n.key = 'a' SET n += $props",
+                "MATCH (n:GqlReservedMapMerge) WHERE elementKey(n) = 'a' SET n += $props",
                 &GqlParams::from([(
                     "props".to_string(),
                     GqlParamValue::Map(BTreeMap::from([(
@@ -2133,26 +2135,49 @@ fn gql_set_map_merge_rejects_reserved_metadata_keys() {
                 )]),
                 &gql_opts(),
             )
-            .unwrap_err();
-        assert!(
-            matches!(&err, EngineError::InvalidOperation(message) if message.contains("reserved metadata")),
-            "expected reserved metadata error for node key {key}, got {err:?}"
-        );
+            .unwrap_or_else(|err| {
+                panic!("SET += map with property key {key} should succeed, got {err:?}")
+            });
     }
     let node = engine.get_node(a).unwrap().unwrap();
+    // Every formerly reserved key is now a plain user property.
+    for key in node_keys {
+        assert_eq!(
+            node.props.get(key),
+            Some(&PropValue::Int(1)),
+            "expected user property {key} written by SET += map"
+        );
+    }
     assert_eq!(
         node.props.get("status"),
         Some(&PropValue::String("old".to_string()))
     );
-    assert!(!node.props.contains_key("id"));
-    assert!(!node.props.contains_key("key"));
-    assert!(!node.props.contains_key("dense_vector"));
+    // Metadata stays untouched by the property writes.
+    assert_eq!(node.key, "a");
+    assert_eq!(node.labels, node_before.labels);
+    assert_eq!(node.weight, node_before.weight);
+    assert_eq!(node.created_at, node_before.created_at);
+    assert!(node.dense_vector.is_none());
+    assert!(node.sparse_vector.is_none());
 
-    for key in ["id", "from", "to", "label", "type", "created_at", "updated_at"] {
-        let err = engine
+    // Dot reads see the property; functions still read metadata.
+    let read = execute_gql_ok(
+        &engine,
+        "MATCH (n:GqlReservedMapMerge) WHERE elementKey(n) = 'a' \
+         RETURN n.updated_at, updatedAt(n), n.key, elementKey(n)",
+    );
+    assert_eq!(read.rows[0].values[0], GqlValue::Int(1));
+    assert!(matches!(read.rows[0].values[1], GqlValue::Int(ts) if ts == node.updated_at));
+    assert_eq!(read.rows[0].values[2], GqlValue::Int(1));
+    assert_eq!(read.rows[0].values[3], GqlValue::String("a".to_string()));
+
+    let edge_before = engine.get_edge(edge_id).unwrap().unwrap();
+    let edge_keys = ["id", "from", "to", "label", "type", "created_at", "updated_at"];
+    for key in edge_keys {
+        engine
             .execute_gql(
-                "MATCH (a:GqlReservedMapMerge) WHERE a.key = 'a' \
-                 MATCH (b:GqlReservedMapMerge) WHERE b.key = 'b' \
+                "MATCH (a:GqlReservedMapMerge) WHERE elementKey(a) = 'a' \
+                 MATCH (b:GqlReservedMapMerge) WHERE elementKey(b) = 'b' \
                  MATCH (a)-[r:Gql_RESERVED_MERGE_EDGE]->(b) SET r += $props",
                 &GqlParams::from([(
                     "props".to_string(),
@@ -2163,19 +2188,31 @@ fn gql_set_map_merge_rejects_reserved_metadata_keys() {
                 )]),
                 &gql_opts(),
             )
-            .unwrap_err();
-        assert!(
-            matches!(&err, EngineError::InvalidOperation(message) if message.contains("reserved metadata")),
-            "expected reserved metadata error for edge key {key}, got {err:?}"
-        );
+            .unwrap_or_else(|err| {
+                panic!("SET += map with edge property key {key} should succeed, got {err:?}")
+            });
     }
     let edge = engine.get_edge(edge_id).unwrap().unwrap();
+    for key in edge_keys {
+        assert_eq!(
+            edge.props.get(key),
+            Some(&PropValue::Int(1)),
+            "expected user property {key} written by SET += map"
+        );
+    }
     assert_eq!(
         edge.props.get("status"),
         Some(&PropValue::String("old".to_string()))
     );
-    assert!(!edge.props.contains_key("from"));
-    assert!(!edge.props.contains_key("type"));
+    // Edge identity and metadata stay untouched by the property writes.
+    assert_eq!(edge.id, edge_id);
+    assert_eq!(edge.from, a);
+    assert_eq!(edge.to, b);
+    assert_eq!(edge.label, "Gql_RESERVED_MERGE_EDGE");
+    assert_eq!(edge.weight, edge_before.weight);
+    assert_eq!(edge.valid_from, edge_before.valid_from);
+    assert_eq!(edge.valid_to, edge_before.valid_to);
+    assert_eq!(edge.created_at, edge_before.created_at);
 }
 
 #[test]
@@ -2191,7 +2228,7 @@ fn gql_remove_property_and_label_are_noop_safe_and_atomic() {
 
     let result = engine
         .execute_gql(
-            "MATCH (n:GqlRemove) WHERE n.key = 'n' REMOVE n.drop REMOVE n.missing REMOVE n:GqlRemoveExtra RETURN n.drop, labels(n)",
+            "MATCH (n:GqlRemove) WHERE elementKey(n) = 'n' REMOVE n.drop REMOVE n.missing REMOVE n:GqlRemoveExtra RETURN n.drop, labels(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -2207,7 +2244,7 @@ fn gql_remove_property_and_label_are_noop_safe_and_atomic() {
 
     let last_label = engine
         .execute_gql(
-            "MATCH (n:GqlRemove) WHERE n.key = 'n' REMOVE n:GqlRemove",
+            "MATCH (n:GqlRemove) WHERE elementKey(n) = 'n' REMOVE n:GqlRemove",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -2217,7 +2254,7 @@ fn gql_remove_property_and_label_are_noop_safe_and_atomic() {
 
     let optional = engine
         .execute_gql(
-            "MATCH (n:GqlRemove) WHERE n.key = 'n' OPTIONAL MATCH (n)-[r:Gql_REMOVE_MISSING]->(m) SET m.name = 'x' REMOVE m.missing",
+            "MATCH (n:GqlRemove) WHERE elementKey(n) = 'n' OPTIONAL MATCH (n)-[r:Gql_REMOVE_MISSING]->(m) SET m.name = 'x' REMOVE m.missing",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -2233,7 +2270,7 @@ fn gql_set_duplicate_targets_are_coalesced_last_write_wins() {
 
     let result = engine
         .execute_gql(
-            "MATCH (n:GqlDuplicateSet) WHERE n.key = 'n' SET n.name = 'first' SET n.name = 'second' RETURN n.name",
+            "MATCH (n:GqlDuplicateSet) WHERE elementKey(n) = 'n' SET n.name = 'first' SET n.name = 'second' RETURN n.name",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -2258,7 +2295,7 @@ fn gql_mixed_create_set_remove_returns_final_created_alias() {
     let (_dir, engine) = query_test_engine();
     let result = engine
         .execute_gql(
-            "CREATE (n:GqlMixedCreate {key: 'n', old: 'x'}) SET n.name = 'Ada' REMOVE n.old SET n:GqlMixedExtra RETURN n.name, n.old, labels(n)",
+            "CREATE (n:GqlMixedCreate {elementKey: 'n', old: 'x'}) SET n.name = 'Ada' REMOVE n.old SET n:GqlMixedExtra RETURN n.name, n.old, labels(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -2296,7 +2333,7 @@ fn gql_set_remove_errors_leave_database_unchanged() {
     );
     let bad_prop = engine
         .execute_gql(
-            "MATCH (n:GqlSetAtomic) WHERE n.key = 'n' SET n.status = 'new' SET n.bad = $bad",
+            "MATCH (n:GqlSetAtomic) WHERE elementKey(n) = 'n' SET n.status = 'new' SET n.bad = $bad",
             &GqlParams::from([("bad".to_string(), GqlParamValue::Float(f64::NAN))]),
             &gql_opts(),
         )
@@ -2322,7 +2359,7 @@ fn gql_set_remove_errors_leave_database_unchanged() {
         .unwrap();
     let bad_window = engine
         .execute_gql(
-            "MATCH (a:GqlSetAtomicEdgeNode) WHERE a.key = 'a' MATCH (b:GqlSetAtomicEdgeNode) WHERE b.key = 'b' MATCH (a)-[r:Gql_SET_ATOMIC_EDGE]->(b) SET r.valid_from = 9223372036854775807",
+            "MATCH (a:GqlSetAtomicEdgeNode) WHERE elementKey(a) = 'a' MATCH (b:GqlSetAtomicEdgeNode) WHERE elementKey(b) = 'b' MATCH (a)-[r:Gql_SET_ATOMIC_EDGE]->(b) SET validFrom(r) = 9223372036854775807",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -2366,7 +2403,7 @@ fn gql_existing_update_cap_uses_final_replacement_count() {
 
     let reverted = engine
         .execute_gql(
-            "MATCH (n:GqlSetRevertCap) WHERE n.key = 'n' SET n.status = 'new' SET n.status = 'old'",
+            "MATCH (n:GqlSetRevertCap) WHERE elementKey(n) = 'n' SET n.status = 'new' SET n.status = 'old'",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 max_mutation_ops: 0,
@@ -2387,7 +2424,7 @@ fn gql_existing_update_cap_uses_final_replacement_count() {
 
     let changed = engine
         .execute_gql(
-            "MATCH (n:GqlSetRevertCap) WHERE n.key = 'n' SET n.status = 'new'",
+            "MATCH (n:GqlSetRevertCap) WHERE elementKey(n) = 'n' SET n.status = 'new'",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 max_mutation_ops: 0,
@@ -2438,7 +2475,7 @@ fn gql_set_label_preserves_vectors() {
 
     engine
         .execute_gql(
-            "MATCH (n:GqlVectorSet) WHERE n.key = 'n' SET n:GqlVectorSetExtra SET n.status = 'ok'",
+            "MATCH (n:GqlVectorSet) WHERE elementKey(n) = 'n' SET n:GqlVectorSetExtra SET n.status = 'ok'",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -2463,8 +2500,8 @@ fn gql_set_label_transfer_uses_final_replacement_key_state() {
 
     engine
         .execute_gql(
-            "MATCH (a:GqlTransferLabel) WHERE a.key = 'shared' \
-             MATCH (b:GqlTransferTarget) WHERE b.key = 'shared' \
+            "MATCH (a:GqlTransferLabel) WHERE elementKey(a) = 'shared' \
+             MATCH (b:GqlTransferTarget) WHERE elementKey(b) = 'shared' \
              SET b:GqlTransferLabel REMOVE a:GqlTransferLabel",
             &GqlParams::new(),
             &gql_opts(),
@@ -2489,7 +2526,7 @@ fn gql_set_label_transfer_uses_final_replacement_key_state() {
     let candidate = insert_query_node(&engine, "GqlConflictCandidate", "dup", &[], 1.0);
     let conflict = engine
         .execute_gql(
-            "MATCH (n:GqlConflictCandidate) WHERE n.key = 'dup' SET n:GqlConflictHeld",
+            "MATCH (n:GqlConflictCandidate) WHERE elementKey(n) = 'dup' SET n:GqlConflictHeld",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -2519,8 +2556,8 @@ fn gql_set_label_cyclic_transfer_rejects_without_index_corruption() {
 
     let err = engine
         .execute_gql(
-            "MATCH (a:GqlCycleLeft) WHERE a.key = 'shared' \
-             MATCH (b:GqlCycleRight) WHERE b.key = 'shared' \
+            "MATCH (a:GqlCycleLeft) WHERE elementKey(a) = 'shared' \
+             MATCH (b:GqlCycleRight) WHERE elementKey(b) = 'shared' \
              SET a:GqlCycleRight SET b:GqlCycleLeft REMOVE a:GqlCycleLeft REMOVE b:GqlCycleRight",
             &GqlParams::new(),
             &gql_opts(),
@@ -2569,7 +2606,7 @@ fn gql_mutation_return_non_mutated_existing_alias_projects_and_commits() {
 
     let result = engine
         .execute_gql(
-            "MATCH (n:GqlNoopReturn) WHERE n.key = 'n' CREATE (c:GqlNoopReturnCreated {key: 'c'}) SET n.missing = null RETURN n",
+            "MATCH (n:GqlNoopReturn) WHERE elementKey(n) = 'n' CREATE (c:GqlNoopReturnCreated {elementKey: 'c'}) SET n.missing = null RETURN n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -2630,7 +2667,7 @@ fn gql_mutation_return_compact_rows_and_vectors_are_accepted() {
 
     let omitted = engine
         .execute_gql(
-            "MATCH (n:GqlReturnOptions) WHERE n.key = 'n' SET n.status = 'new' RETURN n",
+            "MATCH (n:GqlReturnOptions) WHERE elementKey(n) = 'n' SET n.status = 'new' RETURN n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -2646,7 +2683,7 @@ fn gql_mutation_return_compact_rows_and_vectors_are_accepted() {
 
     let vectors = engine
         .execute_gql(
-            "MATCH (n:GqlReturnOptions) WHERE n.key = 'n' SET n.status = 'newer' RETURN n",
+            "MATCH (n:GqlReturnOptions) WHERE elementKey(n) = 'n' SET n.status = 'newer' RETURN n",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 include_vectors: true,
@@ -2664,7 +2701,7 @@ fn gql_mutation_return_compact_rows_and_vectors_are_accepted() {
 
     let compact = engine
         .execute_gql(
-            "MATCH (n:GqlReturnOptions) WHERE n.key = 'n' SET n.status = 'compact' RETURN n.status",
+            "MATCH (n:GqlReturnOptions) WHERE elementKey(n) = 'n' SET n.status = 'compact' RETURN n.status",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 compact_rows: true,
@@ -2710,7 +2747,7 @@ fn gql_mutation_profile_db_hits_are_gated_and_nonzero_for_existing_reads() {
         "MATCH (a:GqlMutationProfileHits)-[r:Gql_PROFILE_HITS]->(b:GqlMutationProfileHits) \
          WHERE id(a) = {a} \
          SET b.status = $status \
-         RETURN b.key ORDER BY a.status, type(r)"
+         RETURN elementKey(b) ORDER BY a.status, type(r)"
     );
     let no_profile = engine
         .execute_gql(
@@ -2730,7 +2767,7 @@ fn gql_mutation_profile_db_hits_are_gated_and_nonzero_for_existing_reads() {
 
     let profiled_create = engine
         .execute_gql(
-            "CREATE (n:GqlMutationProfileCreate {key: 'n'})",
+            "CREATE (n:GqlMutationProfileCreate {elementKey: 'n'})",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 profile: true,
@@ -2793,7 +2830,7 @@ fn gql_mutation_return_row_ops_affect_rows_not_mutations() {
 
     let created = engine
         .execute_gql(
-            "MATCH (s:GqlCreateReturnOpsSeed) CREATE (n:GqlCreateReturnOps {key: s.key, rank: s.rank}) RETURN n.key ORDER BY n.rank DESC SKIP 1 LIMIT 1",
+            "MATCH (s:GqlCreateReturnOpsSeed) CREATE (n:GqlCreateReturnOps {elementKey: elementKey(s), rank: s.rank}) RETURN elementKey(n) ORDER BY n.rank DESC SKIP 1 LIMIT 1",
             &GqlParams::new(),
             &options,
         )
@@ -2819,7 +2856,7 @@ fn gql_mutation_return_row_ops_affect_rows_not_mutations() {
     }
     let set = engine
         .execute_gql(
-            "MATCH (n:GqlSetReturnOps) SET n.touched = true RETURN n.key ORDER BY n.rank, id(n) SKIP 1 LIMIT 2",
+            "MATCH (n:GqlSetReturnOps) SET n.touched = true RETURN elementKey(n) ORDER BY n.rank, id(n) SKIP 1 LIMIT 2",
             &GqlParams::new(),
             &options,
         )
@@ -2854,7 +2891,7 @@ fn gql_mutation_return_row_ops_affect_rows_not_mutations() {
     let null_desc = engine
         .execute_gql(
             "MATCH (n:GqlNullDescReturnOps) SET n.checked = true \
-             RETURN n.key ORDER BY n.rank DESC LIMIT 1",
+             RETURN elementKey(n) ORDER BY n.rank DESC LIMIT 1",
             &GqlParams::new(),
             &options,
         )
@@ -2877,7 +2914,7 @@ fn gql_mutation_return_row_ops_affect_rows_not_mutations() {
 
     let limit_zero = engine
         .execute_gql(
-            "MATCH (n:GqlSetReturnOps) SET n.limit_zero = true RETURN n.key ORDER BY n.rank LIMIT 0",
+            "MATCH (n:GqlSetReturnOps) SET n.limit_zero = true RETURN elementKey(n) ORDER BY n.rank LIMIT 0",
             &GqlParams::new(),
             &options,
         )
@@ -2910,7 +2947,7 @@ fn gql_mutation_return_row_ops_affect_rows_not_mutations() {
     }
     let removed = engine
         .execute_gql(
-            "MATCH (n:GqlRemoveReturnOps) REMOVE n.drop RETURN n.key ORDER BY n.rank DESC LIMIT 2",
+            "MATCH (n:GqlRemoveReturnOps) REMOVE n.drop RETURN elementKey(n) ORDER BY n.rank DESC LIMIT 2",
             &GqlParams::new(),
             &options,
         )
@@ -2990,7 +3027,7 @@ fn gql_mutation_return_caps_and_order_errors_are_atomic() {
 
     let max_order = engine
         .execute_gql(
-            "MATCH (n:GqlReturnCapRows) SET n.status = 'ordered' RETURN n.key ORDER BY n.key",
+            "MATCH (n:GqlReturnCapRows) SET n.status = 'ordered' RETURN elementKey(n) ORDER BY elementKey(n)",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -3006,7 +3043,7 @@ fn gql_mutation_return_caps_and_order_errors_are_atomic() {
 
     let unsupported_order = engine
         .execute_gql(
-            "MATCH (n:GqlReturnCapRows) SET n.status = 'bad-order' RETURN n.key ORDER BY n",
+            "MATCH (n:GqlReturnCapRows) SET n.status = 'bad-order' RETURN elementKey(n) ORDER BY n",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -3046,8 +3083,8 @@ fn gql_mutation_return_distinct_caps_are_precommit_atomic() {
     let cap_err = engine
         .execute_gql(
             "MATCH (s:GqlReturnDistinctCapSeed) \
-             CREATE (n:GqlReturnDistinctCap {key: s.key}) \
-             RETURN DISTINCT n.key AS key",
+             CREATE (n:GqlReturnDistinctCap {elementKey: elementKey(s)}) \
+             RETURN DISTINCT elementKey(n) AS key",
             &GqlParams::new(),
             &options,
         )
@@ -3066,7 +3103,7 @@ fn gql_mutation_return_distinct_caps_are_precommit_atomic() {
     let same = engine
         .execute_gql(
             "MATCH (s:GqlReturnDistinctCapSeed) \
-             CREATE (n:GqlReturnDistinctSame {key: s.key}) \
+             CREATE (n:GqlReturnDistinctSame {elementKey: elementKey(s)}) \
              RETURN DISTINCT 'same' AS key",
             &GqlParams::new(),
             &options,
@@ -3093,7 +3130,7 @@ fn gql_mutation_return_distinct_caps_are_precommit_atomic() {
     let nested_graph = engine
         .execute_gql(
             "MATCH (s:GqlReturnDistinctGraphSeed) \
-             MERGE (n:GqlReturnDistinctGraph {key: s.target}) \
+             MERGE (n:GqlReturnDistinctGraph {elementKey: s.target}) \
              RETURN DISTINCT [n] AS bucket",
             &GqlParams::new(),
             &options,
@@ -3111,7 +3148,7 @@ fn gql_mutation_return_distinct_rejects_commit_assigned_metadata_before_write() 
     let (_dir, engine) = query_test_engine();
     let err = engine
         .execute_gql(
-            "CREATE (n:GqlReturnDistinctMetadata {key: 'n'}) RETURN DISTINCT id(n)",
+            "CREATE (n:GqlReturnDistinctMetadata {elementKey: 'n'}) RETURN DISTINCT id(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -3139,8 +3176,8 @@ fn gql_mutation_return_distinct_rejects_volatile_updated_at_before_write() {
 
     let err = engine
         .execute_gql(
-            "MATCH (n:GqlReturnDistinctUpdatedAt) WHERE n.key = 'n' \
-             SET n.status = 'new' RETURN DISTINCT n.updated_at",
+            "MATCH (n:GqlReturnDistinctUpdatedAt) WHERE elementKey(n) = 'n' \
+             SET n.status = 'new' RETURN DISTINCT updatedAt(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -3172,8 +3209,8 @@ fn gql_mutation_return_prevalidates_order_and_projection_against_final_state() {
     );
     let order_err = engine
         .execute_gql(
-            "MATCH (n:GqlReturnFinalValidation) WHERE n.key = 'rank' \
-             SET n.rank = [1] RETURN n.key ORDER BY n.rank",
+            "MATCH (n:GqlReturnFinalValidation) WHERE elementKey(n) = 'rank' \
+             SET n.rank = [1] RETURN elementKey(n) ORDER BY n.rank",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -3203,7 +3240,7 @@ fn gql_mutation_return_prevalidates_order_and_projection_against_final_state() {
     );
     let projection_err = engine
         .execute_gql(
-            "MATCH (n:GqlReturnFinalValidation) WHERE n.key = 'nested' \
+            "MATCH (n:GqlReturnFinalValidation) WHERE elementKey(n) = 'nested' \
              SET n.payload = 7 RETURN n.payload.inner",
             &GqlParams::new(),
             &gql_opts(),
@@ -3225,8 +3262,8 @@ fn gql_mutation_return_prevalidates_order_and_projection_against_final_state() {
 
     let metadata_id_err = engine
         .execute_gql(
-            "MATCH (n:GqlReturnFinalValidation) WHERE n.key = 'rank' \
-             SET n.status = 'metadata-id-bad' RETURN n.updated_at.inner",
+            "MATCH (n:GqlReturnFinalValidation) WHERE elementKey(n) = 'rank' \
+             SET n.status = 'metadata-id-bad' RETURN updatedAt(n).inner",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -3260,8 +3297,8 @@ fn gql_mutation_return_volatile_metadata_order_rejects_before_write() {
     let node_order = engine
         .execute_gql(
             "MATCH (s:GqlReturnCreatedMetaSeed) \
-             CREATE (n:GqlReturnCreatedMeta {key: s.key}) \
-             RETURN n.key ORDER BY n.id DESC SKIP 1 LIMIT 1",
+             CREATE (n:GqlReturnCreatedMeta {elementKey: elementKey(s)}) \
+             RETURN elementKey(n) ORDER BY id(n) DESC SKIP 1 LIMIT 1",
             &GqlParams::new(),
             &options,
         )
@@ -3288,7 +3325,7 @@ fn gql_mutation_return_volatile_metadata_order_rejects_before_write() {
                  MATCH (to:GqlReturnCreatedEdgeMetaTarget) \
                  WHERE id(from) = {root} \
                  CREATE (from)-[r:Gql_RETURN_CREATED_EDGE_META]->(to) \
-                 RETURN to.key ORDER BY r.to DESC SKIP 1 LIMIT 1"
+                 RETURN elementKey(to) ORDER BY id(endNode(r)) DESC SKIP 1 LIMIT 1"
             ),
             &GqlParams::new(),
             &options,
@@ -3317,7 +3354,7 @@ fn gql_mutation_return_volatile_metadata_order_rejects_before_write() {
     let updated_at_order = engine
         .execute_gql(
             "MATCH (n:GqlReturnChangedUpdatedAt) \
-             SET n.status = 'new' RETURN n.key ORDER BY n.updated_at",
+             SET n.status = 'new' RETURN elementKey(n) ORDER BY updatedAt(n)",
             &GqlParams::new(),
             &options,
         )
@@ -3413,7 +3450,7 @@ fn gql_mutation_return_gql_read_set_conflicts_for_returned_and_ordered_hydration
     let source = format!(
         "MATCH (a:GqlReturnReadSet)-[:Gql_RETURN_READ_SET]->(b:GqlReturnReadSet) \
          WHERE id(a) = {a} SET b.status = 'order-only-node-conflict' \
-         RETURN b.key ORDER BY a.status"
+         RETURN elementKey(b) ORDER BY a.status"
     );
     let (release_tx, handle) = run_paused(source, &engine);
     engine
@@ -3445,7 +3482,7 @@ fn gql_mutation_return_gql_read_set_conflicts_for_returned_and_ordered_hydration
     let source = format!(
         "MATCH (a:GqlReturnReadSet)-[r:Gql_RETURN_READ_SET]->(b:GqlReturnReadSet) \
          WHERE id(a) = {a} SET b.status = 'order-only-edge-conflict' \
-         RETURN b.key ORDER BY r.status"
+         RETURN elementKey(b) ORDER BY r.status"
     );
     let (release_tx, handle) = run_paused(source, &engine);
     engine.delete_edge(edge).unwrap();
@@ -3489,7 +3526,7 @@ fn gql_mutation_return_gql_read_set_conflicts_for_returned_and_ordered_hydration
         .unwrap();
     let source = format!(
         "MATCH p = (a:GqlReturnReadSet)-[:Gql_RETURN_READ_SET]->(b:GqlReturnReadSet) \
-         WHERE id(a) = {a} SET b.status = 'start-node-conflict' RETURN start_node(p)"
+         WHERE id(a) = {a} SET b.status = 'start-node-conflict' RETURN startNode(p)"
     );
     let (release_tx, handle) = run_paused(source, &engine);
     engine
@@ -3542,7 +3579,7 @@ fn gql_mutation_return_gql_read_set_conflicts_for_returned_and_ordered_hydration
         .unwrap();
     let source = format!(
         "MATCH p = (a:GqlReturnReadSet)-[:Gql_RETURN_READ_SET]->(b:GqlReturnReadSet) \
-         WHERE id(a) = {a} SET b.status = 'path-helper-no-conflict' RETURN node_ids(p)"
+         WHERE id(a) = {a} SET b.status = 'path-helper-no-conflict' RETURN nodeIds(p)"
     );
     let (release_tx, handle) = run_paused(source, &engine);
     engine.delete_edge(edge).unwrap();
@@ -3615,8 +3652,8 @@ fn gql_mutation_return_paths_and_existing_aliases_project_after_commit() {
         "MATCH p = (a:GqlReturnPath)-[r:Gql_RETURN_PATH]->(b:GqlReturnPath) \
          WHERE id(a) = {a} \
          SET b.status = 'new-b' \
-         RETURN p, a.status, b.status, length(p), node_ids(p), edge_ids(p), r.kind, \
-                start_node(p), end_node(p), nodes(p), relationships(p)"
+         RETURN p, a.status, b.status, length(p), nodeIds(p), edgeIds(p), r.kind, \
+                startNode(p), endNode(p), nodes(p), relationships(p)"
     );
     let result = engine
         .execute_gql(&source, &GqlParams::new(), &gql_opts())
@@ -3665,7 +3702,7 @@ fn gql_mutation_return_paths_and_existing_aliases_project_after_commit() {
             &format!(
                 "MATCH p = (a:GqlReturnPath)-[:Gql_RETURN_PATH]->(b:GqlReturnPath) \
                  WHERE id(a) = {a} SET b.status = 'bad-limit-zero' \
-                 RETURN start_node(p).key LIMIT 0"
+                 RETURN elementKey(startNode(p)) LIMIT 0"
             ),
             &GqlParams::new(),
             &gql_opts(),
@@ -3699,7 +3736,7 @@ fn gql_mutation_return_missing_params_and_unsupported_projection_are_atomic() {
 
     let missing = engine
         .execute_gql(
-            "MATCH (n:GqlReturnPrevalidate) WHERE n.key = 'n' SET n.status = 'new' RETURN $missing",
+            "MATCH (n:GqlReturnPrevalidate) WHERE elementKey(n) = 'n' SET n.status = 'new' RETURN $missing",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -3717,7 +3754,7 @@ fn gql_mutation_return_missing_params_and_unsupported_projection_are_atomic() {
 
     let unsupported = engine
         .execute_gql(
-            "MATCH (n:GqlReturnPrevalidate) WHERE n.key = 'n' SET n.status = 'new' RETURN relationships(n)",
+            "MATCH (n:GqlReturnPrevalidate) WHERE elementKey(n) = 'n' SET n.status = 'new' RETURN relationships(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -3742,7 +3779,7 @@ fn gql_set_remove_edge_index_flush_reopen_and_stale_candidates() {
     let (dir, engine) = query_test_engine();
     let db_path = dir.path().join("db");
     engine
-        .ensure_edge_property_index("Gql_EDGE_INDEX", "status", SecondaryIndexKind::Equality)
+        .ensure_edge_property_index("Gql_EDGE_INDEX", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let a = insert_query_node(&engine, "GqlEdgeIndexNode", "a", &[], 1.0);
     let b = insert_query_node(&engine, "GqlEdgeIndexNode", "b", &[], 1.0);
@@ -3773,8 +3810,8 @@ fn gql_set_remove_edge_index_flush_reopen_and_stale_candidates() {
 
     engine
         .execute_gql(
-            "MATCH (a:GqlEdgeIndexNode) WHERE a.key = 'a' \
-             MATCH (b:GqlEdgeIndexNode) WHERE b.key = 'b' \
+            "MATCH (a:GqlEdgeIndexNode) WHERE elementKey(a) = 'a' \
+             MATCH (b:GqlEdgeIndexNode) WHERE elementKey(b) = 'b' \
              MATCH (a)-[r:Gql_EDGE_INDEX]->(b) SET r.status = 'new'",
             &GqlParams::new(),
             &gql_opts(),
@@ -3790,8 +3827,8 @@ fn gql_set_remove_edge_index_flush_reopen_and_stale_candidates() {
     assert_eq!(edge_ids_for(&reopened, "new"), vec![edge_id]);
     let removed = reopened
         .execute_gql(
-            "MATCH (a:GqlEdgeIndexNode) WHERE a.key = 'a' \
-             MATCH (b:GqlEdgeIndexNode) WHERE b.key = 'b' \
+            "MATCH (a:GqlEdgeIndexNode) WHERE elementKey(a) = 'a' \
+             MATCH (b:GqlEdgeIndexNode) WHERE elementKey(b) = 'b' \
              MATCH (a)-[r:Gql_EDGE_INDEX]->(b) REMOVE r.status RETURN r.status",
             &GqlParams::new(),
             &gql_opts(),
@@ -3811,7 +3848,7 @@ fn gql_delete_edge_dedupes_updates_indexes_and_survives_reopen() {
     let (dir, engine) = query_test_engine();
     let db_path = dir.path().join("db");
     engine
-        .ensure_edge_property_index("Gql_DELETE_EDGE", "status", SecondaryIndexKind::Equality)
+        .ensure_edge_property_index("Gql_DELETE_EDGE", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let a = insert_query_node(&engine, "GqlDeleteEdgeNode", "a", &[], 1.0);
     let b = insert_query_node(&engine, "GqlDeleteEdgeNode", "b", &[], 1.0);
@@ -3829,8 +3866,8 @@ fn gql_delete_edge_dedupes_updates_indexes_and_survives_reopen() {
 
     let result = engine
         .execute_gql(
-            "MATCH (a:GqlDeleteEdgeNode) WHERE a.key = 'a' \
-             MATCH (b:GqlDeleteEdgeNode) WHERE b.key = 'b' \
+            "MATCH (a:GqlDeleteEdgeNode) WHERE elementKey(a) = 'a' \
+             MATCH (b:GqlDeleteEdgeNode) WHERE elementKey(b) = 'b' \
              MATCH (a)-[r:Gql_DELETE_EDGE {status: 'live'}]->(b) DELETE r DELETE r",
             &GqlParams::new(),
             &gql_opts(),
@@ -3868,8 +3905,8 @@ fn gql_delete_same_edge_across_multiple_rows_deletes_once() {
 
     let result = engine
         .execute_gql(
-            "MATCH (a:GqlDeleteRowsNode) WHERE a.key = 'a' \
-             MATCH (b:GqlDeleteRowsNode) WHERE b.key = 'b' \
+            "MATCH (a:GqlDeleteRowsNode) WHERE elementKey(a) = 'a' \
+             MATCH (b:GqlDeleteRowsNode) WHERE elementKey(b) = 'b' \
              MATCH (a)-[r:Gql_DELETE_ROWS]->(b) MATCH (x:GqlDeleteRowsMarker) DELETE r",
             &GqlParams::new(),
             &gql_opts(),
@@ -3900,7 +3937,7 @@ fn gql_detach_delete_node_cascades_active_and_segment_edges_once() {
 
     let result = engine
         .execute_gql(
-            "MATCH (n:GqlDetachNode) WHERE n.key = 'hub' DETACH DELETE n",
+            "MATCH (n:GqlDetachNode) WHERE elementKey(n) = 'hub' DETACH DELETE n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -3931,8 +3968,8 @@ fn gql_detach_delete_dedupes_shared_and_direct_cascade_edges() {
 
     let shared_result = engine
         .execute_gql(
-            "MATCH (a:GqlDetachDedupeNode) WHERE a.key = 'a' \
-             MATCH (b:GqlDetachDedupeNode) WHERE b.key = 'b' DETACH DELETE a DETACH DELETE b",
+            "MATCH (a:GqlDetachDedupeNode) WHERE elementKey(a) = 'a' \
+             MATCH (b:GqlDetachDedupeNode) WHERE elementKey(b) = 'b' DETACH DELETE a DETACH DELETE b",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -3950,8 +3987,8 @@ fn gql_detach_delete_dedupes_shared_and_direct_cascade_edges() {
         .unwrap();
     let direct_result = engine
         .execute_gql(
-            "MATCH (c:GqlDetachDedupeNode) WHERE c.key = 'c' \
-             MATCH (d:GqlDetachDedupeNode) WHERE d.key = 'd' \
+            "MATCH (c:GqlDetachDedupeNode) WHERE elementKey(c) = 'c' \
+             MATCH (d:GqlDetachDedupeNode) WHERE elementKey(d) = 'd' \
              MATCH (c)-[r:Gql_DETACH_DIRECT]->(d) DELETE r DETACH DELETE c",
             &GqlParams::new(),
             &gql_opts(),
@@ -3972,7 +4009,7 @@ fn gql_delete_optional_null_targets_are_noops() {
     let root = insert_query_node(&engine, "GqlDeleteOptional", "root", &[], 1.0);
     let result = engine
         .execute_gql(
-            "MATCH (n:GqlDeleteOptional) WHERE n.key = 'root' \
+            "MATCH (n:GqlDeleteOptional) WHERE elementKey(n) = 'root' \
              OPTIONAL MATCH (n)-[r:Gql_DELETE_MISSING]->(m) DELETE r DETACH DELETE m",
             &GqlParams::new(),
             &gql_opts(),
@@ -4007,8 +4044,8 @@ fn gql_delete_wins_over_earlier_replacements() {
 
     let result = engine
         .execute_gql(
-            "MATCH (a:GqlDeleteWinsNode) WHERE a.key = 'a' \
-             MATCH (b:GqlDeleteWinsNode) WHERE b.key = 'b' \
+            "MATCH (a:GqlDeleteWinsNode) WHERE elementKey(a) = 'a' \
+             MATCH (b:GqlDeleteWinsNode) WHERE elementKey(b) = 'b' \
              MATCH (a)-[r:Gql_DELETE_WINS]->(b) SET r.status = 'new' DELETE r",
             &GqlParams::new(),
             &gql_opts(),
@@ -4028,7 +4065,7 @@ fn gql_delete_created_edge_and_detach_created_node_use_local_refs() {
     let (_dir, engine) = query_test_engine();
     let direct = engine
         .execute_gql(
-            "CREATE (a:GqlCreatedEdgeDelete {key: 'a'})-[r:Gql_CREATED_EDGE_DELETE]->(b:GqlCreatedEdgeDelete {key: 'b'}) DELETE r",
+            "CREATE (a:GqlCreatedEdgeDelete {elementKey: 'a'})-[r:Gql_CREATED_EDGE_DELETE]->(b:GqlCreatedEdgeDelete {elementKey: 'b'}) DELETE r",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -4048,7 +4085,7 @@ fn gql_delete_created_edge_and_detach_created_node_use_local_refs() {
 
     let detached = engine
         .execute_gql(
-            "CREATE (a:GqlCreatedDetach {key: 'a'})-[r:Gql_CREATED_DETACH]->(b:GqlCreatedDetach {key: 'b'}) DETACH DELETE a",
+            "CREATE (a:GqlCreatedDetach {elementKey: 'a'})-[r:Gql_CREATED_DETACH]->(b:GqlCreatedDetach {elementKey: 'b'}) DETACH DELETE a",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -4087,8 +4124,8 @@ fn gql_delete_caps_fail_before_staging_or_commit() {
 
     let direct_cap = engine
         .execute_gql(
-            "MATCH (a:GqlDeleteCapNode) WHERE a.key = 'a' \
-             MATCH (b:GqlDeleteCapNode) WHERE b.key = 'b' \
+            "MATCH (a:GqlDeleteCapNode) WHERE elementKey(a) = 'a' \
+             MATCH (b:GqlDeleteCapNode) WHERE elementKey(b) = 'b' \
              MATCH (a)-[r:Gql_DELETE_CAP]->(b) DELETE r",
             &GqlParams::new(),
             &GqlExecutionOptions {
@@ -4102,7 +4139,7 @@ fn gql_delete_caps_fail_before_staging_or_commit() {
 
     let detach_cap = engine
         .execute_gql(
-            "MATCH (n:GqlDeleteCapNode) WHERE n.key = 'a' DETACH DELETE n",
+            "MATCH (n:GqlDeleteCapNode) WHERE elementKey(n) = 'a' DETACH DELETE n",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 max_mutation_ops: 1,
@@ -4165,7 +4202,7 @@ fn gql_detach_delete_cap_bounds_high_fanout_cascade() {
 
     let err = engine
         .execute_gql(
-            "MATCH (n:GqlDetachCapHub) WHERE n.key = 'hub' DETACH DELETE n",
+            "MATCH (n:GqlDetachCapHub) WHERE elementKey(n) = 'hub' DETACH DELETE n",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 max_mutation_ops: 3,
@@ -4190,7 +4227,7 @@ fn gql_detach_delete_commit_budget_bounds_edges_added_after_snapshot() {
     let (ready_rx, release_tx) = engine.set_gql_mutation_before_commit_pause();
     let handle = std::thread::spawn(move || {
         worker.execute_gql(
-            "MATCH (n:GqlDetachCommitCapHub) WHERE n.key = 'hub' DETACH DELETE n",
+            "MATCH (n:GqlDetachCommitCapHub) WHERE elementKey(n) = 'hub' DETACH DELETE n",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 max_mutation_ops: 2,
@@ -4237,7 +4274,7 @@ fn gql_delete_rejections_still_happen_before_writes() {
     let node_id = insert_query_node(&engine, "GqlDeleteReject", "n", &[], 1.0);
     let delete_node = engine
         .execute_gql(
-            "MATCH (n:GqlDeleteReject) WHERE n.key = 'n' DELETE n",
+            "MATCH (n:GqlDeleteReject) WHERE elementKey(n) = 'n' DELETE n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -4253,7 +4290,7 @@ fn gql_delete_rejections_still_happen_before_writes() {
 
     let return_after_delete = engine
         .execute_gql(
-            "MATCH (n:GqlDeleteReject) WHERE n.key = 'n' DETACH DELETE n RETURN n",
+            "MATCH (n:GqlDeleteReject) WHERE elementKey(n) = 'n' DETACH DELETE n RETURN n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -4269,7 +4306,7 @@ fn gql_delete_rejections_still_happen_before_writes() {
 
     let cursor_first = engine
         .execute_gql(
-            "MATCH (n:GqlDeleteReject) WHERE n.key = 'n' DETACH DELETE n",
+            "MATCH (n:GqlDeleteReject) WHERE elementKey(n) = 'n' DETACH DELETE n",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 cursor: Some("read-cursor".to_string()),
@@ -4410,7 +4447,7 @@ fn gql_create_node_survives_reopen() {
     let db_path = dir.path().join("db");
     engine
         .execute_gql(
-            "CREATE (n:GqlReopen {key: 'persisted', name: 'stored'}) RETURN id(n)",
+            "CREATE (n:GqlReopen {elementKey: 'persisted', name: 'stored'}) RETURN id(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -4431,7 +4468,7 @@ fn gql_create_edge_label_survives_reopen() {
     let db_path = dir.path().join("db");
     let result = engine
         .execute_gql(
-            "CREATE (a:GqlEdgeReopen {key: 'a'})-[r:Gql_EDGE_REOPEN {since: 7}]->(b:GqlEdgeReopen {key: 'b'}) RETURN id(a), id(r), id(b)",
+            "CREATE (a:GqlEdgeReopen {elementKey: 'a'})-[r:Gql_EDGE_REOPEN {since: 7}]->(b:GqlEdgeReopen {elementKey: 'b'}) RETURN id(a), id(r), id(b)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -4480,7 +4517,7 @@ fn mutation_explain_includes_read_prefix_and_operations() {
 
     let explain = engine
         .explain_gql(
-            "MATCH (n:Person {key: 'explain-mutation-ada'}) SET n.name = 'Ada' RETURN n.name ORDER BY n.name SKIP 0 LIMIT 1",
+            "MATCH (n:Person {elementKey: 'explain-mutation-ada'}) SET n.name = 'Ada' RETURN n.name ORDER BY n.name SKIP 0 LIMIT 1",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -4516,7 +4553,7 @@ fn mutation_explain_includes_read_prefix_and_operations() {
 
     let param_explain = engine
         .explain_gql(
-            "MATCH (n:Person {key: 'explain-mutation-ada'}) SET n.name = 'Ada' \
+            "MATCH (n:Person {elementKey: 'explain-mutation-ada'}) SET n.name = 'Ada' \
              RETURN n.name ORDER BY n.name SKIP $skip LIMIT $limit",
             &GqlParams::from([
                 ("skip".to_string(), GqlParamValue::UInt(2)),
@@ -4776,36 +4813,28 @@ fn seed_rich_gql_graph(engine: &DatabaseEngine) -> RichGqlGraph {
 
 fn install_rich_gql_indexes(engine: &DatabaseEngine) -> RichGqlIndexes {
     let employee_status = engine
-        .ensure_node_property_index("Employee", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Employee", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap()
         .index_id;
     wait_for_property_index_state(engine, employee_status, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(engine, employee_status, SecondaryIndexState::Ready);
 
     let employee_score = engine
-        .ensure_node_property_index(
-            "Employee",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Employee", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap()
         .index_id;
     wait_for_property_index_state(engine, employee_score, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(engine, employee_score, SecondaryIndexState::Ready);
 
     let works_role = engine
-        .ensure_edge_property_index("WORKS_ON", "role", SecondaryIndexKind::Equality)
+        .ensure_edge_property_index("WORKS_ON", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("role").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap()
         .index_id;
     wait_for_edge_property_index_state(engine, works_role, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(engine, works_role, SecondaryIndexState::Ready);
 
     let works_hours = engine
-        .ensure_edge_property_index(
-            "WORKS_ON",
-            "hours",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_edge_property_index("WORKS_ON", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("hours").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap()
         .index_id;
     wait_for_edge_property_index_state(engine, works_hours, SecondaryIndexState::Ready);
@@ -5123,7 +5152,7 @@ fn gql_edge_query_executes_and_matches_native_edge_oracle() {
 
     let endpoint_float_ids = execute_gql_ok(
         &engine,
-        &format!("MATCH ()-[r:LIKES]->() WHERE r.from = {from}.0 AND r.to IN [{to}.0] RETURN id(r)"),
+        &format!("MATCH ()-[r:LIKES]->() WHERE id(startNode(r)) = {from}.0 AND id(endNode(r)) IN [{to}.0] RETURN id(r)"),
     );
     assert_eq!(gql_u64_column(&endpoint_float_ids, 0), vec![keep]);
 
@@ -5193,7 +5222,7 @@ fn gql_edge_query_executes_and_matches_native_edge_oracle() {
 
     let capped_endpoint_and_edge_id = execute_gql_with_options(
         &engine,
-        &format!("MATCH ()-[r]->() WHERE r.from = {from} AND id(r) = {keep} RETURN id(r)"),
+        &format!("MATCH ()-[r]->() WHERE id(startNode(r)) = {from} AND id(r) = {keep} RETURN id(r)"),
         GqlExecutionOptions {
             max_intermediate_bindings: 1,
             ..GqlExecutionOptions::default()
@@ -5416,7 +5445,7 @@ fn gql_bounded_vlp_path_assignment_functions_and_cursors_match_graph_row() {
 
     let source = format!(
         "MATCH p = (a)-[:GQL_PATH*0..2]->(z) WHERE id(a) = {a} \
-         RETURN p, node_ids(p), edge_ids(p), length(p) \
+         RETURN p, nodeIds(p), edgeIds(p), length(p) \
          ORDER BY p"
     );
     let gql = execute_gql_ok(&engine, &source);
@@ -5474,7 +5503,7 @@ fn gql_bounded_vlp_path_assignment_functions_and_cursors_match_graph_row() {
         &format!(
             "MATCH p = (a)-[:GQL_PATH*0..2]->(z) \
              WHERE id(a) = {a} AND length(p) = 2 \
-             RETURN edge_ids(p) ORDER BY p"
+             RETURN edgeIds(p) ORDER BY p"
         ),
     );
     assert_eq!(
@@ -5489,7 +5518,7 @@ fn gql_bounded_vlp_path_assignment_functions_and_cursors_match_graph_row() {
         &engine,
         &format!(
             "MATCH p = (a)-[:GQL_PATH*1..1]->(z) WHERE id(a) = {a} \
-             RETURN start_node(p), end_node(p), nodes(p), relationships(p) ORDER BY p LIMIT 1"
+             RETURN startNode(p), endNode(p), nodes(p), relationships(p) ORDER BY p LIMIT 1"
         ),
     );
     let values = &path_function_values.rows[0].values;
@@ -5606,7 +5635,7 @@ fn gql_shortest_path_executes_native_stage_and_projects_path() {
          MATCH (b:ShortestEnd) WHERE id(b) = {b} \
          WITH a, b \
          MATCH p = shortestPath((a)-[:GQL_SP*1..5]->(b)) \
-         RETURN p, node_ids(p), edge_ids(p), length(p), nodes(p), relationships(p)"
+         RETURN p, nodeIds(p), edgeIds(p), length(p), nodes(p), relationships(p)"
     );
     let result = execute_gql_with_options(
         &engine,
@@ -5951,7 +5980,7 @@ fn gql_fixed_multi_hop_path_assignment_composes_after_fixed_matching() {
     let source = format!(
         "MATCH p = (a:FixedPathStart)-[:GQL_FIXED_PATH_R {{kind: 'first'}}]->(b)<-[s:GQL_FIXED_PATH_S]-(c) \
          WHERE id(a) = {a} \
-         RETURN p, node_ids(p), edge_ids(p), length(p), id(s)"
+         RETURN p, nodeIds(p), edgeIds(p), length(p), id(s)"
     );
     let result = execute_gql_ok(&engine, &source);
     assert_eq!(result.rows.len(), 1);
@@ -6082,7 +6111,7 @@ fn gql_fixed_multi_hop_path_assignment_uses_final_row_cursors() {
     let mismatch = engine
         .execute_gql(
             "MATCH p = (a:FixedPathPageStart)-[:GQL_FIXED_PAGE_R]->(b)-[:GQL_FIXED_PAGE_S]->(c) \
-             RETURN edge_ids(p) ORDER BY p",
+             RETURN edgeIds(p) ORDER BY p",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 cursor: Some(first_cursor),
@@ -6583,10 +6612,10 @@ fn gql_rich_graph_indexed_queries_match_native_oracles() {
 
     let node_query = "MATCH (n:Person:Employee) \
          WHERE n.status IN $statuses AND n.score >= $min_score \
-         RETURN id(n) AS id, n.key AS key, labels(n) AS labels, n.weight AS weight, \
-                n.created_at AS created_at, n.updated_at AS updated_at, \
+         RETURN id(n) AS id, elementKey(n) AS key, labels(n) AS labels, weight(n) AS weight, \
+                createdAt(n) AS created_at, updatedAt(n) AS updated_at, \
                 $payload AS payload, $shape AS shape \
-         ORDER BY n.score ASC, n.key ASC";
+         ORDER BY n.score ASC, elementKey(n) ASC";
     let node_params = GqlParams::from([
         (
             "statuses".to_string(),
@@ -6734,9 +6763,9 @@ fn gql_rich_graph_indexed_queries_match_native_oracles() {
 
     let edge_query = "MATCH ()-[r:WORKS_ON]->() \
          WHERE r.role IN $roles AND r.hours >= $min_hours \
-         RETURN id(r) AS id, r.from AS from, r.to AS to, type(r) AS label, \
-                r.hours AS hours, r.weight AS weight, r.created_at AS created_at, \
-                r.updated_at AS updated_at, r.valid_from AS valid_from, r.valid_to AS valid_to \
+         RETURN id(r) AS id, id(startNode(r)) AS from, id(endNode(r)) AS to, type(r) AS label, \
+                r.hours AS hours, weight(r) AS weight, createdAt(r) AS created_at, \
+                updatedAt(r) AS updated_at, validFrom(r) AS valid_from, validTo(r) AS valid_to \
          ORDER BY r.hours ASC, id(r) ASC";
     let edge_params = GqlParams::from([
         (
@@ -6797,7 +6826,7 @@ fn gql_rich_graph_indexed_queries_match_native_oracles() {
     let endpoint_result = execute_gql_with_params(
         &engine,
         "MATCH ()-[r:WORKS_ON]->() \
-         WHERE r.from = $from AND r.to IN $targets RETURN id(r) ORDER BY id(r)",
+         WHERE id(startNode(r)) = $from AND id(endNode(r)) IN $targets RETURN id(r) ORDER BY id(r)",
         GqlParams::from([
             ("from".to_string(), GqlParamValue::UInt(fixture.alice)),
             (
@@ -6824,7 +6853,7 @@ fn gql_rich_graph_indexed_queries_match_native_oracles() {
 
     let pattern_query = "MATCH (p:Person:Employee)-[r:WORKS_ON]->(c:Company) \
          WHERE p.status = 'focus' AND r.role = 'lead' AND c.tier = 'enterprise' \
-         RETURN id(p), id(r), id(c) ORDER BY p.key, id(r)";
+         RETURN id(p), id(r), id(c) ORDER BY elementKey(p), id(r)";
     let pattern_result = execute_gql_ok(&engine, pattern_query);
     let pattern_native = rich_pattern_oracle(&engine, "lead");
     let pattern_gql = pattern_result
@@ -6961,7 +6990,7 @@ fn gql_execution_rich_expressions_in_read_surfaces_use_graph_row_semantics() {
 fn gql_execution_rich_residual_preserves_simple_pushdown_and_narrow_needs() {
     let (_dir, engine) = query_test_engine();
     engine
-        .ensure_node_property_index("GqlRichPushdown", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("GqlRichPushdown", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     insert_query_node(
         &engine,
@@ -7033,7 +7062,7 @@ fn gql_execution_rich_mutation_set_return_and_error_prevalidation() {
 
     let result = engine
         .execute_gql(
-            "MATCH (n:GqlRichMutation) WHERE n.key = 'n' \
+            "MATCH (n:GqlRichMutation) WHERE elementKey(n) = 'n' \
              SET n.score = n.score + 2 SET n.slug = lower(trim(n.name)) \
              RETURN n.score + 1 AS next_score, n.slug, \
                     CASE n.slug WHEN 'ada' THEN 'ok' ELSE 'bad' END AS status",
@@ -7048,7 +7077,7 @@ fn gql_execution_rich_mutation_set_return_and_error_prevalidation() {
 
     let err = engine
         .execute_gql(
-            "MATCH (n:GqlRichMutation) WHERE n.key = 'n' SET n.score = n.score / 0 RETURN n",
+            "MATCH (n:GqlRichMutation) WHERE elementKey(n) = 'n' SET n.score = n.score / 0 RETURN n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -7059,7 +7088,7 @@ fn gql_execution_rich_mutation_set_return_and_error_prevalidation() {
 
     let direct_id = engine
         .execute_gql(
-            "CREATE (n:GqlRichCreatedId {key: 'ok'}) RETURN id(n) AS id",
+            "CREATE (n:GqlRichCreatedId {elementKey: 'ok'}) RETURN id(n) AS id",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -7068,7 +7097,7 @@ fn gql_execution_rich_mutation_set_return_and_error_prevalidation() {
 
     let err = engine
         .execute_gql(
-            "CREATE (n:GqlRichCreatedIdError {key: 'bad'}) \
+            "CREATE (n:GqlRichCreatedIdError {elementKey: 'bad'}) \
              RETURN 1 / (id(n) - id(n)) AS unsafe",
             &GqlParams::new(),
             &gql_opts(),
@@ -7083,7 +7112,7 @@ fn gql_execution_rich_mutation_set_return_and_error_prevalidation() {
 
     let err = engine
         .execute_gql(
-            "CREATE (n:GqlRichCreatedOrderIdError {key: 'bad'}) \
+            "CREATE (n:GqlRichCreatedOrderIdError {elementKey: 'bad'}) \
              RETURN n ORDER BY 1 / (id(n) - id(n))",
             &GqlParams::new(),
             &gql_opts(),
@@ -7098,7 +7127,7 @@ fn gql_execution_rich_mutation_set_return_and_error_prevalidation() {
 
     let err = engine
         .execute_gql(
-            "CREATE (n:GqlRichCoalesceNan {key: 'bad'}) RETURN coalesce($bad, 1)",
+            "CREATE (n:GqlRichCoalesceNan {elementKey: 'bad'}) RETURN coalesce($bad, 1)",
             &GqlParams::from([("bad".to_string(), GqlParamValue::Float(f64::NAN))]),
             &gql_opts(),
         )
@@ -7136,7 +7165,7 @@ fn gql_return_scalars_missing_null_params_and_duplicate_columns() {
         &engine,
         "MATCH (n:Person) WHERE n.name = $wanted \
          RETURN id(n) AS id, labels(n) AS labels, n.name AS x, n.missing AS missing, \
-                n.optional AS opt, n.key AS x, $answer",
+                n.optional AS opt, elementKey(n) AS x, $answer",
         params,
     );
 
@@ -7174,7 +7203,7 @@ fn gql_return_scalars_missing_null_params_and_duplicate_columns() {
 
     let ambiguous_order = engine
         .execute_gql(
-            "MATCH (n:Person) RETURN n.name AS x, n.key AS x ORDER BY x",
+            "MATCH (n:Person) RETURN n.name AS x, elementKey(n) AS x ORDER BY x",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -7297,11 +7326,11 @@ fn gql_numeric_equality_uses_semantic_equality_indexes() {
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let node_index = engine
-        .ensure_node_property_index("Person", "score", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap()
         .index_id;
     let edge_index = engine
-        .ensure_edge_property_index("LIKES", "score", SecondaryIndexKind::Equality)
+        .ensure_edge_property_index("LIKES", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap()
         .index_id;
     wait_for_property_index_state(&engine, node_index, SecondaryIndexState::Ready);
@@ -7435,11 +7464,11 @@ fn gql_numeric_range_uses_domainless_indexes_for_mixed_numeric_values() {
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let node_index = engine
-        .ensure_node_property_index("Person", "score", SecondaryIndexKind::Range)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap()
         .index_id;
     let edge_index = engine
-        .ensure_edge_property_index("LIKES", "score", SecondaryIndexKind::Range)
+        .ensure_edge_property_index("LIKES", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap()
         .index_id;
     wait_for_property_index_state(&engine, node_index, SecondaryIndexState::Ready);
@@ -7621,7 +7650,7 @@ fn gql_empty_results_and_parameter_values_use_public_handler_path() {
 
     let result = execute_gql_with_params(
         &engine,
-        "MATCH (n:Person) WHERE n.key = $key \
+        "MATCH (n:Person) WHERE elementKey(n) = $key \
          RETURN $payload AS payload, $shape AS shape, $names AS names, n.name",
         GqlParams::from([
             (
@@ -7948,7 +7977,7 @@ fn gql_explain_enforces_referenced_param_caps_like_query() {
 }
 
 #[test]
-fn gql_beta_unsupported_features_are_rejected_by_execution_api() {
+fn gql_unsupported_features_are_rejected_by_execution_api() {
     let (_dir, engine) = query_test_engine();
     let cases = [
         (
@@ -7963,7 +7992,7 @@ fn gql_beta_unsupported_features_are_rejected_by_execution_api() {
             "*",
         ),
         (
-            "MATCH (n:Person) RETURN n UNION CREATE (m:Person {key: 'm'}) RETURN m",
+            "MATCH (n:Person) RETURN n UNION CREATE (m:Person {elementKey: 'm'}) RETURN m",
             "write clauses",
             "CREATE",
         ),
@@ -7999,6 +8028,13 @@ fn gql_uint(value: &GqlValue) -> u64 {
     }
 }
 
+fn gql_bool(value: &GqlValue) -> bool {
+    match value {
+        GqlValue::Bool(value) => *value,
+        other => panic!("expected GQL bool, got {other:?}"),
+    }
+}
+
 fn assert_gql_index_result<'a>(
     result: &'a GqlExecutionResult,
     operation: &str,
@@ -8022,6 +8058,36 @@ fn assert_gql_index_result<'a>(
     stats
 }
 
+fn gql_index_field_identity(value: &GqlValue) -> Vec<(String, String)> {
+    gql_list(value)
+        .iter()
+        .map(|field| {
+            let map = gql_map(field);
+            let source = gql_str(&map["source"]).to_string();
+            let name = match source.as_str() {
+                "property" => gql_str(&map["key"]).to_string(),
+                "metadata" => gql_str(&map["field"]).to_string(),
+                other => panic!("unexpected index field source {other}"),
+            };
+            (source, name)
+        })
+        .collect()
+}
+
+fn assert_gql_index_fields(value: &GqlValue, expected: &[(&str, &str)]) {
+    let expected = expected
+        .iter()
+        .map(|(source, name)| ((*source).to_string(), (*name).to_string()))
+        .collect::<Vec<_>>();
+    assert_eq!(gql_index_field_identity(value), expected);
+}
+
+fn assert_gql_index_field_list_flags(values: &[GqlValue], fields_index: usize, compound_index: usize, field_count_index: usize, expected: &[(&str, &str)]) {
+    assert_gql_index_fields(&values[fields_index], expected);
+    assert_eq!(gql_bool(&values[compound_index]), expected.len() > 1);
+    assert_eq!(gql_uint(&values[field_count_index]), expected.len() as u64);
+}
+
 fn assert_create_property_index_row(
     result: &GqlExecutionResult,
     target_kind: &str,
@@ -8035,12 +8101,14 @@ fn assert_create_property_index_row(
             "operation",
             "target_kind",
             "label",
-            "prop_key",
+            "fields",
             "kind",
             "action",
             "state",
             "index_id",
             "last_error",
+            "compound",
+            "field_count",
         ])
     );
     assert_eq!(result.rows.len(), 1);
@@ -8048,7 +8116,7 @@ fn assert_create_property_index_row(
     assert_eq!(values[0], GqlValue::String("create_property_index".to_string()));
     assert_eq!(values[1], GqlValue::String(target_kind.to_string()));
     assert_eq!(values[2], GqlValue::String(label.to_string()));
-    assert_eq!(values[3], GqlValue::String(prop_key.to_string()));
+    assert_gql_index_field_list_flags(values, 3, 9, 10, &[("property", prop_key)]);
     assert_eq!(values[4], GqlValue::String(kind.to_string()));
     assert_eq!(values[5], GqlValue::String("ensured".to_string()));
     assert!(
@@ -8059,6 +8127,45 @@ fn assert_create_property_index_row(
         "unexpected index state: {:?}",
         values[6]
     );
+    assert_eq!(values[8], GqlValue::Null);
+    gql_uint(&values[7])
+}
+
+fn assert_create_property_index_row_fields(
+    result: &GqlExecutionResult,
+    target_kind: &str,
+    label: &str,
+    fields: &[(&str, &str)],
+    kind: &str,
+) -> u64 {
+    assert_eq!(
+        result.columns,
+        expected_gql_index_columns([
+            "operation",
+            "target_kind",
+            "label",
+            "fields",
+            "kind",
+            "action",
+            "state",
+            "index_id",
+            "last_error",
+            "compound",
+            "field_count",
+        ])
+    );
+    assert_eq!(result.rows.len(), 1);
+    let values = &result.rows[0].values;
+    assert_eq!(values[0], GqlValue::String("create_property_index".to_string()));
+    assert_eq!(values[1], GqlValue::String(target_kind.to_string()));
+    assert_eq!(values[2], GqlValue::String(label.to_string()));
+    assert_gql_index_field_list_flags(values, 3, 9, 10, fields);
+    assert_eq!(values[4], GqlValue::String(kind.to_string()));
+    assert_eq!(values[5], GqlValue::String("ensured".to_string()));
+    assert!(matches!(
+        &values[6],
+        GqlValue::String(state) if state == "building" || state == "ready" || state == "failed"
+    ));
     assert_eq!(values[8], GqlValue::Null);
     gql_uint(&values[7])
 }
@@ -8077,23 +8184,52 @@ fn assert_drop_property_index_row(
             "operation",
             "target_kind",
             "label",
-            "prop_key",
+            "fields",
             "kind",
             "action",
+            "compound",
+            "field_count",
         ])
     );
     assert_eq!(result.rows.len(), 1);
+    let values = &result.rows[0].values;
+    assert_eq!(values[0], GqlValue::String("drop_property_index".to_string()));
+    assert_eq!(values[1], GqlValue::String(target_kind.to_string()));
+    assert_eq!(values[2], GqlValue::String(label.to_string()));
+    assert_gql_index_field_list_flags(values, 3, 6, 7, &[("property", prop_key)]);
+    assert_eq!(values[4], GqlValue::String(kind.to_string()));
+    assert_eq!(values[5], GqlValue::String(action.to_string()));
+}
+
+fn assert_drop_property_index_row_fields(
+    result: &GqlExecutionResult,
+    target_kind: &str,
+    label: &str,
+    fields: &[(&str, &str)],
+    kind: &str,
+    action: &str,
+) {
     assert_eq!(
-        result.rows[0].values,
-        vec![
-            GqlValue::String("drop_property_index".to_string()),
-            GqlValue::String(target_kind.to_string()),
-            GqlValue::String(label.to_string()),
-            GqlValue::String(prop_key.to_string()),
-            GqlValue::String(kind.to_string()),
-            GqlValue::String(action.to_string()),
-        ]
+        result.columns,
+        expected_gql_index_columns([
+            "operation",
+            "target_kind",
+            "label",
+            "fields",
+            "kind",
+            "action",
+            "compound",
+            "field_count",
+        ])
     );
+    assert_eq!(result.rows.len(), 1);
+    let values = &result.rows[0].values;
+    assert_eq!(values[0], GqlValue::String("drop_property_index".to_string()));
+    assert_eq!(values[1], GqlValue::String(target_kind.to_string()));
+    assert_eq!(values[2], GqlValue::String(label.to_string()));
+    assert_gql_index_field_list_flags(values, 3, 6, 7, fields);
+    assert_eq!(values[4], GqlValue::String(kind.to_string()));
+    assert_eq!(values[5], GqlValue::String(action.to_string()));
 }
 
 fn native_node_index(
@@ -8102,11 +8238,20 @@ fn native_node_index(
     prop_key: &str,
     kind: SecondaryIndexKind,
 ) -> Option<NodePropertyIndexInfo> {
+    native_node_index_fields(engine, label, &property_index_fields(prop_key), kind)
+}
+
+fn native_node_index_fields(
+    engine: &DatabaseEngine,
+    label: &str,
+    fields: &[SecondaryIndexField],
+    kind: SecondaryIndexKind,
+) -> Option<NodePropertyIndexInfo> {
     engine
         .list_node_property_indexes()
         .unwrap()
         .into_iter()
-        .find(|info| info.label == label && info.prop_key == prop_key && info.kind == kind)
+        .find(|info| info.label == label && info.fields == fields && info.kind == kind)
 }
 
 fn native_edge_index(
@@ -8115,11 +8260,20 @@ fn native_edge_index(
     prop_key: &str,
     kind: SecondaryIndexKind,
 ) -> Option<EdgePropertyIndexInfo> {
+    native_edge_index_fields(engine, label, &property_index_fields(prop_key), kind)
+}
+
+fn native_edge_index_fields(
+    engine: &DatabaseEngine,
+    label: &str,
+    fields: &[SecondaryIndexField],
+    kind: SecondaryIndexKind,
+) -> Option<EdgePropertyIndexInfo> {
     engine
         .list_edge_property_indexes()
         .unwrap()
         .into_iter()
-        .find(|info| info.label == label && info.prop_key == prop_key && info.kind == kind)
+        .find(|info| info.label == label && info.fields == fields && info.kind == kind)
 }
 
 fn assert_index_cursor_error(err: EngineError) {
@@ -8193,14 +8347,45 @@ fn assert_show_property_index_row(
 ) {
     assert!(
         result.rows.iter().any(|row| {
-            row.values[0] == GqlValue::String(target_kind.to_string())
-                && row.values[1] == GqlValue::String(label.to_string())
-                && row.values[2] == GqlValue::String(prop_key.to_string())
-                && row.values[3] == GqlValue::String(kind.to_string())
-                && gql_uint(&row.values[5]) == index_id
+            gql_uint(&row.values[0]) == index_id
+                && row.values[1] == GqlValue::String(target_kind.to_string())
+                && row.values[2] == GqlValue::String(label.to_string())
+                && gql_index_field_identity(&row.values[3])
+                    == vec![("property".to_string(), prop_key.to_string())]
+                && row.values[4] == GqlValue::String(kind.to_string())
                 && row.values[6] == GqlValue::Null
+                && !gql_bool(&row.values[7])
+                && gql_uint(&row.values[8]) == 1
         }),
         "SHOW PROPERTY INDEXES did not include {target_kind} {label}.{prop_key} {kind} id {index_id}: {:?}",
+        result.rows
+    );
+}
+
+fn assert_show_property_index_row_fields(
+    result: &GqlExecutionResult,
+    target_kind: &str,
+    label: &str,
+    fields: &[(&str, &str)],
+    kind: &str,
+    index_id: u64,
+) {
+    assert!(
+        result.rows.iter().any(|row| {
+            gql_uint(&row.values[0]) == index_id
+                && row.values[1] == GqlValue::String(target_kind.to_string())
+                && row.values[2] == GqlValue::String(label.to_string())
+                && gql_index_field_identity(&row.values[3])
+                    == fields
+                        .iter()
+                        .map(|(source, name)| ((*source).to_string(), (*name).to_string()))
+                        .collect::<Vec<_>>()
+                && row.values[4] == GqlValue::String(kind.to_string())
+                && row.values[6] == GqlValue::Null
+                && gql_bool(&row.values[7]) == (fields.len() > 1)
+                && gql_uint(&row.values[8]) == fields.len() as u64
+        }),
+        "SHOW PROPERTY INDEXES did not include {target_kind} {label} {fields:?} {kind} id {index_id}: {:?}",
         result.rows
     );
 }
@@ -8214,10 +8399,11 @@ fn assert_show_property_index_absent(
 ) {
     assert!(
         result.rows.iter().all(|row| {
-            !(row.values[0] == GqlValue::String(target_kind.to_string())
-                && row.values[1] == GqlValue::String(label.to_string())
-                && row.values[2] == GqlValue::String(prop_key.to_string())
-                && row.values[3] == GqlValue::String(kind.to_string()))
+            !(row.values[1] == GqlValue::String(target_kind.to_string())
+                && row.values[2] == GqlValue::String(label.to_string())
+                && gql_index_field_identity(&row.values[3])
+                    == vec![("property".to_string(), prop_key.to_string())]
+                && row.values[4] == GqlValue::String(kind.to_string()))
         }),
         "SHOW PROPERTY INDEXES unexpectedly included {target_kind} {label}.{prop_key} {kind}: {:?}",
         result.rows
@@ -8304,12 +8490,25 @@ fn assert_gql_index_manifest_secondary_index_shape(db_path: &std::path::Path, ex
         assert_eq!(target.len(), 1);
         let (target_kind, target_payload) = target.iter().next().unwrap();
         assert!(
-            target_kind == "NodeProperty" || target_kind == "EdgeProperty",
+            matches!(
+                target_kind.as_str(),
+                "NodeProperty" | "EdgeProperty" | "NodeFieldIndex" | "EdgeFieldIndex"
+            ),
             "unexpected secondary-index target kind: {target_kind}"
         );
-        assert_json_object_keys(target_payload, &["label_id", "prop_key"]);
-        assert!(target_payload["label_id"].as_u64().is_some());
-        assert!(target_payload["prop_key"].as_str().is_some());
+        match target_kind.as_str() {
+            "NodeProperty" | "EdgeProperty" => {
+                assert_json_object_keys(target_payload, &["label_id", "prop_key"]);
+                assert!(target_payload["label_id"].as_u64().is_some());
+                assert!(target_payload["prop_key"].as_str().is_some());
+            }
+            "NodeFieldIndex" | "EdgeFieldIndex" => {
+                assert_json_object_keys(target_payload, &["fields", "label_id"]);
+                assert!(target_payload["label_id"].as_u64().is_some());
+                assert!(target_payload["fields"].as_array().is_some());
+            }
+            other => panic!("unexpected secondary-index target kind: {other}"),
+        }
     }
 }
 
@@ -8413,6 +8612,123 @@ fn gql_index_create_edge_rows_native_visibility_and_missing_label_tokens() {
         .get_node_label_id("GqlIndexMissingNodeLabel")
         .unwrap()
         .is_some());
+}
+
+#[test]
+fn gql_index_create_drop_show_node_and_edge_compound_fields() {
+    let (_dir, engine) = query_test_engine();
+
+    let node_fields = vec![
+        SecondaryIndexField::property("tenant_id"),
+        SecondaryIndexField::node_meta(NodeMetadataIndexField::UpdatedAt),
+    ];
+    let node_create = execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexNodeCompound) ON (n.tenant_id, updatedAt(n)) KIND RANGE",
+    );
+    let node_index_id = assert_create_property_index_row_fields(
+        &node_create,
+        "node",
+        "GqlIndexNodeCompound",
+        &[("property", "tenant_id"), ("metadata", "updatedAt")],
+        "range",
+    );
+    let native_node = native_node_index_fields(
+        &engine,
+        "GqlIndexNodeCompound",
+        &node_fields,
+        SecondaryIndexKind::Range,
+    )
+    .expect("GQL-created node compound declaration should be native-visible");
+    assert_eq!(native_node.index_id, node_index_id);
+    assert!(native_node.compound);
+
+    let edge_fields = vec![
+        SecondaryIndexField::property("status"),
+        SecondaryIndexField::edge_meta(EdgeMetadataIndexField::ValidTo),
+    ];
+    let edge_create = execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR ()-[r:GQL_INDEX_EDGE_COMPOUND]-() ON (r.status, validTo(r)) KIND RANGE",
+    );
+    let edge_index_id = assert_create_property_index_row_fields(
+        &edge_create,
+        "edge",
+        "GQL_INDEX_EDGE_COMPOUND",
+        &[("property", "status"), ("metadata", "validTo")],
+        "range",
+    );
+    let native_edge = native_edge_index_fields(
+        &engine,
+        "GQL_INDEX_EDGE_COMPOUND",
+        &edge_fields,
+        SecondaryIndexKind::Range,
+    )
+    .expect("GQL-created edge compound declaration should be native-visible");
+    assert_eq!(native_edge.index_id, edge_index_id);
+    assert!(native_edge.compound);
+
+    let show = execute_gql_ok(&engine, "SHOW PROPERTY INDEXES");
+    assert_show_property_index_row_fields(
+        &show,
+        "node",
+        "GqlIndexNodeCompound",
+        &[("property", "tenant_id"), ("metadata", "updatedAt")],
+        "range",
+        node_index_id,
+    );
+    assert_show_property_index_row_fields(
+        &show,
+        "edge",
+        "GQL_INDEX_EDGE_COMPOUND",
+        &[("property", "status"), ("metadata", "validTo")],
+        "range",
+        edge_index_id,
+    );
+
+    let node_drop = execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR (n:GqlIndexNodeCompound) ON (n.tenant_id, updatedAt(n)) KIND RANGE",
+    );
+    assert_drop_property_index_row_fields(
+        &node_drop,
+        "node",
+        "GqlIndexNodeCompound",
+        &[("property", "tenant_id"), ("metadata", "updatedAt")],
+        "range",
+        "dropped",
+    );
+    assert!(
+        native_node_index_fields(
+            &engine,
+            "GqlIndexNodeCompound",
+            &node_fields,
+            SecondaryIndexKind::Range
+        )
+        .is_none()
+    );
+
+    let edge_drop = execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR ()-[r:GQL_INDEX_EDGE_COMPOUND]-() ON (r.status, validTo(r)) KIND RANGE",
+    );
+    assert_drop_property_index_row_fields(
+        &edge_drop,
+        "edge",
+        "GQL_INDEX_EDGE_COMPOUND",
+        &[("property", "status"), ("metadata", "validTo")],
+        "range",
+        "dropped",
+    );
+    assert!(
+        native_edge_index_fields(
+            &engine,
+            "GQL_INDEX_EDGE_COMPOUND",
+            &edge_fields,
+            SecondaryIndexKind::Range
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -8525,35 +8841,37 @@ fn gql_index_show_rows_order_filters_empty_and_stats() {
     assert_eq!(
         empty.columns,
         expected_gql_index_columns([
+            "index_id",
             "target_kind",
             "label",
-            "prop_key",
+            "fields",
             "kind",
             "state",
-            "index_id",
             "last_error",
+            "compound",
+            "field_count",
         ])
     );
     assert_eq!(empty.rows.len(), 0);
     assert_eq!(stats.indexes_returned, 0);
 
     engine
-        .ensure_edge_property_index("GQL_INDEX_SHOW_B_EDGE", "z", SecondaryIndexKind::Range)
+        .ensure_edge_property_index("GQL_INDEX_SHOW_B_EDGE", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("z").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     engine
-        .ensure_node_property_index("GqlIndexShowBNode", "z", SecondaryIndexKind::Range)
+        .ensure_node_property_index("GqlIndexShowBNode", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("z").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     engine
-        .ensure_node_property_index("GqlIndexShowANode", "b", SecondaryIndexKind::Range)
+        .ensure_node_property_index("GqlIndexShowANode", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("b").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     engine
-        .ensure_node_property_index("GqlIndexShowANode", "a", SecondaryIndexKind::Range)
+        .ensure_node_property_index("GqlIndexShowANode", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("a").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     engine
-        .ensure_node_property_index("GqlIndexShowANode", "a", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("GqlIndexShowANode", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("a").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     engine
-        .ensure_edge_property_index("GQL_INDEX_SHOW_A_EDGE", "a", SecondaryIndexKind::Equality)
+        .ensure_edge_property_index("GQL_INDEX_SHOW_A_EDGE", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("a").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
 
     let all = execute_gql_ok(&engine, "SHOW PROPERTY INDEXES");
@@ -8566,10 +8884,10 @@ fn gql_index_show_rows_order_filters_empty_and_stats() {
             .iter()
             .map(|row| {
                 (
-                    gql_str(&row.values[0]).to_string(),
                     gql_str(&row.values[1]).to_string(),
                     gql_str(&row.values[2]).to_string(),
-                    gql_str(&row.values[3]).to_string(),
+                    gql_index_field_identity(&row.values[3]),
+                    gql_str(&row.values[4]).to_string(),
                 )
             })
             .collect::<Vec<_>>(),
@@ -8577,47 +8895,48 @@ fn gql_index_show_rows_order_filters_empty_and_stats() {
             (
                 "node".to_string(),
                 "GqlIndexShowANode".to_string(),
-                "a".to_string(),
+                vec![("property".to_string(), "a".to_string())],
                 "equality".to_string()
             ),
             (
                 "node".to_string(),
                 "GqlIndexShowANode".to_string(),
-                "a".to_string(),
+                vec![("property".to_string(), "a".to_string())],
                 "range".to_string()
             ),
             (
                 "node".to_string(),
                 "GqlIndexShowANode".to_string(),
-                "b".to_string(),
+                vec![("property".to_string(), "b".to_string())],
                 "range".to_string()
             ),
             (
                 "node".to_string(),
                 "GqlIndexShowBNode".to_string(),
-                "z".to_string(),
+                vec![("property".to_string(), "z".to_string())],
                 "range".to_string()
             ),
             (
                 "edge".to_string(),
                 "GQL_INDEX_SHOW_A_EDGE".to_string(),
-                "a".to_string(),
+                vec![("property".to_string(), "a".to_string())],
                 "equality".to_string()
             ),
             (
                 "edge".to_string(),
                 "GQL_INDEX_SHOW_B_EDGE".to_string(),
-                "z".to_string(),
+                vec![("property".to_string(), "z".to_string())],
                 "range".to_string()
             ),
         ]
     );
     for row in &all.rows {
         assert!(
-            matches!(&row.values[4], GqlValue::String(state) if state == "building" || state == "ready" || state == "failed")
+            matches!(&row.values[5], GqlValue::String(state) if state == "building" || state == "ready" || state == "failed")
         );
-        gql_uint(&row.values[5]);
+        gql_uint(&row.values[0]);
         assert_eq!(row.values[6], GqlValue::Null);
+        assert_eq!(gql_uint(&row.values[8]), 1);
     }
 
     let node_only = execute_gql_ok(&engine, "SHOW NODE PROPERTY INDEXES");
@@ -8625,7 +8944,7 @@ fn gql_index_show_rows_order_filters_empty_and_stats() {
     assert!(node_only
         .rows
         .iter()
-        .all(|row| row.values[0] == GqlValue::String("node".to_string())));
+        .all(|row| row.values[1] == GqlValue::String("node".to_string())));
     assert_eq!(
         assert_gql_index_result(&node_only, "show_node_property_indexes").indexes_returned,
         4
@@ -8636,10 +8955,109 @@ fn gql_index_show_rows_order_filters_empty_and_stats() {
     assert!(edge_only
         .rows
         .iter()
-        .all(|row| row.values[0] == GqlValue::String("edge".to_string())));
+        .all(|row| row.values[1] == GqlValue::String("edge".to_string())));
     assert_eq!(
         assert_gql_index_result(&edge_only, "show_edge_property_indexes").indexes_returned,
         2
+    );
+}
+
+#[test]
+fn gql_index_show_includes_native_compound_and_metadata_declarations_sorted() {
+    let (_dir, engine) = query_test_engine();
+    let node_single = engine
+        .ensure_node_property_index(
+            "GqlIndexShowFields",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("a")]),
+        )
+        .unwrap();
+    let node_compound = engine
+        .ensure_node_property_index(
+            "GqlIndexShowFields",
+            SecondaryIndexSpec::range(vec![
+                SecondaryIndexField::property("a"),
+                SecondaryIndexField::property("b"),
+            ]),
+        )
+        .unwrap();
+    let node_metadata = engine
+        .ensure_node_property_index(
+            "GqlIndexShowFields",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::node_meta(
+                NodeMetadataIndexField::UpdatedAt,
+            )]),
+        )
+        .unwrap();
+    let edge_compound = engine
+        .ensure_edge_property_index(
+            "GQL_INDEX_SHOW_FIELDS",
+            SecondaryIndexSpec::range(vec![
+                SecondaryIndexField::property("status"),
+                SecondaryIndexField::edge_meta(EdgeMetadataIndexField::ValidTo),
+            ]),
+        )
+        .unwrap();
+
+    let show = execute_gql_ok(&engine, "SHOW PROPERTY INDEXES");
+    assert_eq!(
+        show.rows
+            .iter()
+            .map(|row| {
+                (
+                    gql_uint(&row.values[0]),
+                    gql_str(&row.values[1]).to_string(),
+                    gql_str(&row.values[2]).to_string(),
+                    gql_index_field_identity(&row.values[3]),
+                    gql_str(&row.values[4]).to_string(),
+                    gql_bool(&row.values[7]),
+                    gql_uint(&row.values[8]),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                node_single.index_id,
+                "node".to_string(),
+                "GqlIndexShowFields".to_string(),
+                vec![("property".to_string(), "a".to_string())],
+                "equality".to_string(),
+                false,
+                1,
+            ),
+            (
+                node_compound.index_id,
+                "node".to_string(),
+                "GqlIndexShowFields".to_string(),
+                vec![
+                    ("property".to_string(), "a".to_string()),
+                    ("property".to_string(), "b".to_string()),
+                ],
+                "range".to_string(),
+                true,
+                2,
+            ),
+            (
+                node_metadata.index_id,
+                "node".to_string(),
+                "GqlIndexShowFields".to_string(),
+                vec![("metadata".to_string(), "updatedAt".to_string())],
+                "equality".to_string(),
+                false,
+                1,
+            ),
+            (
+                edge_compound.index_id,
+                "edge".to_string(),
+                "GQL_INDEX_SHOW_FIELDS".to_string(),
+                vec![
+                    ("property".to_string(), "status".to_string()),
+                    ("metadata".to_string(), "validTo".to_string()),
+                ],
+                "range".to_string(),
+                true,
+                2,
+            ),
+        ]
     );
 }
 
@@ -8756,7 +9174,7 @@ fn gql_index_max_rows_cursor_readonly_profile_and_include_plan() {
         .is_some());
 
     let planned_source =
-        "CREATE PROPERTY INDEX FOR (n:GqlIndexPlan) ON (n.status) KIND EQUALITY";
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexPlan) ON (n.status, updatedAt(n)) KIND RANGE";
     let planned = execute_gql_with_options(
         &engine,
         planned_source,
@@ -8768,6 +9186,18 @@ fn gql_index_max_rows_cursor_readonly_profile_and_include_plan() {
     let plan = planned.plan.as_ref().expect("include_plan should return plan");
     let index_plan = gql_index_explain_payload(plan);
     assert_eq!(index_plan.operation, "create_property_index");
+    assert_eq!(index_plan.targets[0].target_kind, "node");
+    assert_eq!(index_plan.targets[0].label.as_deref(), Some("GqlIndexPlan"));
+    assert_eq!(index_plan.targets[0].fields.len(), 2);
+    assert_eq!(index_plan.targets[0].fields[0].source, "property");
+    assert_eq!(index_plan.targets[0].fields[0].key.as_deref(), Some("status"));
+    assert_eq!(index_plan.targets[0].fields[1].source, "metadata");
+    assert_eq!(
+        index_plan.targets[0].fields[1].field.as_deref(),
+        Some("updatedAt")
+    );
+    assert_eq!(index_plan.targets[0].kind.as_deref(), Some("range"));
+    assert!(index_plan.targets[0].compound);
     let explained = engine
         .explain_gql(planned_source, &GqlParams::new(), &gql_opts())
         .unwrap();
@@ -8805,9 +9235,13 @@ fn gql_index_explain_booleans_readonly_and_no_side_effects() {
     assert_eq!(create.targets.len(), 1);
     assert_eq!(create.targets[0].target_kind, "node");
     assert_eq!(create.targets[0].label.as_deref(), Some("GqlIndexExplainCreate"));
-    assert_eq!(create.targets[0].prop_key.as_deref(), Some("status"));
+    assert_eq!(create.targets[0].fields.len(), 1);
+    assert_eq!(create.targets[0].fields[0].source, "property");
+    assert_eq!(create.targets[0].fields[0].key.as_deref(), Some("status"));
+    assert_eq!(create.targets[0].fields[0].field, None);
     assert_eq!(create.targets[0].kind.as_deref(), Some("equality"));
     assert_eq!(create.targets[0].action.as_deref(), Some("ensure"));
+    assert!(!create.targets[0].compound);
     assert!(create.uses_core_write_queue);
     assert!(create.publishes_manifest);
     assert!(create.creates_labels);
@@ -8825,9 +9259,12 @@ fn gql_index_explain_booleans_readonly_and_no_side_effects() {
     assert_eq!(drop.operation, "drop_property_index");
     assert_eq!(drop.targets[0].target_kind, "edge");
     assert_eq!(drop.targets[0].label.as_deref(), Some("GQL_INDEX_EXPLAIN_DROP"));
-    assert_eq!(drop.targets[0].prop_key.as_deref(), Some("status"));
+    assert_eq!(drop.targets[0].fields.len(), 1);
+    assert_eq!(drop.targets[0].fields[0].source, "property");
+    assert_eq!(drop.targets[0].fields[0].key.as_deref(), Some("status"));
     assert_eq!(drop.targets[0].kind.as_deref(), Some("range"));
     assert_eq!(drop.targets[0].action.as_deref(), Some("drop"));
+    assert!(!drop.targets[0].compound);
     assert!(drop.uses_core_write_queue);
     assert!(drop.publishes_manifest);
     assert!(!drop.creates_labels);
@@ -8850,9 +9287,10 @@ fn gql_index_explain_booleans_readonly_and_no_side_effects() {
     assert_eq!(show.operation, "show_edge_property_indexes");
     assert_eq!(show.targets[0].target_kind, "edge");
     assert!(show.targets[0].label.is_none());
-    assert!(show.targets[0].prop_key.is_none());
+    assert!(show.targets[0].fields.is_empty());
     assert!(show.targets[0].kind.is_none());
     assert_eq!(show.targets[0].action.as_deref(), Some("show"));
+    assert!(!show.targets[0].compound);
     assert!(!show.uses_core_write_queue);
     assert!(!show.publishes_manifest);
     assert!(!show.creates_labels);
@@ -8894,14 +9332,14 @@ fn gql_non_index_results_and_explains_keep_index_payload_absent() {
 
     let read = execute_gql_ok(
         &engine,
-        "MATCH (n:Person) WHERE n.key = 'gql-index-non-index' RETURN id(n)",
+        "MATCH (n:Person) WHERE elementKey(n) = 'gql-index-non-index' RETURN id(n)",
     );
     assert_eq!(read.kind, GqlStatementKind::Query);
     assert!(read.index_stats.is_none());
 
     let mutation = execute_gql_ok(
         &engine,
-        "CREATE (n:GqlIndexNonIndexMutation {key: 'created'}) RETURN id(n)",
+        "CREATE (n:GqlIndexNonIndexMutation {elementKey: 'created'}) RETURN id(n)",
     );
     assert_eq!(mutation.kind, GqlStatementKind::Mutation);
     assert!(mutation.index_stats.is_none());
@@ -8912,7 +9350,7 @@ fn gql_non_index_results_and_explains_keep_index_payload_absent() {
 
     let read_explain = engine
         .explain_gql(
-            "MATCH (n:Person) WHERE n.key = 'gql-index-non-index' RETURN id(n)",
+            "MATCH (n:Person) WHERE elementKey(n) = 'gql-index-non-index' RETURN id(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -8920,7 +9358,7 @@ fn gql_non_index_results_and_explains_keep_index_payload_absent() {
     assert!(read_explain.index.is_none());
     let mutation_explain = engine
         .explain_gql(
-            "CREATE (n:GqlIndexNonIndexExplain {key: 'created'}) RETURN id(n)",
+            "CREATE (n:GqlIndexNonIndexExplain {elementKey: 'created'}) RETURN id(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -8937,18 +9375,10 @@ fn gql_index_show_catalog_smoke_does_not_scan_graph_records() {
     let (_dir, engine) = query_test_engine();
     for index in 0..100 {
         engine
-            .ensure_node_property_index(
-                &format!("GqlIndexSmokeNode{index:03}"),
-                "status",
-                SecondaryIndexKind::Equality,
-            )
+            .ensure_node_property_index(&format!("GqlIndexSmokeNode{index:03}"), SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         engine
-            .ensure_edge_property_index(
-                &format!("GQL_INDEX_SMOKE_EDGE_{index:03}"),
-                "status",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_edge_property_index(&format!("GQL_INDEX_SMOKE_EDGE_{index:03}"), SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
     }
 
@@ -9005,7 +9435,7 @@ fn gql_index_lifecycle_create_persists_across_reopen_and_show() {
     .unwrap();
     assert_eq!(reopened_node.index_id, node_index_id);
     assert_eq!(reopened_node.label, "GqlIndexReopenNode");
-    assert_eq!(reopened_node.prop_key, "status");
+    assert_eq!(reopened_node.fields, property_index_fields("status"));
     assert_eq!(reopened_node.kind, SecondaryIndexKind::Equality);
     assert!(reopened_node.last_error.is_none());
 
@@ -9018,7 +9448,7 @@ fn gql_index_lifecycle_create_persists_across_reopen_and_show() {
     .unwrap();
     assert_eq!(reopened_edge.index_id, edge_index_id);
     assert_eq!(reopened_edge.label, "GQL_INDEX_REOPEN_EDGE");
-    assert_eq!(reopened_edge.prop_key, "score");
+    assert_eq!(reopened_edge.fields, property_index_fields("score"));
     assert_eq!(reopened_edge.kind, SecondaryIndexKind::Range);
     assert!(reopened_edge.last_error.is_none());
 
@@ -9624,6 +10054,219 @@ fn gql_index_lifecycle_planner_uses_ready_declarations_and_falls_back_after_drop
 }
 
 #[test]
+fn gql_index_created_node_metadata_compound_index_is_used_by_gql_read_predicates() {
+    let (_dir, engine) = query_test_engine();
+    let keep = insert_query_node(
+        &engine,
+        "GqlIndexMetaNode",
+        "keep",
+        &[("tenant_id", PropValue::String("acme".to_string()))],
+        1.0,
+    );
+    let old = insert_query_node(
+        &engine,
+        "GqlIndexMetaNode",
+        "old",
+        &[("tenant_id", PropValue::String("acme".to_string()))],
+        1.0,
+    );
+    let other_tenant = insert_query_node(
+        &engine,
+        "GqlIndexMetaNode",
+        "other",
+        &[("tenant_id", PropValue::String("globex".to_string()))],
+        1.0,
+    );
+    set_query_node_updated_at(&engine, keep, 2_000);
+    set_query_node_updated_at(&engine, old, 500);
+    set_query_node_updated_at(&engine, other_tenant, 2_000);
+    engine.flush().unwrap();
+
+    let created = execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexMetaNode) ON (n.tenant_id, updatedAt(n)) KIND RANGE",
+    );
+    let index_id = assert_create_property_index_row_fields(
+        &created,
+        "node",
+        "GqlIndexMetaNode",
+        &[("property", "tenant_id"), ("metadata", "updatedAt")],
+        "range",
+    );
+    wait_for_published_property_index_state(&engine, index_id, SecondaryIndexState::Ready);
+    assert!(
+        native_node_index_fields(
+            &engine,
+            "GqlIndexMetaNode",
+            &[
+                SecondaryIndexField::property("tenant_id"),
+                SecondaryIndexField::node_meta(NodeMetadataIndexField::UpdatedAt),
+            ],
+            SecondaryIndexKind::Range,
+        )
+        .is_some()
+    );
+
+    let source = "MATCH (n:GqlIndexMetaNode) WHERE n.tenant_id = 'acme' AND updatedAt(n) >= 1000 RETURN id(n)";
+    let result = execute_gql_with_options(
+        &engine,
+        source,
+        GqlExecutionOptions {
+            include_plan: true,
+            ..gql_opts()
+        },
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].values[0], GqlValue::UInt(keep));
+    let read = gql_read_explain(result.plan.as_ref().expect("include_plan should return plan"));
+    assert!(
+        read.projection
+            .iter()
+            .any(|line| line.contains("CompoundRangeIndex") && line.contains("NodeMetadata(UpdatedAt)")),
+        "expected GQL read explain to use compound range index, got {:?}",
+        read.projection
+    );
+}
+
+#[test]
+fn gql_index_created_edge_metadata_compound_index_is_used_by_gql_read_predicates() {
+    let (_dir, engine) = query_test_engine();
+    let from = insert_query_node(&engine, "GqlIndexMetaEdgeEndpoint", "from", &[], 1.0);
+    let to = insert_query_node(&engine, "GqlIndexMetaEdgeEndpoint", "to", &[], 1.0);
+    let keep = engine
+        .upsert_edge(
+            from,
+            to,
+            "GQL_INDEX_META_EDGE",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("status", PropValue::String("active".to_string()))]),
+                valid_to: Some(i64::MAX),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_edge(
+            from,
+            to,
+            "GQL_INDEX_META_EDGE",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("status", PropValue::String("active".to_string()))]),
+                valid_to: Some(i64::MAX / 4),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_edge(
+            from,
+            to,
+            "GQL_INDEX_META_EDGE",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("status", PropValue::String("inactive".to_string()))]),
+                valid_to: Some(i64::MAX),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let created = execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR ()-[r:GQL_INDEX_META_EDGE]-() ON (r.status, validTo(r)) KIND RANGE",
+    );
+    let index_id = assert_create_property_index_row_fields(
+        &created,
+        "edge",
+        "GQL_INDEX_META_EDGE",
+        &[("property", "status"), ("metadata", "validTo")],
+        "range",
+    );
+    wait_for_published_property_index_state(&engine, index_id, SecondaryIndexState::Ready);
+    assert!(
+        native_edge_index_fields(
+            &engine,
+            "GQL_INDEX_META_EDGE",
+            &[
+                SecondaryIndexField::property("status"),
+                SecondaryIndexField::edge_meta(EdgeMetadataIndexField::ValidTo),
+            ],
+            SecondaryIndexKind::Range,
+        )
+        .is_some()
+    );
+
+    let source = "MATCH ()-[r:GQL_INDEX_META_EDGE]->() WHERE r.status = 'active' AND validTo(r) >= 4611686018427387903 RETURN id(r)";
+    let result = execute_gql_with_options(
+        &engine,
+        source,
+        GqlExecutionOptions {
+            include_plan: true,
+            ..gql_opts()
+        },
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].values[0], GqlValue::UInt(keep));
+    let read = gql_read_explain(result.plan.as_ref().expect("include_plan should return plan"));
+    assert!(
+        read.projection
+            .iter()
+            .any(|line| line.contains("CompoundRangeIndex") && line.contains("EdgeMetadata(ValidTo)")),
+        "expected GQL read explain to use compound edge range index, got {:?}",
+        read.projection
+    );
+}
+
+#[test]
+fn gql_index_compound_prefix_warning_renders_locked_message() {
+    let (_dir, engine) = query_test_engine();
+    let node = insert_query_node(
+        &engine,
+        "GqlIndexPrefixWarning",
+        "node",
+        &[("tenant_id", PropValue::String("acme".to_string()))],
+        1.0,
+    );
+    set_query_node_updated_at(&engine, node, 2_000);
+    engine.flush().unwrap();
+
+    let created = execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexPrefixWarning) ON (n.tenant_id, updatedAt(n)) KIND RANGE",
+    );
+    let index_id = gql_uint(&created.rows[0].values[7]);
+    wait_for_published_property_index_state(&engine, index_id, SecondaryIndexState::Ready);
+
+    let warning = "compound secondary index skipped because query predicates do not constrain a left prefix of the declaration";
+    let source =
+        "MATCH (n:GqlIndexPrefixWarning) WHERE updatedAt(n) >= 1000 RETURN id(n)";
+    let explained = engine
+        .explain_gql(source, &GqlParams::new(), &gql_opts())
+        .unwrap();
+    let read = gql_read_explain(&explained);
+    assert!(
+        read.warnings.iter().any(|actual| actual == warning),
+        "expected locked compound warning in explain, got {:?}",
+        read.warnings
+    );
+
+    let result = execute_gql_with_options(
+        &engine,
+        source,
+        GqlExecutionOptions {
+            include_plan: true,
+            ..gql_opts()
+        },
+    );
+    let read = gql_read_explain(result.plan.as_ref().expect("include_plan should return plan"));
+    assert!(
+        read.warnings.iter().any(|actual| actual == warning),
+        "expected locked compound warning in include-plan read explain, got {:?}",
+        read.warnings
+    );
+}
+
+#[test]
 fn gql_index_lifecycle_unsupported_explain_and_unknown_drop_have_no_side_effects() {
     let (_dir, engine) = query_test_engine();
     let before = gql_index_side_effect_snapshot(&engine);
@@ -9631,9 +10274,10 @@ fn gql_index_lifecycle_unsupported_explain_and_unknown_drop_have_no_side_effects
     for source in [
         "CREATE INDEX gql_index_named FOR (n:GqlIndexNoSideNamed) ON (n.status)",
         "CREATE TEXT INDEX gql_index_text FOR (n:GqlIndexNoSideFamily) ON (n.status)",
+        "CREATE COMPOUND INDEX",
         "CREATE PROPERTY INDEX FOR (n:GqlIndexNoSideKind) ON (n.status) KIND TEXT",
         "CREATE PROPERTY INDEX FOR ()-[r:GQL_INDEX_NO_SIDE_DIRECTED]->() ON (r.status) KIND EQUALITY",
-        "CREATE PROPERTY INDEX FOR (n:GqlIndexNoSideComposite) ON (n.a, n.b) KIND EQUALITY",
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexNoSideDuplicate) ON (n.a, n.a) KIND EQUALITY",
         "CREATE PROPERTY INDEX FOR (n:GqlIndexNoSideParam) ON (n.$prop) KIND EQUALITY",
         "CREATE PROPERTY INDEX FOR (n:GqlIndexNoSideMismatch) ON (m.status) KIND EQUALITY",
     ] {
@@ -9698,13 +10342,24 @@ fn gql_index_lifecycle_manifest_shape_uses_native_secondary_index_entries() {
         &engine,
         "CREATE PROPERTY INDEX FOR ()-[r:GQL_INDEX_MANIFEST_EDGE]-() ON (r.score) KIND RANGE",
     );
-    assert_gql_index_manifest_secondary_index_shape(&db_path, 2);
+    execute_gql_ok(
+        &engine,
+        "CREATE PROPERTY INDEX FOR (n:GqlIndexManifestNode) ON (n.tenant_id, updatedAt(n)) KIND RANGE",
+    );
+    assert_gql_index_manifest_secondary_index_shape(&db_path, 3);
 
     let manifest = gql_index_manifest_json(&db_path);
     let raw_manifest = manifest.to_string();
     assert!(!raw_manifest.contains("ddl"));
     assert!(!raw_manifest.contains("index_name"));
     assert!(!raw_manifest.contains("provider"));
+    assert!(raw_manifest.contains("NodeFieldIndex"));
+
+    execute_gql_ok(
+        &engine,
+        "DROP PROPERTY INDEX FOR (n:GqlIndexManifestNode) ON (n.tenant_id, updatedAt(n)) KIND RANGE",
+    );
+    assert_gql_index_manifest_secondary_index_shape(&db_path, 2);
 
     execute_gql_ok(
         &engine,
@@ -10113,7 +10768,7 @@ fn gql_schema_publication_enforces_later_writes_through_shared_write_path() {
 
     let err = engine
         .execute_gql(
-            "CREATE (n:Strict {key: 'bad', extra: 'x'}) RETURN n",
+            "CREATE (n:Strict {elementKey: 'bad', extra: 'x'}) RETURN n",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -10285,7 +10940,7 @@ fn gql_read_only_exists_subqueries_execute_with_correlation_and_cache() {
         .execute_gql(
             "MATCH (n:GqlSubExists) \
              WHERE EXISTS { MATCH (n)-[:GQL_SUB_EXISTS_REL]->(m) RETURN m } \
-             RETURN n.key AS key ORDER BY key",
+             RETURN elementKey(n) AS key ORDER BY key",
             &GqlParams::new(),
             &options,
         )
@@ -10302,7 +10957,7 @@ fn gql_read_only_exists_subqueries_execute_with_correlation_and_cache() {
         .execute_gql(
             "MATCH (n:GqlSubExists) \
              WHERE n.status = 'active' AND EXISTS { MATCH (n)-[:GQL_SUB_EXISTS_REL]->(m) RETURN m } \
-             RETURN n.key AS key ORDER BY key",
+             RETURN elementKey(n) AS key ORDER BY key",
             &GqlParams::new(),
             &options,
         )
@@ -10362,7 +11017,7 @@ fn gql_read_only_exists_subqueries_execute_with_correlation_and_cache() {
         .execute_gql(
              "MATCH (n:GqlSubExists) \
              WHERE EXISTS { MATCH (m:GqlSubExists) RETURN m } \
-             RETURN n.key AS key ORDER BY key",
+             RETURN elementKey(n) AS key ORDER BY key",
             &GqlParams::new(),
             &options,
         )
@@ -10428,7 +11083,7 @@ fn gql_read_only_exists_subqueries_execute_with_correlation_and_cache() {
         .unwrap();
     let epoch_source = "MATCH (n:GqlSubEpoch) \
                         WHERE EXISTS { MATCH (n)-[:GQL_SUB_EPOCH_REL]->(m) RETURN m } \
-                        RETURN n.key AS key ORDER BY key";
+                        RETURN elementKey(n) AS key ORDER BY key";
     let first_epoch_page = engine
         .execute_gql(
             epoch_source,
@@ -10517,7 +11172,7 @@ fn gql_exists_subquery_uses_physical_probe_for_simple_matches() {
         .execute_gql(
             "MATCH (outer:GqlSubExistsProbeOuter) \
              WHERE EXISTS { MATCH (inner:GqlSubExistsProbeInner) RETURN inner } \
-             RETURN outer.key",
+             RETURN elementKey(outer)",
             &GqlParams::new(),
             &probe_options,
         )
@@ -10537,7 +11192,7 @@ fn gql_exists_subquery_uses_physical_probe_for_simple_matches() {
         .execute_gql(
             "MATCH (outer:GqlSubExistsProbeOuter) \
              WHERE EXISTS { MATCH (missing:GqlSubExistsProbeMissing) RETURN missing } \
-             RETURN outer.key",
+             RETURN elementKey(outer)",
             &GqlParams::new(),
             &probe_options,
         )
@@ -10555,7 +11210,7 @@ fn gql_exists_subquery_uses_physical_probe_for_simple_matches() {
                 &format!(
                     "MATCH (outer:GqlSubExistsProbeOuter) \
                      WHERE EXISTS {{ MATCH (inner:GqlSubExistsProbeInner) RETURN {projection} }} \
-                     RETURN outer.key"
+                     RETURN elementKey(outer)"
                 ),
                 &GqlParams::new(),
                 &probe_options,
@@ -10576,7 +11231,7 @@ fn gql_exists_subquery_uses_physical_probe_for_simple_matches() {
         .execute_gql(
             "MATCH (outer:GqlSubExistsProbeOuter) \
              WHERE EXISTS { MATCH (inner:GqlSubExistsProbeInner) RETURN inner LIMIT 0 } \
-             RETURN outer.key",
+             RETURN elementKey(outer)",
             &GqlParams::new(),
             &probe_options,
         )
@@ -10587,7 +11242,7 @@ fn gql_exists_subquery_uses_physical_probe_for_simple_matches() {
         .execute_gql(
             "MATCH (outer:GqlSubExistsProbeOuter) \
              WHERE EXISTS { MATCH (inner:GqlSubExistsProbeInner) RETURN 1 / 0 AS boom } \
-             RETURN outer.key",
+             RETURN elementKey(outer)",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -10634,7 +11289,7 @@ fn gql_exists_subquery_probe_does_not_cap_raw_edge_candidates() {
                MATCH (source)-[:GQL_SUB_EXISTS_PROBE_EDGE]->(target:GqlSubExistsProbeEdgeHit) \
                RETURN target \
              } \
-             RETURN source.key",
+             RETURN elementKey(source)",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -10685,7 +11340,7 @@ fn gql_optional_match_where_exists_preserves_left_outer_semantics() {
             "MATCH (n:GqlOptExistsOuter) \
              OPTIONAL MATCH (n)-[:GQL_OPT_EXISTS_REL]->(m:GqlOptExistsInner) \
              WHERE EXISTS { MATCH (m)-[:GQL_OPT_EXISTS_MARK]->(marker:GqlOptExistsMarker) RETURN marker } \
-             RETURN n.key AS outer_key, m.key AS inner_key \
+             RETURN elementKey(n) AS outer_key, elementKey(m) AS inner_key \
              ORDER BY outer_key",
             &GqlParams::new(),
             &GqlExecutionOptions {
@@ -10731,7 +11386,7 @@ fn gql_optional_match_where_exists_preserves_left_outer_semantics() {
              OPTIONAL MATCH (n)-[:GQL_OPT_EXISTS_REL]->(m:GqlOptExistsInner) \
              WITH n, m \
              WHERE EXISTS { MATCH (m)-[:GQL_OPT_EXISTS_MARK]->(marker:GqlOptExistsMarker) RETURN marker } \
-             RETURN n.key AS outer_key, m.key AS inner_key \
+             RETURN elementKey(n) AS outer_key, elementKey(m) AS inner_key \
              ORDER BY outer_key",
             &GqlParams::new(),
             &GqlExecutionOptions {
@@ -10805,7 +11460,7 @@ fn gql_optional_match_where_exists_reuses_canonical_candidate_cache() {
                WHERE marker.bucket = bucket \
                RETURN marker \
              } \
-             RETURN m.key AS inner_key \
+             RETURN elementKey(m) AS inner_key \
              ORDER BY inner_key",
             &GqlParams::new(),
             &GqlExecutionOptions {
@@ -10845,8 +11500,8 @@ fn gql_read_only_call_subqueries_inner_apply_and_cursor() {
         .unwrap();
 
     let source = "MATCH (n:GqlSubCall) \
-                  CALL { MATCH (n)-[:GQL_SUB_CALL_REL]->(m) RETURN m, m.key AS friend } \
-                  RETURN n.key AS source, friend, id(m) AS mid \
+                  CALL { MATCH (n)-[:GQL_SUB_CALL_REL]->(m) RETURN m, elementKey(m) AS friend } \
+                  RETURN elementKey(n) AS source, friend, id(m) AS mid \
                   ORDER BY source, friend";
     let options = GqlExecutionOptions {
         allow_full_scan: true,
@@ -10875,10 +11530,10 @@ fn gql_read_only_call_subqueries_inner_apply_and_cursor() {
         .iter()
         .any(|item| item.contains("invocations=3")));
 
-    let no_order_source = "MATCH (n:GqlSubCall) WHERE n.key = 'a' \
+    let no_order_source = "MATCH (n:GqlSubCall) WHERE elementKey(n) = 'a' \
                            CALL { \
                              MATCH (n)-[:GQL_SUB_CALL_REL]->(m) \
-                             RETURN m.key AS friend ORDER BY friend DESC \
+                             RETURN elementKey(m) AS friend ORDER BY friend DESC \
                            } \
                            RETURN friend";
     let no_order = engine
@@ -10962,10 +11617,10 @@ fn gql_call_subquery_does_not_truncate_inner_rows_to_outer_page_cap() {
             .unwrap();
     }
 
-    let source = "MATCH (n:GqlSubCallPageOuter) WHERE n.key = 'outer' \
+    let source = "MATCH (n:GqlSubCallPageOuter) WHERE elementKey(n) = 'outer' \
                   CALL { \
                     MATCH (n)-[:GQL_SUB_CALL_PAGE_REL]->(m:GqlSubCallPageInner) \
-                    RETURN m.key AS friend ORDER BY friend \
+                    RETURN elementKey(m) AS friend ORDER BY friend \
                   } \
                   RETURN friend ORDER BY friend";
     let first = engine
@@ -11027,11 +11682,11 @@ fn gql_call_subquery_enforces_joined_cache_materialization_cap() {
     let err = engine
         .execute_gql(
             "MATCH (n:GqlSubCallCapOuter) \
-             WITH n.bucket AS bucket, n.key AS source \
+             WITH n.bucket AS bucket, elementKey(n) AS source \
              CALL { \
                MATCH (m:GqlSubCallCapInner) \
                WHERE m.bucket = bucket \
-               RETURN m.key AS friend ORDER BY friend \
+               RETURN elementKey(m) AS friend ORDER BY friend \
              } \
              RETURN source, friend \
              ORDER BY source, friend",
@@ -11084,7 +11739,7 @@ fn gql_exists_subquery_union_branches_see_correlated_imports_and_cache() {
     let result = engine
         .execute_gql(
             "MATCH (n:GqlSubUnionExistsOuter) \
-             WITH n.bucket AS bucket, n.key AS key \
+             WITH n.bucket AS bucket, elementKey(n) AS key \
              WHERE EXISTS { \
                MATCH (left:GqlSubUnionExistsLeft) WHERE left.bucket = bucket RETURN left AS hit \
                UNION \
@@ -11148,12 +11803,12 @@ fn gql_call_subquery_union_branches_see_correlated_imports_and_dedupe() {
             "MATCH (n:GqlSubUnionCallOuter) \
              CALL { \
                MATCH (n)-[:GQL_SUB_UNION_CALL_A]->(m:GqlSubUnionCallInner) \
-               RETURN m.key AS friend, m AS friend_node \
+               RETURN elementKey(m) AS friend, m AS friend_node \
                UNION \
                MATCH (n)-[:GQL_SUB_UNION_CALL_B]->(m:GqlSubUnionCallInner) \
-               RETURN m.key AS friend, m AS friend_node \
+               RETURN elementKey(m) AS friend, m AS friend_node \
              } \
-             RETURN n.key AS source, friend, id(friend_node) AS friend_id \
+             RETURN elementKey(n) AS source, friend, id(friend_node) AS friend_id \
              ORDER BY source, friend",
             &GqlParams::new(),
             &GqlExecutionOptions {
@@ -11216,7 +11871,7 @@ fn gql_call_subquery_mixed_union_output_cursor_resumes() {
     for query in [
         "MATCH (outer:GqlSubUnionMixedCursorOuter) \
          CALL { \
-           MATCH (m:GqlSubUnionMixedCursor) WHERE m.key = 'node' RETURN m AS mixed \
+           MATCH (m:GqlSubUnionMixedCursor) WHERE elementKey(m) = 'node' RETURN m AS mixed \
            UNION \
            MATCH (a:GqlSubUnionMixedCursor)-[r:GQL_SUB_UNION_MIXED_CURSOR_REL]->(b:GqlSubUnionMixedCursor) RETURN r AS mixed \
          } \
@@ -11225,7 +11880,7 @@ fn gql_call_subquery_mixed_union_output_cursor_resumes() {
          CALL { \
            MATCH (a:GqlSubUnionMixedCursor)-[r:GQL_SUB_UNION_MIXED_CURSOR_REL]->(b:GqlSubUnionMixedCursor) RETURN r AS mixed \
            UNION \
-           MATCH (m:GqlSubUnionMixedCursor) WHERE m.key = 'node' RETURN m AS mixed \
+           MATCH (m:GqlSubUnionMixedCursor) WHERE elementKey(m) = 'node' RETURN m AS mixed \
          } \
          RETURN mixed ORDER BY mixed",
     ] {
@@ -11273,7 +11928,7 @@ fn gql_read_only_subqueries_reject_mutation_collision_depth_and_caps() {
     for source in [
         "MATCH (n:GqlSubReject) WHERE EXISTS { CREATE (m) RETURN m } RETURN n",
         "MATCH (n:GqlSubReject) CALL { CREATE (m) RETURN m } RETURN n",
-        "CREATE (n:GqlSubReject {key: 'x'}) CALL { MATCH (m) RETURN m } RETURN n",
+        "CREATE (n:GqlSubReject {elementKey: 'x'}) CALL { MATCH (m) RETURN m } RETURN n",
     ] {
         let err = engine
             .execute_gql(
@@ -11319,7 +11974,7 @@ fn gql_read_only_subqueries_reject_mutation_collision_depth_and_caps() {
              WHERE EXISTS { \
                MATCH (m:GqlSubReject) RETURN m AS item \
                UNION \
-               MATCH (x:GqlSubReject) WHERE x.key = m.key RETURN x AS item \
+               MATCH (x:GqlSubReject) WHERE elementKey(x) = elementKey(m) RETURN x AS item \
              } \
              RETURN n",
             &GqlParams::new(),
@@ -11384,7 +12039,7 @@ fn gql_read_only_subqueries_reject_mutation_collision_depth_and_caps() {
                     WHERE EXISTS { MATCH (x:GqlSubReject) RETURN x } \
                     RETURN m \
                   } \
-                  RETURN n.key AS key ORDER BY key";
+                  RETURN elementKey(n) AS key ORDER BY key";
     let ok = engine
         .execute_gql(
             nested,
@@ -11420,7 +12075,7 @@ fn gql_read_only_subqueries_reject_mutation_collision_depth_and_caps() {
         .execute_gql(
             "MATCH (n:GqlSubReject) \
              WHERE EXISTS { MATCH (n) RETURN n } \
-             RETURN n.key",
+             RETURN elementKey(n)",
             &GqlParams::new(),
             &GqlExecutionOptions {
                 allow_full_scan: true,
@@ -12694,7 +13349,7 @@ fn gql_mutation_return_aggregation_is_rejected() {
     let (_dir, engine) = query_test_engine();
     let err = engine
         .execute_gql(
-            "CREATE (n:GqlAggregationRejected {key: 'n'}) RETURN count(*)",
+            "CREATE (n:GqlAggregationRejected {elementKey: 'n'}) RETURN count(*)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -12709,9 +13364,9 @@ fn gql_mutation_return_aggregation_is_rejected() {
 fn gql_mutation_read_after_write_stages_remain_rejected() {
     let (_dir, engine) = query_test_engine();
     for source in [
-        "CREATE (n:Person {key: 'with-after-write'}) WITH n RETURN n",
-        "CREATE (n:Person {key: 'match-after-write'}) MATCH (n) RETURN n",
-        "CREATE (n:Person {key: 'call-after-write'}) CALL { MATCH (m) RETURN m } RETURN n",
+        "CREATE (n:Person {elementKey: 'with-after-write'}) WITH n RETURN n",
+        "CREATE (n:Person {elementKey: 'match-after-write'}) MATCH (n) RETURN n",
+        "CREATE (n:Person {elementKey: 'call-after-write'}) CALL { MATCH (m) RETURN m } RETURN n",
     ] {
         let err = engine
             .execute_gql(source, &GqlParams::new(), &gql_opts())
@@ -13133,7 +13788,7 @@ fn gql_order_by_edge_label_and_unsupported_order_keys_are_clear() {
     ));
     let labels_property_err = engine
         .explain_gql(
-            "MATCH (n:Person) RETURN n ORDER BY n.labels",
+            "MATCH (n:Person) RETURN n ORDER BY labels(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -13147,7 +13802,7 @@ fn gql_order_by_edge_label_and_unsupported_order_keys_are_clear() {
     ));
     let labels_alias_err = engine
         .execute_gql(
-            "MATCH (n:Person) RETURN n.labels AS ls ORDER BY ls",
+            "MATCH (n:Person) RETURN labels(n) AS ls ORDER BY ls",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -13171,11 +13826,11 @@ fn gql_order_by_edge_label_and_unsupported_order_keys_are_clear() {
         )
         .unwrap();
     for source in [
-        "MATCH p = (a)-[:PATH_ORDER*1..1]->(b) RETURN p ORDER BY node_ids(p)",
-        "MATCH p = (a)-[:PATH_ORDER*1..1]->(b) RETURN p ORDER BY edge_ids(p)",
+        "MATCH p = (a)-[:PATH_ORDER*1..1]->(b) RETURN p ORDER BY nodeIds(p)",
+        "MATCH p = (a)-[:PATH_ORDER*1..1]->(b) RETURN p ORDER BY edgeIds(p)",
         "MATCH p = (a)-[:PATH_ORDER*1..1]->(b) RETURN p ORDER BY nodes(p)",
         "MATCH p = (a)-[:PATH_ORDER*1..1]->(b) RETURN p ORDER BY relationships(p)",
-        "MATCH p = (a)-[:PATH_ORDER*1..1]->(b) RETURN p.edge_ids AS ids ORDER BY ids",
+        "MATCH p = (a)-[:PATH_ORDER*1..1]->(b) RETURN edgeIds(p) AS ids ORDER BY ids",
     ] {
         let err = engine
             .execute_gql(source, &GqlParams::new(), &gql_opts())
@@ -13219,7 +13874,7 @@ fn gql_order_by_edge_label_and_unsupported_order_keys_are_clear() {
 
     let non_finite = engine
         .execute_gql(
-            "MATCH (n:Person) RETURN n.key ORDER BY $bad",
+            "MATCH (n:Person) RETURN elementKey(n) ORDER BY $bad",
             &GqlParams::from([("bad".to_string(), GqlParamValue::Float(f64::NAN))]),
             &gql_opts(),
         )
@@ -13234,7 +13889,7 @@ fn gql_order_by_edge_label_and_unsupported_order_keys_are_clear() {
 
     let empty_non_finite = engine
         .execute_gql(
-            "MATCH (n:Person) WHERE n.key = 'missing-order-row' RETURN n.key ORDER BY $bad",
+            "MATCH (n:Person) WHERE elementKey(n) = 'missing-order-row' RETURN elementKey(n) ORDER BY $bad",
             &GqlParams::from([("bad".to_string(), GqlParamValue::Float(f64::NAN))]),
             &gql_opts(),
         )
@@ -13249,7 +13904,7 @@ fn gql_order_by_edge_label_and_unsupported_order_keys_are_clear() {
 
     let explain_bytes_order_param = engine
         .explain_gql(
-            "MATCH (n:Person) RETURN n.key ORDER BY $bad",
+            "MATCH (n:Person) RETURN elementKey(n) ORDER BY $bad",
             &GqlParams::from([("bad".to_string(), GqlParamValue::Bytes(vec![1, 2, 3]))]),
             &gql_opts(),
         )
@@ -13269,7 +13924,7 @@ fn gql_order_by_edge_label_and_unsupported_order_keys_are_clear() {
     );
     let bytes_limit_zero = engine
         .execute_gql(
-            "MATCH (n:Person) WHERE n.key = 'bytes-key' RETURN id(n) ORDER BY n.payload LIMIT 0",
+            "MATCH (n:Person) WHERE elementKey(n) = 'bytes-key' RETURN id(n) ORDER BY n.payload LIMIT 0",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -13534,7 +14189,7 @@ fn gql_explain_reports_targets_row_ops_caps_and_does_not_execute_rows() {
 
     let id_order = engine
         .explain_gql(
-            "MATCH (n:Person) RETURN n.key ORDER BY id(n)",
+            "MATCH (n:Person) RETURN elementKey(n) ORDER BY id(n)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -13556,7 +14211,7 @@ fn gql_explain_reports_targets_row_ops_caps_and_does_not_execute_rows() {
 
     let edge = engine
         .explain_gql(
-            "MATCH ()-[r:LIKES]->() RETURN r.from, r.to, type(r), r.valid_from, r.valid_to",
+            "MATCH ()-[r:LIKES]->() RETURN id(startNode(r)), id(endNode(r)), type(r), validFrom(r), validTo(r)",
             &GqlParams::new(),
             &gql_opts(),
         )
@@ -13811,7 +14466,7 @@ fn gql_projection_counters_prove_scalar_fast_paths_and_no_public_query_calls() {
     engine.reset_query_execution_counters_for_test();
     let edge_metadata = execute_gql_ok(
         &engine,
-        "MATCH ()-[r:LIKES]->() RETURN id(r), type(r), r.from, r.to",
+        "MATCH ()-[r:LIKES]->() RETURN id(r), type(r), id(startNode(r)), id(endNode(r))",
     );
     assert_eq!(
         edge_metadata.rows[0].values,
@@ -14279,12 +14934,12 @@ fn gql_scalar_projection_survives_flush_reopen_and_tombstone_shadowing() {
     let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let result = execute_gql_ok(
         &reopened,
-        "MATCH (n:Person) WHERE n.key = 'reopen-keep' RETURN n.state ORDER BY n.state",
+        "MATCH (n:Person) WHERE elementKey(n) = 'reopen-keep' RETURN n.state ORDER BY n.state",
     );
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0].values[0], GqlValue::String("new".to_string()));
 
-    let all_keys = execute_gql_ok(&reopened, "MATCH (n:Person) RETURN n.key ORDER BY n.key LIMIT 10");
+    let all_keys = execute_gql_ok(&reopened, "MATCH (n:Person) RETURN elementKey(n) ORDER BY elementKey(n) LIMIT 10");
     assert!(!gql_string_column(&all_keys, 0).contains(&"reopen-drop".to_string()));
     reopened.close().unwrap();
 }
@@ -14335,7 +14990,7 @@ fn gql_edge_metadata_functions_and_dot_properties_survive_reopen_shadowing() {
     let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let result = execute_gql_ok(
         &reopened,
-        "MATCH ()-[r:LIKES]->() RETURN id(r), type(r), r.id, r.label, r.from, r.to",
+        "MATCH ()-[r:LIKES]->() RETURN id(r), type(r), r.id, r.label, id(startNode(r)), id(endNode(r))",
     );
     assert_eq!(result.rows.len(), 1);
     assert_eq!(
@@ -14484,4 +15139,215 @@ fn gql_indexed_and_pattern_oracles_survive_flush_reopen_with_shadows() {
     assert!(reopened.get_edge(fixture.review_edge).unwrap().is_none());
 
     reopened.close().unwrap();
+}
+
+#[test]
+fn gql_match_pattern_map_metadata_keys_filter_metadata_not_properties() {
+    let (_dir, engine) = query_test_engine();
+    execute_gql_ok(
+        &engine,
+        "CREATE (a:MapMetaNode {elementKey: 'map-meta-a', name: 'a'})",
+    );
+    execute_gql_ok(
+        &engine,
+        "CREATE (b:MapMetaNode {elementKey: 'map-meta-b', name: 'b', marker: 'map-meta-a'})",
+    );
+
+    // elementKey in a MATCH map filters the node key, not a property named elementKey.
+    let by_key = execute_gql_ok(
+        &engine,
+        "MATCH (n:MapMetaNode {elementKey: 'map-meta-a'}) RETURN n.name",
+    );
+    assert_eq!(by_key.rows.len(), 1);
+    assert_eq!(by_key.rows[0].values[0], GqlValue::String("a".to_string()));
+
+    let missing = execute_gql_ok(
+        &engine,
+        "MATCH (n:MapMetaNode {elementKey: 'map-meta-missing'}) RETURN n",
+    );
+    assert!(missing.rows.is_empty());
+
+    // Node weight in a MATCH map filters metadata via the residual predicate path
+    // (no native node weight eq filter); default node weight is 1.0.
+    let by_weight = execute_gql_ok(
+        &engine,
+        "MATCH (n:MapMetaNode {weight: 1.0}) RETURN elementKey(n) ORDER BY elementKey(n)",
+    );
+    assert_eq!(by_weight.rows.len(), 2);
+    assert_eq!(
+        by_weight.rows[0].values[0],
+        GqlValue::String("map-meta-a".to_string())
+    );
+
+    execute_gql_ok(
+        &engine,
+        "MATCH (a:MapMetaNode {elementKey: 'map-meta-a'}) \
+         MATCH (b:MapMetaNode {elementKey: 'map-meta-b'}) \
+         CREATE (a)-[:MAP_META_EDGE {weight: 2.5, validFrom: 10, tag: 'x'}]->(b)",
+    );
+
+    // Edge map metadata keys filter edge metadata through native eq filters.
+    let edge_hit = execute_gql_ok(
+        &engine,
+        "MATCH (a:MapMetaNode)-[r:MAP_META_EDGE {weight: 2.5, validFrom: 10}]->(b:MapMetaNode) \
+         RETURN validTo(r), r.tag",
+    );
+    assert_eq!(edge_hit.rows.len(), 1);
+    assert_eq!(edge_hit.rows[0].values[0], GqlValue::Int(i64::MAX));
+    assert_eq!(edge_hit.rows[0].values[1], GqlValue::String("x".to_string()));
+
+    let edge_miss = execute_gql_ok(
+        &engine,
+        "MATCH (a:MapMetaNode)-[r:MAP_META_EDGE {weight: 9.0}]->(b:MapMetaNode) RETURN id(r)",
+    );
+    assert!(edge_miss.rows.is_empty());
+
+    // A user property spelled like a metadata map key is still reachable via dot access.
+    let by_property = execute_gql_ok(
+        &engine,
+        "MATCH (n:MapMetaNode) WHERE n.marker = 'map-meta-a' RETURN elementKey(n)",
+    );
+    assert_eq!(by_property.rows.len(), 1);
+    assert_eq!(
+        by_property.rows[0].values[0],
+        GqlValue::String("map-meta-b".to_string())
+    );
+}
+
+#[test]
+fn gql_element_map_snake_case_keys_are_user_properties() {
+    let (_dir, engine) = query_test_engine();
+
+    // snake_case spellings and the old reserved name `key` are plain user properties in
+    // element maps; only the exact camelCase metadata names route to metadata.
+    execute_gql_ok(
+        &engine,
+        "CREATE (a:SnakeMapNode {elementKey: 'snake-a', updated_at: 99, key: 'custom'})",
+    );
+    execute_gql_ok(&engine, "CREATE (b:SnakeMapNode {elementKey: 'snake-b'})");
+    execute_gql_ok(
+        &engine,
+        "MATCH (a:SnakeMapNode {elementKey: 'snake-a'}) \
+         MATCH (b:SnakeMapNode {elementKey: 'snake-b'}) \
+         CREATE (a)-[:SNAKE_MAP_EDGE {valid_from: 10, valid_to: 20, weight: 2.5}]->(b)",
+    );
+
+    let node = execute_gql_ok(
+        &engine,
+        "MATCH (n:SnakeMapNode {elementKey: 'snake-a'}) \
+         RETURN n.updated_at, n.key, updatedAt(n)",
+    );
+    assert_eq!(node.rows.len(), 1);
+    assert_eq!(node.rows[0].values[0], GqlValue::Int(99));
+    assert_eq!(node.rows[0].values[1], GqlValue::String("custom".to_string()));
+    // Real metadata is the commit timestamp, untouched by the look-alike property.
+    match &node.rows[0].values[2] {
+        GqlValue::Int(ts) => assert!(*ts > 99, "updatedAt(n) must be a commit timestamp"),
+        other => panic!("expected Int updatedAt, got {other:?}"),
+    }
+
+    // snake_case map keys in MATCH filter the properties, not edge validity metadata.
+    let edge = execute_gql_ok(
+        &engine,
+        "MATCH (a:SnakeMapNode)-[r:SNAKE_MAP_EDGE {valid_from: 10}]->(b:SnakeMapNode) \
+         RETURN r.valid_from, r.valid_to, validFrom(r), validTo(r), weight(r)",
+    );
+    assert_eq!(edge.rows.len(), 1);
+    assert_eq!(edge.rows[0].values[0], GqlValue::Int(10));
+    assert_eq!(edge.rows[0].values[1], GqlValue::Int(20));
+    // Validity metadata kept its defaults: the edge is visible now and unbounded.
+    assert_eq!(edge.rows[0].values[3], GqlValue::Int(i64::MAX));
+    match &edge.rows[0].values[2] {
+        GqlValue::Int(from) => assert!(*from < i64::MAX),
+        other => panic!("expected Int validFrom, got {other:?}"),
+    }
+    // camelCase `weight` in the same map DID route to metadata.
+    assert_eq!(edge.rows[0].values[4], GqlValue::Float(2.5));
+
+    let edge_props_miss = execute_gql_ok(
+        &engine,
+        "MATCH (a:SnakeMapNode)-[r:SNAKE_MAP_EDGE {valid_from: 11}]->(b:SnakeMapNode) \
+         RETURN id(r)",
+    );
+    assert!(edge_props_miss.rows.is_empty());
+}
+
+#[test]
+fn gql_metadata_set_items_in_merge_actions_node_set_and_endpoint_return() {
+    let (_dir, engine) = gql_create_test_engine_with_options(DbOptions {
+        edge_uniqueness: true,
+        ..DbOptions::default()
+    });
+    execute_gql_ok(&engine, "CREATE (a:MetaSetNode {elementKey: 'meta-set-a'})");
+    execute_gql_ok(&engine, "CREATE (b:MetaSetNode {elementKey: 'meta-set-b'})");
+
+    // Node metadata SET on a matched node, read back in the same mutation RETURN.
+    let node_set = execute_gql_ok(
+        &engine,
+        "MATCH (n:MetaSetNode {elementKey: 'meta-set-a'}) SET weight(n) = 2.5 RETURN weight(n)",
+    );
+    assert_eq!(node_set.rows.len(), 1);
+    assert_eq!(node_set.rows[0].values[0], GqlValue::Float(2.5));
+
+    // Metadata l-values inside ON CREATE SET hit the created-edge target arm; unset
+    // validity keeps its default (validTo = i64::MAX).
+    let created = execute_gql_ok(
+        &engine,
+        "MATCH (a:MetaSetNode {elementKey: 'meta-set-a'}) \
+         MATCH (b:MetaSetNode {elementKey: 'meta-set-b'}) \
+         MERGE (a)-[r:META_SET_EDGE]->(b) \
+         ON CREATE SET weight(r) = 0.5, validFrom(r) = 10 \
+         RETURN weight(r), validFrom(r), validTo(r)",
+    );
+    assert_eq!(created.rows.len(), 1);
+    assert_eq!(created.rows[0].values[0], GqlValue::Float(0.5));
+    assert_eq!(created.rows[0].values[1], GqlValue::Int(10));
+    assert_eq!(created.rows[0].values[2], GqlValue::Int(i64::MAX));
+    assert_eq!(created.mutation_stats.as_ref().unwrap().edges_created, 1);
+
+    // Same MERGE again: ON MATCH SET metadata l-values hit the matched-edge target arm.
+    let matched = execute_gql_ok(
+        &engine,
+        "MATCH (a:MetaSetNode {elementKey: 'meta-set-a'}) \
+         MATCH (b:MetaSetNode {elementKey: 'meta-set-b'}) \
+         MERGE (a)-[r:META_SET_EDGE]->(b) \
+         ON MATCH SET weight(r) = 1.5, validTo(r) = 20000000000000 \
+         RETURN weight(r), validFrom(r), validTo(r)",
+    );
+    assert_eq!(matched.rows.len(), 1);
+    assert_eq!(matched.rows[0].values[0], GqlValue::Float(1.5));
+    assert_eq!(matched.rows[0].values[1], GqlValue::Int(10));
+    assert_eq!(matched.rows[0].values[2], GqlValue::Int(20000000000000));
+    assert_eq!(matched.mutation_stats.as_ref().unwrap().edges_created, 0);
+
+    // Node MERGE ON MATCH SET metadata l-value on the matched node.
+    let node_merge = execute_gql_ok(
+        &engine,
+        "MERGE (n:MetaSetNode {elementKey: 'meta-set-b'}) \
+         ON MATCH SET weight(n) = 3.0 RETURN weight(n)",
+    );
+    assert_eq!(node_merge.rows.len(), 1);
+    assert_eq!(node_merge.rows[0].values[0], GqlValue::Float(3.0));
+
+    // Mutation RETURN projects endpoint ids of a matched edge.
+    let ids = execute_gql_ok(
+        &engine,
+        "MATCH (a:MetaSetNode {elementKey: 'meta-set-a'}) \
+         MATCH (b:MetaSetNode {elementKey: 'meta-set-b'}) \
+         RETURN id(a), id(b)",
+    );
+    let (a_id, b_id) = match (&ids.rows[0].values[0], &ids.rows[0].values[1]) {
+        (GqlValue::UInt(a), GqlValue::UInt(b)) => (*a, *b),
+        other => panic!("expected node ids, got {other:?}"),
+    };
+    let endpoints = execute_gql_ok(
+        &engine,
+        "MATCH (a:MetaSetNode)-[r:META_SET_EDGE]->(b:MetaSetNode) \
+         SET weight(r) = 0.75 \
+         RETURN id(startNode(r)), id(endNode(r)), weight(r)",
+    );
+    assert_eq!(endpoints.rows.len(), 1);
+    assert_eq!(endpoints.rows[0].values[0], GqlValue::UInt(a_id));
+    assert_eq!(endpoints.rows[0].values[1], GqlValue::UInt(b_id));
+    assert_eq!(endpoints.rows[0].values[2], GqlValue::Float(0.75));
 }

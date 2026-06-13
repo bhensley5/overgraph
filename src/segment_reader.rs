@@ -22,10 +22,19 @@ use crate::planner_stats::{
 use crate::property_value_semantics::hash_prop_equality_key;
 use crate::property_value_semantics::{NumericRangeSortKey, NUMERIC_RANGE_KEY_BYTES};
 use crate::row_projection::{EdgeSelectedFieldNeeds, NodeSelectedFieldNeeds, PropertySelection};
+use crate::secondary_index_key::{
+    for_each_compound_sidecar_entry as for_each_compound_sidecar_payload_entry,
+    scan_compound_sidecar_prefix_limited, scan_compound_sidecar_range_limited,
+    validate_compound_sidecar_header_only, validate_compound_sidecar_payload, CompoundPrefixBounds,
+    CompoundRangeBounds, CompoundSidecarDeclaration,
+};
 use crate::segment_components::{
-    component_id, decode_identity_header, decode_manifest_envelope, dependency_digest,
-    is_packed_core_component_kind, packed_core_container_record, secondary_declaration_dependency,
-    segment_source_groups_from_records, source_component_dependency, source_group_dependency,
+    component_id, compound_component_kind_for_entry, decode_identity_header,
+    decode_manifest_envelope, dependency_digest, is_packed_core_component_kind,
+    packed_core_container_record, secondary_declaration_dependency,
+    secondary_index_component_dependencies_for_entry,
+    secondary_index_declaration_fingerprint_for_entry, segment_source_groups_from_records,
+    source_component_dependency, source_group_dependency,
     validate_packed_core_manifest_contract_for_open, ComponentAvailability, ComponentDependencyV1,
     ComponentFallbackClass, ComponentHandleV1, ComponentRequirement, ComponentTrustClass,
     SegmentComponentKind, SegmentComponentManifestV1, SegmentComponentRecordV1,
@@ -33,7 +42,8 @@ use crate::segment_components::{
     SEGMENT_COMPONENT_MANIFEST_FILENAME,
 };
 use crate::segment_writer::{
-    component_fingerprint, dense_config_fingerprint, edge_property_equality_component_fingerprint,
+    component_fingerprint, compound_component_fingerprint_for_kind_and_entry,
+    dense_config_fingerprint, edge_property_equality_component_fingerprint,
     edge_property_range_component_fingerprint, node_property_equality_component_fingerprint,
     node_property_range_component_fingerprint, planner_stats_component_dependencies,
     planner_stats_component_fingerprint, NODE_VECTOR_META_ENTRY_SIZE, SEGMENT_FORMAT_VERSION,
@@ -53,6 +63,8 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+
+type NodeSelectedFieldsAtOffset = (Option<String>, BTreeMap<String, PropValue>, Option<i64>);
 
 /// Segment file data, either mmap'd or an empty placeholder.
 /// Segment component payloads can be 0 bytes when empty.
@@ -102,6 +114,10 @@ fn secondary_eq_component_kind(
         PlannerStatsDeclaredIndexTarget::EdgeProperty => {
             SegmentComponentKind::EdgePropertyEqualityIndex { index_id }
         }
+        PlannerStatsDeclaredIndexTarget::NodeFieldIndex
+        | PlannerStatsDeclaredIndexTarget::EdgeFieldIndex => {
+            unreachable!("compound equality indexes do not use legacy equality sidecars")
+        }
     }
 }
 
@@ -115,6 +131,10 @@ fn secondary_range_component_kind(
         }
         PlannerStatsDeclaredIndexTarget::EdgeProperty => {
             SegmentComponentKind::EdgePropertyRangeIndex { index_id }
+        }
+        PlannerStatsDeclaredIndexTarget::NodeFieldIndex
+        | PlannerStatsDeclaredIndexTarget::EdgeFieldIndex => {
+            unreachable!("compound range indexes do not use legacy range sidecars")
         }
     }
 }
@@ -5251,6 +5271,13 @@ impl SegmentReader {
         )
     }
 
+    fn open_compound_sidecar_payload(
+        &self,
+        kind: SegmentComponentKind,
+    ) -> Result<Option<MappedData>, EngineError> {
+        try_open_optional_manifest_payload(&self.component_registry, None, &self.seg_dir, kind)
+    }
+
     fn set_declared_index_runtime_coverage_state(
         &self,
         index_id: u64,
@@ -5296,6 +5323,14 @@ impl SegmentReader {
             return;
         }
         let target = planner_stats_declared_index_target(entry);
+        if matches!(
+            entry.target,
+            SecondaryIndexTarget::NodeFieldIndex { .. }
+                | SecondaryIndexTarget::EdgeFieldIndex { .. }
+        ) {
+            self.warm_compound_runtime_coverage(entry, target);
+            return;
+        }
         match entry.kind {
             SecondaryIndexKind::Equality => {
                 self.warm_secondary_eq_runtime_coverage(entry.index_id, target)
@@ -5304,6 +5339,37 @@ impl SegmentReader {
                 self.warm_secondary_range_runtime_coverage(entry.index_id, target)
             }
         }
+    }
+
+    fn warm_compound_runtime_coverage(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+        target: PlannerStatsDeclaredIndexTarget,
+    ) {
+        let Some(component_kind) = compound_component_kind_for_entry(entry) else {
+            return;
+        };
+        let kind = match entry.kind {
+            SecondaryIndexKind::Equality => PlannerStatsDeclaredIndexKind::Equality,
+            SecondaryIndexKind::Range => PlannerStatsDeclaredIndexKind::Range,
+        };
+        let state = match self.open_compound_sidecar_payload(component_kind.clone()) {
+            Ok(Some(data)) => {
+                let declaration = CompoundSidecarDeclaration::from_manifest_entry(
+                    entry,
+                    secondary_index_declaration_fingerprint_for_entry(entry),
+                );
+                match declaration.and_then(|declaration| {
+                    validate_compound_sidecar_header_only(&data, &declaration)
+                }) {
+                    Ok(()) => DeclaredIndexRuntimeCoverageState::Available,
+                    Err(_) => DeclaredIndexRuntimeCoverageState::Corrupt,
+                }
+            }
+            Ok(None) => self.secondary_component_unavailable_state(component_kind),
+            Err(_) => DeclaredIndexRuntimeCoverageState::Corrupt,
+        };
+        self.set_declared_index_runtime_coverage_state(entry.index_id, target, kind, state);
     }
 
     fn warm_secondary_eq_runtime_coverage(
@@ -5812,6 +5878,9 @@ impl SegmentReader {
     where
         F: FnMut(u64, &[u64]) -> Result<(), EngineError>,
     {
+        if entry.target.single_property_key().is_none() {
+            return Ok(false);
+        }
         self.for_each_secondary_eq_group_for_target(
             entry.index_id,
             planner_stats_declared_index_target(entry),
@@ -5894,6 +5963,239 @@ impl SegmentReader {
             .unwrap()
             .remove(&(index_id, PlannerStatsDeclaredIndexTarget::NodeProperty));
         self.validate_secondary_range_sidecar(index_id)
+    }
+
+    pub(crate) fn validate_compound_sidecar_for_entry(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+    ) -> Result<bool, EngineError> {
+        let Some(kind) = compound_component_kind_for_entry(entry) else {
+            return Ok(false);
+        };
+        let Some(data) = self.open_compound_sidecar_payload(kind.clone())? else {
+            return Ok(false);
+        };
+        let declaration = CompoundSidecarDeclaration::from_manifest_entry(
+            entry,
+            secondary_index_declaration_fingerprint_for_entry(entry),
+        )?;
+        match validate_compound_sidecar_payload(&data, &declaration) {
+            Ok(_) => {
+                self.component_registry
+                    .set_availability(kind, ComponentAvailability::Available);
+                Ok(true)
+            }
+            Err(error) => {
+                mark_optional_component_corrupt(&self.component_registry, kind, error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn compound_sidecar_lightweight_available_for_entry(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+    ) -> Result<bool, EngineError> {
+        let Some(kind) = compound_component_kind_for_entry(entry) else {
+            return Ok(false);
+        };
+        let Some(data) = self.open_compound_sidecar_payload(kind.clone())? else {
+            return Ok(false);
+        };
+        let declaration = CompoundSidecarDeclaration::from_manifest_entry(
+            entry,
+            secondary_index_declaration_fingerprint_for_entry(entry),
+        )?;
+        match validate_compound_sidecar_header_only(&data, &declaration) {
+            Ok(()) => {
+                self.component_registry
+                    .set_availability(kind, ComponentAvailability::Available);
+                Ok(true)
+            }
+            Err(error) => {
+                mark_optional_component_corrupt(&self.component_registry, kind, error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn for_each_compound_sidecar_entry<F>(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+        callback: F,
+    ) -> Result<bool, EngineError>
+    where
+        F: FnMut(&[u8], u64) -> Result<(), EngineError>,
+    {
+        let Some(kind) = compound_component_kind_for_entry(entry) else {
+            return Ok(false);
+        };
+        let Some(data) = self.open_compound_sidecar_payload(kind.clone())? else {
+            return Ok(false);
+        };
+        let declaration = CompoundSidecarDeclaration::from_manifest_entry(
+            entry,
+            secondary_index_declaration_fingerprint_for_entry(entry),
+        )?;
+        match for_each_compound_sidecar_payload_entry(&data, &declaration, callback) {
+            Ok(()) => {
+                self.component_registry
+                    .set_availability(kind, ComponentAvailability::Available);
+                Ok(true)
+            }
+            Err(error) => {
+                mark_optional_component_corrupt(&self.component_registry, kind, error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn compound_prefix_candidates_if_present(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+        bounds: &CompoundPrefixBounds,
+    ) -> Result<Option<Vec<u64>>, EngineError> {
+        self.compound_prefix_candidates_if_present_limited(entry, bounds, usize::MAX)
+    }
+
+    pub(crate) fn compound_prefix_candidates_if_present_limited(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+        bounds: &CompoundPrefixBounds,
+        limit: usize,
+    ) -> Result<Option<Vec<u64>>, EngineError> {
+        let Some(kind) = compound_component_kind_for_entry(entry) else {
+            return Ok(None);
+        };
+        let Some(data) = self.open_compound_sidecar_payload(kind.clone())? else {
+            return Ok(None);
+        };
+        let declaration = CompoundSidecarDeclaration::from_manifest_entry(
+            entry,
+            secondary_index_declaration_fingerprint_for_entry(entry),
+        )?;
+        match scan_compound_sidecar_prefix_limited(&data, &declaration, bounds, limit) {
+            Ok(ids) => {
+                self.component_registry
+                    .set_availability(kind, ComponentAvailability::Available);
+                Ok(Some(ids))
+            }
+            Err(error) => {
+                mark_optional_component_corrupt(&self.component_registry, kind, error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    // Planner-stats gap probe: sums key-table postings counts over the bound
+    // range without decoding postings. Returns Ok(None) when the sidecar is
+    // absent; corrupt visited bytes mark the component corrupt and error,
+    // exactly like the candidate scans.
+    pub(crate) fn compound_prefix_posting_count_if_present(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+        bounds: &CompoundPrefixBounds,
+        cap: u64,
+    ) -> Result<Option<u64>, EngineError> {
+        let Some(kind) = compound_component_kind_for_entry(entry) else {
+            return Ok(None);
+        };
+        let Some(data) = self.open_compound_sidecar_payload(kind.clone())? else {
+            return Ok(None);
+        };
+        let declaration = CompoundSidecarDeclaration::from_manifest_entry(
+            entry,
+            secondary_index_declaration_fingerprint_for_entry(entry),
+        )?;
+        match crate::secondary_index_key::count_compound_sidecar_prefix(
+            &data,
+            &declaration,
+            bounds,
+            cap,
+        ) {
+            Ok(count) => {
+                self.component_registry
+                    .set_availability(kind, ComponentAvailability::Available);
+                Ok(Some(count))
+            }
+            Err(error) => {
+                mark_optional_component_corrupt(&self.component_registry, kind, error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn compound_range_posting_count_if_present(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+        bounds: &CompoundRangeBounds,
+        cap: u64,
+    ) -> Result<Option<u64>, EngineError> {
+        let Some(kind) = compound_component_kind_for_entry(entry) else {
+            return Ok(None);
+        };
+        let Some(data) = self.open_compound_sidecar_payload(kind.clone())? else {
+            return Ok(None);
+        };
+        let declaration = CompoundSidecarDeclaration::from_manifest_entry(
+            entry,
+            secondary_index_declaration_fingerprint_for_entry(entry),
+        )?;
+        match crate::secondary_index_key::count_compound_sidecar_range(
+            &data,
+            &declaration,
+            bounds,
+            cap,
+        ) {
+            Ok(count) => {
+                self.component_registry
+                    .set_availability(kind, ComponentAvailability::Available);
+                Ok(Some(count))
+            }
+            Err(error) => {
+                mark_optional_component_corrupt(&self.component_registry, kind, error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn compound_range_candidates_if_present(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+        bounds: &CompoundRangeBounds,
+    ) -> Result<Option<Vec<u64>>, EngineError> {
+        self.compound_range_candidates_if_present_limited(entry, bounds, usize::MAX)
+    }
+
+    pub(crate) fn compound_range_candidates_if_present_limited(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+        bounds: &CompoundRangeBounds,
+        limit: usize,
+    ) -> Result<Option<Vec<u64>>, EngineError> {
+        let Some(kind) = compound_component_kind_for_entry(entry) else {
+            return Ok(None);
+        };
+        let Some(data) = self.open_compound_sidecar_payload(kind.clone())? else {
+            return Ok(None);
+        };
+        let declaration = CompoundSidecarDeclaration::from_manifest_entry(
+            entry,
+            secondary_index_declaration_fingerprint_for_entry(entry),
+        )?;
+        match scan_compound_sidecar_range_limited(&data, &declaration, bounds, limit) {
+            Ok(ids) => {
+                self.component_registry
+                    .set_availability(kind, ComponentAvailability::Available);
+                Ok(Some(ids))
+            }
+            Err(error) => {
+                mark_optional_component_corrupt(&self.component_registry, kind, error.to_string());
+                Err(error)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -6006,6 +6308,9 @@ impl SegmentReader {
     where
         F: FnMut(NumericRangeSortKey, u64) -> Result<(), EngineError>,
     {
+        if entry.target.single_property_key().is_none() {
+            return Ok(false);
+        }
         self.for_each_secondary_range_entry_for_target(
             entry.index_id,
             planner_stats_declared_index_target(entry),
@@ -6157,6 +6462,32 @@ impl SegmentReader {
         }
 
         Ok(())
+    }
+
+    /// Decode selected node record fields directly at a known data offset.
+    ///
+    /// Used by compound index builds where the caller already holds the
+    /// record's offset from a meta table, so no ID-based re-location is
+    /// needed. Vector needs are not supported on this path.
+    pub(crate) fn node_selected_fields_at_offset(
+        &self,
+        node_id: u64,
+        data_offset: u64,
+        needs: &NodeSelectedFieldNeeds,
+    ) -> Result<NodeSelectedFieldsAtOffset, EngineError> {
+        let offset = usize_from_u64(data_offset, "node selected-field record offset")?;
+        decode_node_selected_fields_at(&self.nodes_mmap, offset, node_id, needs)
+    }
+
+    /// Decode selected edge record fields directly at a known data offset.
+    pub(crate) fn edge_selected_fields_at_offset(
+        &self,
+        edge_id: u64,
+        data_offset: u64,
+        needs: &EdgeSelectedFieldNeeds,
+    ) -> Result<(BTreeMap<String, PropValue>, Option<i64>), EngineError> {
+        let offset = usize_from_u64(data_offset, "edge selected-field record offset")?;
+        decode_edge_selected_fields_at(&self.edges_mmap, offset, edge_id, needs)
     }
 
     fn selected_node_fields_from_meta(
@@ -7616,6 +7947,15 @@ fn expected_component_contract(
             },
             ComponentTrustClass::OptionalCandidateIndex,
         ),
+        NodeCompoundEqualityIndex { .. }
+        | NodeCompoundRangeIndex { .. }
+        | EdgeCompoundEqualityIndex { .. }
+        | EdgeCompoundRangeIndex { .. } => (
+            ComponentRequirement::Optional {
+                fallback: ComponentFallbackClass::RecordScan,
+            },
+            ComponentTrustClass::OptionalCandidateIndex,
+        ),
         PackedSegmentContainer => (
             ComponentRequirement::Required,
             ComponentTrustClass::AuxiliaryBlob,
@@ -7709,6 +8049,36 @@ fn expected_component_dependencies(
                 secondary_declaration_dependency(entry),
             ]
         }
+        NodeCompoundEqualityIndex { index_id } | NodeCompoundRangeIndex { index_id } => {
+            let entry = secondary_indexes
+                .iter()
+                .find(|entry| {
+                    entry.index_id == *index_id
+                        && matches!(entry.target, SecondaryIndexTarget::NodeFieldIndex { .. })
+                })
+                .ok_or_else(|| {
+                    EngineError::CorruptRecord(format!(
+                        "component {:?} has no matching secondary index declaration",
+                        kind
+                    ))
+                })?;
+            secondary_index_component_dependencies_for_entry(entry, source_groups)
+        }
+        EdgeCompoundEqualityIndex { index_id } | EdgeCompoundRangeIndex { index_id } => {
+            let entry = secondary_indexes
+                .iter()
+                .find(|entry| {
+                    entry.index_id == *index_id
+                        && matches!(entry.target, SecondaryIndexTarget::EdgeFieldIndex { .. })
+                })
+                .ok_or_else(|| {
+                    EngineError::CorruptRecord(format!(
+                        "component {:?} has no matching secondary index declaration",
+                        kind
+                    ))
+                })?;
+            secondary_index_component_dependencies_for_entry(entry, source_groups)
+        }
         EdgeWeightIndex | EdgeUpdatedAtIndex | EdgeValidFromIndex | EdgeValidToIndex => {
             vec![source_group_dependency(
                 SegmentSourceGroupKind::EdgeMetadataSource,
@@ -7801,6 +8171,13 @@ fn expected_component_build_fingerprint(
             edge_property_equality_component_fingerprint(*index_id)
         }
         EdgePropertyRangeIndex { index_id } => edge_property_range_component_fingerprint(*index_id),
+        NodeCompoundEqualityIndex { .. }
+        | NodeCompoundRangeIndex { .. }
+        | EdgeCompoundEqualityIndex { .. }
+        | EdgeCompoundRangeIndex { .. } => secondary_indexes
+            .iter()
+            .find_map(|entry| compound_component_fingerprint_for_kind_and_entry(kind, entry))
+            .unwrap_or(0),
         PackedSegmentContainer => component_fingerprint("flush.packed_segment_container", &[]),
     }
 }
@@ -9523,7 +9900,12 @@ pub(crate) mod tests {
     use super::*;
     use crate::memtable::Memtable;
     use crate::property_value_semantics::numeric_range_sort_key_for_value;
+    use crate::secondary_index_key::{
+        compound_prefix_bounds, encode_compound_tuple_key, encode_compound_tuple_prefix,
+        CompoundFieldValue, CompoundTupleContext,
+    };
     use crate::segment_writer::{
+        node_compound_eq_sidecar_path, publish_compound_sidecar_component,
         write_segment_without_degree_sidecar_for_test as write_segment,
         write_segment_without_degree_sidecar_with_secondary_indexes_for_test as write_segment_with_secondary_indexes,
     };
@@ -9624,6 +10006,42 @@ pub(crate) mod tests {
                 panic!("test component unexpectedly used a packed handle")
             }
         }
+    }
+
+    fn node_compound_entry_for_test(index_id: u64) -> SecondaryIndexManifestEntry {
+        SecondaryIndexManifestEntry {
+            index_id,
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 1,
+                fields: vec![
+                    SecondaryIndexFieldManifest::Property {
+                        key: "tenant".to_string(),
+                    },
+                    SecondaryIndexFieldManifest::Property {
+                        key: "score".to_string(),
+                    },
+                ],
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        }
+    }
+
+    fn node_compound_key_for_test(
+        entry: &SecondaryIndexManifestEntry,
+        tenant: &str,
+        score: i64,
+    ) -> Vec<u8> {
+        let context = CompoundTupleContext::from_manifest_entry(entry).unwrap();
+        encode_compound_tuple_key(
+            &context,
+            &[
+                CompoundFieldValue::Property(Some(&PropValue::String(tenant.to_string()))),
+                CompoundFieldValue::Property(Some(&PropValue::Int(score))),
+            ],
+        )
+        .unwrap()
     }
 
     fn rewrite_component_payload_for_test(
@@ -9871,6 +10289,93 @@ pub(crate) mod tests {
         write_segment(&seg_dir, 1, mt, dense_config).unwrap();
         let reader = SegmentReader::open_unpinned_for_test(&seg_dir, 1, dense_config).unwrap();
         (dir, reader)
+    }
+
+    #[test]
+    fn compound_sidecar_component_reports_missing_available_and_corrupt() {
+        let entry = node_compound_entry_for_test(700);
+        let mt = Memtable::new();
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let info = write_segment(&seg_dir, 1, &mt, None).unwrap();
+
+        let missing =
+            SegmentReader::open_with_info(&seg_dir, &info, None, std::slice::from_ref(&entry))
+                .unwrap();
+        assert!(!missing.validate_compound_sidecar_for_entry(&entry).unwrap());
+        assert!(matches!(
+            missing.optional_component_availability_for_test(
+                SegmentComponentKind::NodeCompoundEqualityIndex {
+                    index_id: entry.index_id,
+                },
+            ),
+            ComponentAvailability::Missing
+        ));
+
+        let key_one = node_compound_key_for_test(&entry, "acme", 1);
+        let key_two = node_compound_key_for_test(&entry, "acme", 2);
+        publish_compound_sidecar_component(
+            &seg_dir,
+            &entry,
+            &[
+                (key_two, 9),
+                (key_one, 3),
+                (node_compound_key_for_test(&entry, "beta", 1), 11),
+            ],
+        )
+        .unwrap();
+
+        let available =
+            SegmentReader::open_with_info(&seg_dir, &info, None, std::slice::from_ref(&entry))
+                .unwrap();
+        assert!(available
+            .validate_compound_sidecar_for_entry(&entry)
+            .unwrap());
+        assert!(matches!(
+            available.optional_component_availability_for_test(
+                SegmentComponentKind::NodeCompoundEqualityIndex {
+                    index_id: entry.index_id,
+                },
+            ),
+            ComponentAvailability::Available
+        ));
+        let context = CompoundTupleContext::from_manifest_entry(&entry).unwrap();
+        let prefix = encode_compound_tuple_prefix(
+            &context,
+            &[CompoundFieldValue::Property(Some(&PropValue::String(
+                "acme".to_string(),
+            )))],
+        )
+        .unwrap();
+        assert_eq!(
+            available
+                .compound_prefix_candidates_if_present(&entry, &compound_prefix_bounds(&prefix))
+                .unwrap(),
+            Some(vec![3, 9])
+        );
+
+        let path = node_compound_eq_sidecar_path(&seg_dir, entry.index_id);
+        rewrite_payload_file(&path, |payload| {
+            let last = payload.last_mut().unwrap();
+            *last ^= 0x01;
+        });
+        let corrupt =
+            SegmentReader::open_with_info(&seg_dir, &info, None, std::slice::from_ref(&entry))
+                .unwrap();
+        let error = corrupt
+            .validate_compound_sidecar_for_entry(&entry)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("compound secondary index unavailable: corrupt sidecar"));
+        assert!(matches!(
+            corrupt.optional_component_availability_for_test(
+                SegmentComponentKind::NodeCompoundEqualityIndex {
+                    index_id: entry.index_id,
+                },
+            ),
+            ComponentAvailability::CorruptIdentity { .. }
+        ));
     }
 
     #[test]

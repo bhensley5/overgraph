@@ -952,7 +952,7 @@ impl ReadView {
             .graph_row_query_calls
             .fetch_add(1, Ordering::Relaxed);
         let runtime = self.normalize_graph_row_runtime_plan(query)?;
-        let physical_plan = self.plan_graph_row_physical(query, &runtime)?;
+        let physical_plan = self.plan_graph_row_physical(query, &runtime, include_plan)?;
         let policy_cutoffs = self.query_policy_cutoffs();
         let cursor_state = GraphRowCursorState {
             decoded: None,
@@ -1082,7 +1082,7 @@ impl ReadView {
             .graph_row_query_calls
             .fetch_add(1, Ordering::Relaxed);
         let runtime = self.normalize_graph_row_runtime_plan(query)?;
-        let physical_plan = self.plan_graph_row_physical(query, &runtime)?;
+        let physical_plan = self.plan_graph_row_physical(query, &runtime, false)?;
         let policy_cutoffs = self.query_policy_cutoffs();
         let mut followups = Vec::new();
         let initial_row_count = initial_rows.as_ref().map_or(0, Vec::len);
@@ -3788,7 +3788,7 @@ fn pipeline_match_carried_aliases(
 fn graph_row_runtime_warnings(warnings: &[QueryPlanWarning]) -> Vec<String> {
     warnings
         .iter()
-        .map(|warning| format!("{warning:?}"))
+        .map(|warning| gql_query_plan_warning_message(*warning).to_string())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()

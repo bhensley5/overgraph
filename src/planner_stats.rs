@@ -3,6 +3,13 @@ use crate::property_value_semantics::{
     hash_prop_equality_key, numeric_range_sort_key_for_value, NumericRangeSortKey,
     NUMERIC_RANGE_KEY_BYTES,
 };
+use crate::secondary_index_key::{decode_compound_tuple_components, CompoundComponentClass};
+#[cfg(test)]
+use crate::secondary_index_key::{
+    encode_compound_tuple_key, for_each_compound_sidecar_entry, CompoundFieldValue,
+    CompoundSidecarDeclaration, CompoundTupleContext,
+};
+use crate::segment_components::secondary_index_declaration_fingerprint_for_entry;
 #[cfg(test)]
 use crate::segment_components::{
     decode_identity_header, COMPONENT_IDENTITY_HEADER_LEN, COMPONENT_IDENTITY_HEADER_MAGIC,
@@ -12,8 +19,9 @@ use crate::segment_writer::{
     publish_planner_stats_component_payload_from_latest, CompactEdgeMeta, CompactNodeMeta,
 };
 use crate::types::{
-    EdgeRecord, NodeIdMap, NodeRecord, PropValue, SecondaryIndexKind, SecondaryIndexManifestEntry,
-    SecondaryIndexState, SecondaryIndexTarget, MAX_NODE_LABELS_PER_NODE,
+    EdgeRecord, NodeIdMap, NodeRecord, PropValue, SecondaryIndexFieldManifest, SecondaryIndexKind,
+    SecondaryIndexManifestEntry, SecondaryIndexState, SecondaryIndexTarget,
+    MAX_NODE_LABELS_PER_NODE, MAX_SECONDARY_INDEX_FIELDS,
 };
 use crc32fast::Hasher as Crc32Hasher;
 use serde::{Deserialize, Serialize};
@@ -48,10 +56,11 @@ pub(crate) const PLANNER_STATS_SOFT_SIDECAR_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const PLANNER_STATS_HARD_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const PLANNER_STATS_HARD_CANDIDATE_CAP: usize = 65_536;
 pub(crate) const PLANNER_STATS_DEFAULT_SELECTED_SOURCE_CAP: usize = 4096;
+pub(crate) const COMPOUND_STATS_EXACT_PREFIX_LIMIT: usize = 4096;
 pub(crate) const PLANNER_STATS_COMPACTION_GENERAL_PROP_DECODE_BUDGET_NODES: usize = 1024;
 pub(crate) const PLANNER_STATS_COMPACTION_GENERAL_PROP_DECODE_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const PLANNER_STATS_REFRESH_GENERAL_PROP_DECODE_BUDGET_NODES: usize = 0;
-type RangeStatsKey = [u8; NUMERIC_RANGE_KEY_BYTES];
+pub(crate) type RangeStatsKey = [u8; NUMERIC_RANGE_KEY_BYTES];
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PlannerStatsAvailability {
@@ -135,8 +144,11 @@ impl PlannerStatsBuildPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub(crate) enum PlannerStatsDeclaredIndexKind {
+    #[default]
     Equality,
     Range,
 }
@@ -148,13 +160,16 @@ pub(crate) enum PlannerStatsDeclaredIndexTarget {
     #[default]
     NodeProperty,
     EdgeProperty,
+    NodeFieldIndex,
+    EdgeFieldIndex,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum DeclaredIndexRuntimeCoverageState {
     Available,
     Missing,
     Corrupt,
+    #[default]
     Unknown,
 }
 
@@ -264,6 +279,10 @@ pub(crate) struct DeclaredIndexStatsFingerprint {
     pub kind: PlannerStatsDeclaredIndexKind,
     pub target_label_id: u32,
     pub prop_key: String,
+    #[serde(default)]
+    pub field_fingerprint: u64,
+    #[serde(default)]
+    pub field_count: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -303,6 +322,8 @@ pub(crate) struct SegmentPlannerStatsV1 {
     pub range_index_stats: Vec<RangeIndexPlannerStats>,
     pub adjacency_stats: Vec<AdjacencyPlannerStats>,
     pub node_id_sample: Vec<u64>,
+    #[serde(default)]
+    pub compound_index_stats: Vec<CompoundIndexPlannerStats>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -325,6 +346,7 @@ pub(crate) struct StatsCorePartial {
 pub(crate) struct DeclaredIndexStatsEvidence {
     pub equality_index_stats: Vec<EqualityIndexPlannerStats>,
     pub range_index_stats: Vec<RangeIndexPlannerStats>,
+    pub compound_index_stats: Vec<CompoundIndexPlannerStats>,
 }
 
 impl DeclaredIndexStatsEvidence {
@@ -332,12 +354,16 @@ impl DeclaredIndexStatsEvidence {
         self.equality_index_stats
             .sort_by_key(|stats| stats.index_id);
         self.range_index_stats.sort_by_key(|stats| stats.index_id);
+        self.compound_index_stats
+            .sort_by_key(|stats| (stats.index_id, declared_index_kind_rank(stats.kind)));
     }
 
     pub(crate) fn extend(&mut self, mut other: DeclaredIndexStatsEvidence) {
         self.equality_index_stats
             .append(&mut other.equality_index_stats);
         self.range_index_stats.append(&mut other.range_index_stats);
+        self.compound_index_stats
+            .append(&mut other.compound_index_stats);
         self.sort();
     }
 }
@@ -427,6 +453,67 @@ pub(crate) struct RangeIndexPlannerStats {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CompoundIndexPlannerStats {
+    pub index_id: u64,
+    pub target: PlannerStatsDeclaredIndexTarget,
+    pub target_label_id: u32,
+    pub kind: PlannerStatsDeclaredIndexKind,
+    pub field_fingerprint: u64,
+    pub field_count: u16,
+    pub total_postings: u64,
+    pub distinct_full_keys: u64,
+    pub prefix_stats: Vec<CompoundPrefixStats>,
+    pub range_stats: Vec<CompoundRangeStats>,
+    pub coverage: DeclaredIndexRuntimeCoverageState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompoundPrefixStats {
+    pub prefix_len: u16,
+    pub distinct_prefixes: u64,
+    pub max_postings_per_prefix: u64,
+    pub exact_prefix_postings: Vec<CompoundExactPrefixStat>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompoundExactPrefixStat {
+    pub encoded_prefix: Vec<u8>,
+    pub postings: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CompoundRangeStats {
+    pub equality_prefix_len: u16,
+    pub range_field_ordinal: u16,
+    pub total_numeric_entries: u64,
+    pub min_key: Option<RangeStatsKey>,
+    pub max_key: Option<RangeStatsKey>,
+    pub buckets: Vec<RangeBucket>,
+}
+
+impl CompoundRangeStats {
+    /// Bound-aware posting estimate over this block's numeric histogram for
+    /// the query's actual range bounds (keys use the sidecar numeric range
+    /// key encoding).
+    pub(crate) fn estimate_range_postings(
+        &self,
+        lower: Option<(RangeStatsKey, bool)>,
+        upper: Option<(RangeStatsKey, bool)>,
+    ) -> PlannerStatsValueEstimate {
+        estimate_range_key_histogram(
+            self.total_numeric_entries,
+            self.min_key,
+            self.max_key,
+            self.buckets
+                .iter()
+                .map(|bucket| (bucket.upper_key, bucket.count)),
+            lower,
+            upper,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RangeBucket {
     pub upper_key: RangeStatsKey,
     pub count: u64,
@@ -507,11 +594,13 @@ impl EstimateConfidence {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum StalePostingRisk {
     Low,
     Medium,
     High,
+    // An absent risk classification must never read as safe.
+    #[default]
     Unknown,
 }
 
@@ -568,8 +657,12 @@ pub(crate) struct PlannerStatsView {
     pub timestamp_rollups: BTreeMap<u32, TimestampRollupStats>,
     pub equality_index_rollups: BTreeMap<u64, EqualityIndexRollupStats>,
     pub range_index_rollups: BTreeMap<u64, RangeIndexRollupStats>,
+    pub compound_index_rollups: BTreeMap<u64, CompoundIndexRollupStats>,
     pub adjacency_rollups: BTreeMap<(PlannerStatsDirection, Option<u32>), AdjacencyRollupStats>,
     pub segment_stale_risks: BTreeMap<u64, StalePostingRisk>,
+    /// Highest-ranked risk in `segment_stale_risks`, precomputed at view
+    /// build so per-estimate calls do not iterate every segment.
+    pub max_segment_stale_risk: StalePostingRisk,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -659,6 +752,28 @@ struct RangeIndexSegmentRollupStats {
     buckets: Vec<RangeBucket>,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CompoundIndexRollupStats {
+    pub index_id: u64,
+    pub target: PlannerStatsDeclaredIndexTarget,
+    pub target_label_id: u32,
+    pub kind: PlannerStatsDeclaredIndexKind,
+    pub field_fingerprint: u64,
+    pub field_count: u16,
+    pub total_postings: u64,
+    pub distinct_full_keys: u64,
+    pub prefix_stats: Vec<CompoundPrefixStats>,
+    pub range_stats: Vec<CompoundRangeStats>,
+    pub coverage: PlannerStatsFamilyCoverage,
+    segment_rollups: BTreeMap<u64, CompoundIndexPlannerStats>,
+    /// Prefix lengths whose merged exact-prefix map overflowed the cap (or
+    /// merged a segment whose own exact list was incomplete). Overflow is
+    /// sticky: later segments must not rebuild a partial map that costing
+    /// would trust as exact.
+    exact_overflowed_prefix_lens: BTreeSet<u16>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AdjacencyRollupStats {
     pub direction: PlannerStatsDirection,
@@ -694,8 +809,19 @@ impl PlannerStatsView {
             secondary_indexes,
             runtime_coverage,
         );
-        view.segment_stale_risks = segment_stale_risks;
+        view.set_segment_stale_risks(segment_stale_risks);
         view
+    }
+
+    /// Single mutation point for segment stale risks: keeps the precomputed
+    /// max in lockstep with the map so estimates can never read a stale max.
+    pub(crate) fn set_segment_stale_risks(&mut self, risks: BTreeMap<u64, StalePostingRisk>) {
+        self.max_segment_stale_risk = risks
+            .values()
+            .copied()
+            .max_by_key(|risk| risk.rank())
+            .unwrap_or(StalePostingRisk::Unknown);
+        self.segment_stale_risks = risks;
     }
 
     pub(crate) fn node_label_count(&self, label_id: u32) -> u64 {
@@ -819,11 +945,7 @@ impl PlannerStatsView {
     }
 
     pub(crate) fn max_segment_stale_risk(&self) -> StalePostingRisk {
-        self.segment_stale_risks
-            .values()
-            .copied()
-            .max_by_key(|risk| risk.rank())
-            .unwrap_or(StalePostingRisk::Unknown)
+        self.max_segment_stale_risk
     }
 
     fn validate_rollup_shape(&self) {
@@ -1027,6 +1149,11 @@ struct RangeRollupBuilder {
     coverage: CoverageBuilder,
 }
 
+struct CompoundRollupBuilder {
+    stats: CompoundIndexRollupStats,
+    coverage: CoverageBuilder,
+}
+
 struct AdjacencyRollupBuilder {
     stats: AdjacencyRollupStats,
     coverage: CoverageBuilder,
@@ -1046,7 +1173,16 @@ struct RangeIndexDeclaration {
     prop_key: String,
 }
 
-type DeclaredIndexFingerprintSet = BTreeSet<(u64, u8, u8, u32, String)>;
+#[derive(Clone)]
+struct CompoundIndexDeclaration {
+    target: PlannerStatsDeclaredIndexTarget,
+    target_label_id: u32,
+    kind: PlannerStatsDeclaredIndexKind,
+    field_fingerprint: u64,
+    field_count: u16,
+}
+
+type DeclaredIndexFingerprintSet = BTreeSet<(u64, u8, u8, u32, u64, u16, String)>;
 
 #[cfg(test)]
 fn build_planner_stats_view_from_snapshots(
@@ -1114,9 +1250,12 @@ fn build_planner_stats_view_from_snapshots_with_runtime_coverage(
     let mut property_builders: BTreeMap<(u32, String), PropertyRollupBuilder> = BTreeMap::new();
     let equality_declarations = ready_equality_declarations(secondary_indexes);
     let range_declarations = ready_range_declarations(secondary_indexes);
+    let compound_declarations = ready_compound_declarations(secondary_indexes);
     let mut equality_builders =
         equality_rollup_builders(&equality_declarations, all_segment_ids.clone());
     let mut range_builders = range_rollup_builders(&range_declarations, all_segment_ids.clone());
+    let mut compound_builders =
+        compound_rollup_builders(&compound_declarations, all_segment_ids.clone());
     let mut adjacency_builders: BTreeMap<
         (PlannerStatsDirection, Option<u32>),
         AdjacencyRollupBuilder,
@@ -1179,6 +1318,14 @@ fn build_planner_stats_view_from_snapshots_with_runtime_coverage(
                     &declared_fingerprints,
                     runtime_coverage,
                 );
+                add_compound_rollups(
+                    &mut compound_builders,
+                    segment.segment_id,
+                    stats,
+                    &compound_declarations,
+                    &declared_fingerprints,
+                    runtime_coverage,
+                );
                 add_adjacency_rollups(
                     &mut adjacency_builders,
                     all_segment_ids.clone(),
@@ -1235,6 +1382,14 @@ fn build_planner_stats_view_from_snapshots_with_runtime_coverage(
         })
         .collect();
 
+    let compound_index_rollups = compound_builders
+        .into_iter()
+        .map(|(index_id, mut builder)| {
+            builder.stats.coverage = builder.coverage.finish();
+            (index_id, builder.stats)
+        })
+        .collect();
+
     let adjacency_rollups = adjacency_builders
         .into_iter()
         .map(|(key, mut builder)| {
@@ -1257,8 +1412,10 @@ fn build_planner_stats_view_from_snapshots_with_runtime_coverage(
         timestamp_rollups,
         equality_index_rollups,
         range_index_rollups,
+        compound_index_rollups,
         adjacency_rollups,
         segment_stale_risks: BTreeMap::new(),
+        max_segment_stale_risk: StalePostingRisk::Unknown,
     };
     view.validate_rollup_shape();
     view
@@ -1435,6 +1592,48 @@ fn ready_range_declarations(
     declarations
 }
 
+fn ready_compound_declarations(
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> BTreeMap<u64, CompoundIndexDeclaration> {
+    let mut declarations = BTreeMap::new();
+    for entry in secondary_indexes {
+        if entry.state != SecondaryIndexState::Ready {
+            continue;
+        }
+        let (target, target_label_id, field_count) = match &entry.target {
+            SecondaryIndexTarget::NodeFieldIndex { label_id, fields } => (
+                PlannerStatsDeclaredIndexTarget::NodeFieldIndex,
+                *label_id,
+                fields.len() as u16,
+            ),
+            SecondaryIndexTarget::EdgeFieldIndex { label_id, fields } => (
+                PlannerStatsDeclaredIndexTarget::EdgeFieldIndex,
+                *label_id,
+                fields.len() as u16,
+            ),
+            SecondaryIndexTarget::NodeProperty { .. }
+            | SecondaryIndexTarget::EdgeProperty { .. } => {
+                continue;
+            }
+        };
+        let kind = match entry.kind {
+            SecondaryIndexKind::Equality => PlannerStatsDeclaredIndexKind::Equality,
+            SecondaryIndexKind::Range => PlannerStatsDeclaredIndexKind::Range,
+        };
+        declarations.insert(
+            entry.index_id,
+            CompoundIndexDeclaration {
+                target,
+                target_label_id,
+                kind,
+                field_fingerprint: secondary_index_declaration_fingerprint_for_entry(entry),
+                field_count,
+            },
+        );
+    }
+    declarations
+}
+
 fn equality_rollup_builders(
     declarations: &BTreeMap<u64, EqualityIndexDeclaration>,
     all_segment_ids: Arc<[u64]>,
@@ -1479,6 +1678,31 @@ fn range_rollup_builders(
     builders
 }
 
+fn compound_rollup_builders(
+    declarations: &BTreeMap<u64, CompoundIndexDeclaration>,
+    all_segment_ids: Arc<[u64]>,
+) -> BTreeMap<u64, CompoundRollupBuilder> {
+    let mut builders = BTreeMap::new();
+    for (index_id, declaration) in declarations {
+        builders.insert(
+            *index_id,
+            CompoundRollupBuilder {
+                stats: CompoundIndexRollupStats {
+                    index_id: *index_id,
+                    target: declaration.target,
+                    target_label_id: declaration.target_label_id,
+                    kind: declaration.kind,
+                    field_fingerprint: declaration.field_fingerprint,
+                    field_count: declaration.field_count,
+                    ..Default::default()
+                },
+                coverage: CoverageBuilder::new(all_segment_ids.clone()),
+            },
+        );
+    }
+    builders
+}
+
 fn ready_property_target(
     entry: &SecondaryIndexManifestEntry,
 ) -> Option<(PlannerStatsDeclaredIndexTarget, u32, String)> {
@@ -1496,6 +1720,8 @@ fn ready_property_target(
             *label_id,
             prop_key.clone(),
         )),
+        SecondaryIndexTarget::NodeFieldIndex { .. }
+        | SecondaryIndexTarget::EdgeFieldIndex { .. } => None,
     }
 }
 
@@ -1734,6 +1960,159 @@ fn add_range_rollups(
     }
 }
 
+fn add_compound_rollups(
+    compound_builders: &mut BTreeMap<u64, CompoundRollupBuilder>,
+    segment_id: u64,
+    stats: &SegmentPlannerStatsV1,
+    declarations: &BTreeMap<u64, CompoundIndexDeclaration>,
+    declared_fingerprints: &DeclaredIndexFingerprintSet,
+    runtime_coverage: &DeclaredIndexRuntimeCoverage,
+) {
+    let mut seen = BTreeSet::new();
+    for index_stats in &stats.compound_index_stats {
+        if !seen.insert(index_stats.index_id) {
+            continue;
+        };
+        let Some(builder) = compound_builders.get_mut(&index_stats.index_id) else {
+            continue;
+        };
+        let Some(declaration) = declarations.get(&index_stats.index_id) else {
+            continue;
+        };
+        if !declared_compound_block_matches(index_stats, declaration, declared_fingerprints)
+            || !runtime_coverage.is_available(
+                segment_id,
+                index_stats.index_id,
+                declaration.target,
+                declaration.kind,
+            )
+        {
+            builder.coverage.mark_mismatched(segment_id);
+            continue;
+        }
+        builder.coverage.mark_covered(segment_id);
+        builder.stats.total_postings = builder
+            .stats
+            .total_postings
+            .saturating_add(index_stats.total_postings);
+        builder.stats.distinct_full_keys = builder
+            .stats
+            .distinct_full_keys
+            .saturating_add(index_stats.distinct_full_keys);
+        merge_compound_prefix_stats(
+            &mut builder.stats.prefix_stats,
+            &mut builder.stats.exact_overflowed_prefix_lens,
+            &index_stats.prefix_stats,
+        );
+        merge_compound_range_stats(&mut builder.stats.range_stats, &index_stats.range_stats);
+        builder
+            .stats
+            .segment_rollups
+            .insert(segment_id, index_stats.clone());
+    }
+}
+
+fn merge_compound_prefix_stats(
+    target: &mut Vec<CompoundPrefixStats>,
+    exact_overflowed_prefix_lens: &mut BTreeSet<u16>,
+    source: &[CompoundPrefixStats],
+) {
+    for source_stats in source {
+        let target_stats = match target
+            .iter_mut()
+            .find(|stats| stats.prefix_len == source_stats.prefix_len)
+        {
+            Some(stats) => stats,
+            None => {
+                target.push(CompoundPrefixStats {
+                    prefix_len: source_stats.prefix_len,
+                    distinct_prefixes: 0,
+                    max_postings_per_prefix: 0,
+                    exact_prefix_postings: Vec::new(),
+                });
+                target.last_mut().expect("compound prefix stat inserted")
+            }
+        };
+        target_stats.distinct_prefixes = target_stats
+            .distinct_prefixes
+            .saturating_add(source_stats.distinct_prefixes);
+        target_stats.max_postings_per_prefix = target_stats
+            .max_postings_per_prefix
+            .max(source_stats.max_postings_per_prefix);
+        if exact_overflowed_prefix_lens.contains(&source_stats.prefix_len) {
+            continue;
+        }
+        // A segment whose own exact list overflowed contributes an empty
+        // list while reporting more distinct prefixes; merging anything
+        // partial would later be trusted as exact by costing, so overflow
+        // poisons the merged map permanently.
+        let source_exact_complete =
+            source_stats.exact_prefix_postings.len() as u64 == source_stats.distinct_prefixes;
+        if !source_exact_complete {
+            exact_overflowed_prefix_lens.insert(source_stats.prefix_len);
+            target_stats.exact_prefix_postings = Vec::new();
+            continue;
+        }
+        let mut exact: BTreeMap<Vec<u8>, u64> = target_stats
+            .exact_prefix_postings
+            .iter()
+            .map(|stat| (stat.encoded_prefix.clone(), stat.postings))
+            .collect();
+        let mut overflowed = false;
+        for stat in &source_stats.exact_prefix_postings {
+            saturating_add_map_value(&mut exact, stat.encoded_prefix.clone(), stat.postings);
+            if exact.len() > COMPOUND_STATS_EXACT_PREFIX_LIMIT {
+                exact.clear();
+                overflowed = true;
+                break;
+            }
+        }
+        if overflowed {
+            exact_overflowed_prefix_lens.insert(source_stats.prefix_len);
+        }
+        target_stats.exact_prefix_postings = exact
+            .into_iter()
+            .map(|(encoded_prefix, postings)| CompoundExactPrefixStat {
+                encoded_prefix,
+                postings,
+            })
+            .collect();
+    }
+    target.sort_by_key(|stats| stats.prefix_len);
+}
+
+fn merge_compound_range_stats(target: &mut Vec<CompoundRangeStats>, source: &[CompoundRangeStats]) {
+    for source_stats in source {
+        let target_stats = match target.iter_mut().find(|stats| {
+            stats.equality_prefix_len == source_stats.equality_prefix_len
+                && stats.range_field_ordinal == source_stats.range_field_ordinal
+        }) {
+            Some(stats) => stats,
+            None => {
+                target.push(CompoundRangeStats {
+                    equality_prefix_len: source_stats.equality_prefix_len,
+                    range_field_ordinal: source_stats.range_field_ordinal,
+                    total_numeric_entries: 0,
+                    min_key: None,
+                    max_key: None,
+                    buckets: Vec::new(),
+                });
+                target.last_mut().expect("compound range stat inserted")
+            }
+        };
+        target_stats.total_numeric_entries = target_stats
+            .total_numeric_entries
+            .saturating_add(source_stats.total_numeric_entries);
+        target_stats.min_key = min_option(target_stats.min_key, source_stats.min_key);
+        target_stats.max_key = max_option(target_stats.max_key, source_stats.max_key);
+        target_stats
+            .buckets
+            .extend(source_stats.buckets.iter().cloned());
+        target_stats.buckets.sort_by_key(|left| left.upper_key);
+    }
+    target.sort_by_key(|stats| (stats.equality_prefix_len, stats.range_field_ordinal));
+}
+
 fn add_adjacency_rollups(
     adjacency_builders: &mut BTreeMap<(PlannerStatsDirection, Option<u32>), AdjacencyRollupBuilder>,
     all_segment_ids: Arc<[u64]>,
@@ -1807,6 +2186,8 @@ fn declared_equality_block_matches(
         declaration.target,
         PlannerStatsDeclaredIndexKind::Equality,
         declaration.target_label_id,
+        0,
+        0,
         &declaration.prop_key,
     ))
 }
@@ -1826,7 +2207,33 @@ fn declared_range_block_matches(
         declaration.target,
         PlannerStatsDeclaredIndexKind::Range,
         declaration.target_label_id,
+        0,
+        0,
         &declaration.prop_key,
+    ))
+}
+
+fn declared_compound_block_matches(
+    block: &CompoundIndexPlannerStats,
+    declaration: &CompoundIndexDeclaration,
+    declared_fingerprints: &DeclaredIndexFingerprintSet,
+) -> bool {
+    if block.target != declaration.target
+        || block.target_label_id != declaration.target_label_id
+        || block.kind != declaration.kind
+        || block.field_fingerprint != declaration.field_fingerprint
+        || block.field_count != declaration.field_count
+    {
+        return false;
+    }
+    declared_fingerprints.contains(&declared_index_key(
+        block.index_id,
+        declaration.target,
+        declaration.kind,
+        declaration.target_label_id,
+        declaration.field_fingerprint,
+        declaration.field_count,
+        "",
     ))
 }
 
@@ -1840,6 +2247,8 @@ fn declared_index_fingerprint_set(stats: &SegmentPlannerStatsV1) -> DeclaredInde
                 declared.target,
                 declared.kind,
                 declared.target_label_id,
+                declared.field_fingerprint,
+                declared.field_count,
                 &declared.prop_key,
             )
         })
@@ -1851,13 +2260,17 @@ fn declared_index_key(
     target: PlannerStatsDeclaredIndexTarget,
     kind: PlannerStatsDeclaredIndexKind,
     target_label_id: u32,
+    field_fingerprint: u64,
+    field_count: u16,
     prop_key: &str,
-) -> (u64, u8, u8, u32, String) {
+) -> (u64, u8, u8, u32, u64, u16, String) {
     (
         index_id,
         declared_index_target_rank(target),
         declared_index_kind_rank(kind),
         target_label_id,
+        field_fingerprint,
+        field_count,
         prop_key.to_string(),
     )
 }
@@ -1878,7 +2291,7 @@ fn max_option<T: Ord + Copy>(left: Option<T>, right: Option<T>) -> Option<T> {
     }
 }
 
-fn saturating_add_map_value(map: &mut BTreeMap<u64, u64>, key: u64, value: u64) {
+fn saturating_add_map_value<K: Ord>(map: &mut BTreeMap<K, u64>, key: K, value: u64) {
     map.entry(key)
         .and_modify(|count| *count = count.saturating_add(value))
         .or_insert(value);
@@ -2417,7 +2830,17 @@ pub(crate) fn write_targeted_secondary_index_planner_stats_sidecar(
         return Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable);
     }
 
-    let target_equality_stats = if matches!(target_index.kind, SecondaryIndexKind::Equality) {
+    let target_is_property = matches!(
+        target_index.target,
+        SecondaryIndexTarget::NodeProperty { .. } | SecondaryIndexTarget::EdgeProperty { .. }
+    );
+    let target_is_compound = matches!(
+        target_index.target,
+        SecondaryIndexTarget::NodeFieldIndex { .. } | SecondaryIndexTarget::EdgeFieldIndex { .. }
+    );
+    let target_equality_stats = if target_is_property
+        && matches!(target_index.kind, SecondaryIndexKind::Equality)
+    {
         let mut stats =
             build_equality_index_stats_from_segment(segment, std::slice::from_ref(target_index))?;
         let Some(stats) = stats.pop() else {
@@ -2430,13 +2853,27 @@ pub(crate) fn write_targeted_secondary_index_planner_stats_sidecar(
     } else {
         None
     };
-    let target_range_stats = if matches!(target_index.kind, SecondaryIndexKind::Range) {
+    let target_range_stats =
+        if target_is_property && matches!(target_index.kind, SecondaryIndexKind::Range) {
+            let mut stats =
+                build_range_index_stats_from_segment(segment, std::slice::from_ref(target_index))?;
+            let Some(stats) = stats.pop() else {
+                return Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable);
+            };
+            if !stats.sidecar_present_at_build {
+                return Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable);
+            }
+            Some(stats)
+        } else {
+            None
+        };
+    let target_compound_stats = if target_is_compound {
         let mut stats =
-            build_range_index_stats_from_segment(segment, std::slice::from_ref(target_index))?;
+            build_compound_index_stats_from_segment(segment, std::slice::from_ref(target_index))?;
         let Some(stats) = stats.pop() else {
             return Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable);
         };
-        if !stats.sidecar_present_at_build {
+        if stats.coverage != DeclaredIndexRuntimeCoverageState::Available {
             return Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable);
         }
         Some(stats)
@@ -2464,6 +2901,7 @@ pub(crate) fn write_targeted_secondary_index_planner_stats_sidecar(
                 target_index.index_id,
                 target_equality_stats,
                 target_range_stats,
+                target_compound_stats,
             );
             planner_stats_sidecar_payload(stats)
         },
@@ -2561,6 +2999,7 @@ pub(crate) fn build_flush_stats(
     let declared_evidence = DeclaredIndexStatsEvidence {
         equality_index_stats: build_equality_index_stats_from_sidecars(seg_dir, secondary_indexes)?,
         range_index_stats: build_range_index_stats_from_sidecars(seg_dir, secondary_indexes)?,
+        compound_index_stats: build_compound_index_stats_from_sidecars(seg_dir, secondary_indexes)?,
     };
     Ok(assemble_flush_stats_from_partials(
         segment_id,
@@ -2691,6 +3130,7 @@ pub(crate) fn build_compaction_stats(
     let declared_evidence = DeclaredIndexStatsEvidence {
         equality_index_stats: build_equality_index_stats_from_sidecars(seg_dir, secondary_indexes)?,
         range_index_stats: build_range_index_stats_from_sidecars(seg_dir, secondary_indexes)?,
+        compound_index_stats: build_compound_index_stats_from_sidecars(seg_dir, secondary_indexes)?,
     };
     Ok(assemble_compaction_stats_from_partials(
         segment_id,
@@ -2728,6 +3168,7 @@ fn assemble_stats_from_partials(
         property_stats: core.property_stats,
         equality_index_stats: declared_evidence.equality_index_stats,
         range_index_stats: declared_evidence.range_index_stats,
+        compound_index_stats: declared_evidence.compound_index_stats,
         adjacency_stats: core.adjacency_stats,
         node_id_sample: core.node_id_sample,
     }
@@ -2742,6 +3183,7 @@ fn build_equality_index_stats_from_sidecars(
     for entry in secondary_indexes {
         if entry.state != SecondaryIndexState::Ready
             || !matches!(entry.kind, SecondaryIndexKind::Equality)
+            || entry.target.single_property_key().is_none()
         {
             continue;
         }
@@ -2752,6 +3194,8 @@ fn build_equality_index_stats_from_sidecars(
             SecondaryIndexTarget::EdgeProperty { .. } => {
                 format!("edge_prop_eq_{}.dat", entry.index_id)
             }
+            SecondaryIndexTarget::NodeFieldIndex { .. }
+            | SecondaryIndexTarget::EdgeFieldIndex { .. } => continue,
         };
         let path = seg_dir.join("secondary_indexes").join(file_name);
         let groups = read_secondary_eq_group_counts(&path)?;
@@ -2813,6 +3257,10 @@ pub(crate) fn equality_index_stats_from_group_counts(
     let (target_label_id, prop_key) = match &entry.target {
         SecondaryIndexTarget::NodeProperty { label_id, prop_key } => (*label_id, prop_key),
         SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => (*label_id, prop_key),
+        SecondaryIndexTarget::NodeFieldIndex { .. }
+        | SecondaryIndexTarget::EdgeFieldIndex { .. } => {
+            unreachable!("single-property equality stats require property target")
+        }
     };
     let mut value_counts = BTreeMap::new();
     let mut total_postings = 0u64;
@@ -2850,6 +3298,9 @@ fn build_range_index_stats_from_sidecars(
         if !matches!(&entry.kind, SecondaryIndexKind::Range) {
             continue;
         }
+        if entry.target.single_property_key().is_none() {
+            continue;
+        }
         let file_name = match &entry.target {
             SecondaryIndexTarget::NodeProperty { .. } => {
                 format!("node_prop_range_{}.dat", entry.index_id)
@@ -2857,6 +3308,8 @@ fn build_range_index_stats_from_sidecars(
             SecondaryIndexTarget::EdgeProperty { .. } => {
                 format!("edge_prop_range_{}.dat", entry.index_id)
             }
+            SecondaryIndexTarget::NodeFieldIndex { .. }
+            | SecondaryIndexTarget::EdgeFieldIndex { .. } => continue,
         };
         let path = seg_dir.join("secondary_indexes").join(file_name);
         let encoded_values = read_secondary_range_encoded_values(&path)?;
@@ -2923,6 +3376,10 @@ pub(crate) fn range_index_stats_from_encoded_values(
     let (target_label_id, prop_key) = match &entry.target {
         SecondaryIndexTarget::NodeProperty { label_id, prop_key } => (*label_id, prop_key),
         SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => (*label_id, prop_key),
+        SecondaryIndexTarget::NodeFieldIndex { .. }
+        | SecondaryIndexTarget::EdgeFieldIndex { .. } => {
+            unreachable!("single-property range stats require property target")
+        }
     };
     let mut encoded_values = encoded_values.to_vec();
     encoded_values.sort_unstable();
@@ -2936,6 +3393,378 @@ pub(crate) fn range_index_stats_from_encoded_values(
         buckets: range_buckets(&encoded_values, PLANNER_STATS_RANGE_BUCKETS),
         sidecar_present_at_build,
     }
+}
+
+#[cfg(test)]
+fn build_compound_index_stats_from_sidecars(
+    seg_dir: &Path,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<Vec<CompoundIndexPlannerStats>, EngineError> {
+    let mut result = Vec::new();
+    for entry in secondary_indexes {
+        if entry.state != SecondaryIndexState::Ready
+            || !matches!(
+                entry.target,
+                SecondaryIndexTarget::NodeFieldIndex { .. }
+                    | SecondaryIndexTarget::EdgeFieldIndex { .. }
+            )
+        {
+            continue;
+        }
+        let file_name = match (&entry.target, &entry.kind) {
+            (SecondaryIndexTarget::NodeFieldIndex { .. }, SecondaryIndexKind::Equality) => {
+                format!("node_compound_eq_{}.dat", entry.index_id)
+            }
+            (SecondaryIndexTarget::NodeFieldIndex { .. }, SecondaryIndexKind::Range) => {
+                format!("node_compound_range_{}.dat", entry.index_id)
+            }
+            (SecondaryIndexTarget::EdgeFieldIndex { .. }, SecondaryIndexKind::Equality) => {
+                format!("edge_compound_eq_{}.dat", entry.index_id)
+            }
+            (SecondaryIndexTarget::EdgeFieldIndex { .. }, SecondaryIndexKind::Range) => {
+                format!("edge_compound_range_{}.dat", entry.index_id)
+            }
+            _ => continue,
+        };
+        let path = seg_dir.join("secondary_indexes").join(file_name);
+        let Some(data) = read_optional_component_payload(&path)? else {
+            result.push(compound_index_stats_from_written_entries(
+                entry,
+                &[],
+                DeclaredIndexRuntimeCoverageState::Missing,
+            )?);
+            continue;
+        };
+        let declaration = CompoundSidecarDeclaration::from_manifest_entry(
+            entry,
+            secondary_index_declaration_fingerprint_for_entry(entry),
+        )?;
+        let mut builder = CompoundStatsBuilder::new(entry)?;
+        for_each_compound_sidecar_entry(&data, &declaration, |key, _id| builder.observe(key))?;
+        result.push(builder.finish(DeclaredIndexRuntimeCoverageState::Available));
+    }
+    result.sort_by_key(|stats| stats.index_id);
+    Ok(result)
+}
+
+fn build_compound_index_stats_from_segment(
+    segment: &SegmentReader,
+    secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<Vec<CompoundIndexPlannerStats>, EngineError> {
+    let mut result = Vec::new();
+    for entry in secondary_indexes {
+        if entry.state != SecondaryIndexState::Ready
+            || !matches!(
+                entry.target,
+                SecondaryIndexTarget::NodeFieldIndex { .. }
+                    | SecondaryIndexTarget::EdgeFieldIndex { .. }
+            )
+        {
+            continue;
+        }
+        let mut builder = CompoundStatsBuilder::new(entry)?;
+        let coverage =
+            match segment.for_each_compound_sidecar_entry(entry, |key, _id| builder.observe(key)) {
+                Ok(true) => DeclaredIndexRuntimeCoverageState::Available,
+                Ok(false) => DeclaredIndexRuntimeCoverageState::Missing,
+                Err(_) => DeclaredIndexRuntimeCoverageState::Corrupt,
+            };
+        result.push(builder.finish(coverage));
+    }
+    result.sort_by_key(|stats| stats.index_id);
+    Ok(result)
+}
+
+pub(crate) fn compound_index_stats_from_written_entries(
+    entry: &SecondaryIndexManifestEntry,
+    entries: &[(Vec<u8>, u64)],
+    coverage: DeclaredIndexRuntimeCoverageState,
+) -> Result<CompoundIndexPlannerStats, EngineError> {
+    let mut builder = CompoundStatsBuilder::new(entry)?;
+    if entries.windows(2).all(|pair| pair[0].0 <= pair[1].0) {
+        for (key, _id) in entries {
+            builder.observe(key)?;
+        }
+    } else {
+        let mut ordered: Vec<&(Vec<u8>, u64)> = entries.iter().collect();
+        ordered.sort_by(|left, right| left.0.cmp(&right.0));
+        for (key, _id) in ordered {
+            builder.observe(key)?;
+        }
+    }
+    Ok(builder.finish(coverage))
+}
+
+/// Streaming accumulator for compound declaration planner stats.
+///
+/// Every construction path visits sidecar entries in sorted tuple-key order
+/// (flush state, compaction merge output, and sidecar scans), so the
+/// accumulator keeps O(field_count) running state per open prefix plus the
+/// bounded exact-prefix lists and one weighted (value, count) pair per
+/// distinct key for range stats — never a map over every distinct tuple key
+/// or a value repeated per posting.
+pub(crate) struct CompoundStatsBuilder<'a> {
+    entry: &'a SecondaryIndexManifestEntry,
+    target: PlannerStatsDeclaredIndexTarget,
+    target_label_id: u32,
+    fields: &'a [SecondaryIndexFieldManifest],
+    kind: PlannerStatsDeclaredIndexKind,
+    total_postings: u64,
+    distinct_full_keys: u64,
+    has_current: bool,
+    current_key: Vec<u8>,
+    current_key_postings: u64,
+    current_component_ends: [usize; MAX_SECONDARY_INDEX_FIELDS],
+    current_numeric_values: [Option<RangeStatsKey>; MAX_SECONDARY_INDEX_FIELDS],
+    prefix_state: Vec<CompoundPrefixAccumulator>,
+    range_values: Vec<Vec<(RangeStatsKey, u64)>>,
+}
+
+#[derive(Default)]
+struct CompoundPrefixAccumulator {
+    open_postings: u64,
+    distinct_prefixes: u64,
+    max_postings_per_prefix: u64,
+    exact_prefix_postings: Vec<CompoundExactPrefixStat>,
+    exact_overflowed: bool,
+}
+
+impl<'a> CompoundStatsBuilder<'a> {
+    pub(crate) fn new(entry: &'a SecondaryIndexManifestEntry) -> Result<Self, EngineError> {
+        let (target, target_label_id, fields) = match &entry.target {
+            SecondaryIndexTarget::NodeFieldIndex { label_id, fields } => (
+                PlannerStatsDeclaredIndexTarget::NodeFieldIndex,
+                *label_id,
+                fields.as_slice(),
+            ),
+            SecondaryIndexTarget::EdgeFieldIndex { label_id, fields } => (
+                PlannerStatsDeclaredIndexTarget::EdgeFieldIndex,
+                *label_id,
+                fields.as_slice(),
+            ),
+            SecondaryIndexTarget::NodeProperty { .. }
+            | SecondaryIndexTarget::EdgeProperty { .. } => {
+                return Err(EngineError::InvalidOperation(
+                    "compound secondary index unavailable: single-property declaration cannot build compound stats"
+                        .to_string(),
+                ));
+            }
+        };
+        if fields.is_empty() || fields.len() > MAX_SECONDARY_INDEX_FIELDS {
+            return Err(EngineError::InvalidOperation(format!(
+                "compound secondary index unavailable: declaration field count {} is outside 1..={MAX_SECONDARY_INDEX_FIELDS}",
+                fields.len()
+            )));
+        }
+        let kind = match entry.kind {
+            SecondaryIndexKind::Equality => PlannerStatsDeclaredIndexKind::Equality,
+            SecondaryIndexKind::Range => PlannerStatsDeclaredIndexKind::Range,
+        };
+        Ok(Self {
+            entry,
+            target,
+            target_label_id,
+            fields,
+            kind,
+            total_postings: 0,
+            distinct_full_keys: 0,
+            has_current: false,
+            current_key: Vec::new(),
+            current_key_postings: 0,
+            current_component_ends: [0; MAX_SECONDARY_INDEX_FIELDS],
+            current_numeric_values: [None; MAX_SECONDARY_INDEX_FIELDS],
+            prefix_state: (0..fields.len())
+                .map(|_| CompoundPrefixAccumulator::default())
+                .collect(),
+            range_values: vec![Vec::new(); fields.len()],
+        })
+    }
+
+    pub(crate) fn observe(&mut self, key: &[u8]) -> Result<(), EngineError> {
+        self.total_postings = self.total_postings.saturating_add(1);
+        if self.has_current {
+            match key.cmp(self.current_key.as_slice()) {
+                std::cmp::Ordering::Equal => {
+                    self.current_key_postings = self.current_key_postings.saturating_add(1);
+                    return Ok(());
+                }
+                std::cmp::Ordering::Less => {
+                    return Err(EngineError::CorruptRecord(
+                        "compound stats input keys are not in sorted order".to_string(),
+                    ));
+                }
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+
+        let components = decode_compound_tuple_components(key, self.fields)?;
+        let mut new_ends = [0usize; MAX_SECONDARY_INDEX_FIELDS];
+        let mut new_numeric_values = [None; MAX_SECONDARY_INDEX_FIELDS];
+        let mut offset = 0usize;
+        for (ordinal, component) in components.iter().enumerate() {
+            offset += 3 + component.payload.len();
+            new_ends[ordinal] = offset;
+            if matches!(self.kind, PlannerStatsDeclaredIndexKind::Range)
+                && ordinal > 0
+                && component.class == CompoundComponentClass::Numeric
+                && component.payload.len() == NUMERIC_RANGE_KEY_BYTES
+            {
+                let mut key_bytes = [0_u8; NUMERIC_RANGE_KEY_BYTES];
+                key_bytes.copy_from_slice(component.payload);
+                NumericRangeSortKey::from_sidecar_bytes(key_bytes)?;
+                new_numeric_values[ordinal] = Some(key_bytes);
+            }
+        }
+
+        if self.has_current {
+            let divergence = (0..self.fields.len())
+                .find(|&ordinal| {
+                    key[..new_ends[ordinal]]
+                        != self.current_key[..self.current_component_ends[ordinal]]
+                })
+                .unwrap_or(self.fields.len());
+            self.close_current_key();
+            for ordinal in divergence..self.fields.len() {
+                self.close_prefix(ordinal);
+            }
+        }
+
+        self.current_key.clear();
+        self.current_key.extend_from_slice(key);
+        self.current_key_postings = 1;
+        self.current_component_ends = new_ends;
+        self.current_numeric_values = new_numeric_values;
+        self.has_current = true;
+        Ok(())
+    }
+
+    fn close_current_key(&mut self) {
+        self.distinct_full_keys += 1;
+        for state in &mut self.prefix_state {
+            state.open_postings = state
+                .open_postings
+                .saturating_add(self.current_key_postings);
+        }
+        for ordinal in 1..self.fields.len() {
+            if let Some(value) = self.current_numeric_values[ordinal] {
+                self.range_values[ordinal].push((value, self.current_key_postings));
+            }
+        }
+    }
+
+    fn close_prefix(&mut self, ordinal: usize) {
+        let end = self.current_component_ends[ordinal];
+        let state = &mut self.prefix_state[ordinal];
+        state.distinct_prefixes += 1;
+        state.max_postings_per_prefix = state.max_postings_per_prefix.max(state.open_postings);
+        if !state.exact_overflowed {
+            if state.exact_prefix_postings.len() >= COMPOUND_STATS_EXACT_PREFIX_LIMIT {
+                state.exact_overflowed = true;
+                state.exact_prefix_postings = Vec::new();
+            } else {
+                state.exact_prefix_postings.push(CompoundExactPrefixStat {
+                    encoded_prefix: self.current_key[..end].to_vec(),
+                    postings: state.open_postings,
+                });
+            }
+        }
+        state.open_postings = 0;
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        coverage: DeclaredIndexRuntimeCoverageState,
+    ) -> CompoundIndexPlannerStats {
+        if self.has_current {
+            self.close_current_key();
+            for ordinal in 0..self.fields.len() {
+                self.close_prefix(ordinal);
+            }
+        }
+
+        let mut prefix_stats = Vec::with_capacity(self.fields.len());
+        for (ordinal, state) in std::mem::take(&mut self.prefix_state)
+            .into_iter()
+            .enumerate()
+        {
+            if state.distinct_prefixes == 0 {
+                continue;
+            }
+            prefix_stats.push(CompoundPrefixStats {
+                prefix_len: (ordinal + 1) as u16,
+                distinct_prefixes: state.distinct_prefixes,
+                max_postings_per_prefix: state.max_postings_per_prefix,
+                exact_prefix_postings: if state.exact_overflowed {
+                    Vec::new()
+                } else {
+                    state.exact_prefix_postings
+                },
+            });
+        }
+
+        let mut range_stats = Vec::new();
+        for (ordinal, mut values) in std::mem::take(&mut self.range_values)
+            .into_iter()
+            .enumerate()
+        {
+            if ordinal == 0 || values.is_empty() {
+                continue;
+            }
+            values.sort_unstable();
+            range_stats.push(CompoundRangeStats {
+                equality_prefix_len: ordinal as u16,
+                range_field_ordinal: ordinal as u16,
+                total_numeric_entries: values.iter().map(|(_, count)| *count).sum(),
+                min_key: values.first().map(|(value, _)| *value),
+                max_key: values.last().map(|(value, _)| *value),
+                buckets: weighted_range_buckets(&values, PLANNER_STATS_RANGE_BUCKETS),
+            });
+        }
+
+        CompoundIndexPlannerStats {
+            index_id: self.entry.index_id,
+            target: self.target,
+            target_label_id: self.target_label_id,
+            kind: self.kind,
+            field_fingerprint: secondary_index_declaration_fingerprint_for_entry(self.entry),
+            field_count: self.fields.len() as u16,
+            total_postings: self.total_postings,
+            distinct_full_keys: self.distinct_full_keys,
+            prefix_stats,
+            range_stats,
+            coverage,
+        }
+    }
+}
+
+/// `range_buckets` over weighted `(value, count)` pairs, producing the same
+/// buckets the count-expanded value list would without materializing it.
+fn weighted_range_buckets(values: &[(RangeStatsKey, u64)], cap: usize) -> Vec<RangeBucket> {
+    let total: u64 = values.iter().map(|(_, count)| *count).sum();
+    if total == 0 || cap == 0 {
+        return Vec::new();
+    }
+    let bucket_count = total.min(cap as u64);
+    let mut buckets = Vec::with_capacity(bucket_count as usize);
+    let mut start = 0u64;
+    let mut pair_idx = 0usize;
+    let mut cumulative = 0u64;
+    for bucket_idx in 0..bucket_count {
+        let end =
+            (((bucket_idx as u128 + 1) * total as u128).div_ceil(bucket_count as u128)) as u64;
+        if end > start {
+            while cumulative < end {
+                cumulative = cumulative.saturating_add(values[pair_idx].1);
+                pair_idx += 1;
+            }
+            buckets.push(RangeBucket {
+                upper_key: values[pair_idx - 1].0,
+                count: end - start,
+            });
+        }
+        start = end;
+    }
+    buckets
 }
 
 fn ready_planner_stats_indexes(
@@ -2992,6 +3821,25 @@ fn retain_current_declared_index_stats(
                     )
             })
     });
+    stats.compound_index_stats.retain(|block| {
+        block.index_id != target_index_id
+            && block.coverage == DeclaredIndexRuntimeCoverageState::Available
+            && ready_indexes.iter().any(|entry| {
+                let kind = match entry.kind {
+                    SecondaryIndexKind::Equality => PlannerStatsDeclaredIndexKind::Equality,
+                    SecondaryIndexKind::Range => PlannerStatsDeclaredIndexKind::Range,
+                };
+                entry.index_id == block.index_id
+                    && kind == block.kind
+                    && secondary_index_target_matches_compound_stats(
+                        entry,
+                        block.target,
+                        block.target_label_id,
+                        block.field_fingerprint,
+                        block.field_count,
+                    )
+            })
+    });
 }
 
 fn merge_targeted_declared_index_stats(
@@ -3000,6 +3848,7 @@ fn merge_targeted_declared_index_stats(
     target_index_id: u64,
     target_equality_stats: Option<EqualityIndexPlannerStats>,
     target_range_stats: Option<RangeIndexPlannerStats>,
+    target_compound_stats: Option<CompoundIndexPlannerStats>,
 ) -> SegmentPlannerStatsV1 {
     let declared = declared_index_fingerprints(ready_indexes);
     let declaration_fingerprint = declaration_fingerprint(&declared);
@@ -3017,12 +3866,21 @@ fn merge_targeted_declared_index_stats(
     if let Some(range) = target_range_stats {
         stats.range_index_stats.push(range);
     }
+    if let Some(compound) = target_compound_stats {
+        stats.compound_index_stats.push(compound);
+    }
     stats
         .equality_index_stats
         .sort_by_key(|index_stats| index_stats.index_id);
     stats
         .range_index_stats
         .sort_by_key(|index_stats| index_stats.index_id);
+    stats.compound_index_stats.sort_by_key(|index_stats| {
+        (
+            index_stats.index_id,
+            declared_index_kind_rank(index_stats.kind),
+        )
+    });
     stats
 }
 
@@ -3040,7 +3898,37 @@ fn secondary_index_target_matches_stats(
             label_id: expected_label_id,
             prop_key: target_prop_key,
         } => *expected_label_id == target_label_id && target_prop_key == prop_key,
+        SecondaryIndexTarget::NodeFieldIndex { .. }
+        | SecondaryIndexTarget::EdgeFieldIndex { .. } => false,
     }
+}
+
+fn secondary_index_target_matches_compound_stats(
+    entry: &SecondaryIndexManifestEntry,
+    target: PlannerStatsDeclaredIndexTarget,
+    target_label_id: u32,
+    field_fingerprint: u64,
+    field_count: u16,
+) -> bool {
+    let (entry_target, entry_label_id, entry_field_count) = match &entry.target {
+        SecondaryIndexTarget::NodeFieldIndex { label_id, fields } => (
+            PlannerStatsDeclaredIndexTarget::NodeFieldIndex,
+            *label_id,
+            fields.len() as u16,
+        ),
+        SecondaryIndexTarget::EdgeFieldIndex { label_id, fields } => (
+            PlannerStatsDeclaredIndexTarget::EdgeFieldIndex,
+            *label_id,
+            fields.len() as u16,
+        ),
+        SecondaryIndexTarget::NodeProperty { .. } | SecondaryIndexTarget::EdgeProperty { .. } => {
+            return false;
+        }
+    };
+    entry_target == target
+        && entry_label_id == target_label_id
+        && entry_field_count == field_count
+        && secondary_index_declaration_fingerprint_for_entry(entry) == field_fingerprint
 }
 
 fn build_minimal_targeted_refresh_stats(
@@ -3094,6 +3982,7 @@ fn build_minimal_targeted_refresh_stats(
         property_stats: Vec::new(),
         equality_index_stats: Vec::new(),
         range_index_stats: Vec::new(),
+        compound_index_stats: Vec::new(),
         adjacency_stats: build_adjacency_stats_from_edge_meta(edge_refs.into_iter()),
         node_id_sample: node_id_sample(node_ids.into_iter()),
     })
@@ -3704,6 +4593,77 @@ fn validate_declared_index_stats(
         validate_ordered_option_pair(range.min_key, range.max_key, "range index bounds")?;
         validate_range_buckets(range.total_entries, &range.buckets)?;
     }
+
+    let mut compound_seen = BTreeMap::new();
+    for compound in &stats.compound_index_stats {
+        let Some(declared_index) = declared.get(&compound.index_id) else {
+            return Err(format!(
+                "planner stats compound index {} has no declaration",
+                compound.index_id
+            ));
+        };
+        if declared_index.kind != compound.kind
+            || declared_index.target != compound.target
+            || declared_index.target_label_id != compound.target_label_id
+            || declared_index.field_fingerprint != compound.field_fingerprint
+            || declared_index.field_count != compound.field_count
+        {
+            return Err(format!(
+                "planner stats compound index {} declaration mismatch",
+                compound.index_id
+            ));
+        }
+        if compound_seen.insert(compound.index_id, ()).is_some() {
+            return Err(format!(
+                "planner stats compound index {} appears more than once",
+                compound.index_id
+            ));
+        }
+        let target_count =
+            declared_index_target_count(declared_index, label_counts, &edge_label_counts);
+        if compound.total_postings > target_count {
+            return Err(format!(
+                "planner stats compound index {} postings exceed target count",
+                compound.index_id
+            ));
+        }
+        if compound.distinct_full_keys > compound.total_postings {
+            return Err(format!(
+                "planner stats compound index {} distinct keys exceed postings",
+                compound.index_id
+            ));
+        }
+        for prefix in &compound.prefix_stats {
+            if prefix.distinct_prefixes > compound.distinct_full_keys {
+                return Err(format!(
+                    "planner stats compound index {} prefix distinct count exceeds full keys",
+                    compound.index_id
+                ));
+            }
+            if prefix.max_postings_per_prefix > compound.total_postings {
+                return Err(format!(
+                    "planner stats compound index {} prefix max exceeds postings",
+                    compound.index_id
+                ));
+            }
+            if prefix.exact_prefix_postings.len() > COMPOUND_STATS_EXACT_PREFIX_LIMIT {
+                return Err(format!(
+                    "planner stats compound index {} exact prefix map exceeds cap",
+                    compound.index_id
+                ));
+            }
+        }
+        for range in &compound.range_stats {
+            if range.total_numeric_entries > compound.total_postings {
+                return Err(format!(
+                    "planner stats compound index {} range entries exceed postings",
+                    compound.index_id
+                ));
+            }
+            validate_ordered_option_pair(range.min_key, range.max_key, "compound range bounds")?;
+            validate_range_buckets(range.total_numeric_entries, &range.buckets)?;
+        }
+    }
     Ok(())
 }
 
@@ -3727,10 +4687,12 @@ fn declared_index_target_count(
     edge_label_counts: &BTreeMap<u32, u64>,
 ) -> u64 {
     match declared_index.target {
-        PlannerStatsDeclaredIndexTarget::NodeProperty => *node_label_counts
+        PlannerStatsDeclaredIndexTarget::NodeProperty
+        | PlannerStatsDeclaredIndexTarget::NodeFieldIndex => *node_label_counts
             .get(&declared_index.target_label_id)
             .unwrap_or(&0),
-        PlannerStatsDeclaredIndexTarget::EdgeProperty => *edge_label_counts
+        PlannerStatsDeclaredIndexTarget::EdgeProperty
+        | PlannerStatsDeclaredIndexTarget::EdgeFieldIndex => *edge_label_counts
             .get(&declared_index.target_label_id)
             .unwrap_or(&0),
     }
@@ -4140,10 +5102,8 @@ fn declared_index_fingerprints(
         .filter(|entry| entry.state == SecondaryIndexState::Ready)
         .map(|entry| {
             let target = planner_stats_declared_index_target(entry);
-            let (target_label_id, prop_key) = match &entry.target {
-                SecondaryIndexTarget::NodeProperty { label_id, prop_key } => (*label_id, prop_key),
-                SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => (*label_id, prop_key),
-            };
+            let (target_label_id, prop_key, field_fingerprint, field_count) =
+                planner_stats_target_field_identity(entry);
             let kind = match entry.kind {
                 SecondaryIndexKind::Equality => PlannerStatsDeclaredIndexKind::Equality,
                 SecondaryIndexKind::Range => PlannerStatsDeclaredIndexKind::Range,
@@ -4153,7 +5113,9 @@ fn declared_index_fingerprints(
                 target,
                 kind,
                 target_label_id,
-                prop_key: prop_key.clone(),
+                field_fingerprint,
+                field_count,
+                prop_key,
             }
         })
         .collect();
@@ -4165,6 +5127,8 @@ fn declared_index_fingerprints(
             })
             .then_with(|| declared_index_kind_rank(a.kind).cmp(&declared_index_kind_rank(b.kind)))
             .then_with(|| a.target_label_id.cmp(&b.target_label_id))
+            .then_with(|| a.field_fingerprint.cmp(&b.field_fingerprint))
+            .then_with(|| a.field_count.cmp(&b.field_count))
             .then_with(|| a.prop_key.cmp(&b.prop_key))
     });
     declared
@@ -4176,6 +5140,30 @@ pub(crate) fn planner_stats_declared_index_target(
     match &entry.target {
         SecondaryIndexTarget::NodeProperty { .. } => PlannerStatsDeclaredIndexTarget::NodeProperty,
         SecondaryIndexTarget::EdgeProperty { .. } => PlannerStatsDeclaredIndexTarget::EdgeProperty,
+        SecondaryIndexTarget::NodeFieldIndex { .. } => {
+            PlannerStatsDeclaredIndexTarget::NodeFieldIndex
+        }
+        SecondaryIndexTarget::EdgeFieldIndex { .. } => {
+            PlannerStatsDeclaredIndexTarget::EdgeFieldIndex
+        }
+    }
+}
+
+fn planner_stats_target_field_identity(
+    entry: &SecondaryIndexManifestEntry,
+) -> (u32, String, u64, u16) {
+    match &entry.target {
+        SecondaryIndexTarget::NodeProperty { label_id, prop_key }
+        | SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => {
+            (*label_id, prop_key.clone(), 0, 0)
+        }
+        SecondaryIndexTarget::NodeFieldIndex { label_id, fields }
+        | SecondaryIndexTarget::EdgeFieldIndex { label_id, fields } => (
+            *label_id,
+            String::new(),
+            secondary_index_declaration_fingerprint_for_entry(entry),
+            fields.len() as u16,
+        ),
     }
 }
 
@@ -4192,6 +5180,8 @@ fn declaration_fingerprint(declared: &[DeclaredIndexStatsFingerprint]) -> u64 {
             },
         );
         hash = fnv_update_u32(hash, entry.target_label_id);
+        hash = fnv_update_u64(hash, entry.field_fingerprint);
+        hash = fnv_update_u32(hash, entry.field_count as u32);
         hash = fnv_update_bytes(hash, entry.prop_key.as_bytes());
     }
     hash
@@ -4224,6 +5214,8 @@ fn declared_index_target_rank(target: PlannerStatsDeclaredIndexTarget) -> u8 {
     match target {
         PlannerStatsDeclaredIndexTarget::NodeProperty => 0,
         PlannerStatsDeclaredIndexTarget::EdgeProperty => 1,
+        PlannerStatsDeclaredIndexTarget::NodeFieldIndex => 2,
+        PlannerStatsDeclaredIndexTarget::EdgeFieldIndex => 3,
     }
 }
 
@@ -4666,11 +5658,47 @@ fn fsync_dir(dir: &Path) -> Result<(), EngineError> {
 mod tests {
     use super::*;
     use crate::types::{
-        SecondaryIndexKind, SecondaryIndexManifestEntry, SecondaryIndexState, SecondaryIndexTarget,
+        SecondaryIndexFieldManifest, SecondaryIndexKind, SecondaryIndexManifestEntry,
+        SecondaryIndexState, SecondaryIndexTarget,
     };
 
     fn test_range_key(value: PropValue) -> NumericRangeSortKey {
         numeric_range_sort_key_for_value(&value).expect("test value must encode as numeric key")
+    }
+
+    #[test]
+    fn max_segment_stale_risk_precompute_matches_iterated_max() {
+        // The per-estimate hot path reads a precomputed field; it must agree
+        // with iterating the map for every shape, including empty (Unknown).
+        let cases: Vec<(Vec<(u64, StalePostingRisk)>, StalePostingRisk)> = vec![
+            (vec![], StalePostingRisk::Unknown),
+            (vec![(1, StalePostingRisk::Low)], StalePostingRisk::Low),
+            (
+                vec![(1, StalePostingRisk::Low), (2, StalePostingRisk::High)],
+                StalePostingRisk::High,
+            ),
+            (
+                vec![
+                    (1, StalePostingRisk::Medium),
+                    (2, StalePostingRisk::Unknown),
+                ],
+                StalePostingRisk::Unknown,
+            ),
+        ];
+        for (entries, expected) in cases {
+            let risks: BTreeMap<u64, StalePostingRisk> = entries.into_iter().collect();
+            let iterated = risks
+                .values()
+                .copied()
+                .max_by_key(|risk| risk.rank())
+                .unwrap_or(StalePostingRisk::Unknown);
+            // Production wiring: the setter must keep the precomputed max in
+            // lockstep with the map.
+            let mut view = PlannerStatsView::default();
+            view.set_segment_stale_risks(risks);
+            assert_eq!(view.max_segment_stale_risk(), iterated);
+            assert_eq!(view.max_segment_stale_risk(), expected);
+        }
     }
 
     fn test_range_key_i64(value: i64) -> NumericRangeSortKey {
@@ -4715,6 +5743,7 @@ mod tests {
             property_stats: Vec::new(),
             equality_index_stats: Vec::new(),
             range_index_stats: Vec::new(),
+            compound_index_stats: Vec::new(),
             adjacency_stats: Vec::new(),
             node_id_sample: vec![42],
         }
@@ -4744,6 +5773,53 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         }
+    }
+
+    fn compound_node_entry(index_id: u64, kind: SecondaryIndexKind) -> SecondaryIndexManifestEntry {
+        SecondaryIndexManifestEntry {
+            index_id,
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 7,
+                fields: vec![
+                    SecondaryIndexFieldManifest::Property {
+                        key: "tenant".to_string(),
+                    },
+                    SecondaryIndexFieldManifest::Property {
+                        key: "score".to_string(),
+                    },
+                ],
+            },
+            kind,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        }
+    }
+
+    fn encode_compound_test_tuple(
+        entry: &SecondaryIndexManifestEntry,
+        tenant: &str,
+        score: i64,
+    ) -> Vec<u8> {
+        let context = CompoundTupleContext::from_manifest_entry(entry).unwrap();
+        let tenant_value = PropValue::String(tenant.to_string());
+        let score_value = PropValue::Int(score);
+        encode_compound_tuple_key(
+            &context,
+            &[
+                CompoundFieldValue::Property(Some(&tenant_value)),
+                CompoundFieldValue::Property(Some(&score_value)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn compound_written_entries(entry: &SecondaryIndexManifestEntry) -> Vec<(Vec<u8>, u64)> {
+        vec![
+            (encode_compound_test_tuple(entry, "acme", 20), 3),
+            (encode_compound_test_tuple(entry, "globex", 10), 4),
+            (encode_compound_test_tuple(entry, "acme", 10), 1),
+            (encode_compound_test_tuple(entry, "acme", 20), 2),
+        ]
     }
 
     #[test]
@@ -4796,6 +5872,210 @@ mod tests {
                 .pop()
                 .unwrap();
         assert_eq!(from_written, from_sidecar);
+    }
+
+    #[test]
+    fn compound_stats_from_written_entries_are_deterministic_and_distinct() {
+        let entry = compound_node_entry(91, SecondaryIndexKind::Range);
+        let entries = compound_written_entries(&entry);
+        let mut reversed = entries.clone();
+        reversed.reverse();
+
+        let stats = compound_index_stats_from_written_entries(
+            &entry,
+            &entries,
+            DeclaredIndexRuntimeCoverageState::Available,
+        )
+        .unwrap();
+        let reversed_stats = compound_index_stats_from_written_entries(
+            &entry,
+            &reversed,
+            DeclaredIndexRuntimeCoverageState::Available,
+        )
+        .unwrap();
+
+        assert_eq!(stats, reversed_stats);
+        assert_eq!(stats.index_id, 91);
+        assert_eq!(
+            stats.target,
+            PlannerStatsDeclaredIndexTarget::NodeFieldIndex
+        );
+        assert_eq!(stats.kind, PlannerStatsDeclaredIndexKind::Range);
+        assert_eq!(stats.target_label_id, 7);
+        assert_eq!(stats.field_count, 2);
+        assert_ne!(stats.field_fingerprint, 0);
+        assert_eq!(stats.total_postings, 4);
+        assert_eq!(stats.distinct_full_keys, 3);
+        assert_ne!(
+            planner_stats_declaration_fingerprint_for_entry(&entry),
+            planner_stats_declaration_fingerprint_for_entry(&range_entry(91))
+        );
+
+        let prefix_one = stats
+            .prefix_stats
+            .iter()
+            .find(|prefix| prefix.prefix_len == 1)
+            .expect("first prefix stats");
+        assert_eq!(prefix_one.distinct_prefixes, 2);
+        assert_eq!(prefix_one.max_postings_per_prefix, 3);
+        assert_eq!(prefix_one.exact_prefix_postings.len(), 2);
+        assert!(prefix_one
+            .exact_prefix_postings
+            .iter()
+            .all(|exact| exact.postings > 0));
+
+        let prefix_two = stats
+            .prefix_stats
+            .iter()
+            .find(|prefix| prefix.prefix_len == 2)
+            .expect("full tuple prefix stats");
+        assert_eq!(prefix_two.distinct_prefixes, 3);
+        assert_eq!(prefix_two.max_postings_per_prefix, 2);
+        assert_eq!(prefix_two.exact_prefix_postings.len(), 3);
+
+        assert_eq!(stats.range_stats.len(), 1);
+        let range = &stats.range_stats[0];
+        assert_eq!(range.equality_prefix_len, 1);
+        assert_eq!(range.range_field_ordinal, 1);
+        assert_eq!(range.total_numeric_entries, 4);
+        assert_eq!(range.min_key, Some(test_range_stats_key_i64(10)));
+        assert_eq!(range.max_key, Some(test_range_stats_key_i64(20)));
+        assert_eq!(
+            range.buckets.iter().map(|bucket| bucket.count).sum::<u64>(),
+            4
+        );
+    }
+
+    #[test]
+    fn merged_exact_prefix_overflow_is_sticky_across_segments() {
+        fn exact(prefix: &[u8], postings: u64) -> CompoundExactPrefixStat {
+            CompoundExactPrefixStat {
+                encoded_prefix: prefix.to_vec(),
+                postings,
+            }
+        }
+        fn segment(
+            distinct: u64,
+            exact_stats: Vec<CompoundExactPrefixStat>,
+        ) -> Vec<CompoundPrefixStats> {
+            vec![CompoundPrefixStats {
+                prefix_len: 1,
+                distinct_prefixes: distinct,
+                max_postings_per_prefix: 5,
+                exact_prefix_postings: exact_stats,
+            }]
+        }
+
+        // Overflow during the merge itself: a full complete segment plus two
+        // new prefixes crosses the cap and clears the map.
+        let mut target = Vec::new();
+        let mut overflowed = BTreeSet::new();
+        let full: Vec<CompoundExactPrefixStat> = (0..COMPOUND_STATS_EXACT_PREFIX_LIMIT)
+            .map(|ordinal| exact(format!("p{ordinal:05}").as_bytes(), 1))
+            .collect();
+        merge_compound_prefix_stats(
+            &mut target,
+            &mut overflowed,
+            &segment(COMPOUND_STATS_EXACT_PREFIX_LIMIT as u64, full),
+        );
+        assert_eq!(
+            target[0].exact_prefix_postings.len(),
+            COMPOUND_STATS_EXACT_PREFIX_LIMIT
+        );
+        merge_compound_prefix_stats(
+            &mut target,
+            &mut overflowed,
+            &segment(2, vec![exact(b"zz-1", 3), exact(b"zz-2", 4)]),
+        );
+        assert!(target[0].exact_prefix_postings.is_empty());
+
+        // The bug: a later small complete segment must not rebuild a partial
+        // exact map that costing would trust as exact.
+        merge_compound_prefix_stats(
+            &mut target,
+            &mut overflowed,
+            &segment(1, vec![exact(b"zz-3", 7)]),
+        );
+        assert!(
+            target[0].exact_prefix_postings.is_empty(),
+            "partial exact map must not be rebuilt after overflow"
+        );
+
+        // A source segment whose own exact list overflowed (empty list, many
+        // distinct prefixes) poisons the merged map the same way.
+        let mut target = Vec::new();
+        let mut overflowed = BTreeSet::new();
+        merge_compound_prefix_stats(
+            &mut target,
+            &mut overflowed,
+            &segment((COMPOUND_STATS_EXACT_PREFIX_LIMIT as u64) + 10, Vec::new()),
+        );
+        merge_compound_prefix_stats(
+            &mut target,
+            &mut overflowed,
+            &segment(1, vec![exact(b"a", 2)]),
+        );
+        assert!(
+            target[0].exact_prefix_postings.is_empty(),
+            "incomplete source segment must poison the merged exact map"
+        );
+        assert_eq!(
+            target[0].distinct_prefixes,
+            (COMPOUND_STATS_EXACT_PREFIX_LIMIT as u64) + 11
+        );
+    }
+
+    #[test]
+    fn weighted_range_buckets_match_expanded_range_buckets() {
+        let pairs: Vec<(RangeStatsKey, u64)> = (0..200)
+            .map(|value| (test_range_stats_key_i64(value), (value % 7 + 1) as u64))
+            .collect();
+        let expanded: Vec<RangeStatsKey> = pairs
+            .iter()
+            .flat_map(|(key, count)| std::iter::repeat_n(*key, *count as usize))
+            .collect();
+        for cap in [1usize, 3, PLANNER_STATS_RANGE_BUCKETS, 1000] {
+            assert_eq!(
+                weighted_range_buckets(&pairs, cap),
+                range_buckets(&expanded, cap),
+                "weighted buckets diverge from expanded buckets at cap {cap}"
+            );
+        }
+        assert!(weighted_range_buckets(&[], PLANNER_STATS_RANGE_BUCKETS).is_empty());
+    }
+
+    #[test]
+    fn compound_stats_builder_rejects_unsorted_streamed_keys() {
+        let entry = compound_node_entry(93, SecondaryIndexKind::Equality);
+        let later = encode_compound_test_tuple(&entry, "tenant-b", 1);
+        let earlier = encode_compound_test_tuple(&entry, "tenant-a", 1);
+        let mut builder = CompoundStatsBuilder::new(&entry).unwrap();
+        builder.observe(&later).unwrap();
+        assert!(builder.observe(&earlier).is_err());
+    }
+
+    #[test]
+    fn compound_exact_prefix_stats_are_bounded() {
+        let entry = compound_node_entry(92, SecondaryIndexKind::Equality);
+        let mut entries = Vec::new();
+        for index in 0..=COMPOUND_STATS_EXACT_PREFIX_LIMIT {
+            entries.push((
+                encode_compound_test_tuple(&entry, &format!("tenant-{index}"), index as i64),
+                index as u64,
+            ));
+        }
+
+        let stats = compound_index_stats_from_written_entries(
+            &entry,
+            &entries,
+            DeclaredIndexRuntimeCoverageState::Available,
+        )
+        .unwrap();
+
+        for prefix in &stats.prefix_stats {
+            assert!(prefix.distinct_prefixes > COMPOUND_STATS_EXACT_PREFIX_LIMIT as u64);
+            assert!(prefix.exact_prefix_postings.is_empty());
+        }
     }
 
     #[test]
@@ -4901,6 +6181,8 @@ mod tests {
             index_id: 31,
             kind: PlannerStatsDeclaredIndexKind::Equality,
             target_label_id: 7,
+            field_fingerprint: 0,
+            field_count: 0,
             prop_key: "color".to_string(),
         });
         stats.equality_index_stats.push(EqualityIndexPlannerStats {
@@ -4921,6 +6203,8 @@ mod tests {
             index_id: 32,
             kind: PlannerStatsDeclaredIndexKind::Range,
             target_label_id: 7,
+            field_fingerprint: 0,
+            field_count: 0,
             prop_key: "score".to_string(),
         });
         stats.range_index_stats.push(RangeIndexPlannerStats {
@@ -5000,6 +6284,8 @@ mod tests {
             index_id,
             kind: PlannerStatsDeclaredIndexKind::Equality,
             target_label_id,
+            field_fingerprint: 0,
+            field_count: 0,
             prop_key: prop_key.to_string(),
         });
         stats.equality_index_stats.push(EqualityIndexPlannerStats {
@@ -5030,6 +6316,8 @@ mod tests {
             index_id,
             kind: PlannerStatsDeclaredIndexKind::Range,
             target_label_id,
+            field_fingerprint: 0,
+            field_count: 0,
             prop_key: prop_key.to_string(),
         });
         stats.range_index_stats.push(RangeIndexPlannerStats {
@@ -5081,6 +6369,7 @@ mod tests {
             12,
             None,
             Some(replacement_range),
+            None,
         );
 
         assert_eq!(
@@ -5158,6 +6447,8 @@ mod tests {
             index_id: input.index_id,
             kind: PlannerStatsDeclaredIndexKind::Range,
             target_label_id: input.label_id,
+            field_fingerprint: 0,
+            field_count: 0,
             prop_key: input.prop_key.to_string(),
         });
         stats.range_index_stats.push(RangeIndexPlannerStats {
@@ -5172,12 +6463,119 @@ mod tests {
         });
     }
 
+    fn encode_legacy_enveloped_stats<T: serde::Serialize>(stats: &T) -> Vec<u8> {
+        let payload = rmp_serde::to_vec(stats).unwrap();
+        let mut crc = Crc32Hasher::new();
+        crc.update(&payload);
+        let checksum = crc.finalize();
+        let mut data = Vec::with_capacity(PLANNER_STATS_ENVELOPE_LEN + payload.len());
+        data.extend_from_slice(&PLANNER_STATS_MAGIC);
+        data.extend_from_slice(&PLANNER_STATS_FORMAT_VERSION.to_le_bytes());
+        data.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        data.extend_from_slice(&checksum.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&payload);
+        data
+    }
+
     #[test]
     fn envelope_round_trip() {
         let stats = minimal_stats(9);
         let data = encode_enveloped_stats(&stats).unwrap();
         let decoded = decode_planner_stats_envelope(&data, 9, 1, 0).unwrap();
         assert_eq!(decoded, stats);
+    }
+
+    #[test]
+    fn legacy_stats_without_compound_fields_decode_with_defaults() {
+        #[derive(serde::Serialize)]
+        struct LegacyDeclaredIndexStatsFingerprint {
+            index_id: u64,
+            target: PlannerStatsDeclaredIndexTarget,
+            kind: PlannerStatsDeclaredIndexKind,
+            target_label_id: u32,
+            prop_key: String,
+        }
+
+        #[derive(serde::Serialize)]
+        struct LegacySegmentPlannerStatsV1 {
+            format_version: u32,
+            segment_id: u64,
+            build_kind: PlannerStatsBuildKind,
+            built_at_ms: i64,
+            declaration_fingerprint: u64,
+            declared_indexes: Vec<LegacyDeclaredIndexStatsFingerprint>,
+            node_count: u64,
+            edge_count: u64,
+            truncated: bool,
+            general_property_stats_complete: bool,
+            general_property_sampled_node_count: u64,
+            general_property_sampled_raw_bytes: u64,
+            general_property_budget_exhausted: bool,
+            node_label_stats: Vec<NodeLabelPlannerStats>,
+            timestamp_stats: Vec<TimestampPlannerStats>,
+            property_stats: Vec<PropertyPlannerStats>,
+            equality_index_stats: Vec<EqualityIndexPlannerStats>,
+            range_index_stats: Vec<RangeIndexPlannerStats>,
+            adjacency_stats: Vec<AdjacencyPlannerStats>,
+            node_id_sample: Vec<u64>,
+        }
+
+        let mut stats = minimal_stats(9);
+        add_eq_stats(
+            &mut stats,
+            11,
+            7,
+            "color",
+            1,
+            1,
+            vec![ValueFrequency {
+                value_hash: hash_prop_equality_key(&PropValue::String("red".to_string())),
+                count: 1,
+            }],
+        );
+        let legacy = LegacySegmentPlannerStatsV1 {
+            format_version: stats.format_version,
+            segment_id: stats.segment_id,
+            build_kind: stats.build_kind,
+            built_at_ms: stats.built_at_ms,
+            declaration_fingerprint: stats.declaration_fingerprint,
+            declared_indexes: stats
+                .declared_indexes
+                .iter()
+                .map(|declared| LegacyDeclaredIndexStatsFingerprint {
+                    index_id: declared.index_id,
+                    target: declared.target,
+                    kind: declared.kind,
+                    target_label_id: declared.target_label_id,
+                    prop_key: declared.prop_key.clone(),
+                })
+                .collect(),
+            node_count: stats.node_count,
+            edge_count: stats.edge_count,
+            truncated: stats.truncated,
+            general_property_stats_complete: stats.general_property_stats_complete,
+            general_property_sampled_node_count: stats.general_property_sampled_node_count,
+            general_property_sampled_raw_bytes: stats.general_property_sampled_raw_bytes,
+            general_property_budget_exhausted: stats.general_property_budget_exhausted,
+            node_label_stats: stats.node_label_stats.clone(),
+            timestamp_stats: stats.timestamp_stats.clone(),
+            property_stats: stats.property_stats.clone(),
+            equality_index_stats: stats.equality_index_stats.clone(),
+            range_index_stats: stats.range_index_stats.clone(),
+            adjacency_stats: stats.adjacency_stats.clone(),
+            node_id_sample: stats.node_id_sample.clone(),
+        };
+
+        let data = encode_legacy_enveloped_stats(&legacy);
+        let decoded = decode_planner_stats_envelope(&data, 9, 1, 0).unwrap();
+
+        assert!(decoded.compound_index_stats.is_empty());
+        assert_eq!(decoded.declared_indexes.len(), 1);
+        assert_eq!(decoded.declared_indexes[0].prop_key, "color");
+        assert_eq!(decoded.declared_indexes[0].field_fingerprint, 0);
+        assert_eq!(decoded.declared_indexes[0].field_count, 0);
+        assert_eq!(decoded.equality_index_stats, stats.equality_index_stats);
     }
 
     #[test]
@@ -5488,6 +6886,8 @@ mod tests {
             index_id: 11,
             kind: PlannerStatsDeclaredIndexKind::Equality,
             target_label_id: 7,
+            field_fingerprint: 0,
+            field_count: 0,
             prop_key: "color".to_string(),
         };
         let mut bad_equality_count = minimal_stats(9);
@@ -5511,6 +6911,8 @@ mod tests {
             index_id: 12,
             kind: PlannerStatsDeclaredIndexKind::Range,
             target_label_id: 7,
+            field_fingerprint: 0,
+            field_count: 0,
             prop_key: "score".to_string(),
         };
         let mut bad_range_bucket = minimal_stats(9);
@@ -5835,6 +7237,137 @@ mod tests {
     }
 
     #[test]
+    fn rollup_compound_stats_require_runtime_coverage_and_matching_declaration() {
+        let entry = compound_node_entry(93, SecondaryIndexKind::Range);
+        let compound_stats = compound_index_stats_from_written_entries(
+            &entry,
+            &compound_written_entries(&entry),
+            DeclaredIndexRuntimeCoverageState::Available,
+        )
+        .unwrap();
+        let mut stats = minimal_stats(1);
+        stats.node_count = 4;
+        stats.general_property_sampled_node_count = 4;
+        stats.node_label_stats = vec![NodeLabelPlannerStats {
+            label_id: 7,
+            node_count: 4,
+            min_node_id: Some(1),
+            max_node_id: Some(4),
+            min_updated_at_ms: Some(1000),
+            max_updated_at_ms: Some(1000),
+        }];
+        stats.declared_indexes = declared_index_fingerprints(std::slice::from_ref(&entry));
+        stats.compound_index_stats.push(compound_stats.clone());
+        let available = PlannerStatsAvailability::Available(Box::new(stats.clone()));
+        let segments = vec![PlannerStatsSegmentSnapshot {
+            segment_id: 1,
+            node_count: 4,
+            edge_count: 0,
+            availability: &available,
+        }];
+
+        for state in [
+            DeclaredIndexRuntimeCoverageState::Available,
+            DeclaredIndexRuntimeCoverageState::Missing,
+            DeclaredIndexRuntimeCoverageState::Corrupt,
+            DeclaredIndexRuntimeCoverageState::Unknown,
+        ] {
+            let mut runtime_coverage = DeclaredIndexRuntimeCoverage::default();
+            if state != DeclaredIndexRuntimeCoverageState::Unknown {
+                runtime_coverage.insert(
+                    1,
+                    93,
+                    PlannerStatsDeclaredIndexTarget::NodeFieldIndex,
+                    PlannerStatsDeclaredIndexKind::Range,
+                    state,
+                );
+            }
+            let view = build_planner_stats_view_from_snapshots_with_runtime_coverage(
+                1,
+                &segments,
+                std::slice::from_ref(&entry),
+                &runtime_coverage,
+            );
+            let rollup = view.compound_index_rollups.get(&93).unwrap();
+            if state == DeclaredIndexRuntimeCoverageState::Available {
+                assert_eq!(rollup.coverage.covered_segment_ids, vec![1]);
+                assert_eq!(rollup.total_postings, 4);
+                assert_eq!(rollup.distinct_full_keys, 3);
+                assert_eq!(rollup.prefix_stats, compound_stats.prefix_stats);
+                assert_eq!(rollup.range_stats, compound_stats.range_stats);
+            } else {
+                assert_eq!(rollup.coverage.mismatched_segment_ids, vec![1]);
+                assert_eq!(rollup.total_postings, 0);
+                assert!(rollup.prefix_stats.is_empty());
+                assert!(rollup.range_stats.is_empty());
+            }
+        }
+
+        let missing = PlannerStatsAvailability::Missing;
+        let missing_segments = vec![PlannerStatsSegmentSnapshot {
+            segment_id: 1,
+            node_count: 4,
+            edge_count: 0,
+            availability: &missing,
+        }];
+        let view = build_planner_stats_view_from_snapshots(
+            1,
+            &missing_segments,
+            std::slice::from_ref(&entry),
+        );
+        let rollup = view.compound_index_rollups.get(&93).unwrap();
+        assert_eq!(rollup.coverage.uncovered_segment_ids, vec![1]);
+        assert_eq!(rollup.total_postings, 0);
+
+        let unavailable = PlannerStatsAvailability::Unavailable {
+            reason: "bad compound stats crc".to_string(),
+        };
+        let unavailable_segments = vec![PlannerStatsSegmentSnapshot {
+            segment_id: 1,
+            node_count: 4,
+            edge_count: 0,
+            availability: &unavailable,
+        }];
+        let view = build_planner_stats_view_from_snapshots(
+            1,
+            &unavailable_segments,
+            std::slice::from_ref(&entry),
+        );
+        let rollup = view.compound_index_rollups.get(&93).unwrap();
+        assert_eq!(rollup.coverage.uncovered_segment_ids, vec![1]);
+        assert_eq!(rollup.total_postings, 0);
+
+        let mut stale_stats = stats;
+        stale_stats.compound_index_stats[0].field_fingerprint = stale_stats.compound_index_stats[0]
+            .field_fingerprint
+            .wrapping_add(1);
+        let stale_available = PlannerStatsAvailability::Available(Box::new(stale_stats));
+        let stale_segments = vec![PlannerStatsSegmentSnapshot {
+            segment_id: 1,
+            node_count: 4,
+            edge_count: 0,
+            availability: &stale_available,
+        }];
+        let mut runtime_coverage = DeclaredIndexRuntimeCoverage::default();
+        runtime_coverage.insert(
+            1,
+            93,
+            PlannerStatsDeclaredIndexTarget::NodeFieldIndex,
+            PlannerStatsDeclaredIndexKind::Range,
+            DeclaredIndexRuntimeCoverageState::Available,
+        );
+        let view = build_planner_stats_view_from_snapshots_with_runtime_coverage(
+            1,
+            &stale_segments,
+            std::slice::from_ref(&entry),
+            &runtime_coverage,
+        );
+        let rollup = view.compound_index_rollups.get(&93).unwrap();
+        assert_eq!(rollup.coverage.mismatched_segment_ids, vec![1]);
+        assert_eq!(rollup.total_postings, 0);
+    }
+
+    #[test]
     fn rollup_declared_index_stats_treat_unknown_runtime_coverage_as_unavailable() {
         let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         let mut stats = minimal_stats(1);
@@ -5880,6 +7413,8 @@ mod tests {
             index_id: 31,
             kind: PlannerStatsDeclaredIndexKind::Equality,
             target_label_id: 7,
+            field_fingerprint: 0,
+            field_count: 0,
             prop_key: "color".to_string(),
         });
         stats.equality_index_stats.push(EqualityIndexPlannerStats {
@@ -6013,6 +7548,8 @@ mod tests {
             index_id: 12,
             kind: PlannerStatsDeclaredIndexKind::Range,
             target_label_id: 7,
+            field_fingerprint: 0,
+            field_count: 0,
             prop_key: "score".to_string(),
         });
         stats.range_index_stats.push(RangeIndexPlannerStats {
@@ -6605,6 +8142,8 @@ mod tests {
                 index_id: 11,
                 kind: PlannerStatsDeclaredIndexKind::Equality,
                 target_label_id: 7,
+                field_fingerprint: 0,
+                field_count: 0,
                 prop_key: "color".to_string(),
             },
             DeclaredIndexStatsFingerprint {
@@ -6612,6 +8151,8 @@ mod tests {
                 index_id: 12,
                 kind: PlannerStatsDeclaredIndexKind::Range,
                 target_label_id: 7,
+                field_fingerprint: 0,
+                field_count: 0,
                 prop_key: "score".to_string(),
             },
         ];

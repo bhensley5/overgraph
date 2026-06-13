@@ -145,27 +145,27 @@ let node = db.get_node_by_key("User", "alice")?;
 let nodes = db.get_nodes(&[alice, bob])?;
 ```
 
-## Optional: use GQL Beta for query strings
+## Optional: use GQL for query strings
 
-GQL Beta is useful when a graph read or mutation is clearer as a GQL/Cypher-shaped string. This
+GQL is useful when a graph read or mutation is clearer as a GQL/Cypher-shaped string. This
 example creates nodes, creates edges, then queries the graph with aggregation.
 
 **Python**
 ```python
 db.execute_gql(
     """
-    CREATE (alice:User {key: 'gql-alice', role: 'engineer'}),
-           (bob:User {key: 'gql-bob', role: 'designer'}),
-           (project:Project {key: 'gql-atlas', name: 'Atlas'})
-    RETURN alice.key AS alice, bob.key AS bob, project.name AS project
+    CREATE (alice:User {elementKey: 'gql-alice', role: 'engineer'}),
+           (bob:User {elementKey: 'gql-bob', role: 'designer'}),
+           (project:Project {elementKey: 'gql-atlas', name: 'Atlas'})
+    RETURN elementKey(alice) AS alice, elementKey(bob) AS bob, project.name AS project
     """
 )
 
 db.execute_gql(
     """
-    MATCH (alice:User {key: 'gql-alice'})
-    MATCH (bob:User {key: 'gql-bob'})
-    MATCH (project:Project {key: 'gql-atlas'})
+    MATCH (alice:User {elementKey: 'gql-alice'})
+    MATCH (bob:User {elementKey: 'gql-bob'})
+    MATCH (project:Project {elementKey: 'gql-atlas'})
     CREATE (alice)-[:WORKS_ON {since: 2026}]->(project),
            (bob)-[:WORKS_ON {since: 2026}]->(project)
     RETURN project.name AS project
@@ -175,8 +175,8 @@ db.execute_gql(
 rows = db.execute_gql(
     """
     MATCH (u:User)-[r:WORKS_ON]->(p:Project)
-    WHERE p.key = 'gql-atlas'
-    WITH p.name AS project, count(*) AS contributors, collect(u.key) AS users
+    WHERE elementKey(p) = 'gql-atlas'
+    WITH p.name AS project, count(*) AS contributors, collect(elementKey(u)) AS users
     RETURN project, contributors, users
     """
 )
@@ -187,16 +187,16 @@ print(rows["rows"])
 **Node.js**
 ```javascript
 db.executeGql(
-  `CREATE (alice:User {key: 'gql-alice', role: 'engineer'}),
-          (bob:User {key: 'gql-bob', role: 'designer'}),
-          (project:Project {key: 'gql-atlas', name: 'Atlas'})
-   RETURN alice.key AS alice, bob.key AS bob, project.name AS project`
+  `CREATE (alice:User {elementKey: 'gql-alice', role: 'engineer'}),
+          (bob:User {elementKey: 'gql-bob', role: 'designer'}),
+          (project:Project {elementKey: 'gql-atlas', name: 'Atlas'})
+   RETURN elementKey(alice) AS alice, elementKey(bob) AS bob, project.name AS project`
 );
 
 db.executeGql(
-  `MATCH (alice:User {key: 'gql-alice'})
-   MATCH (bob:User {key: 'gql-bob'})
-   MATCH (project:Project {key: 'gql-atlas'})
+  `MATCH (alice:User {elementKey: 'gql-alice'})
+   MATCH (bob:User {elementKey: 'gql-bob'})
+   MATCH (project:Project {elementKey: 'gql-atlas'})
    CREATE (alice)-[:WORKS_ON {since: 2026}]->(project),
           (bob)-[:WORKS_ON {since: 2026}]->(project)
    RETURN project.name AS project`
@@ -204,8 +204,8 @@ db.executeGql(
 
 const rows = db.executeGql(
   `MATCH (u:User)-[r:WORKS_ON]->(p:Project)
-   WHERE p.key = 'gql-atlas'
-   WITH p.name AS project, count(*) AS contributors, collect(u.key) AS users
+   WHERE elementKey(p) = 'gql-atlas'
+   WITH p.name AS project, count(*) AS contributors, collect(elementKey(u)) AS users
    RETURN project, contributors, users`
 );
 
@@ -215,18 +215,18 @@ console.log(rows.rows);
 **Rust**
 ```rust
 db.execute_gql(
-    "CREATE (alice:User {key: 'gql-alice', role: 'engineer'}), \
-            (bob:User {key: 'gql-bob', role: 'designer'}), \
-            (project:Project {key: 'gql-atlas', name: 'Atlas'}) \
-     RETURN alice.key AS alice, bob.key AS bob, project.name AS project",
+    "CREATE (alice:User {elementKey: 'gql-alice', role: 'engineer'}), \
+            (bob:User {elementKey: 'gql-bob', role: 'designer'}), \
+            (project:Project {elementKey: 'gql-atlas', name: 'Atlas'}) \
+     RETURN elementKey(alice) AS alice, elementKey(bob) AS bob, project.name AS project",
     &GqlParams::new(),
     &GqlExecutionOptions::default(),
 )?;
 
 db.execute_gql(
-    "MATCH (alice:User {key: 'gql-alice'}) \
-     MATCH (bob:User {key: 'gql-bob'}) \
-     MATCH (project:Project {key: 'gql-atlas'}) \
+    "MATCH (alice:User {elementKey: 'gql-alice'}) \
+     MATCH (bob:User {elementKey: 'gql-bob'}) \
+     MATCH (project:Project {elementKey: 'gql-atlas'}) \
      CREATE (alice)-[:WORKS_ON {since: 2026}]->(project), \
             (bob)-[:WORKS_ON {since: 2026}]->(project) \
      RETURN project.name AS project",
@@ -236,8 +236,8 @@ db.execute_gql(
 
 let rows = db.execute_gql(
     "MATCH (u:User)-[r:WORKS_ON]->(p:Project) \
-     WHERE p.key = 'gql-atlas' \
-     WITH p.name AS project, count(*) AS contributors, collect(u.key) AS users \
+     WHERE elementKey(p) = 'gql-atlas' \
+     WITH p.name AS project, count(*) AS contributors, collect(elementKey(u)) AS users \
      RETURN project, contributors, users",
     &GqlParams::new(),
     &GqlExecutionOptions::default(),

@@ -2354,6 +2354,7 @@ fn test_find_nodes_building_declaration_still_uses_fallback() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    seed_internal_node_labels(&engine, &[1]).unwrap();
 
     let red = PropValue::String("red".to_string());
     let mut props = BTreeMap::new();
@@ -2378,11 +2379,18 @@ fn test_find_nodes_building_declaration_still_uses_fallback() {
             },
         )
         .unwrap();
+    let person_label_id = engine
+        .list_node_labels()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.label == "Person")
+        .unwrap()
+        .label_id;
 
     let entry = SecondaryIndexManifestEntry {
         index_id: 1,
         target: SecondaryIndexTarget::NodeProperty {
-            label_id: 1,
+            label_id: person_label_id,
             prop_key: "color".to_string(),
         },
         kind: SecondaryIndexKind::Equality,
@@ -2468,7 +2476,7 @@ fn test_find_nodes_ready_declaration_uses_index_lookup_across_sources() {
         .unwrap();
 
     let info = engine
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let ready = wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
     assert_eq!(ready.index_id, info.index_id);
@@ -2566,7 +2574,7 @@ fn test_find_nodes_ready_equality_index_matches_signed_zero_verifier_semantics()
     engine.flush().unwrap();
 
     let info = engine
-        .ensure_node_property_index("Person", "temp", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("temp").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
@@ -2603,7 +2611,7 @@ fn test_find_nodes_active_equality_index_uses_semantic_hashes() {
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let info = engine
-        .ensure_node_property_index("Person", "score", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -2752,7 +2760,7 @@ fn test_find_nodes_semantic_equality_index_updates_tombstones_and_shadows() {
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let info = engine
-        .ensure_node_property_index("Person", "score", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -2969,7 +2977,7 @@ fn test_find_nodes_ready_declaration_suppresses_stale_and_collision_candidates()
     engine.flush().unwrap();
 
     let info = engine
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let ready = wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
     assert_eq!(ready.index_id, info.index_id);
@@ -3070,7 +3078,7 @@ fn test_find_nodes_ready_declaration_respects_prune_policies() {
         .unwrap();
 
     let info = engine
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -3131,7 +3139,7 @@ fn test_find_nodes_ready_eq_cursor_no_false_next_after_stale_candidates() {
     red_props.insert("color".to_string(), red.clone());
 
     let info = engine
-        .ensure_node_property_index("Employee", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Employee", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -3227,7 +3235,7 @@ fn test_find_nodes_ready_declaration_keeps_revived_same_id_after_tombstone() {
         .unwrap();
 
     let info = engine
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -3285,7 +3293,7 @@ fn test_find_nodes_ready_declaration_filters_same_id_label_change() {
         .unwrap();
 
     let info = engine
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -3623,10 +3631,7 @@ fn test_find_nodes_range_fallback_orders_and_paginates() {
         .unwrap();
 
     let info = engine
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     assert_eq!(info.state, SecondaryIndexState::Building);
 
@@ -4116,10 +4121,7 @@ fn test_find_nodes_range_open_and_closed_intervals_match_in_fallback_and_ready_p
     assert_eq!(routes.range_index_lookup, 0);
 
     let info = engine
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -4379,7 +4381,7 @@ fn test_find_nodes_range_ready_parity_matches_bruteforce_oracle_across_domains()
     assert_eq!(routes.range_index_lookup, 0);
 
     for (prop_key, kind, _, _) in &queries {
-        let info = engine.ensure_node_property_index("Person", prop_key, kind.clone()).unwrap();
+        let info = engine.ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: (prop_key).to_string() }], kind: kind.clone() }).unwrap();
         wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
     }
 
@@ -4460,10 +4462,7 @@ fn test_find_nodes_range_ready_refills_segment_chunks_with_pruned_overrides() {
         .unwrap();
 
     let info = engine
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -4588,10 +4587,7 @@ fn test_find_nodes_range_ready_declaration_routes_and_orders_across_sources() {
         .unwrap();
 
     let info = engine
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     let ready = wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
     assert_eq!(ready.index_id, info.index_id);
@@ -4686,10 +4682,7 @@ fn test_find_nodes_range_ready_declaration_hides_stale_and_incompatible_older_ma
     engine.flush().unwrap();
 
     let info = engine
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -4773,10 +4766,7 @@ fn test_find_nodes_range_ready_paged_verifies_latest_numeric_key_before_cursor()
     engine.flush().unwrap();
 
     let info = engine
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -4882,10 +4872,7 @@ fn test_find_nodes_range_ready_domainless_uint_int_and_float() {
         .unwrap();
 
     let uint_info = engine
-        .ensure_node_property_index("Person",
-            "count",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("count").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&engine, uint_info.index_id, SecondaryIndexState::Ready);
 
@@ -4954,10 +4941,7 @@ fn test_find_nodes_range_ready_domainless_uint_int_and_float() {
         .unwrap();
 
     let float_info = engine
-        .ensure_node_property_index("Person",
-            "temp",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("temp").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&engine, float_info.index_id, SecondaryIndexState::Ready);
 

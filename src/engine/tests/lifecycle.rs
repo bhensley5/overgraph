@@ -11,6 +11,17 @@ fn lifecycle_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabe
     }
 }
 
+fn seed_lifecycle_manifest_node_label(
+    manifest: &mut crate::types::ManifestState,
+    label: &str,
+    label_id: u32,
+) {
+    manifest.node_label_tokens.insert(label.to_string(), label_id);
+    manifest.next_node_label_id = manifest
+        .next_node_label_id
+        .max(label_id.saturating_add(1));
+}
+
 fn traverse_depth_two(
     engine: &DatabaseEngine,
     start: u64,
@@ -427,6 +438,203 @@ fn wait_for_path_absent(path: &std::path::Path) {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+fn lifecycle_node_compound_spec(kind: SecondaryIndexKind) -> SecondaryIndexSpec {
+    SecondaryIndexSpec {
+        fields: vec![
+            SecondaryIndexField::property("tenant"),
+            SecondaryIndexField::node_meta(NodeMetadataIndexField::UpdatedAt),
+        ],
+        kind,
+    }
+}
+
+fn lifecycle_edge_compound_range_spec() -> SecondaryIndexSpec {
+    SecondaryIndexSpec {
+        fields: vec![
+            SecondaryIndexField::edge_meta(EdgeMetadataIndexField::From),
+            SecondaryIndexField::property("status"),
+            SecondaryIndexField::edge_meta(EdgeMetadataIndexField::ValidTo),
+        ],
+        kind: SecondaryIndexKind::Range,
+    }
+}
+
+fn insert_lifecycle_compound_node(
+    db: &DatabaseEngine,
+    key: &str,
+    tenant: &str,
+) -> u64 {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "tenant".to_string(),
+        PropValue::String(tenant.to_string()),
+    );
+    db.upsert_node(
+        "Person",
+        key,
+        UpsertNodeOptions {
+            props,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+fn insert_lifecycle_compound_edge(
+    db: &DatabaseEngine,
+    suffix: &str,
+    from_id: u64,
+    status: &str,
+    valid_to: i64,
+) -> u64 {
+    let to_id = db
+        .upsert_node(
+            "Person",
+            &format!("compound-edge-target-{suffix}"),
+            UpsertNodeOptions::default(),
+        )
+        .unwrap();
+    let mut props = BTreeMap::new();
+    props.insert(
+        "status".to_string(),
+        PropValue::String(status.to_string()),
+    );
+    db.upsert_edge(
+        from_id,
+        to_id,
+        "KNOWS",
+        UpsertEdgeOptions {
+            props,
+            valid_to: Some(valid_to),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+fn lifecycle_compound_node_candidates_for_tenant(
+    segment: &crate::segment_reader::SegmentReader,
+    entry: &SecondaryIndexManifestEntry,
+    tenant: &str,
+) -> Vec<u64> {
+    let context = crate::secondary_index_key::CompoundTupleContext::from_manifest_entry(entry)
+        .unwrap();
+    let tenant_value = PropValue::String(tenant.to_string());
+    let prefix = crate::secondary_index_key::encode_compound_tuple_prefix(
+        &context,
+        &[crate::secondary_index_key::CompoundFieldValue::Property(Some(
+            &tenant_value,
+        ))],
+    )
+    .unwrap();
+    let bounds = crate::secondary_index_key::compound_prefix_bounds(&prefix);
+    let mut ids = segment
+        .compound_prefix_candidates_if_present(entry, &bounds)
+        .unwrap()
+        .unwrap_or_default();
+    ids.sort_unstable();
+    ids
+}
+
+fn lifecycle_compound_edge_candidates_for_from_status(
+    segment: &crate::segment_reader::SegmentReader,
+    entry: &SecondaryIndexManifestEntry,
+    from_id: u64,
+    status: &str,
+) -> Vec<u64> {
+    let context = crate::secondary_index_key::CompoundTupleContext::from_manifest_entry(entry)
+        .unwrap();
+    let status_value = PropValue::String(status.to_string());
+    let prefix = crate::secondary_index_key::encode_compound_tuple_prefix(
+        &context,
+        &[
+            crate::secondary_index_key::CompoundFieldValue::MetadataU64(from_id),
+            crate::secondary_index_key::CompoundFieldValue::Property(Some(&status_value)),
+        ],
+    )
+    .unwrap();
+    let bounds = crate::secondary_index_key::compound_prefix_bounds(&prefix);
+    let mut ids = segment
+        .compound_prefix_candidates_if_present(entry, &bounds)
+        .unwrap()
+        .unwrap_or_default();
+    ids.sort_unstable();
+    ids
+}
+
+fn corrupt_compound_sidecar_payload_only_in_place(path: &std::path::Path) {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let compound_payload_offset = component_payload_offset_for_test(path)
+        + crate::secondary_index_key::COMPOUND_SIDECAR_HEADER_LEN as u64;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap();
+    assert!(
+        file.metadata().unwrap().len() > compound_payload_offset,
+        "compound sidecar must have payload bytes after the header"
+    );
+    file.seek(SeekFrom::Start(compound_payload_offset))
+        .unwrap();
+    file.write_all(&[0xFF]).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn create_ready_lifecycle_node_compound_index(
+    db_path: &std::path::Path,
+) -> (u64, u64, SecondaryIndexSpec) {
+    let db = DatabaseEngine::open(db_path, &DbOptions::default()).unwrap();
+    let mut props = BTreeMap::new();
+    props.insert(
+        "tenant".to_string(),
+        PropValue::String("acme".to_string()),
+    );
+    db.upsert_node(
+        "Person",
+        "compound-ready",
+        UpsertNodeOptions {
+            props,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.flush().unwrap();
+    let spec = lifecycle_node_compound_spec(SecondaryIndexKind::Equality);
+    let info = db
+        .ensure_node_property_index("Person", spec.clone())
+        .unwrap();
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    let segment_id = db.segments_for_test()[0].segment_id;
+    db.close().unwrap();
+    (info.index_id, segment_id, spec)
+}
+
+fn create_ready_lifecycle_edge_compound_range_index(
+    db_path: &std::path::Path,
+) -> (u64, u64, u64, u64, SecondaryIndexSpec) {
+    let db = DatabaseEngine::open(db_path, &DbOptions::default()).unwrap();
+    let from_id = db
+        .upsert_node(
+            "Person",
+            "compound-edge-source",
+            UpsertNodeOptions::default(),
+        )
+        .unwrap();
+    let edge_id = insert_lifecycle_compound_edge(&db, "ready", from_id, "open", 250);
+    db.flush().unwrap();
+    let spec = lifecycle_edge_compound_range_spec();
+    let info = db
+        .ensure_edge_property_index("KNOWS", spec.clone())
+        .unwrap();
+    wait_for_edge_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    let segment_id = db.segments_for_test()[0].segment_id;
+    db.close().unwrap();
+    (info.index_id, segment_id, from_id, edge_id, spec)
 }
 
 // --- Low-level write_op API tests ---
@@ -12749,7 +12957,7 @@ fn test_property_index_manifest_reopens_and_reseeds_active_memtable() {
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         index_id = db
-            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap()
             .index_id;
         db.close().unwrap();
@@ -12825,7 +13033,7 @@ fn test_ensure_property_index_while_flush_in_flight_preserves_manifest_and_seedi
     ready_rx.recv().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     assert_eq!(info.state, SecondaryIndexState::Building);
     let status_hash = hash_prop_equality_key(&PropValue::String("active".to_string()));
@@ -12895,7 +13103,7 @@ fn test_ready_property_index_downgrades_when_flush_publish_missed_declaration_sn
     publish_ready_rx.recv().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -12967,7 +13175,7 @@ fn test_published_property_query_route_stays_snapshot_stable_across_build_comple
 
     let (build_ready_rx, build_release_tx) = db.set_secondary_index_build_pause();
     let info = db
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     build_ready_rx.recv().unwrap();
 
@@ -13056,7 +13264,7 @@ fn test_ready_property_index_downgrades_when_bg_compaction_missed_declaration_sn
     let expected_ids = vec![node_a, node_b];
 
     let info = db
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -13139,13 +13347,10 @@ fn test_failed_property_indexes_survive_reopen_and_queries_fallback() {
             .unwrap();
 
         let eq = db
-            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         let range = db
-            .ensure_node_property_index("Person",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         db.with_runtime_manifest_write(|manifest| {
             for entry in &mut manifest.secondary_indexes {
@@ -13297,7 +13502,7 @@ fn test_equality_index_backfills_existing_segments_and_compaction_preserves_side
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -13367,7 +13572,7 @@ fn test_missing_equality_sidecar_reopens_and_repairs_to_ready() {
         db.flush().unwrap();
 
         let info = db
-            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
@@ -13419,7 +13624,7 @@ fn test_corrupt_equality_sidecar_reopens_failed_and_queries_fallback() {
         db.flush().unwrap();
 
         let info = db
-            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
@@ -13490,7 +13695,7 @@ fn test_ready_equality_sidecar_tail_corruption_does_not_full_scan_on_open() {
         db.flush().unwrap();
 
         let info = db
-            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
@@ -13544,7 +13749,7 @@ fn test_missing_equality_sidecar_while_open_queries_fallback_and_repairs() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -13675,7 +13880,7 @@ fn test_corrupt_equality_sidecar_while_open_queries_fallback_and_marks_failed() 
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -13718,7 +13923,7 @@ fn test_compaction_with_corrupt_ready_sidecar_succeeds_and_marks_failed() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -13783,7 +13988,7 @@ fn test_compaction_with_missing_ready_sidecar_rebuilds_equality_index_via_target
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -13873,7 +14078,7 @@ fn test_drop_equality_index_routes_to_fallback_and_cleans_sidecar() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -13888,7 +14093,7 @@ fn test_drop_equality_index_routes_to_fallback_and_cleans_sidecar() {
     assert!(sidecar_path.exists());
 
     assert!(db
-        .drop_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .drop_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap());
     assert!(
         db.list_node_property_indexes().unwrap()
@@ -13931,6 +14136,583 @@ fn test_drop_equality_index_routes_to_fallback_and_cleans_sidecar() {
 }
 
 #[test]
+fn test_compound_index_background_build_transitions_ready_and_writes_sidecar() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut props = BTreeMap::new();
+    props.insert(
+        "tenant".to_string(),
+        PropValue::String("acme".to_string()),
+    );
+    db.upsert_node(
+        "Person",
+        "compound-bg-build",
+        UpsertNodeOptions {
+            props,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.flush().unwrap();
+
+    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
+    let spec = lifecycle_node_compound_spec(SecondaryIndexKind::Equality);
+    let info = db
+        .ensure_node_property_index("Person", spec.clone())
+        .unwrap();
+    assert_eq!(info.state, SecondaryIndexState::Building);
+    assert!(info.compound);
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let initial_sidecar_path = crate::segment_writer::node_compound_eq_sidecar_path(
+        &seg_dir,
+        info.index_id,
+    );
+    assert!(!initial_sidecar_path.exists());
+
+    release_tx.send(()).unwrap();
+    let ready = wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    assert!(ready.last_error.is_none());
+    let entry =
+        wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    let sidecar_path = crate::segment_writer::node_compound_eq_sidecar_path(&seg_dir, info.index_id);
+    assert!(sidecar_path.exists());
+    assert!(db.segments_for_test()[0]
+        .validate_compound_sidecar_for_entry(&entry)
+        .unwrap());
+    db.close().unwrap();
+}
+
+#[test]
+fn test_compound_index_fast_merge_compaction_preserves_sidecars() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let opts = DbOptions {
+        compact_after_n_flushes: 0,
+        ..DbOptions::default()
+    };
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+
+    let first_id = insert_lifecycle_compound_node(&db, "compound-fast-first", "acme");
+    db.flush().unwrap();
+    let spec = lifecycle_node_compound_spec(SecondaryIndexKind::Equality);
+    let info = db.ensure_node_property_index("Person", spec).unwrap();
+    assert!(info.compound);
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let second_id = insert_lifecycle_compound_node(&db, "compound-fast-second", "acme");
+    db.flush().unwrap();
+    assert_eq!(db.segments_for_test().len(), 2);
+
+    let stats = db.compact().unwrap().unwrap();
+    assert_eq!(stats.segments_merged, 2);
+    assert_eq!(db.segments_for_test().len(), 1);
+
+    let entry =
+        wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    let compacted_segment = db.segments_for_test()[0].clone();
+    assert!(compacted_segment
+        .validate_compound_sidecar_for_entry(&entry)
+        .unwrap());
+    assert_eq!(
+        lifecycle_compound_node_candidates_for_tenant(&compacted_segment, &entry, "acme"),
+        vec![first_id, second_id]
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn test_compound_index_background_compaction_preserves_sidecars() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let opts = DbOptions {
+        compact_after_n_flushes: 0,
+        ..DbOptions::default()
+    };
+    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+
+    let first_id = insert_lifecycle_compound_node(&db, "compound-bg-first", "acme");
+    db.flush().unwrap();
+    let spec = lifecycle_node_compound_spec(SecondaryIndexKind::Equality);
+    let info = db.ensure_node_property_index("Person", spec).unwrap();
+    assert!(info.compound);
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let second_id = insert_lifecycle_compound_node(&db, "compound-bg-second", "acme");
+    db.flush().unwrap();
+    assert_eq!(db.segments_for_test().len(), 2);
+
+    db.start_bg_compact().unwrap();
+    let stats = db.wait_for_bg_compact().expect("background compaction");
+    assert_eq!(stats.segments_merged, 2);
+    assert_eq!(db.segments_for_test().len(), 1);
+
+    let entry =
+        wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    let compacted_segment = db.segments_for_test()[0].clone();
+    assert!(compacted_segment
+        .validate_compound_sidecar_for_entry(&entry)
+        .unwrap());
+    assert_eq!(
+        lifecycle_compound_node_candidates_for_tenant(&compacted_segment, &entry, "acme"),
+        vec![first_id, second_id]
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn test_compaction_with_corrupt_ready_compound_sidecar_rebuilds_and_marks_failed() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let first_id = insert_lifecycle_compound_node(&db, "compound-corrupt-first", "acme");
+    db.flush().unwrap();
+    let spec = lifecycle_node_compound_spec(SecondaryIndexKind::Equality);
+    let info = db.ensure_node_property_index("Person", spec).unwrap();
+    assert!(info.compound);
+    wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+    let second_id = insert_lifecycle_compound_node(&db, "compound-corrupt-second", "acme");
+    db.flush().unwrap();
+    let corrupt_seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let corrupt_sidecar_path =
+        crate::segment_writer::node_compound_eq_sidecar_path(&corrupt_seg_dir, info.index_id);
+    corrupt_sidecar_header_in_place(&corrupt_sidecar_path);
+
+    let stats = db.compact().unwrap().unwrap();
+    assert_eq!(stats.segments_merged, 2);
+
+    let failed = wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Failed);
+    assert_eq!(failed.state, SecondaryIndexState::Failed);
+    assert!(failed
+        .last_error
+        .as_deref()
+        .unwrap()
+        .starts_with("compound secondary index unavailable:"));
+
+    let entry =
+        wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Failed);
+    let compacted_segment = db.segments_for_test()[0].clone();
+    assert!(compacted_segment
+        .validate_compound_sidecar_for_entry(&entry)
+        .unwrap());
+    assert_eq!(
+        lifecycle_compound_node_candidates_for_tenant(&compacted_segment, &entry, "acme"),
+        vec![first_id, second_id]
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn test_compaction_compound_sidecar_excludes_deleted_node_on_reuse_and_rebuild() {
+    for force_rebuild in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let opts = DbOptions {
+            compact_after_n_flushes: 0,
+            ..DbOptions::default()
+        };
+        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+
+        let keep_id = insert_lifecycle_compound_node(&db, "compound-del-keep", "acme");
+        let drop_id = insert_lifecycle_compound_node(&db, "compound-del-drop", "acme");
+        db.flush().unwrap();
+        let spec = lifecycle_node_compound_spec(SecondaryIndexKind::Equality);
+        let info = db.ensure_node_property_index("Person", spec).unwrap();
+        assert!(info.compound);
+        wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+        let entry =
+            wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+        // Tombstone one node in a later segment; survivor filtering must drop
+        // its postings from the compacted compound sidecar.
+        db.delete_node(drop_id).unwrap();
+        let extra_id = insert_lifecycle_compound_node(&db, "compound-del-extra", "acme");
+        db.flush().unwrap();
+        assert_eq!(db.segments_for_test().len(), 2);
+
+        if force_rebuild {
+            for segment in db.segments_for_test() {
+                let seg_dir = segment_dir(&db_path, segment.segment_id);
+                let sidecar_path = crate::segment_writer::node_compound_eq_sidecar_path(
+                    &seg_dir,
+                    info.index_id,
+                );
+                if sidecar_path.exists() {
+                    std::fs::remove_file(&sidecar_path).unwrap();
+                }
+            }
+        }
+
+        let stats = db.compact().unwrap().unwrap();
+        assert_eq!(stats.segments_merged, 2);
+        assert_eq!(db.segments_for_test().len(), 1);
+
+        let compacted_segment = db.segments_for_test()[0].clone();
+        assert!(compacted_segment
+            .validate_compound_sidecar_for_entry(&entry)
+            .unwrap());
+        let mut expected = vec![keep_id, extra_id];
+        expected.sort_unstable();
+        assert_eq!(
+            lifecycle_compound_node_candidates_for_tenant(&compacted_segment, &entry, "acme"),
+            expected,
+            "deleted node {drop_id} must be excluded (force_rebuild={force_rebuild})"
+        );
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn test_compaction_compound_sidecar_excludes_label_loss_on_reuse_and_rebuild() {
+    for force_rebuild in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("testdb");
+        let opts = DbOptions {
+            compact_after_n_flushes: 0,
+            ..DbOptions::default()
+        };
+        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+
+        let keep_id = insert_lifecycle_compound_node(&db, "compound-label-keep", "acme");
+        let lose_id = insert_lifecycle_compound_node(&db, "compound-label-lose", "acme");
+        db.flush().unwrap();
+        let spec = lifecycle_node_compound_spec(SecondaryIndexKind::Equality);
+        let info = db.ensure_node_property_index("Person", spec).unwrap();
+        assert!(info.compound);
+        wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+        let entry =
+            wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+
+        // Drop the indexed label in a later segment; the record survives but
+        // must vanish from the Person-scoped compound sidecar.
+        assert!(db.add_node_label(lose_id, "Contractor").unwrap());
+        assert!(db.remove_node_label(lose_id, "Person").unwrap());
+        let extra_id = insert_lifecycle_compound_node(&db, "compound-label-extra", "acme");
+        db.flush().unwrap();
+        assert_eq!(db.segments_for_test().len(), 2);
+
+        if force_rebuild {
+            for segment in db.segments_for_test() {
+                let seg_dir = segment_dir(&db_path, segment.segment_id);
+                let sidecar_path = crate::segment_writer::node_compound_eq_sidecar_path(
+                    &seg_dir,
+                    info.index_id,
+                );
+                if sidecar_path.exists() {
+                    std::fs::remove_file(&sidecar_path).unwrap();
+                }
+            }
+        }
+
+        let stats = db.compact().unwrap().unwrap();
+        assert_eq!(stats.segments_merged, 2);
+        assert_eq!(db.segments_for_test().len(), 1);
+
+        let compacted_segment = db.segments_for_test()[0].clone();
+        assert!(compacted_segment
+            .validate_compound_sidecar_for_entry(&entry)
+            .unwrap());
+        let mut expected = vec![keep_id, extra_id];
+        expected.sort_unstable();
+        assert_eq!(
+            lifecycle_compound_node_candidates_for_tenant(&compacted_segment, &entry, "acme"),
+            expected,
+            "label-losing node {lose_id} must be excluded (force_rebuild={force_rebuild})"
+        );
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn test_compound_index_reopen_keeps_compatible_ready_declaration_ready() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let (index_id, _segment_id, _spec) = create_ready_lifecycle_node_compound_index(&db_path);
+
+    let reopened_core = EngineCore::open(&db_path, &DbOptions::default()).unwrap();
+    let entry = reopened_core
+        .manifest
+        .secondary_indexes
+        .iter()
+        .find(|entry| entry.index_id == index_id)
+        .unwrap();
+    assert_eq!(entry.state, SecondaryIndexState::Ready);
+    assert!(entry.last_error.is_none());
+    reopened_core.close_fast().unwrap();
+}
+
+#[test]
+fn test_compound_index_reopen_missing_sidecar_becomes_building() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let (index_id, segment_id, _spec) = create_ready_lifecycle_node_compound_index(&db_path);
+    let seg_dir = segment_dir(&db_path, segment_id);
+    let sidecar_path = crate::segment_writer::node_compound_eq_sidecar_path(&seg_dir, index_id);
+    std::fs::remove_file(&sidecar_path).unwrap();
+    assert!(!sidecar_path.exists());
+
+    let reopened_core = EngineCore::open(&db_path, &DbOptions::default()).unwrap();
+    let entry = reopened_core
+        .manifest
+        .secondary_indexes
+        .iter()
+        .find(|entry| entry.index_id == index_id)
+        .unwrap();
+    assert_eq!(entry.state, SecondaryIndexState::Building);
+    assert!(entry.last_error.is_none());
+    assert!(!sidecar_path.exists());
+    reopened_core.close_fast().unwrap();
+}
+
+#[test]
+fn test_compound_index_reopen_header_corruption_fails_and_retry_repairs() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let (index_id, segment_id, spec) = create_ready_lifecycle_node_compound_index(&db_path);
+    let seg_dir = segment_dir(&db_path, segment_id);
+    let sidecar_path = crate::segment_writer::node_compound_eq_sidecar_path(&seg_dir, index_id);
+    corrupt_sidecar_header_in_place(&sidecar_path);
+
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let failed = db
+        .list_node_property_indexes()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.index_id == index_id)
+        .unwrap();
+    assert_eq!(failed.state, SecondaryIndexState::Failed);
+    assert!(failed
+        .last_error
+        .as_deref()
+        .unwrap()
+        .contains("compound secondary index unavailable:"));
+
+    let retry = db
+        .ensure_node_property_index("Person", spec.clone())
+        .unwrap();
+    assert_eq!(retry.index_id, index_id);
+    assert_eq!(retry.state, SecondaryIndexState::Building);
+    assert!(retry.last_error.is_none());
+
+    let ready = wait_for_property_index_state(&db, index_id, SecondaryIndexState::Ready);
+    assert!(ready.last_error.is_none());
+    let entry = wait_for_published_property_index_state(&db, index_id, SecondaryIndexState::Ready);
+    assert!(db.segments_for_test()[0]
+        .validate_compound_sidecar_for_entry(&entry)
+        .unwrap());
+    db.close().unwrap();
+}
+
+#[test]
+fn test_compound_index_reopen_does_not_full_validate_payload_only_corruption() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let (index_id, segment_id, _spec) = create_ready_lifecycle_node_compound_index(&db_path);
+    let seg_dir = segment_dir(&db_path, segment_id);
+    let sidecar_path = crate::segment_writer::node_compound_eq_sidecar_path(&seg_dir, index_id);
+    corrupt_compound_sidecar_payload_only_in_place(&sidecar_path);
+
+    let reopened_core = EngineCore::open(&db_path, &DbOptions::default()).unwrap();
+    let entry = reopened_core
+        .manifest
+        .secondary_indexes
+        .iter()
+        .find(|entry| entry.index_id == index_id)
+        .unwrap();
+    assert_eq!(entry.state, SecondaryIndexState::Ready);
+    assert!(entry.last_error.is_none());
+    reopened_core.close_fast().unwrap();
+}
+
+#[test]
+fn test_drop_compound_index_cleans_sidecar_and_component_records() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let (index_id, segment_id, spec) = create_ready_lifecycle_node_compound_index(&db_path);
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let seg_dir = segment_dir(&db_path, segment_id);
+    let sidecar_path = crate::segment_writer::node_compound_eq_sidecar_path(&seg_dir, index_id);
+    assert!(sidecar_path.exists());
+
+    assert!(db.drop_node_property_index("Person", spec).unwrap());
+    assert!(
+        db.list_node_property_indexes().unwrap()
+            .into_iter()
+            .all(|entry| entry.index_id != index_id)
+    );
+    assert!(
+        !db.active_memtable()
+            .compound_secondary_state()
+            .contains_key(&index_id)
+    );
+
+    wait_for_path_absent(&sidecar_path);
+    let component_manifest = read_component_manifest_for_test(&seg_dir);
+    assert!(component_manifest.components.iter().all(|record| {
+        !matches!(
+            record.kind,
+            SegmentComponentKind::NodeCompoundEqualityIndex { index_id: component_index_id }
+                if component_index_id == index_id
+        )
+    }));
+
+    db.close().unwrap();
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    assert!(reopened.list_node_property_indexes().unwrap().is_empty());
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_edge_compound_range_background_build_reopen_and_drop_cleanup() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let from_id = db
+        .upsert_node(
+            "Person",
+            "compound-edge-source",
+            UpsertNodeOptions::default(),
+        )
+        .unwrap();
+    let first_edge_id = insert_lifecycle_compound_edge(&db, "first", from_id, "open", 100);
+    let second_edge_id = insert_lifecycle_compound_edge(&db, "second", from_id, "open", 300);
+    let closed_edge_id = insert_lifecycle_compound_edge(&db, "closed", from_id, "closed", 200);
+    db.flush().unwrap();
+
+    let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
+    let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
+    let spec = lifecycle_edge_compound_range_spec();
+    let info = db
+        .ensure_edge_property_index("KNOWS", spec.clone())
+        .unwrap();
+    assert_eq!(info.state, SecondaryIndexState::Building);
+    assert!(info.compound);
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let initial_sidecar_path =
+        crate::segment_writer::edge_compound_range_sidecar_path(&seg_dir, info.index_id);
+    assert!(!initial_sidecar_path.exists());
+
+    release_tx.send(()).unwrap();
+    let ready = wait_for_edge_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    assert!(ready.last_error.is_none());
+    let entry =
+        wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
+    let sidecar_path =
+        crate::segment_writer::edge_compound_range_sidecar_path(&seg_dir, info.index_id);
+    assert!(sidecar_path.exists());
+    let segment = db.segments_for_test()[0].clone();
+    assert!(segment.validate_compound_sidecar_for_entry(&entry).unwrap());
+    assert_eq!(
+        lifecycle_compound_edge_candidates_for_from_status(&segment, &entry, from_id, "open"),
+        vec![first_edge_id, second_edge_id]
+    );
+    assert_eq!(
+        lifecycle_compound_edge_candidates_for_from_status(&segment, &entry, from_id, "closed"),
+        vec![closed_edge_id]
+    );
+    db.close().unwrap();
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened_info = reopened
+        .list_edge_property_indexes()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    assert_eq!(reopened_info.state, SecondaryIndexState::Ready);
+    assert!(reopened_info.last_error.is_none());
+    let reopened_entry =
+        wait_for_published_property_index_state(&reopened, info.index_id, SecondaryIndexState::Ready);
+    let reopened_segment = reopened.segments_for_test()[0].clone();
+    assert!(reopened_segment
+        .validate_compound_sidecar_for_entry(&reopened_entry)
+        .unwrap());
+
+    assert!(reopened.drop_edge_property_index("KNOWS", spec).unwrap());
+    assert!(reopened
+        .list_edge_property_indexes()
+        .unwrap()
+        .into_iter()
+        .all(|entry| entry.index_id != info.index_id));
+    assert!(
+        !reopened
+            .active_memtable()
+            .compound_secondary_state()
+            .contains_key(&info.index_id)
+    );
+
+    wait_for_path_absent(&sidecar_path);
+    let component_manifest = read_component_manifest_for_test(&seg_dir);
+    assert!(component_manifest.components.iter().all(|record| {
+        !matches!(
+            record.kind,
+            SegmentComponentKind::EdgeCompoundRangeIndex {
+                index_id: component_index_id
+            } if component_index_id == info.index_id
+        )
+    }));
+    reopened.close().unwrap();
+
+    let reopened_after_drop = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    assert!(reopened_after_drop
+        .list_edge_property_indexes()
+        .unwrap()
+        .is_empty());
+    reopened_after_drop.close().unwrap();
+}
+
+#[test]
+fn test_edge_compound_range_reopen_header_corruption_fails_and_retry_repairs() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let (index_id, segment_id, from_id, edge_id, spec) =
+        create_ready_lifecycle_edge_compound_range_index(&db_path);
+    let seg_dir = segment_dir(&db_path, segment_id);
+    let sidecar_path = crate::segment_writer::edge_compound_range_sidecar_path(&seg_dir, index_id);
+    corrupt_sidecar_header_in_place(&sidecar_path);
+
+    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let failed = db
+        .list_edge_property_indexes()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.index_id == index_id)
+        .unwrap();
+    assert_eq!(failed.state, SecondaryIndexState::Failed);
+    assert!(failed
+        .last_error
+        .as_deref()
+        .unwrap()
+        .contains("compound secondary index unavailable:"));
+
+    let retry = db
+        .ensure_edge_property_index("KNOWS", spec.clone())
+        .unwrap();
+    assert_eq!(retry.index_id, index_id);
+    assert_eq!(retry.state, SecondaryIndexState::Building);
+    assert!(retry.last_error.is_none());
+
+    let ready = wait_for_edge_property_index_state(&db, index_id, SecondaryIndexState::Ready);
+    assert!(ready.last_error.is_none());
+    let entry = wait_for_published_property_index_state(&db, index_id, SecondaryIndexState::Ready);
+    let segment = db.segments_for_test()[0].clone();
+    assert!(segment.validate_compound_sidecar_for_entry(&entry).unwrap());
+    assert_eq!(
+        lifecycle_compound_edge_candidates_for_from_status(&segment, &entry, from_id, "open"),
+        vec![edge_id]
+    );
+    db.close().unwrap();
+}
+
+#[test]
 fn test_equality_backfill_survives_compaction_during_build() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
@@ -13954,7 +14736,7 @@ fn test_equality_backfill_survives_compaction_during_build() {
 
     let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
@@ -14004,7 +14786,7 @@ fn test_equality_index_close_while_build_paused_reopens_and_resumes() {
     let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
@@ -14079,14 +14861,14 @@ fn test_drop_equality_index_while_build_paused_stale_sidecar_does_not_resurrect(
     let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
 
     assert!(db
-        .drop_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .drop_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap());
     assert!(db.list_node_property_indexes().unwrap().is_empty());
     let manifest_after_drop = crate::manifest::load_manifest_readonly(&db_path)
@@ -14146,10 +14928,7 @@ fn test_property_range_index_manifest_reopens_and_reseeds_active_memtable() {
     ready_rx.recv().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     assert_eq!(info.state, SecondaryIndexState::Building);
     let frozen_memtable = db.immutable_memtable(0);
@@ -14217,10 +14996,7 @@ fn test_ready_property_range_index_downgrades_when_flush_publish_missed_declarat
     publish_ready_rx.recv().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -14301,10 +15077,7 @@ fn test_missing_range_sidecar_reopens_and_repairs_to_ready() {
         db.flush().unwrap();
 
         let info = db
-            .ensure_node_property_index("Person",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
@@ -14360,10 +15133,7 @@ fn test_corrupt_range_sidecar_reopens_failed_and_queries_fallback() {
         db.flush().unwrap();
 
         let info = db
-            .ensure_node_property_index("Person",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
@@ -14444,10 +15214,7 @@ fn test_ready_range_sidecar_tail_corruption_does_not_full_scan_on_open() {
         db.flush().unwrap();
 
         let info = db
-            .ensure_node_property_index("Person",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
@@ -14508,10 +15275,7 @@ fn test_missing_range_sidecar_while_open_queries_fallback_and_repairs() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -14631,10 +15395,7 @@ fn test_corrupt_range_sidecar_while_open_queries_fallback_and_marks_failed() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -14715,10 +15476,7 @@ fn test_compaction_with_corrupt_ready_range_sidecar_succeeds_and_marks_failed() 
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -14792,10 +15550,7 @@ fn test_compaction_with_missing_ready_range_sidecar_rebuilds_index_via_targeted_
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -14896,10 +15651,7 @@ fn test_drop_range_index_routes_to_fallback_cleans_sidecar_and_stays_dropped() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -14924,10 +15676,7 @@ fn test_drop_range_index_routes_to_fallback_cleans_sidecar_and_stays_dropped() {
     let packed_core_before_drop = packed_core_snapshot_for_test(&first_seg_dir);
 
     assert!(db
-        .drop_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .drop_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap());
     assert!(
         db.list_node_property_indexes().unwrap()
@@ -15051,10 +15800,7 @@ fn test_range_backfill_survives_compaction_during_build() {
 
     let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
     let info = db
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
@@ -15112,10 +15858,7 @@ fn test_range_index_close_fast_while_build_paused_reopens_and_resumes() {
     let seg_dir = segment_dir(&db_path, db.segments_for_test()[0].segment_id);
     let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
     let info = db
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
@@ -15179,6 +15922,7 @@ fn test_open_rejects_conflicting_range_declarations_for_same_property() {
     std::fs::create_dir_all(&db_path).unwrap();
 
     let mut manifest = crate::manifest::default_manifest();
+    seed_lifecycle_manifest_node_label(&mut manifest, "Person", 1);
     manifest.secondary_indexes = vec![
         SecondaryIndexManifestEntry {
             index_id: 1,
@@ -15218,6 +15962,7 @@ fn test_open_rejects_duplicate_secondary_index_ids_in_manifest() {
     std::fs::create_dir_all(&db_path).unwrap();
 
     let mut manifest = crate::manifest::default_manifest();
+    seed_lifecycle_manifest_node_label(&mut manifest, "Person", 1);
     manifest.secondary_indexes = vec![
         SecondaryIndexManifestEntry {
             index_id: 1,
@@ -15259,6 +16004,7 @@ fn test_open_rejects_duplicate_equality_declarations_for_same_property() {
     std::fs::create_dir_all(&db_path).unwrap();
 
     let mut manifest = crate::manifest::default_manifest();
+    seed_lifecycle_manifest_node_label(&mut manifest, "Person", 1);
     manifest.secondary_indexes = vec![
         SecondaryIndexManifestEntry {
             index_id: 1,
@@ -16173,7 +16919,7 @@ fn test_publish_counters_rebuild_sources_for_property_index_change_and_skip_exis
     let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
     db.reset_publish_counters_for_test();
     let info = db
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
 
     let counters = db.publish_counter_snapshot_for_test();
@@ -16191,7 +16937,7 @@ fn test_publish_counters_rebuild_sources_for_property_index_change_and_skip_exis
 
     db.reset_publish_counters_for_test();
     let existing = db
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     assert_eq!(existing.index_id, info.index_id);
 
@@ -16243,7 +16989,7 @@ fn test_property_index_followups_coalesce_while_first_followup_is_in_flight() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
 
@@ -16332,7 +17078,7 @@ fn test_targeted_equality_stats_refresh_replaces_reader_after_ready_transition()
     assert!(old_reader.planner_stats().unwrap().equality_index_stats.is_empty());
 
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -16454,7 +17200,7 @@ fn test_ready_index_adopts_refreshed_sidecar_when_stats_refresh_fails() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let ready_entry =
         wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -16532,7 +17278,7 @@ fn test_optional_refresh_preserves_root_manifest_and_republishes_once() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let ready_entry =
         wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -16607,7 +17353,7 @@ fn test_optional_refresh_adoption_rejects_older_reader_generation() {
     db.flush().unwrap();
 
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let ready_entry =
         wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -16670,7 +17416,7 @@ fn test_optional_refresh_orphan_files_are_cleaned_on_reopen() {
         db.flush().unwrap();
 
         let info = db
-            .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
@@ -16756,7 +17502,7 @@ fn test_public_index_list_waits_for_ready_publish_after_targeted_stats_refresh()
 
     let (build_ready_rx, build_release_tx) = db.set_secondary_index_build_pause();
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     build_ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
@@ -16829,7 +17575,7 @@ fn test_targeted_stats_refresh_ignores_stale_legacy_tmp_and_publishes_ready_inde
     std::fs::set_permissions(&tmp_path, perms).unwrap();
 
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let ready = wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     assert_eq!(ready.state, SecondaryIndexState::Ready);
@@ -16880,10 +17626,7 @@ fn test_targeted_range_stats_refresh_writes_minimal_stats_when_missing() {
     let packed_core_before = packed_core_snapshot_for_test(&seg_dir);
 
     let info = db
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -16960,10 +17703,7 @@ fn test_targeted_range_stats_refresh_writes_minimal_stats_when_corrupt() {
     std::fs::write(&stats_path, b"corrupt planner stats").unwrap();
 
     let info = db
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
@@ -17012,7 +17752,7 @@ fn test_targeted_stats_refresh_drops_stale_declared_index_blocks() {
     db.flush().unwrap();
 
     let color = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&db, color.index_id, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(&db, color.index_id, SecondaryIndexState::Ready);
@@ -17024,10 +17764,10 @@ fn test_targeted_stats_refresh_drops_stale_declared_index_blocks() {
         .any(|stats| stats.index_id == color.index_id));
 
     assert!(db
-        .drop_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .drop_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap());
     let tier = db
-        .ensure_node_property_index("Person", "tier", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("tier").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&db, tier.index_id, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(&db, tier.index_id, SecondaryIndexState::Ready);
@@ -17076,7 +17816,7 @@ fn test_targeted_stats_refresh_skips_obsolete_segments_before_write_and_swap() {
     let old_segments = db.segments_for_test();
 
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     let ready_entry =
@@ -17116,6 +17856,7 @@ fn test_secondary_index_non_ready_finalize_outcomes_do_not_request_stats_refresh
     fn finalize_eq_for_status(status: SecondaryEqCoverageStatus) -> SecondaryEqFinalizeOutcome {
         let dir = TempDir::new().unwrap();
         let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+        seed_internal_node_labels(&db, &[1]).unwrap();
         let entry = SecondaryIndexManifestEntry {
             index_id: 991,
             target: SecondaryIndexTarget::NodeProperty {
@@ -17180,6 +17921,7 @@ fn test_secondary_index_non_ready_finalize_outcomes_do_not_request_stats_refresh
     ) -> SecondaryRangeFinalizeOutcome {
         let dir = TempDir::new().unwrap();
         let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+        seed_internal_node_labels(&db, &[1]).unwrap();
         let entry = SecondaryIndexManifestEntry {
             index_id: 992,
             target: SecondaryIndexTarget::NodeProperty {
@@ -17265,7 +18007,7 @@ fn test_targeted_stats_refresh_swaps_only_affected_reader_arcs() {
         db.flush().unwrap();
     }
     let info = db
-        .ensure_node_property_index("Person", "color", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     let ready_entry =

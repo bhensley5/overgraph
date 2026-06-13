@@ -143,15 +143,18 @@ impl EqualityRawPostingBudget {
     }
 
     fn next_chunk_limit(&self) -> Option<usize> {
+        self.remaining_source_limit()
+            .map(|limit| limit.min(QUERY_VERIFY_CHUNK))
+    }
+
+    // Memtable sources are read in one call, so they must receive the full
+    // remaining budget: a chunk-clamped limit silently drops matches past the
+    // clamp without any TooBroad signal.
+    fn remaining_source_limit(&self) -> Option<usize> {
         if self.consumed > self.cap {
             None
         } else {
-            Some(
-                self.cap
-                    .saturating_add(1)
-                    .saturating_sub(self.consumed)
-                    .min(QUERY_VERIFY_CHUNK),
-            )
+            Some(self.cap.saturating_add(1).saturating_sub(self.consumed))
         }
     }
 
@@ -197,29 +200,39 @@ fn memtable_secondary_eq_nodes_for_filter(
     memtable.find_secondary_eq_nodes_at(index_id, prop_key, prop_value, snapshot_seq)
 }
 
+// Returns the matching ids plus a possibly-truncated flag. The flag must be
+// conservative: cross-hash dedup can shrink the combined result below
+// `max_ids` even when one hash group stopped at its limit, so callers cannot
+// infer completeness from the returned length alone.
 fn memtable_secondary_eq_raw_nodes_for_filter(
     memtable: &Memtable,
     index_id: u64,
     prop_value: &PropValue,
     snapshot_seq: u64,
     max_ids: Option<usize>,
-) -> Vec<u64> {
+) -> (Vec<u64>, bool) {
     let mut ids = Vec::new();
+    let mut possibly_truncated = false;
     for value_hash in equality_probe_value_hashes(prop_value) {
         let remaining = max_ids.map(|max_ids| max_ids.saturating_sub(ids.len()));
         if remaining == Some(0) {
+            possibly_truncated = true;
             break;
         }
-        ids.extend(memtable.find_secondary_eq_nodes_by_hash_at_limited(
+        let group_ids = memtable.find_secondary_eq_nodes_by_hash_at_limited(
             index_id,
             value_hash,
             snapshot_seq,
             remaining,
-        ));
+        );
+        if remaining.is_some_and(|remaining| group_ids.len() >= remaining) {
+            possibly_truncated = true;
+        }
+        ids.extend(group_ids);
     }
     ids.sort_unstable();
     ids.dedup();
-    ids
+    (ids, possibly_truncated)
 }
 
 fn memtable_secondary_eq_count_for_filter(
@@ -655,12 +668,6 @@ impl ReadView {
         } else {
             SecondaryIndexState::Building
         };
-        let next_last_error = if next_state == SecondaryIndexState::Failed {
-            error.as_ref().map(ToString::to_string)
-        } else {
-            None
-        };
-
         let current_entry = self
             .secondary_index_entries
             .iter()
@@ -668,11 +675,48 @@ impl ReadView {
         if !matches!(current_entry.kind, SecondaryIndexKind::Equality) {
             return None;
         }
+        let next_last_error = if next_state == SecondaryIndexState::Failed {
+            error.as_ref().map(|error| {
+                secondary_index_failure_message_for_entry(current_entry, error.to_string())
+            })
+        } else {
+            None
+        };
         if current_entry.state == next_state && current_entry.last_error == next_last_error {
             return None;
         }
 
-        Some(SecondaryIndexReadFollowup::EqualitySidecarFailure { index_id, error })
+        if matches!(
+            current_entry.target,
+            SecondaryIndexTarget::NodeFieldIndex { .. }
+                | SecondaryIndexTarget::EdgeFieldIndex { .. }
+        ) {
+            Some(SecondaryIndexReadFollowup::CompoundEqualitySidecarFailure {
+                index_id,
+                error,
+            })
+        } else {
+            Some(SecondaryIndexReadFollowup::EqualitySidecarFailure { index_id, error })
+        }
+    }
+
+    /// Compound materializations select declarations of either kind for
+    /// prefix-only scans, so the repair followup must be dispatched on the
+    /// declaration kind: the kind-specific helpers return `None` for entries
+    /// of the other kind, which would silently break the rebuild loop.
+    fn compound_sidecar_failure_followup(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+        error: Option<EngineError>,
+    ) -> Option<SecondaryIndexReadFollowup> {
+        match entry.kind {
+            SecondaryIndexKind::Equality => {
+                self.equality_sidecar_failure_followup(entry.index_id, error)
+            }
+            SecondaryIndexKind::Range => {
+                self.range_sidecar_failure_followup(entry.index_id, error)
+            }
+        }
     }
 
     fn ready_equality_verified_node_ids(
@@ -895,36 +939,36 @@ impl ReadView {
         let mut raw_posting_budget = EqualityRawPostingBudget::new(raw_posting_cap);
         let mut accepted = NodeIdSet::default();
 
-        let raw_limit = match raw_posting_budget.next_chunk_limit() {
+        let raw_limit = match raw_posting_budget.remaining_source_limit() {
             Some(limit) if limit > 0 => limit,
             _ => return Ok((None, None)),
         };
-        let ids = memtable_secondary_eq_raw_nodes_for_filter(
+        let (ids, truncated) = memtable_secondary_eq_raw_nodes_for_filter(
             &self.memtable,
             index_id,
             prop_value,
             self.snapshot_seq,
             Some(raw_limit),
         );
-        if raw_posting_budget.consume(ids.len()) {
+        if raw_posting_budget.consume(ids.len()) || truncated {
             return Ok((None, None));
         }
         accepted.extend(ids);
 
         let mut deleted_above = self.memtable.collect_deleted_nodes_at(self.snapshot_seq);
         for epoch in &self.immutable_epochs {
-            let raw_limit = match raw_posting_budget.next_chunk_limit() {
+            let raw_limit = match raw_posting_budget.remaining_source_limit() {
                 Some(limit) if limit > 0 => limit,
                 _ => return Ok((None, None)),
             };
-            let ids = memtable_secondary_eq_raw_nodes_for_filter(
+            let (ids, truncated) = memtable_secondary_eq_raw_nodes_for_filter(
                 &epoch.memtable,
                 index_id,
                 prop_value,
                 self.snapshot_seq,
                 Some(raw_limit),
             );
-            if raw_posting_budget.consume(ids.len()) {
+            if raw_posting_budget.consume(ids.len()) || truncated {
                 return Ok((None, None));
             }
             accepted.extend(ids.into_iter().filter(|id| !deleted_above.contains(id)));
@@ -1151,12 +1195,6 @@ impl ReadView {
         } else {
             SecondaryIndexState::Building
         };
-        let next_last_error = if next_state == SecondaryIndexState::Failed {
-            error.as_ref().map(ToString::to_string)
-        } else {
-            None
-        };
-
         let current_entry = self
             .secondary_index_entries
             .iter()
@@ -1164,11 +1202,26 @@ impl ReadView {
         if !matches!(current_entry.kind, SecondaryIndexKind::Range) {
             return None;
         }
+        let next_last_error = if next_state == SecondaryIndexState::Failed {
+            error.as_ref().map(|error| {
+                secondary_index_failure_message_for_entry(current_entry, error.to_string())
+            })
+        } else {
+            None
+        };
         if current_entry.state == next_state && current_entry.last_error == next_last_error {
             return None;
         }
 
-        Some(SecondaryIndexReadFollowup::RangeSidecarFailure { index_id, error })
+        if matches!(
+            current_entry.target,
+            SecondaryIndexTarget::NodeFieldIndex { .. }
+                | SecondaryIndexTarget::EdgeFieldIndex { .. }
+        ) {
+            Some(SecondaryIndexReadFollowup::CompoundRangeSidecarFailure { index_id, error })
+        } else {
+            Some(SecondaryIndexReadFollowup::RangeSidecarFailure { index_id, error })
+        }
     }
 
     fn nodes_by_single_label_id_paged_unfiltered(

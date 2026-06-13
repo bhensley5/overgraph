@@ -1,5 +1,5 @@
 /**
- * OverGraph Example: GQL Beta
+ * OverGraph Example: GQL
  *
  * Run: node examples/node/gql-readonly.mjs
  * (Requires: npm run build in overgraph-node/ first)

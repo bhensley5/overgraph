@@ -17,6 +17,10 @@ import { packNodeBatch } from '../helpers/pack-binary.mjs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+function propertyIndexSpec(propKey, kind) {
+  return { kind, fields: [{ source: 'property', key: propKey }] };
+}
+
 function parseArgs(argv) {
   const args = {
     profile: 'small',
@@ -395,11 +399,11 @@ function queryBenchNodes(start, count) {
 
 function buildQueryBenchmarkDb(path, preloadNodes) {
   const db = OverGraph.open(path);
-  const status = db.ensureNodePropertyIndex('Person', 'status', 'equality');
+  const status = db.ensureNodePropertyIndex('Person', propertyIndexSpec('status', 'equality'));
   waitForPropertyIndexReady(db, status.indexId);
-  const tier = db.ensureNodePropertyIndex('Person', 'tier', 'equality');
+  const tier = db.ensureNodePropertyIndex('Person', propertyIndexSpec('tier', 'equality'));
   waitForPropertyIndexReady(db, tier.indexId);
-  const score = db.ensureNodePropertyIndex('Person', 'score', 'range');
+  const score = db.ensureNodePropertyIndex('Person', propertyIndexSpec('score', 'range'));
   waitForPropertyIndexReady(db, score.indexId);
 
   const layout = queryBenchmarkLayout(preloadNodes);
@@ -457,9 +461,9 @@ function buildEdgeQueryBenchmarkDb(path, preloadEdges) {
 
 function buildIndexedEdgeQueryBenchmarkDb(path, preloadEdges) {
   const fixture = buildEdgeQueryBenchmarkDb(path, preloadEdges);
-  const role = fixture.db.ensureEdgePropertyIndex('WORKS_AT', 'role', 'equality');
+  const role = fixture.db.ensureEdgePropertyIndex('WORKS_AT', propertyIndexSpec('role', 'equality'));
   waitForEdgePropertyIndexReady(fixture.db, role.indexId);
-  const score = fixture.db.ensureEdgePropertyIndex('WORKS_AT', 'score', 'range');
+  const score = fixture.db.ensureEdgePropertyIndex('WORKS_AT', propertyIndexSpec('score', 'range'));
   waitForEdgePropertyIndexReady(fixture.db, score.indexId);
   return fixture;
 }
@@ -514,9 +518,9 @@ function buildGraphRowBenchmarkDb(path, preloadEdges) {
     })));
   }
 
-  const role = db.ensureEdgePropertyIndex('WORKS_AT', 'role', 'equality');
+  const role = db.ensureEdgePropertyIndex('WORKS_AT', propertyIndexSpec('role', 'equality'));
   waitForEdgePropertyIndexReady(db, role.indexId);
-  const score = db.ensureEdgePropertyIndex('WORKS_AT', 'score', 'range');
+  const score = db.ensureEdgePropertyIndex('WORKS_AT', propertyIndexSpec('score', 'range'));
   waitForEdgePropertyIndexReady(db, score.indexId);
   return {
     db,

@@ -77,11 +77,11 @@ These are already part of the public engine.
 
 ## Now
 
-Active work expanding the GQL Beta surface, tightening numeric property semantics, and improving projection and late hydration.
+Active work expanding the GQL surface, tightening numeric property semantics, and improving projection and late hydration.
 
 ### GQL Reads And Mutations
 
-GQL Beta is live in Rust, Node.js, and Python. GQL/Cypher-style query strings compile into the same native read and write substrates as the structured APIs, so callers move between request objects and `MATCH` / `CREATE` strings without changing engines.
+GQL is live in Rust, Node.js, and Python. GQL/Cypher-style query strings compile into the same native read and write substrates as the structured APIs, so callers move between request objects and `MATCH` / `CREATE` strings without changing engines.
 
 - Reads: `MATCH`, `OPTIONAL MATCH`, bounded variable-length paths, path values, row projection, parameters, `WHERE`, `RETURN`, `ORDER BY`, `SKIP`, `LIMIT`, continuation cursors, and explain output.
 - Mutations: `CREATE`, `SET`, `REMOVE`, `DELETE r`, and `DETACH DELETE n`, with mutation `RETURN` for `CREATE`, `SET`, and `REMOVE`.
@@ -89,7 +89,7 @@ GQL Beta is live in Rust, Node.js, and Python. GQL/Cypher-style query strings co
 - Predictable row output: late hydration, selected-field projection, compact connector rows, vector payloads excluded unless requested.
 - Unsupported syntax is explicit so callers know exactly what is in scope.
 
-`execute_gql` and `explain_gql` route reads and mutations through the right native substrate. `explain_gql` is side-effect-free. Rust, Node.js, and Python parity remains the bar as the beta grows.
+`execute_gql` and `explain_gql` route reads and mutations through the right native substrate. `explain_gql` is side-effect-free. Rust, Node.js, and Python parity remains the bar as the GQL surface grows.
 
 ### Numeric Property Semantics
 

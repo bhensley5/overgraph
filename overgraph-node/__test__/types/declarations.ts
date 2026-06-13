@@ -16,10 +16,14 @@ import type {
   NodeInput,
   NodeLabelFilter,
   NodeLabelInfo,
+  NodePropertyIndexInfo,
   NodeSchema,
   NodeSchemaInfo,
   OverGraph,
   SchemaCheckOptions,
+  SecondaryIndexField,
+  SecondaryIndexSpec,
+  EdgePropertyIndexInfo,
   SchemaLiteral,
   SchemaSetOptions,
   SchemaValidationReport,
@@ -41,12 +45,75 @@ import type {
   GqlPath,
   GqlStatementKind,
   GqlValue,
+  QueryPlan,
+  QueryPlanCompoundIndexDetails,
   QueryEdgeRequest,
   QueryPlanNode,
+  QueryPlanWarning,
 } from '../../query-types.js'
 import type * as QueryTypes from '../../query-types.js'
 
 declare const db: OverGraph
+
+const nodeIndexSpec: SecondaryIndexSpec = {
+  kind: 'range',
+  fields: [
+    { source: 'property', key: 'tenant_id' },
+    { source: 'metadata', field: 'updated_at' },
+  ],
+}
+const nodeIndexInfo: NodePropertyIndexInfo = db.ensureNodePropertyIndex('Person', nodeIndexSpec)
+const nodeIndexField: SecondaryIndexField = nodeIndexInfo.fields[0]
+const nodeIndexCompound: boolean = nodeIndexInfo.compound
+const nodeIndexState: 'building' | 'ready' | 'failed' = nodeIndexInfo.state
+const droppedNodeIndex: boolean = db.dropNodePropertyIndex('Person', nodeIndexSpec)
+const nodeIndexInfoAsync: Promise<NodePropertyIndexInfo> = db.ensureNodePropertyIndexAsync('Person', nodeIndexSpec)
+const droppedNodeIndexAsync: Promise<boolean> = db.dropNodePropertyIndexAsync('Person', nodeIndexSpec)
+
+const edgeIndexSpec: SecondaryIndexSpec = {
+  kind: 'equality',
+  fields: [
+    { source: 'metadata', field: 'from' },
+    { source: 'property', key: 'status' },
+  ],
+}
+const edgeIndexInfo: EdgePropertyIndexInfo = db.ensureEdgePropertyIndex('RELATES_TO', edgeIndexSpec)
+const edgeIndexFields: Array<SecondaryIndexField> = edgeIndexInfo.fields
+const edgeIndexCompound: boolean = edgeIndexInfo.compound
+const droppedEdgeIndex: boolean = db.dropEdgePropertyIndex('RELATES_TO', edgeIndexSpec)
+
+const compoundPlanDetails: QueryPlanCompoundIndexDetails = {
+  indexId: 1,
+  targetKind: 'node',
+  label: 'Person',
+  kind: 'range',
+  fields: nodeIndexSpec.fields,
+  compound: true,
+  matchedPrefixLen: 1,
+  rangeField: { source: 'metadata', field: 'updated_at' },
+  inExpansions: 0,
+  estimatedCandidates: null,
+  coverage: 'ready',
+  residualPredicates: 1,
+  finalVerification: true,
+  fallbackReason: null,
+}
+const compoundPlanNode: QueryPlanNode = {
+  kind: 'compound_range_index',
+  details: compoundPlanDetails,
+}
+const compoundWarning: QueryPlanWarning = 'compound_index_prefix_not_satisfied'
+const compoundPlan: QueryPlan = {
+  kind: 'node_query',
+  root: compoundPlanNode,
+  estimatedCandidates: null,
+  warnings: [compoundWarning],
+  notes: [],
+  publicInputs: {
+    nodeLabels: [{ name: 'Person', known: true, mode: 'all' }],
+    edgeLabels: [],
+  },
+}
 
 const edgeInput: EdgeInput = {
   from: 1,
@@ -322,7 +389,9 @@ const gqlExplainSchemaOperation: string | undefined = gqlExplain.schema?.operati
 const gqlExplainSchemaTargetLabel: string | null | undefined = gqlExplain.schema?.targets[0]?.label
 const gqlExplainSchemaScanLimit: number | null | undefined = gqlExplain.schema?.options.scanLimit
 const gqlExplainIndexOperation: string | undefined = gqlExplain.index?.operation
-const gqlExplainIndexTargetProp: string | null | undefined = gqlExplain.index?.targets[0]?.propKey
+const gqlExplainIndexTargetFields: Array<QueryTypes.GqlIndexExplainField> | undefined =
+  gqlExplain.index?.targets[0]?.fields
+const gqlExplainIndexTargetCompound: boolean | undefined = gqlExplain.index?.targets[0]?.compound
 const gqlPipelineRowCap: number = gqlExplain.caps.maxPipelineRows
 const gqlGroupCap: number = gqlExplain.caps.maxGroups
 const gqlCollectCap: number = gqlExplain.caps.maxCollectItems
@@ -365,9 +434,10 @@ const gqlIndexExplain: GqlIndexExplain = {
     {
       targetKind: 'property_index_catalog',
       label: null,
-      propKey: null,
+      fields: [],
       kind: null,
       action: 'show',
+      compound: false,
     },
   ],
   usesCoreWriteQueue: false,
@@ -500,6 +570,7 @@ void gqlIndexStats
 void gqlIndexExplain
 void gqlResultIndexStats
 void gqlExplainIndexOperation
-void gqlExplainIndexTargetProp
+void gqlExplainIndexTargetFields
+void gqlExplainIndexTargetCompound
 void mutationOperation
 void mutationReturnColumns

@@ -1943,7 +1943,8 @@ impl EngineCore {
         catalog: &impl LabelCatalogLookup,
     ) -> Result<NodePropertyIndexInfo, EngineError> {
         Ok(match &entry.target {
-            SecondaryIndexTarget::NodeProperty { label_id, prop_key } => NodePropertyIndexInfo {
+            SecondaryIndexTarget::NodeProperty { label_id, .. }
+            | SecondaryIndexTarget::NodeFieldIndex { label_id, .. } => NodePropertyIndexInfo {
                 index_id: entry.index_id,
                 label: catalog
                     .node_label(*label_id)
@@ -1954,13 +1955,14 @@ impl EngineCore {
                             entry.index_id, label_id
                         ))
                     })?,
-                prop_key: prop_key.clone(),
+                fields: entry.target.public_fields(),
                 kind: entry.kind.clone(),
                 state: entry.state,
                 last_error: entry.last_error.clone(),
+                compound: entry.target.is_compound(),
             },
-            SecondaryIndexTarget::EdgeProperty { .. } => {
-                unreachable!("node_property_index_info called with EdgeProperty target")
+            SecondaryIndexTarget::EdgeProperty { .. } | SecondaryIndexTarget::EdgeFieldIndex { .. } => {
+                unreachable!("node_property_index_info called with edge target")
             }
         })
     }
@@ -1970,7 +1972,8 @@ impl EngineCore {
         catalog: &impl LabelCatalogLookup,
     ) -> Result<EdgePropertyIndexInfo, EngineError> {
         Ok(match &entry.target {
-            SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => EdgePropertyIndexInfo {
+            SecondaryIndexTarget::EdgeProperty { label_id, .. }
+            | SecondaryIndexTarget::EdgeFieldIndex { label_id, .. } => EdgePropertyIndexInfo {
                 index_id: entry.index_id,
                 label: catalog
                     .edge_label(*label_id)
@@ -1981,13 +1984,14 @@ impl EngineCore {
                             entry.index_id, label_id
                         ))
                     })?,
-                prop_key: prop_key.clone(),
+                fields: entry.target.public_fields(),
                 kind: entry.kind.clone(),
                 state: entry.state,
                 last_error: entry.last_error.clone(),
+                compound: entry.target.is_compound(),
             },
-            SecondaryIndexTarget::NodeProperty { .. } => {
-                unreachable!("edge_property_index_info called with NodeProperty target")
+            SecondaryIndexTarget::NodeProperty { .. } | SecondaryIndexTarget::NodeFieldIndex { .. } => {
+                unreachable!("edge_property_index_info called with node target")
             }
         })
     }
@@ -1995,8 +1999,7 @@ impl EngineCore {
     pub fn ensure_node_property_index(
         &mut self,
         label: &str,
-        prop_key: &str,
-        kind: SecondaryIndexKind,
+        spec: SecondaryIndexSpec,
     ) -> Result<(NodePropertyIndexInfo, PublishImpact), EngineError> {
         enum EnsureOutcome {
             Existing,
@@ -2004,6 +2007,7 @@ impl EngineCore {
             Retry,
         }
 
+        spec.validate_for_node()?;
         let catalog = self.label_catalog.read().unwrap();
         let mut label_plan = LabelResolutionPlan::from_catalog(&catalog);
         let label_id = label_plan.resolve_node_label_for_write(label)?;
@@ -2011,16 +2015,17 @@ impl EngineCore {
         let (node_labels_to_create, edge_labels_to_create) = label_plan.token_creations();
         drop(label_plan);
         drop(catalog);
-        let prop_key = prop_key.to_string();
+        let target = spec.node_target(label_id)?;
+        let lookup_key = SecondaryIndexLookupKey {
+            discriminant: SecondaryIndexTargetDiscriminant::Node,
+            target_label_id: label_id,
+            fields: target.public_fields(),
+            kind: spec.kind.clone(),
+        };
         let (entry, outcome) = self.with_runtime_manifest_write(|manifest| {
             stage_label_tokens_in_manifest(manifest, &node_labels_to_stage, &[])?;
             if let Some(existing) = manifest.secondary_indexes.iter_mut().find(|entry| {
-                entry.target
-                    == SecondaryIndexTarget::NodeProperty {
-                        label_id,
-                        prop_key: prop_key.clone(),
-                    }
-                    && entry.kind == kind
+                secondary_index_lookup_key(entry) == lookup_key
             }) {
                 if existing.state == SecondaryIndexState::Failed {
                     existing.state = SecondaryIndexState::Building;
@@ -2032,11 +2037,8 @@ impl EngineCore {
 
             let entry = SecondaryIndexManifestEntry {
                 index_id: manifest.next_secondary_index_id,
-                target: SecondaryIndexTarget::NodeProperty {
-                    label_id,
-                    prop_key: prop_key.clone(),
-                },
-                kind: kind.clone(),
+                target: target.clone(),
+                kind: spec.kind.clone(),
                 state: SecondaryIndexState::Building,
                 last_error: None,
             };
@@ -2051,18 +2053,22 @@ impl EngineCore {
             EnsureOutcome::New => {
                 self.rebuild_secondary_index_catalog()?;
                 self.seed_secondary_index_entry(&entry)?;
-                self.enqueue_secondary_index_job(SecondaryIndexJob::Build {
-                    index_id: entry.index_id,
-                });
+                if secondary_index_target_requires_sidecar_build(&entry.target) {
+                    self.enqueue_secondary_index_job(SecondaryIndexJob::Build {
+                        index_id: entry.index_id,
+                    });
+                }
                 PublishImpact::RebuildSources
             }
             EnsureOutcome::Retry => {
                 self.rebuild_secondary_index_catalog()?;
                 self.remove_secondary_index_entry_from_memtables(entry.index_id)?;
                 self.seed_secondary_index_entry(&entry)?;
-                self.enqueue_secondary_index_job(SecondaryIndexJob::Build {
-                    index_id: entry.index_id,
-                });
+                if secondary_index_target_requires_sidecar_build(&entry.target) {
+                    self.enqueue_secondary_index_job(SecondaryIndexJob::Build {
+                        index_id: entry.index_id,
+                    });
+                }
                 PublishImpact::RebuildSources
             }
         };
@@ -2077,9 +2083,9 @@ impl EngineCore {
     pub fn drop_node_property_index(
         &mut self,
         label: &str,
-        prop_key: &str,
-        kind: SecondaryIndexKind,
+        spec: SecondaryIndexSpec,
     ) -> Result<(bool, PublishImpact), EngineError> {
+        spec.validate_for_node()?;
         let label_id = {
             let catalog = self.label_catalog.read().unwrap();
             let Some(label_id) = resolve_node_label_for_read(&catalog, label)? else {
@@ -2087,15 +2093,16 @@ impl EngineCore {
             };
             label_id
         };
-        let prop_key = prop_key.to_string();
+        let target = spec.node_target(label_id)?;
+        let lookup_key = SecondaryIndexLookupKey {
+            discriminant: SecondaryIndexTargetDiscriminant::Node,
+            target_label_id: label_id,
+            fields: target.public_fields(),
+            kind: spec.kind.clone(),
+        };
         let removed = self.with_runtime_manifest_write(|manifest| {
             let idx = manifest.secondary_indexes.iter().position(|entry| {
-                entry.target
-                    == SecondaryIndexTarget::NodeProperty {
-                        label_id,
-                        prop_key: prop_key.clone(),
-                    }
-                    && entry.kind == kind
+                secondary_index_lookup_key(entry) == lookup_key
             });
             Ok(idx.map(|idx| manifest.secondary_indexes.remove(idx)))
         })?;
@@ -2113,8 +2120,7 @@ impl EngineCore {
     pub fn ensure_edge_property_index(
         &mut self,
         label: &str,
-        prop_key: &str,
-        kind: SecondaryIndexKind,
+        spec: SecondaryIndexSpec,
     ) -> Result<(EdgePropertyIndexInfo, PublishImpact), EngineError> {
         enum EnsureOutcome {
             Existing,
@@ -2122,6 +2128,7 @@ impl EngineCore {
             Retry,
         }
 
+        spec.validate_for_edge()?;
         let catalog = self.label_catalog.read().unwrap();
         let mut label_plan = LabelResolutionPlan::from_catalog(&catalog);
         let label_id = label_plan.resolve_edge_label_for_write(label)?;
@@ -2129,16 +2136,17 @@ impl EngineCore {
         let (node_labels_to_create, edge_labels_to_create) = label_plan.token_creations();
         drop(label_plan);
         drop(catalog);
-        let prop_key = prop_key.to_string();
+        let target = spec.edge_target(label_id)?;
+        let lookup_key = SecondaryIndexLookupKey {
+            discriminant: SecondaryIndexTargetDiscriminant::Edge,
+            target_label_id: label_id,
+            fields: target.public_fields(),
+            kind: spec.kind.clone(),
+        };
         let (entry, outcome) = self.with_runtime_manifest_write(|manifest| {
             stage_label_tokens_in_manifest(manifest, &[], &edge_labels_to_stage)?;
             if let Some(existing) = manifest.secondary_indexes.iter_mut().find(|entry| {
-                entry.target
-                    == SecondaryIndexTarget::EdgeProperty {
-                        label_id,
-                        prop_key: prop_key.clone(),
-                    }
-                    && entry.kind == kind
+                secondary_index_lookup_key(entry) == lookup_key
             }) {
                 if existing.state == SecondaryIndexState::Failed {
                     existing.state = SecondaryIndexState::Building;
@@ -2150,11 +2158,8 @@ impl EngineCore {
 
             let entry = SecondaryIndexManifestEntry {
                 index_id: manifest.next_secondary_index_id,
-                target: SecondaryIndexTarget::EdgeProperty {
-                    label_id,
-                    prop_key: prop_key.clone(),
-                },
-                kind: kind.clone(),
+                target: target.clone(),
+                kind: spec.kind.clone(),
                 state: SecondaryIndexState::Building,
                 last_error: None,
             };
@@ -2169,18 +2174,22 @@ impl EngineCore {
             EnsureOutcome::New => {
                 self.rebuild_secondary_index_catalog()?;
                 self.seed_secondary_index_entry(&entry)?;
-                self.enqueue_secondary_index_job(SecondaryIndexJob::Build {
-                    index_id: entry.index_id,
-                });
+                if secondary_index_target_requires_sidecar_build(&entry.target) {
+                    self.enqueue_secondary_index_job(SecondaryIndexJob::Build {
+                        index_id: entry.index_id,
+                    });
+                }
                 PublishImpact::RebuildSources
             }
             EnsureOutcome::Retry => {
                 self.rebuild_secondary_index_catalog()?;
                 self.remove_secondary_index_entry_from_memtables(entry.index_id)?;
                 self.seed_secondary_index_entry(&entry)?;
-                self.enqueue_secondary_index_job(SecondaryIndexJob::Build {
-                    index_id: entry.index_id,
-                });
+                if secondary_index_target_requires_sidecar_build(&entry.target) {
+                    self.enqueue_secondary_index_job(SecondaryIndexJob::Build {
+                        index_id: entry.index_id,
+                    });
+                }
                 PublishImpact::RebuildSources
             }
         };
@@ -2195,9 +2204,9 @@ impl EngineCore {
     pub fn drop_edge_property_index(
         &mut self,
         label: &str,
-        prop_key: &str,
-        kind: SecondaryIndexKind,
+        spec: SecondaryIndexSpec,
     ) -> Result<(bool, PublishImpact), EngineError> {
+        spec.validate_for_edge()?;
         let label_id = {
             let catalog = self.label_catalog.read().unwrap();
             let Some(label_id) = resolve_edge_label_for_read(&catalog, label)? else {
@@ -2205,15 +2214,16 @@ impl EngineCore {
             };
             label_id
         };
-        let prop_key = prop_key.to_string();
+        let target = spec.edge_target(label_id)?;
+        let lookup_key = SecondaryIndexLookupKey {
+            discriminant: SecondaryIndexTargetDiscriminant::Edge,
+            target_label_id: label_id,
+            fields: target.public_fields(),
+            kind: spec.kind.clone(),
+        };
         let removed = self.with_runtime_manifest_write(|manifest| {
             let idx = manifest.secondary_indexes.iter().position(|entry| {
-                entry.target
-                    == SecondaryIndexTarget::EdgeProperty {
-                        label_id,
-                        prop_key: prop_key.clone(),
-                    }
-                    && entry.kind == kind
+                secondary_index_lookup_key(entry) == lookup_key
             });
             Ok(idx.map(|idx| manifest.secondary_indexes.remove(idx)))
         })?;

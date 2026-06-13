@@ -100,7 +100,7 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
   - [Graph Pipeline Queries](#graph-pipeline-queries)
     - [query_graph_pipeline](#query_graph_pipeline)
     - [explain_graph_pipeline](#explain_graph_pipeline)
-  - [GQL Beta](#gql-beta)
+  - [GQL](#gql)
     - [Overview](#overview)
     - [Read Syntax](#read-syntax)
     - [Mutation Syntax](#mutation-syntax)
@@ -1829,11 +1829,13 @@ Counts through the edge-label posting path without hydrating edge records.
 
 ## Property Index Management
 
-Property indexes are optional declarations on node or edge properties. Public query methods stay the same whether or not you declare an index.
+Property indexes are optional declarations on ordered node or edge field lists. A field can be a
+user property or supported record metadata; public query methods stay the same whether or not you
+declare an index.
 
 Lifecycle rules:
-- `ensure_node_property_index` registers an equality or numeric range declaration and starts background build work when needed.
-- `ensure_edge_property_index` does the same for edge properties, scoped by edge label.
+- `ensure_node_property_index` registers an equality or range declaration over one to eight ordered node fields and starts background build work when needed.
+- `ensure_edge_property_index` does the same for edge fields, scoped by edge label.
 - `list_node_property_indexes` exposes declaration kind, lifecycle state, and any last error from the published read snapshot, so `Ready` means new public reads can use the same ready catalog.
 - `list_edge_property_indexes` exposes the same state for edge declarations.
 - `find_nodes`, `find_nodes_paged`, `find_nodes_range`, and `find_nodes_range_paged` use declaration-backed execution only when a matching declaration is `Ready`.
@@ -1842,38 +1844,56 @@ Lifecycle rules:
 
 ### ensure_node_property_index
 
-Ensures an optional secondary index declaration for a node property.
+Ensures an optional secondary index declaration for a node field list.
 
 **Rust**
 ```rust
 let eq = db.ensure_node_property_index(
     "User",
-    "role",
-    SecondaryIndexKind::Equality,
+    SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("role")]),
 )?;
 
 let range = db.ensure_node_property_index(
     "User",
-    "score",
-    SecondaryIndexKind::Range,
+    SecondaryIndexSpec::range(vec![
+        SecondaryIndexField::property("tenant_id"),
+        SecondaryIndexField::node_meta(NodeMetadataIndexField::UpdatedAt),
+    ]),
 )?;
 ```
 
 **Node.js**
 ```javascript
-const eq = db.ensureNodePropertyIndex('User', 'role', 'equality');
+const eq = db.ensureNodePropertyIndex('User', {
+  kind: 'equality',
+  fields: [{ source: 'property', key: 'role' }],
+});
 
-const range = db.ensureNodePropertyIndex('User', 'score', 'range');
+const range = db.ensureNodePropertyIndex('User', {
+  kind: 'range',
+  fields: [
+    { source: 'property', key: 'tenant_id' },
+    { source: 'metadata', field: 'updated_at' },
+  ],
+});
 ```
 
 **Python**
 ```python
-eq = db.ensure_node_property_index("User", "role", "equality")
+eq = db.ensure_node_property_index(
+    "User",
+    {"kind": "equality", "fields": [{"source": "property", "key": "role"}]},
+)
 
 range_info = db.ensure_node_property_index(
     "User",
-    "score",
-    "range",
+    {
+        "kind": "range",
+        "fields": [
+            {"source": "property", "key": "tenant_id"},
+            {"source": "metadata", "field": "updated_at"},
+        ],
+    },
 )
 ```
 
@@ -1882,8 +1902,7 @@ range_info = db.ensure_node_property_index(
 | Parameter | Rust | Node.js | Python | Required | Description |
 |-----------|------|---------|--------|----------|-------------|
 | label | `&str` | `string` | `str` | Yes | Restrict the declaration to this node label. |
-| prop_key | `&str` | `string` | `str` | Yes | Property key to declare. |
-| kind | `SecondaryIndexKind` | `string` | `str` | Yes | Equality declaration or domainless numeric range declaration. |
+| spec | `SecondaryIndexSpec` | `SecondaryIndexSpec` | `dict` / `SecondaryIndexSpecLike` | Yes | Ordered field list plus `equality` or `range` kind. |
 
 #### Returns
 
@@ -1896,12 +1915,14 @@ The current declaration info.
 #### Behavior
 
 - Equality declarations use `SecondaryIndexKind::Equality` or `"equality"`. Finite scalar numeric equality is semantic across signed integers, unsigned integers, and finite floats; string equality and other non-numeric equality remain exact.
-- Range declarations use `SecondaryIndexKind::Range` or `"range"`. Range indexes are domainless numeric indexes over finite scalar numeric values across signed integers, unsigned integers, and finite floats.
+- Range declarations use `SecondaryIndexKind::Range` or `"range"`. Range narrowing applies to the first non-equality field after a constrained left prefix and is domainless numeric over finite scalar numeric values across signed integers, unsigned integers, and finite floats.
 - Range indexes exclude non-finite floats, non-numeric values, arrays, and maps.
 - Re-ensuring an existing declaration returns the existing declaration info.
 - Re-ensuring a `Failed` declaration retries it by moving it back to `Building`.
-- A `(label, prop_key)` pair has one range declaration shape; callers do not choose `int`, `uint`, or `float` variants.
+- The field list must contain one to eight fields. Duplicate fields are rejected. A property named like metadata, such as `updated_at`, stays a property when declared as `{ source: "property" }`.
+- Supported node metadata fields are `id`, `key`, `weight`, `created_at`, and `updated_at`. Supported edge metadata fields are listed under [`ensure_edge_property_index`](#ensure_edge_property_index). Node declarations reject edge metadata fields.
 - A declaration becoming `Ready` is what enables declaration-backed routing. Callers do not switch to a different query method.
+- Compound candidates obey left-prefix semantics: equality predicates must constrain fields from the start of the declaration, optionally followed by one range field. If predicates skip the left prefix, explain warnings may include `CompoundIndexPrefixNotSatisfied` / `compound_index_prefix_not_satisfied`.
 - Ready equality and range index candidates are still verified against the latest visible records before results are returned.
 
 ---
@@ -1914,19 +1935,24 @@ Drops an optional node-property secondary index declaration.
 ```rust
 let removed = db.drop_node_property_index(
     "User",
-    "role",
-    SecondaryIndexKind::Equality,
+    SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("role")]),
 )?;
 ```
 
 **Node.js**
 ```javascript
-const removed = db.dropNodePropertyIndex('User', 'role', 'equality');
+const removed = db.dropNodePropertyIndex('User', {
+  kind: 'equality',
+  fields: [{ source: 'property', key: 'role' }],
+});
 ```
 
 **Python**
 ```python
-removed = db.drop_node_property_index("User", "role", "equality")
+removed = db.drop_node_property_index(
+    "User",
+    {"kind": "equality", "fields": [{"source": "property", "key": "role"}]},
+)
 ```
 
 #### Parameters
@@ -1985,10 +2011,11 @@ User-facing declaration information returned by [`ensure_node_property_index`](#
 |-------|------|---------|--------|-------------|
 | index_id | `u64` | `indexId: number` | `index_id: int` | Stable declaration ID. |
 | label | `String` | `label: string` | `label: str` | Declared node label. |
-| prop_key | `String` | `propKey: string` | `prop_key: str` | Declared property key. |
+| fields | `Vec<SecondaryIndexField>` | `fields: SecondaryIndexField[]` | `fields: list[dict]` | Ordered declaration fields. |
 | kind | `SecondaryIndexKind` | `kind: string` | `kind: str` | `equality` or `range`. |
 | state | `SecondaryIndexState` | `state: string` | `state: str` | `building`, `ready`, or `failed`. |
-| last_error | `Option<String>` | `lastError?: string` | `last_error: str \| None` | Most recent build or validation failure, if any. |
+| last_error | `Option<String>` | `lastError: string \| null` | `last_error: str \| None` | Most recent build or validation failure, if any. |
+| compound | `bool` | `compound: boolean` | `compound: bool` | True when the declaration has two or more fields. |
 
 State meanings:
 - `building`: the declaration exists, but the declaration-backed path is not live yet.
@@ -1999,38 +2026,56 @@ State meanings:
 
 ### ensure_edge_property_index
 
-Ensures an optional secondary index declaration for an edge property, scoped to one edge label.
+Ensures an optional secondary index declaration for an edge field list, scoped to one edge label.
 
 **Rust**
 ```rust
 let eq = db.ensure_edge_property_index(
     "WORKS_AT",
-    "role",
-    SecondaryIndexKind::Equality,
+    SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("role")]),
 )?;
 
 let range = db.ensure_edge_property_index(
     "WORKS_AT",
-    "score",
-    SecondaryIndexKind::Range,
+    SecondaryIndexSpec::range(vec![
+        SecondaryIndexField::edge_meta(EdgeMetadataIndexField::From),
+        SecondaryIndexField::property("score"),
+    ]),
 )?;
 ```
 
 **Node.js**
 ```javascript
-const eq = db.ensureEdgePropertyIndex('WORKS_AT', 'role', 'equality');
+const eq = db.ensureEdgePropertyIndex('WORKS_AT', {
+  kind: 'equality',
+  fields: [{ source: 'property', key: 'role' }],
+});
 
-const range = db.ensureEdgePropertyIndex('WORKS_AT', 'score', 'range');
+const range = db.ensureEdgePropertyIndex('WORKS_AT', {
+  kind: 'range',
+  fields: [
+    { source: 'metadata', field: 'from' },
+    { source: 'property', key: 'score' },
+  ],
+});
 ```
 
 **Python**
 ```python
-eq = db.ensure_edge_property_index("WORKS_AT", "role", "equality")
+eq = db.ensure_edge_property_index(
+    "WORKS_AT",
+    {"kind": "equality", "fields": [{"source": "property", "key": "role"}]},
+)
 
 range_info = db.ensure_edge_property_index(
     "WORKS_AT",
-    "score",
-    "range",
+    {
+        "kind": "range",
+        "fields": [
+            {"source": "metadata", "field": "from"},
+            {"source": "property", "key": "score"},
+        ],
+    },
 )
 ```
 
@@ -2045,6 +2090,7 @@ Parameters, kind values, and lifecycle states match [`ensure_node_property_index
 #### Behavior
 
 - Edge property declarations are edge-label-scoped. A property filter without an edge label cannot use an edge-label-scoped edge-property declaration as a direct-query anchor.
+- Supported edge metadata fields are `id`, `from`, `to`, `weight`, `created_at`, `updated_at`, `valid_from`, and `valid_to`. Edge declarations reject node metadata fields.
 - Ready edge declarations are candidate sources only. `query_edge_ids`, `query_edges`, and graph-row execution still verify edge metadata and edge property predicates before returning results.
 - Direct `EdgeQuery` anchor legality is unchanged: edge property indexes improve planning inside legal direct edge queries, but do not make filter-only direct edge queries legal by themselves.
 - Graph-row plans may choose a ready edge-property equality or range source as an edge anchor when it is cheaper than node-anchor expansion.
@@ -2059,19 +2105,24 @@ Drops an optional edge-property secondary index declaration.
 ```rust
 let removed = db.drop_edge_property_index(
     "WORKS_AT",
-    "role",
-    SecondaryIndexKind::Equality,
+    SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("role")]),
 )?;
 ```
 
 **Node.js**
 ```javascript
-const removed = db.dropEdgePropertyIndex('WORKS_AT', 'role', 'equality');
+const removed = db.dropEdgePropertyIndex('WORKS_AT', {
+  kind: 'equality',
+  fields: [{ source: 'property', key: 'role' }],
+});
 ```
 
 **Python**
 ```python
-removed = db.drop_edge_property_index("WORKS_AT", "role", "equality")
+removed = db.drop_edge_property_index(
+    "WORKS_AT",
+    {"kind": "equality", "fields": [{"source": "property", "key": "role"}]},
+)
 ```
 
 Same parameters and kind values as [`ensure_edge_property_index`](#ensure_edge_property_index). Returns `true` if a declaration existed and was removed, `false` otherwise.
@@ -2111,7 +2162,7 @@ One entry per edge declaration.
 
 User-facing declaration information returned by [`ensure_edge_property_index`](#ensure_edge_property_index) and [`list_edge_property_indexes`](#list_edge_property_indexes).
 
-Fields match [`NodePropertyIndexInfo`](#nodepropertyindexinfo), with the edge-label scope exposed as `label`: `index_id` / `indexId`, `label`, `prop_key` / `propKey`, `kind`, `state`, and `last_error` / `lastError`.
+Fields match [`NodePropertyIndexInfo`](#nodepropertyindexinfo), with the edge-label scope exposed as `label`: `index_id` / `indexId`, `label`, `fields`, `kind`, `state`, `last_error` / `lastError`, and `compound`.
 
 ---
 
@@ -2707,7 +2758,7 @@ Node IDs matching the time range. Uses the timestamp index.
 ## Queries
 
 Native query APIs combine explicit IDs, label-scoped keys, label/edge-label constraints, property filters, timestamp filters, and
-row-producing graph patterns through normal function-call and object APIs. GQL Beta, documented below, adds a
+row-producing graph patterns through normal function-call and object APIs. GQL, documented below, adds a
 query-string API for graph reads and mutations over the same native substrates.
 
 Native query APIs return matching IDs, hydrated records, or graph-row results with explicit columns,
@@ -3086,7 +3137,7 @@ unsupported error that points callers to `query_graph_rows` / `explain_graph_row
 
 Use graph-row queries when you need row bindings across nodes and edges, optional groups,
 bounded variable-length paths, path values, explicit return columns, final-row cursors, compact rows,
-or the same substrate used by GQL Beta.
+or the same substrate used by GQL.
 
 #### query_graph_rows
 
@@ -3291,7 +3342,7 @@ Node.js and Python async APIs expose graph-row query and explain methods through
 ### Graph Pipeline Queries
 
 Graph pipeline queries are the structured public API for composable multi-stage graph reads. They
-use the same native executor that GQL Beta lowers into for `WITH`, `DISTINCT`, aggregation, `UNION`,
+use the same native executor that GQL lowers into for `WITH`, `DISTINCT`, aggregation, `UNION`,
 read-only `CALL`, and shortest-path stages. Use graph pipelines when you want the Phase 34 row
 pipeline substrate without parsing a GQL string.
 
@@ -3512,14 +3563,14 @@ Node.js and Python async APIs expose pipeline query and explain methods through
 
 ---
 
-### GQL Beta
+### GQL
 
 #### Overview
 
-**GQL Beta** is OverGraph's GQL/Cypher-style query language for graph reads and writes, running in
+**GQL** is OverGraph's GQL/Cypher-style query language for graph reads and writes, running in
 OverGraph's embedded Rust engine.
 
-Use GQL Beta when a graph query or mutation is clearer as text than as request objects. It is not a
+Use GQL when a graph query or mutation is clearer as text than as request objects. It is not a
 full ISO GQL or Cypher implementation; supported syntax is documented below, and unsupported
 features are collected in [Current Limits](#current-limits).
 
@@ -3610,7 +3661,7 @@ Pattern shapes:
 | One-hop path plus edge alias | `MATCH p = (a)-[r:KNOWS*1..1]->(b)` |
 | Shortest path | `MATCH p = shortestPath((a)-[:KNOWS*1..5]->(b))` |
 | All equal shortest paths | `MATCH p = allShortestPaths((a)-[:KNOWS*1..5]-(b))` |
-| Property map predicates | `MATCH (n:Person {name: $name})` |
+| Map predicates | `MATCH (n:Person {name: $name})`, `MATCH (n:Person {elementKey: 'ada'})` |
 
 Relationship quantifiers must have a finite upper bound no greater than `max_path_hops`.
 Variable-length paths are relationship-simple: one path cannot reuse the same edge ID.
@@ -3624,12 +3675,12 @@ found. GQL shortest paths are unweighted; use the native `shortest_path` APIs fo
 Bind endpoints first:
 
 ```gql
-MATCH (a:Person {key: $from})
+MATCH (a:Person {elementKey: $from})
 WITH a
-MATCH (b:Person {key: $to})
+MATCH (b:Person {elementKey: $to})
 WITH a, b
 MATCH p = shortestPath((a)-[:KNOWS*1..4]->(b))
-RETURN p, node_ids(p) AS node_ids, edge_ids(p) AS edge_ids, length(p) AS hops
+RETURN p, nodeIds(p) AS node_ids, edgeIds(p) AS edge_ids, length(p) AS hops
 ```
 
 Expressions:
@@ -3637,14 +3688,10 @@ Expressions:
 | Expression | Example |
 |------------|---------|
 | Variables | `n`, `r`, `company` |
-| Node ID | `id(n)` |
-| Edge ID | `id(r)` |
-| Node labels | `labels(n)` |
-| Edge label/type | `type(r)` |
-| Node metadata | `n.id`, `n.labels`, `n.key`, `n.weight`, `n.created_at`, `n.updated_at` |
-| Edge metadata | `r.from`, `r.to`, `r.weight`, `r.created_at`, `r.updated_at`, `r.valid_from`, `r.valid_to` |
-| Path fields | `p.node_ids`, `p.edge_ids`, `p.length` |
-| Property access | `n.name`, `n.rank`, `r.since`, `r.role`, `r.id`, `r.label` |
+| Node metadata | `id(n)`, `labels(n)`, `elementKey(n)`, `weight(n)`, `createdAt(n)`, `updatedAt(n)` |
+| Edge metadata | `id(r)`, `type(r)`, `weight(r)`, `createdAt(r)`, `updatedAt(r)`, `validFrom(r)`, `validTo(r)`, `id(startNode(r))`, `id(endNode(r))` |
+| Path functions | `length(p)`, `nodeIds(p)`, `edgeIds(p)`, `nodes(p)`, `relationships(p)`, `startNode(p)`, `endNode(p)` |
+| Property access | `n.name`, `n.rank`, `r.since`, `r.role` |
 | Literals | `null`, booleans, integers, floats, strings, lists, maps |
 | Params | `$name`, `$ids`, `$minSince`, `$payload` |
 | Boolean predicates | `AND`, `OR`, `NOT` |
@@ -3657,24 +3704,56 @@ Expressions:
 | Simple `CASE` | `CASE n.status WHEN 'active' THEN 1 ELSE 0 END` |
 | Return all bound aliases | `RETURN *` |
 
-Functions:
+##### Metadata Functions
+
+A function call reads engine metadata; a dot access reads a user property. Metadata functions work
+in every expression context: `WHERE`, `RETURN`, `ORDER BY`, `WITH`, aggregates, and `CASE`.
+Function names match case-insensitively; the canonical spelling is camelCase.
+
+| Function | Valid argument | Reads | Writable via `SET` |
+|----------|----------------|-------|--------------------|
+| `id(n)`, `id(r)` | node or edge alias | element ID | read-only |
+| `labels(n)` | node alias | label list | read-only (`SET n:Label` / `REMOVE n:Label`) |
+| `type(r)` | edge alias | edge label | read-only |
+| `elementKey(n)` | node alias | node key | read-only (set at creation via the `elementKey` map entry) |
+| `weight(n)`, `weight(r)` | node or edge alias | weight | yes: `SET weight(n) = 2.5` |
+| `createdAt(n)`, `createdAt(r)` | node or edge alias | created timestamp | read-only |
+| `updatedAt(n)`, `updatedAt(r)` | node or edge alias | updated timestamp | read-only |
+| `validFrom(r)` | edge alias | validity start | yes: `SET validFrom(r) = 10` |
+| `validTo(r)` | edge alias | validity end | yes: `SET validTo(r) = 20` |
+| `id(startNode(r))` | edge alias | source node ID | read-only |
+| `id(endNode(r))` | edge alias | target node ID | read-only |
+
+Using a read-only metadata function as a `SET` target is an error, and `REMOVE` never accepts
+metadata functions. On an edge alias, `startNode(r)` / `endNode(r)` are valid only as the direct
+argument of `id(...)`; use the bound pattern alias when the full endpoint node is needed.
+
+No property name is reserved. `n.weight`, `n.key`, `n.updated_at`, and `r.valid_from` are ordinary
+property lookups (null when the property is absent) and never read metadata; a user property named
+`weight` coexists with the engine weight read by `weight(n)`.
+
+##### Path Functions
+
+| Function | Valid argument | Returns |
+|----------|----------------|---------|
+| `length(p)` | path alias | hop count |
+| `startNode(p)` | path alias | first node |
+| `endNode(p)` | path alias | last node |
+| `nodes(p)` | path alias | node ID list |
+| `relationships(p)` | path alias | edge ID list |
+| `nodeIds(p)` | path alias | node ID list |
+| `edgeIds(p)` | path alias | edge ID list |
+
+Paths have no dot fields; `p.anything` is an error that suggests the path functions.
+
+##### Scalar Functions
 
 | Function | Valid argument |
 |----------|----------------|
-| `id(n)` | node or edge alias |
-| `labels(n)` | node alias |
-| `type(r)` | edge alias |
-| `length(p)` | path alias |
-| `start_node(p)` | path alias |
-| `end_node(p)` | path alias |
-| `nodes(p)` | path alias |
-| `relationships(p)` | path alias |
-| `node_ids(p)` | path alias |
-| `edge_ids(p)` | path alias |
 | `coalesce(value, ...)` | one or more scalar/list/map/null values |
-| `to_string(value)` | scalar numeric, boolean, string, or null |
-| `to_integer(value)` | numeric, base-10 integer string, or null |
-| `to_float(value)` | numeric, finite-float string, or null |
+| `toString(value)` | scalar numeric, boolean, string, or null |
+| `toInteger(value)` | numeric, base-10 integer string, or null |
+| `toFloat(value)` | numeric, finite-float string, or null |
 | `abs(value)` | numeric or null |
 | `floor(value)` | numeric or null |
 | `ceil(value)` | numeric or null |
@@ -3747,8 +3826,9 @@ RETURN group, total, coalesce(avg_rank, 0.0) AS avg_rank, statuses
 ORDER BY total DESC
 ```
 
-Edge ID and edge-label metadata use `id(r)` and `type(r)`. Dot access such as `r.id` and
-`r.label` reads ordinary edge properties with those names when present.
+Element metadata always uses function syntax, such as `id(r)`, `type(r)`, and `updatedAt(n)`. Dot
+access such as `r.id`, `r.label`, and `n.updated_at` reads ordinary user properties with those
+names when present.
 
 ##### Read-Only Subqueries
 
@@ -3795,7 +3875,7 @@ OPTIONAL MATCH <pattern> [WHERE <predicate>]
 WITH [DISTINCT] <items> [ORDER BY ...] [SKIP ...] [LIMIT ...] [WHERE <predicate>]
 CALL { <read clauses ending in RETURN> }
 CREATE <pattern> [, <pattern>...]
-MERGE (n:Label {key: expr}) [ON CREATE SET ...] [ON MATCH SET ...]
+MERGE (n:Label {elementKey: expr}) [ON CREATE SET ...] [ON MATCH SET ...]
 MERGE (a)-[r:TYPE]->(b) [ON CREATE SET ...] [ON MATCH SET ...]
 SET <assignment>
 REMOVE <target>
@@ -3816,17 +3896,43 @@ Mutation forms:
 
 | Form | Example | Notes |
 |------|---------|-------|
-| Create node | `CREATE (n:Person {key: 'ada', name: 'Ada'})` | A created node needs at least one label and a string `key`. |
-| Create edge | `MATCH (a:Person) WHERE a.key = 'a' MATCH (b:Person) WHERE b.key = 'b' CREATE (a)-[r:KNOWS {since: 2026}]->(b)` | The edge needs exactly one relationship label. |
-| Merge keyed node | `MERGE (n:Person {key: $key}) ON CREATE SET n.created = true ON MATCH SET n.seen = true` | Exactly one static label and identity property named `key`. The key must evaluate to a non-null string. |
-| Merge unique edge | `MATCH (a:Person {key: $a}) MATCH (b:Person {key: $b}) MERGE (a)-[r:KNOWS]->(b)` | Requires bound non-null endpoints and `edge_uniqueness = true`. Null endpoint rows are skipped. |
-| Set property | `MATCH (n:Person) WHERE n.key = 'ada' SET n.status = 'active'` | `null` removes the property. |
-| Merge property map | `MATCH (n:Person) WHERE n.key = 'ada' SET n += $props` | The right side must be a map. Null map values remove properties. |
-| Add node label | `MATCH (n:Person) WHERE n.key = 'ada' SET n:Engineer` | Label/key conflicts reject the whole statement. |
-| Remove property | `MATCH (n:Person) WHERE n.key = 'ada' REMOVE n.status` | Missing properties are no-ops. |
-| Remove node label | `MATCH (n:Person) WHERE n.key = 'ada' REMOVE n:Engineer` | Removing the last live label is rejected. |
+| Create node | `CREATE (n:Person {elementKey: 'ada', name: 'Ada'})` | A created node needs at least one label and a string `elementKey` map entry. |
+| Create edge | `MATCH (a:Person {elementKey: 'a'}) MATCH (b:Person {elementKey: 'b'}) CREATE (a)-[r:KNOWS {since: 2026}]->(b)` | The edge needs exactly one relationship label. |
+| Merge keyed node | `MERGE (n:Person {elementKey: $key}) ON CREATE SET n.created = true ON MATCH SET n.seen = true` | Exactly one static label and identity entry named `elementKey`. The key must evaluate to a non-null string. |
+| Merge unique edge | `MATCH (a:Person {elementKey: $a}) MATCH (b:Person {elementKey: $b}) MERGE (a)-[r:KNOWS]->(b)` | Requires bound non-null endpoints and `edge_uniqueness = true`. Null endpoint rows are skipped. |
+| Set property | `MATCH (n:Person) WHERE elementKey(n) = 'ada' SET n.status = 'active'` | `null` removes the property. |
+| Set metadata | `MATCH (a)-[r:KNOWS]->(b) SET weight(r) = 0.5` | Function l-values: `weight(n)`, `weight(r)`, `validFrom(r)`, `validTo(r)`. All other metadata functions are read-only `SET` targets. |
+| Merge property map | `MATCH (n:Person) WHERE elementKey(n) = 'ada' SET n += $props` | The right side must be a map of pure user properties; no map key is treated as metadata. Null map values remove properties. |
+| Add node label | `MATCH (n:Person) WHERE elementKey(n) = 'ada' SET n:Engineer` | Label/key conflicts reject the whole statement. |
+| Remove property | `MATCH (n:Person) WHERE elementKey(n) = 'ada' REMOVE n.status` | Missing properties are no-ops. `REMOVE` does not accept metadata functions. |
+| Remove node label | `MATCH (n:Person) WHERE elementKey(n) = 'ada' REMOVE n:Engineer` | Removing the last live label is rejected. |
 | Delete edge | `MATCH (a)-[r:KNOWS]->(b) DELETE r` | Node deletion requires `DETACH DELETE`. |
-| Detach delete node | `MATCH (n:Person) WHERE n.key = 'ada' DETACH DELETE n` | Incident edges are deleted with the node. |
+| Detach delete node | `MATCH (n:Person) WHERE elementKey(n) = 'ada' DETACH DELETE n` | Incident edges are deleted with the node. |
+
+##### Element Maps
+
+Element maps in `CREATE`, `MERGE`, and `MATCH` patterns describe the element itself, so they carry
+metadata under the exact camelCase metadata function names:
+
+- Node maps: `elementKey` (required in `CREATE` node maps; the `MERGE` node identity entry) and
+  optional `weight`.
+- Edge maps: optional `weight`, `validFrom`, and `validTo` (`validFrom` must be less than
+  `validTo`).
+- `MATCH` pattern maps filter on the same vocabulary: `MATCH (n:Person {elementKey: 'ada'})`
+  matches the node key, and edge maps route `weight` / `validFrom` / `validTo` to the
+  corresponding metadata filters.
+- Every other map key is a user property, with no name restrictions.
+- Metadata map keys that do not fit the target kind, such as `validFrom` on a node map, are errors.
+- `SET x += {...}` maps are pure user properties and never route map keys to metadata.
+
+Because element-map keys named after metadata always mean metadata, a user property literally named
+`weight`, `elementKey`, `validFrom`, or `validTo` cannot be set through a `CREATE`/`MERGE` element
+map. Set it with `SET` after creation:
+
+```gql
+CREATE (n:Part {elementKey: 'p1'})
+SET n.weight = 'heavy'
+```
 
 `CREATE` is strict. It fails if a node `(label, key)` membership already exists or was already
 created earlier in the same statement. When `edge_uniqueness = true`, edge `CREATE` also fails if
@@ -3835,7 +3941,7 @@ creates are allowed.
 
 `MERGE` supports two shapes:
 
-- keyed node: `MERGE (n:Label {key: expr})`
+- keyed node: `MERGE (n:Label {elementKey: expr})`
 - unique relationship: `MERGE (a)-[r:TYPE]->(b)`
 
 `ON CREATE SET` runs only when the entity is created. `ON MATCH SET` runs when the entity already
@@ -3870,12 +3976,12 @@ Mutation `RETURN` supports:
 - `ORDER BY`, `SKIP` / `OFFSET`, and `LIMIT` over prevalidated return expressions
 
 Mutation `RETURN` aggregation remains unsupported. Mutation `RETURN ORDER BY`, `RETURN DISTINCT`,
-and `MERGE` actions cannot depend on commit-assigned values such as newly created IDs, timestamps,
-created-edge endpoint metadata, or same-mutation `updated_at`.
+and `MERGE` actions cannot depend on commit-assigned metadata of created or merged aliases: `id(x)`,
+`createdAt(x)`, `updatedAt(x)`, `id(startNode(r))`, and `id(endNode(r))` are rejected there.
 
 #### Schema DDL Syntax
 
-GQL Beta can manage the current graph type, which is OverGraph's active label-scoped schema catalog.
+GQL can manage the current graph type, which is OverGraph's active label-scoped schema catalog.
 Schema DDL is atomic at the graph-schema target level and uses the same Rust core schema-management
 APIs as the programmatic Rust, Node.js, and Python methods.
 
@@ -3970,27 +4076,36 @@ return more rows than `max_rows`, OverGraph returns an error instead of silently
 
 #### Property-Index DDL Syntax
 
-GQL Beta can manage the same optional equality and range property-index declarations exposed by the
-native Rust, Node.js, and Python property-index APIs. These declarations are performance
-accelerators for eligible node and edge property predicates; they do not enforce uniqueness,
-required properties, value constraints, or query correctness. Public query APIs remain correct
-without them, while they are building, or after they are dropped.
+GQL can manage the same optional equality and range property-index declarations exposed by the
+native Rust, Node.js, and Python property-index APIs. Declarations use one to eight ordered fields.
+Fields can be properties or supported metadata functions. These declarations are performance
+accelerators for eligible node and edge predicates; they do not enforce uniqueness, required
+properties, value constraints, or query correctness. Public query APIs remain correct without them,
+while they are building, or after they are dropped.
 
-Native property-index APIs remain unchanged. Use GQL property-index DDL when target-based text is
-clearer than calling the existing Rust/Python snake_case or Node.js camelCase ensure, list, and drop
-property-index methods directly.
+The native APIs use the same field-list declarations described above. Use GQL property-index DDL
+when target-based text is clearer than calling the Rust/Python snake_case or Node.js camelCase
+ensure, list, and drop property-index methods directly.
 
 Supported statements:
 
 ```gql
 CREATE PROPERTY INDEX FOR (n:<node-label>) ON (n.<property-key>) KIND EQUALITY
 CREATE PROPERTY INDEX FOR (n:<node-label>) ON (n.<property-key>) KIND RANGE
+CREATE PROPERTY INDEX FOR (n:<node-label>) ON (<field>, <field>, ...) KIND EQUALITY
+CREATE PROPERTY INDEX FOR (n:<node-label>) ON (<field>, <field>, ...) KIND RANGE
 CREATE PROPERTY INDEX FOR ()-[r:<edge-label>]-() ON (r.<property-key>) KIND EQUALITY
 CREATE PROPERTY INDEX FOR ()-[r:<edge-label>]-() ON (r.<property-key>) KIND RANGE
+CREATE PROPERTY INDEX FOR ()-[r:<edge-label>]-() ON (<field>, <field>, ...) KIND EQUALITY
+CREATE PROPERTY INDEX FOR ()-[r:<edge-label>]-() ON (<field>, <field>, ...) KIND RANGE
 DROP PROPERTY INDEX FOR (n:<node-label>) ON (n.<property-key>) KIND EQUALITY
 DROP PROPERTY INDEX FOR (n:<node-label>) ON (n.<property-key>) KIND RANGE
+DROP PROPERTY INDEX FOR (n:<node-label>) ON (<field>, <field>, ...) KIND EQUALITY
+DROP PROPERTY INDEX FOR (n:<node-label>) ON (<field>, <field>, ...) KIND RANGE
 DROP PROPERTY INDEX FOR ()-[r:<edge-label>]-() ON (r.<property-key>) KIND EQUALITY
 DROP PROPERTY INDEX FOR ()-[r:<edge-label>]-() ON (r.<property-key>) KIND RANGE
+DROP PROPERTY INDEX FOR ()-[r:<edge-label>]-() ON (<field>, <field>, ...) KIND EQUALITY
+DROP PROPERTY INDEX FOR ()-[r:<edge-label>]-() ON (<field>, <field>, ...) KIND RANGE
 SHOW PROPERTY INDEXES
 SHOW NODE PROPERTY INDEXES
 SHOW EDGE PROPERTY INDEXES
@@ -4002,30 +4117,39 @@ Examples:
 
 ```gql
 CREATE PROPERTY INDEX FOR (n:Person) ON (n.status) KIND EQUALITY
+CREATE PROPERTY INDEX FOR (n:Person) ON (n.tenant_id, updatedAt(n)) KIND RANGE
 CREATE PROPERTY INDEX FOR ()-[r:WORKS_AT]-() ON (r.since) KIND RANGE
+CREATE PROPERTY INDEX FOR ()-[r:WORKS_AT]-() ON (id(startNode(r)), r.status, validTo(r)) KIND RANGE
 SHOW PROPERTY INDEXES
 DROP PROPERTY INDEX FOR (n:Person) ON (n.status) KIND EQUALITY
 DROP PROPERTY INDEX FOR ()-[r:WORKS_AT]-() ON (r.since) KIND RANGE
 ```
 
-Labels and property keys can be bare identifiers or quoted strings. Index identity is target-based:
-target kind, label, property key, and kind. There are no user-assigned index names in this GQL
-surface.
+Labels and property keys can be bare identifiers or quoted strings. Dot fields in index DDL are
+property fields, even when the property name looks like metadata. Metadata fields use function
+syntax: node `id(n)`, `elementKey(n)`, `weight(n)`, `createdAt(n)`, `updatedAt(n)`; edge `id(r)`,
+`weight(r)`, `createdAt(r)`, `updatedAt(r)`, `validFrom(r)`, `validTo(r)`, `id(startNode(r))`,
+and `id(endNode(r))`. Index identity is target-based: target kind, label, ordered field list, and
+kind. There are no user-assigned index names in this GQL surface.
 
 Result row columns are stable:
 
 | Statement | Columns |
 |-----------|---------|
-| `CREATE PROPERTY INDEX ...` | `operation`, `target_kind`, `label`, `prop_key`, `kind`, `action`, `state`, `index_id`, `last_error` |
-| `DROP PROPERTY INDEX ...` | `operation`, `target_kind`, `label`, `prop_key`, `kind`, `action` |
-| `SHOW PROPERTY INDEXES` | `target_kind`, `label`, `prop_key`, `kind`, `state`, `index_id`, `last_error` |
+| `CREATE PROPERTY INDEX ...` | `operation`, `target_kind`, `label`, `fields`, `kind`, `action`, `state`, `index_id`, `last_error`, `compound`, `field_count` |
+| `DROP PROPERTY INDEX ...` | `operation`, `target_kind`, `label`, `fields`, `kind`, `action`, `compound`, `field_count` |
+| `SHOW PROPERTY INDEXES` | `target_kind`, `label`, `fields`, `kind`, `state`, `index_id`, `last_error`, `compound`, `field_count` |
 
 Operation values are `create_property_index`, `drop_property_index`, `show_property_indexes`,
 `show_node_property_indexes`, or `show_edge_property_indexes`. `target_kind` is `node` or `edge`
 in action and catalog rows. `kind` is `equality` or `range`. Row `action` is `ensured`, `dropped`,
 or `not_found`. Explain target `action` is `ensure`, `drop`, or `show`. `state` is the current
 declaration lifecycle state, such as `building`, `ready`, or `failed`; `last_error` is null unless
-the declaration reports a retained error.
+the declaration reports a retained error. `fields` is an ordered list of objects with `source`
+(`property` or `metadata`), `key` for property fields, and `field` for metadata fields. Metadata
+`field` values use the camelCase function spellings: `id`, `elementKey`, `weight`, `createdAt`,
+`updatedAt`, `validFrom`, `validTo`, and `startNode` / `endNode` for edge endpoint IDs. `compound`
+is true when the list has two or more fields, and `field_count` is the list length.
 
 Index statements return `kind = index`, `mutation_stats` / `mutationStats = null`,
 `schema_stats` / `schemaStats = null`, `next_cursor` / `nextCursor = null`, and
@@ -4051,7 +4175,7 @@ Nested index explain fields:
 | Field | Node.js | Python | Description |
 |-------|---------|--------|-------------|
 | `operation` | `operation` | `operation` | Index operation string. |
-| `targets` | `targets` | `targets` | Planned targets with target kind, label, property key, kind, and action. |
+| `targets` | `targets` | `targets` | Planned targets with target kind, label, fields, kind, action, and compound flag. |
 | `usesCoreWriteQueue` / `uses_core_write_queue` | `usesCoreWriteQueue` | `uses_core_write_queue` | True for mutating CREATE and DROP statements. |
 | `publishesManifest` / `publishes_manifest` | `publishesManifest` | `publishes_manifest` | True for statements that can publish index declaration state when executed. |
 | `createsLabels` / `creates_labels` | `createsLabels` | `creates_labels` | True for CREATE statements that may create missing label tokens. |
@@ -4065,9 +4189,10 @@ Index explain target fields:
 |-------|---------|--------|-------------|
 | `targetKind` / `target_kind` | `targetKind` | `target_kind` | `node`, `edge`, or `property_index_catalog` for all-index SHOW. |
 | `label` | `label` | `label` | Node or edge label for CREATE/DROP; null for SHOW. |
-| `propKey` / `prop_key` | `propKey` | `prop_key` | Property key for CREATE/DROP; null for SHOW. |
+| `fields` | `fields` | `fields` | Ordered field-list objects; empty for SHOW explain targets. |
 | `kind` | `kind` | `kind` | `equality` or `range` for CREATE/DROP; null for SHOW. |
 | `action` | `action` | `action` | `ensure`, `drop`, or `show`. |
+| `compound` | `compound` | `compound` | True when the target field list has two or more fields. |
 
 `CREATE` and `DROP` are rejected in `ReadOnly` mode. `SHOW PROPERTY INDEXES`, `SHOW NODE PROPERTY
 INDEXES`, and `SHOW EDGE PROPERTY INDEXES` are allowed in `ReadOnly` mode. All index statements
@@ -4102,7 +4227,7 @@ let grouped = db.execute_gql(
 )?;
 
 let created = db.execute_gql(
-    "CREATE (n:Person {key: 'ada', name: 'Ada'}) RETURN n.name AS name",
+    "CREATE (n:Person {elementKey: 'ada', name: 'Ada'}) RETURN n.name AS name",
     &GqlParams::new(),
     &GqlExecutionOptions::default(),
 )?;
@@ -4133,14 +4258,14 @@ const asyncResult = await db.executeGqlAsync(
 );
 
 const created = db.executeGql(
-  "CREATE (n:Person {key: 'ada', name: 'Ada'}) RETURN n.name AS name"
+  "CREATE (n:Person {elementKey: 'ada', name: 'Ada'}) RETURN n.name AS name"
 );
 
 const merged = db.executeGql(
-  `MERGE (n:Person {key: 'ada'})
+  `MERGE (n:Person {elementKey: 'ada'})
    ON CREATE SET n.status = 'created'
    ON MATCH SET n.status = 'matched'
-   RETURN n.key AS key, n.status AS status`
+   RETURN elementKey(n) AS key, n.status AS status`
 );
 
 const explain = db.explainGql(
@@ -4156,12 +4281,12 @@ result = db.execute_gql(
 
 path_result = db.execute_gql(
     """
-    MATCH (a:Person {key: $from_key})
+    MATCH (a:Person {elementKey: $from_key})
     WITH a
-    MATCH (b:Person {key: $to_key})
+    MATCH (b:Person {elementKey: $to_key})
     WITH a, b
     MATCH p = shortestPath((a)-[:KNOWS*1..4]->(b))
-    RETURN node_ids(p) AS node_ids, edge_ids(p) AS edge_ids
+    RETURN nodeIds(p) AS node_ids, edgeIds(p) AS edge_ids
     """,
     {"from_key": "ada", "to_key": "ben"},
 )
@@ -4171,7 +4296,7 @@ async_result = await async_db.execute_gql(
 )
 
 created = db.execute_gql(
-    "CREATE (n:Person {key: 'ada', name: 'Ada'}) RETURN n.name AS name"
+    "CREATE (n:Person {elementKey: 'ada', name: 'Ada'}) RETURN n.name AS name"
 )
 
 explain = db.explain_gql(
@@ -4183,7 +4308,7 @@ explain = db.explain_gql(
 
 | Parameter | Rust | Node.js | Python | Required | Default | Description |
 |-----------|------|---------|--------|----------|---------|-------------|
-| statement | `&str` | `string` | `str` | Yes | - | One GQL Beta read, mutation, schema, or property-index statement. |
+| statement | `&str` | `string` | `str` | Yes | - | One GQL read, mutation, schema, or property-index statement. |
 | params | `&GqlParams` | `GqlParams \| null` | `GqlParams \| None` | No | empty | Named params referenced as `$name` in the statement. |
 | options | `&GqlExecutionOptions` | `GqlExecutionOptions \| null` | keyword options | No | default options | Execution mode, caps, explain/profile, row-format, cursor, and vector options. |
 
@@ -4296,7 +4421,7 @@ Mutation results use the same row shapes and include `mutation_stats` / `mutatio
 
 ```javascript
 const result = db.executeGql(
-  "MATCH (n:Person) WHERE n.key = 'ada' SET n.status = 'active' RETURN n.key AS key, n.status AS status"
+  "MATCH (n:Person) WHERE elementKey(n) = 'ada' SET n.status = 'active' RETURN elementKey(n) AS key, n.status AS status"
 );
 
 console.log(result.kind);                    // 'mutation'
@@ -4342,7 +4467,7 @@ Node.js bytes are returned as `Buffer`. Python bytes are returned as `bytes`. Ru
 lists, maps, and path values; when a node or edge alias is collected as an expression, the collected
 value is its ID. Return node, edge, or path aliases directly when the result should contain hydrated
 graph element values. Path helper functions return scalar/list values: `length(p)` returns hop
-count, `node_ids(p)` / `edge_ids(p)` return ID lists, and `nodes(p)` / `relationships(p)` return ID
+count, `nodeIds(p)` / `edgeIds(p)` return ID lists, and `nodes(p)` / `relationships(p)` return ID
 lists for helper expressions while returning a path alias as a value hydrates path `nodes` / `edges`.
 
 Node values expose only requested fields:
@@ -4623,7 +4748,7 @@ statements are allowed:
 
 ```javascript
 db.executeGql(
-  "CREATE (n:Person {key: 'blocked'})",
+  "CREATE (n:Person {elementKey: 'blocked'})",
   null,
   { mode: 'readOnly' }
 );
@@ -4634,7 +4759,7 @@ Mutation, schema, and index statements reject cursors:
 
 ```javascript
 db.executeGql(
-  "CREATE (n:Person {key: 'bad-cursor'})",
+  "CREATE (n:Person {elementKey: 'bad-cursor'})",
   null,
   { cursor: 'opaque-read-cursor' }
 );
@@ -4661,7 +4786,7 @@ GQL create mutation:
 
 ```javascript
 const created = db.executeGql(
-  `CREATE (p:Person {key: $key, name: $name, status: 'active'})
+  `CREATE (p:Person {elementKey: $key, name: $name, status: 'active'})
    RETURN p.name AS name`,
   { key: 'ada', name: 'Ada' }
 );
@@ -4675,9 +4800,9 @@ GQL set mutation with returned rows:
 ```javascript
 const updated = db.executeGql(
   `MATCH (p:Person)
-   WHERE p.key = $key
+   WHERE elementKey(p) = $key
    SET p.status = 'active'
-   RETURN p.key AS key, p.status AS status`,
+   RETURN elementKey(p) AS key, p.status AS status`,
   { key: 'ada' }
 );
 
@@ -4691,10 +4816,10 @@ Keyed node `MERGE` with `ON CREATE SET` / `ON MATCH SET`:
 const merged = db.executeGql(
   `MATCH (s:Source)
    WITH s.target_key AS key
-   MERGE (a:Account {key: key})
+   MERGE (a:Account {elementKey: key})
    ON CREATE SET a.status = 'created', a.count = 1
    ON MATCH SET a.status = 'matched', a.count = coalesce(a.count, 0) + 1
-   RETURN DISTINCT a.key AS key, a.status AS status, a.count AS count`
+   RETURN DISTINCT elementKey(a) AS key, a.status AS status, a.count AS count`
 );
 ```
 
@@ -4702,8 +4827,8 @@ Unique relationship `MERGE`:
 
 ```javascript
 const rel = db.executeGql(
-  `MATCH (a:Person {key: $from_key})
-   MATCH (b:Person {key: $to_key})
+  `MATCH (a:Person {elementKey: $from_key})
+   MATCH (b:Person {elementKey: $to_key})
    MERGE (a)-[r:KNOWS]->(b)
    ON CREATE SET r.since = 2026
    ON MATCH SET r.seen = true
@@ -4716,7 +4841,7 @@ GQL delete mutation:
 ```javascript
 db.executeGql(
   `MATCH (p:Person)-[r:WORKS_AT]->(c:Company)
-   WHERE p.key = $key
+   WHERE elementKey(p) = $key
    DELETE r`,
   { key: 'ada' }
 );
@@ -4781,7 +4906,7 @@ Direct edge query:
 
 ```javascript
 const likes = db.executeGql(
-  'MATCH ()-[r:LIKES]->() RETURN id(r) AS id, type(r) AS label, r.weight AS weight LIMIT 25'
+  'MATCH ()-[r:LIKES]->() RETURN id(r) AS id, type(r) AS label, weight(r) AS weight LIMIT 25'
 );
 ```
 
@@ -4828,7 +4953,7 @@ Bounded path value and path functions:
 const rows = db.executeGql(
   `MATCH p = (a:Person)-[:KNOWS*1..3]->(b:Person)
    WHERE a.name = $name
-   RETURN p, length(p) AS hops, node_ids(p) AS nodeIds, edge_ids(p) AS edgeIds
+   RETURN p, length(p) AS hops, nodeIds(p) AS nodeIds, edgeIds(p) AS edgeIds
    ORDER BY hops ASC
    LIMIT 10`,
   { name: 'Ada' }
@@ -4843,12 +4968,12 @@ Constrained shortest path with pre-bound endpoints:
 ```python
 paths = db.execute_gql(
     """
-    MATCH (a:Person {key: $from_key})
+    MATCH (a:Person {elementKey: $from_key})
     WITH a
-    MATCH (b:Person {key: $to_key})
+    MATCH (b:Person {elementKey: $to_key})
     WITH a, b
     MATCH p = shortestPath((a)-[:KNOWS*1..4]->(b))
-    RETURN p, node_ids(p) AS node_ids, edge_ids(p) AS edge_ids, length(p) AS hops
+    RETURN p, nodeIds(p) AS node_ids, edgeIds(p) AS edge_ids, length(p) AS hops
     """,
     {"from_key": "ada", "to_key": "cy"},
 )
@@ -4963,7 +5088,7 @@ result = await async_db.execute_gql(
 
 #### Current Limits
 
-GQL Beta is intentionally narrower than ISO GQL and Cypher. It rejects:
+GQL is intentionally narrower than ISO GQL and Cypher. It rejects:
 
 - Full ISO GQL
 - Full Cypher compatibility
@@ -4975,7 +5100,7 @@ GQL Beta is intentionally narrower than ISO GQL and Cypher. It rejects:
   database lifecycle DDL
 - Vector writes or vector mutation syntax
 - Mutating subqueries and procedure calls such as `CALL db.labels()`
-- Unsupported `MERGE` shapes: unkeyed nodes, multi-label nodes, non-key identity maps,
+- Unsupported `MERGE` shapes: unkeyed nodes, multi-label nodes, identity maps beyond a single `elementKey` entry,
   relationship properties in the `MERGE` pattern, unbound endpoints, relationship MERGE without
   `edge_uniqueness = true`, undirected or variable-length relationship MERGE, path-assigned MERGE,
   and general pattern MERGE
@@ -4983,7 +5108,7 @@ GQL Beta is intentionally narrower than ISO GQL and Cypher. It rejects:
 - `UNWIND`, `FOREACH`, and `LOAD CSV`
 - Dynamic labels and dynamic relationship types
 - Unbounded variable-length paths, weighted shortest-path GQL syntax, all-pairs shortest path, and broad shortest-path endpoint scans
-- Advanced path functions beyond `length`, `start_node`, `end_node`, `nodes`, `relationships`, `node_ids`, and `edge_ids`
+- Advanced path functions beyond `length`, `startNode`, `endNode`, `nodes`, `relationships`, `nodeIds`, and `edgeIds`
 - Multi-hop relationship-list aliases separate from path aliases
 - Path assignment over multiple relationship segments
 - Pattern-local predicates inside node or relationship patterns
@@ -4991,8 +5116,8 @@ GQL Beta is intentionally narrower than ISO GQL and Cypher. It rejects:
 - Mutation `RETURN ORDER BY` or `RETURN DISTINCT` on commit-assigned or same-mutation-volatile metadata
 
 Use structured query APIs when you need request-object construction, strongly bounded pagination by
-ID, native upsert semantics, vector writes, schema/index management, or APIs outside GQL Beta. Use
-GQL Beta when a graph query or mutation reads better as text.
+ID, native upsert semantics, vector writes, schema/index management, or APIs outside GQL. Use
+GQL when a graph query or mutation reads better as text.
 
 ---
 
@@ -5289,6 +5414,8 @@ Plan node kinds include:
 | `node_label_any_index` | Node-label `Any` candidate source. |
 | `property_equality_index` | Ready equality property index candidate source. |
 | `property_range_index` | Ready range property index candidate source. |
+| `compound_equality_index` | Ready compound equality declaration candidate source using a satisfied left prefix. |
+| `compound_range_index` | Ready compound range declaration candidate source using equality prefix fields plus one range field. |
 | `timestamp_index` | Built-in timestamp index candidate source. |
 | `explicit_edge_ids` | Explicit edge ID candidate universe. |
 | `edge_label_index` | Edge label index candidate source. |
@@ -5316,6 +5443,7 @@ Warning strings include:
 | Warning | Meaning |
 |---------|---------|
 | `missing_ready_index` | Needed index is absent, not ready, or unavailable. |
+| `compound_index_prefix_not_satisfied` | A compound declaration existed, but the query did not constrain its left prefix. |
 | `using_fallback_scan` | Query used a scan universe. |
 | `full_scan_requires_opt_in` | Query would need a full scan but the caller did not opt in. |
 | `full_scan_explicitly_allowed` | Full scan ran because caller opted in. |
@@ -7141,7 +7269,7 @@ println!("label token schema: {}", manifest.label_token_schema_version);
 | label_token_schema_version | `u32` | Node-label / edge-label catalog schema marker. |
 | node_label_tokens | `BTreeMap<String, u32>` | Public node label to internal `label_id`. |
 | edge_label_tokens | `BTreeMap<String, u32>` | Public edge label to internal `label_id`. |
-| secondary_indexes | `Vec<SecondaryIndexManifestEntry>` | Raw optional secondary-index declarations. Node targets use `SecondaryIndexTarget::NodeProperty { label_id, prop_key }`; edge targets use `SecondaryIndexTarget::EdgeProperty { label_id, prop_key }`. |
+| secondary_indexes | `Vec<SecondaryIndexManifestEntry>` | Raw optional secondary-index declarations. Node targets use `SecondaryIndexTarget::Node { label_id }`; edge targets use `SecondaryIndexTarget::Edge { label_id }`; ordered fields are stored separately on each entry. |
 | schema_catalog_version | `u32` | Raw schema catalog marker for diagnostics. |
 | node_schemas | `Vec<NodeSchemaManifestEntry>` | Raw persisted node-schema entries keyed by internal label IDs. Use schema APIs for ordinary reads/writes. |
 | edge_schemas | `Vec<EdgeSchemaManifestEntry>` | Raw persisted edge-schema entries keyed by internal label IDs. Use schema APIs for ordinary reads/writes. |
@@ -7422,8 +7550,8 @@ asyncio.run(main())
 | | `explain_edge_query` | Explain an edge query plan |
 | | `query_graph_rows` | Structured graph-row query |
 | | `explain_graph_rows` | Explain a graph-row query |
-| | `execute_gql` | GQL Beta query-string reads and mutations |
-| | `explain_gql` | Explain a GQL Beta statement |
+| | `execute_gql` | GQL query-string reads and mutations |
+| | `explain_gql` | Explain a GQL statement |
 | **Pagination** | `*_paged` | Paginated variants |
 | **Traversal** | `neighbors` | Immediate neighbors |
 | | `neighbors_paged` | Paginated neighbors |

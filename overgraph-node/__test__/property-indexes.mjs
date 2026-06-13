@@ -41,11 +41,31 @@ function planHasKind(node, kind) {
   return Array.isArray(node.inputs) && node.inputs.some(input => planHasKind(input, kind));
 }
 
+function propertyIndexSpec(propKey, kind) {
+  return { kind, fields: [{ source: 'property', key: propKey }] };
+}
+
+function propertyFieldKey(info) {
+  assert.equal(info.fields.length, 1);
+  assert.equal(info.fields[0].source, 'property');
+  return info.fields[0].key;
+}
+
+function hasPropertyField(info, propKey) {
+  return info.fields.length === 1
+    && info.fields[0].source === 'property'
+    && info.fields[0].key === propKey;
+}
+
+function sameFields(actual, expected) {
+  return JSON.stringify(actual) === JSON.stringify(expected);
+}
+
 async function ensureRangeIndexReady(db, propKey = 'score') {
-  db.ensureNodePropertyIndex('Person', propKey, 'range');
+  db.ensureNodePropertyIndex('Person', propertyIndexSpec(propKey, 'range'));
   return waitForIndexState(
     db,
-    infos => infos.find(info => info.label === 'Person' && info.propKey === propKey && info.kind === 'range')
+    infos => infos.find(info => info.label === 'Person' && hasPropertyField(info, propKey) && info.kind === 'range')
   );
 }
 
@@ -73,38 +93,47 @@ describe('node property index APIs', () => {
   });
 
   it('ensures, lists, and drops declared property indexes', async () => {
-    const eq = db.ensureNodePropertyIndex('Person', 'color', 'equality');
+    const colorSpec = propertyIndexSpec('color', 'equality');
+    const scoreSpec = propertyIndexSpec('score', 'range');
+    const eq = db.ensureNodePropertyIndex('Person', colorSpec);
     assert.equal(eq.kind, 'equality');
     assert.equal('domain' in eq, false);
     assert.equal(eq.state, 'building');
+    assert.equal(eq.compound, false);
+    assert.deepEqual(eq.fields, colorSpec.fields);
+    assert.equal(Object.hasOwn(eq, 'lastError'), true);
+    assert.equal(eq.lastError, null);
 
-    const range = db.ensureNodePropertyIndex('Person', 'score', 'range');
+    const range = db.ensureNodePropertyIndex('Person', scoreSpec);
     assert.equal(range.kind, 'range');
     assert.equal('domain' in range, false);
     assert.equal(range.state, 'building');
+    assert.deepEqual(range.fields, scoreSpec.fields);
+    assert.equal(Object.hasOwn(range, 'lastError'), true);
+    assert.equal(range.lastError, null);
 
     await waitForIndexState(
       db,
-      infos => infos.find(info => info.label === 'Person' && info.propKey === 'color' && info.kind === 'equality')
+      infos => infos.find(info => info.label === 'Person' && hasPropertyField(info, 'color') && info.kind === 'equality')
     );
     const readyRange = await waitForIndexState(
       db,
-      infos => infos.find(info => info.label === 'Person' && info.propKey === 'score' && info.kind === 'range')
+      infos => infos.find(info => info.label === 'Person' && hasPropertyField(info, 'score') && info.kind === 'range')
     );
     assert.equal('domain' in readyRange, false);
 
     const listed = db.listNodePropertyIndexes();
     assert.equal(listed.length, 2);
     assert.deepEqual(
-      listed.map(info => [info.propKey, info.kind, 'domain' in info, info.state]).sort(),
+      listed.map(info => [propertyFieldKey(info), info.kind, 'domain' in info, info.state, info.compound]).sort(),
       [
-        ['color', 'equality', false, 'ready'],
-        ['score', 'range', false, 'ready'],
+        ['color', 'equality', false, 'ready', false],
+        ['score', 'range', false, 'ready', false],
       ]
     );
 
-    assert.equal(db.dropNodePropertyIndex('Person', 'color', 'equality'), true);
-    assert.equal(db.dropNodePropertyIndex('Person', 'color', 'equality'), false);
+    assert.equal(db.dropNodePropertyIndex('Person', colorSpec), true);
+    assert.equal(db.dropNodePropertyIndex('Person', colorSpec), false);
   });
 
   it('runs range queries and paging through the public API', async () => {
@@ -151,10 +180,22 @@ describe('node property index APIs', () => {
 
   it('validates kind and range-bound inputs at the binding boundary', () => {
     assert.throws(
-      () => db.ensureNodePropertyIndex('Person', 'score', 'bogus'),
-      /Invalid index kind/i
+      () => db.ensureNodePropertyIndex('Person', { fields: [{ source: 'property', key: 'score' }] }),
+      /invalid secondary index: kind is required/i
     );
-    assert.equal(db.ensureNodePropertyIndex('Person', 'score', 'range').kind, 'range');
+    assert.throws(
+      () => db.ensureNodePropertyIndex('Person', { kind: 'equality' }),
+      /invalid secondary index: fields are required/i
+    );
+    assert.throws(
+      () => db.ensureNodePropertyIndex('Person', { kind: 'equality', fields: [{ key: 'score' }] }),
+      /invalid secondary index: field source is required/i
+    );
+    assert.throws(
+      () => db.ensureNodePropertyIndex('Person', propertyIndexSpec('score', 'bogus')),
+      /invalid secondary index|Invalid index kind/i
+    );
+    assert.equal(db.ensureNodePropertyIndex('Person', propertyIndexSpec('score', 'range')).kind, 'range');
     assert.throws(
       () => db.findNodesRange('Person', 'score', { value: 10, inclusive: true, domain: 'bogus' }),
       /Invalid range value type annotation/i
@@ -181,17 +222,71 @@ describe('node property index APIs', () => {
     );
   });
 
+  it('declares, uses, and drops compound field-list indexes', async () => {
+    const compoundSpec = {
+      kind: 'range',
+      fields: [
+        { source: 'property', key: 'color' },
+        { source: 'metadata', field: 'updated_at' },
+      ],
+    };
+    const info = db.ensureNodePropertyIndex('Person', compoundSpec);
+    assert.equal(info.compound, true);
+    assert.deepEqual(info.fields, compoundSpec.fields);
+    const ready = await waitForIndexState(
+      db,
+      infos => infos.find(index => index.label === 'Person' && index.kind === 'range' && sameFields(index.fields, compoundSpec.fields))
+    );
+    assert.equal(ready.state, 'ready');
+    assert.equal(ready.compound, true);
+
+    const query = {
+      labelFilter: { labels: ['Person'], mode: 'all' },
+      filter: {
+        and: [
+          { property: 'color', eq: 'red' },
+          { updatedAt: { gte: 0 } },
+        ],
+      },
+      limit: 10,
+    };
+    assert.equal(db.queryNodeIds(query).items.length, 3);
+    const plan = db.explainNodeQuery(query);
+    assert.ok(planHasKind(plan.root, 'compound_range_index'));
+    assert.equal(db.dropNodePropertyIndex('Person', compoundSpec), true);
+    assert.equal(db.dropNodePropertyIndex('Person', compoundSpec), false);
+  });
+
   it('supports async property index and range APIs', async () => {
-    const asyncEq = await db.ensureNodePropertyIndexAsync('Person', 'temp', 'equality');
+    const tempSpec = propertyIndexSpec('temp', 'equality');
+    const asyncEq = await db.ensureNodePropertyIndexAsync('Person', tempSpec);
     assert.equal(asyncEq.kind, 'equality');
     await waitForIndexState(
       db,
-      infos => infos.find(info => info.label === 'Person' && info.propKey === 'temp' && info.kind === 'equality')
+      infos => infos.find(info => info.label === 'Person' && hasPropertyField(info, 'temp') && info.kind === 'equality')
     );
     await ensureRangeIndexReady(db);
 
     const listed = await db.listNodePropertyIndexesAsync();
-    assert.ok(listed.some(info => info.propKey === 'temp' && info.kind === 'equality'));
+    assert.ok(listed.some(info => hasPropertyField(info, 'temp') && info.kind === 'equality'));
+
+    const compoundSpec = {
+      kind: 'range',
+      fields: [
+        { source: 'property', key: 'color' },
+        { source: 'metadata', field: 'updated_at' },
+      ],
+    };
+    const asyncCompound = await db.ensureNodePropertyIndexAsync('Person', compoundSpec);
+    assert.equal(asyncCompound.compound, true);
+    assert.deepEqual(asyncCompound.fields, compoundSpec.fields);
+    await waitForIndexState(
+      db,
+      infos => infos.find(info => info.label === 'Person' && info.kind === 'range' && sameFields(info.fields, compoundSpec.fields))
+    );
+
+    const listedWithCompound = await db.listNodePropertyIndexesAsync();
+    assert.ok(listedWithCompound.some(info => info.compound && sameFields(info.fields, compoundSpec.fields)));
 
     const ids = await db.findNodesRangeAsync('Person',
       'score',
@@ -209,7 +304,8 @@ describe('node property index APIs', () => {
     assert.equal(page.items.length, 2);
     assert.equal(page.nextCursor?.domain, 'int');
 
-    assert.equal(await db.dropNodePropertyIndexAsync('Person', 'temp', 'equality'), true);
+    assert.equal(await db.dropNodePropertyIndexAsync('Person', tempSpec), true);
+    assert.equal(await db.dropNodePropertyIndexAsync('Person', compoundSpec), true);
   });
 });
 
@@ -225,15 +321,19 @@ describe('edge property index APIs', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'overgraph-edge-prop-index-'));
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
 
-    const eq = db.ensureEdgePropertyIndex('WORKS_AT', 'status', 'equality');
+    const eq = db.ensureEdgePropertyIndex('WORKS_AT', propertyIndexSpec('status', 'equality'));
     assert.equal(eq.kind, 'equality');
     assert.equal('domain' in eq, false);
     assert.equal(eq.state, 'building');
+    assert.equal(Object.hasOwn(eq, 'lastError'), true);
+    assert.equal(eq.lastError, null);
 
-    const range = db.ensureEdgePropertyIndex('WORKS_AT', 'score', 'range');
+    const range = db.ensureEdgePropertyIndex('WORKS_AT', propertyIndexSpec('score', 'range'));
     assert.equal(range.kind, 'range');
     assert.equal('domain' in range, false);
     assert.equal(range.state, 'building');
+    assert.equal(Object.hasOwn(range, 'lastError'), true);
+    assert.equal(range.lastError, null);
 
     source = db.upsertNode('Person', 'source');
     hotTarget = db.upsertNode('Company', 'hot-target');
@@ -249,11 +349,11 @@ describe('edge property index APIs', () => {
 
     await waitForEdgeIndexState(
       db,
-      infos => infos.find(info => info.label === 'WORKS_AT' && info.propKey === 'status' && info.kind === 'equality')
+      infos => infos.find(info => info.label === 'WORKS_AT' && hasPropertyField(info, 'status') && info.kind === 'equality')
     );
     await waitForEdgeIndexState(
       db,
-      infos => infos.find(info => info.label === 'WORKS_AT' && info.propKey === 'score' && info.kind === 'range')
+      infos => infos.find(info => info.label === 'WORKS_AT' && hasPropertyField(info, 'score') && info.kind === 'range')
     );
   });
 
@@ -265,14 +365,55 @@ describe('edge property index APIs', () => {
   it('ensures, lists, validates, and drops declared edge property indexes', () => {
     const listed = db.listEdgePropertyIndexes();
     assert.deepEqual(
-      listed.map(info => [info.propKey, info.kind, 'domain' in info, info.state]).sort(),
+      listed.map(info => [propertyFieldKey(info), info.kind, 'domain' in info, info.state, info.compound]).sort(),
       [
-        ['score', 'range', false, 'ready'],
-        ['status', 'equality', false, 'ready'],
+        ['score', 'range', false, 'ready', false],
+        ['status', 'equality', false, 'ready', false],
       ]
     );
 
-    assert.equal(db.dropEdgePropertyIndex('WORKS_AT', 'missing', 'equality'), false);
+    assert.equal(db.dropEdgePropertyIndex('WORKS_AT', propertyIndexSpec('missing', 'equality')), false);
+  });
+
+  it('declares, uses, and drops edge field-list indexes', async () => {
+    const compoundSource = db.upsertNode('Person', 'compound-source');
+    const compoundHotTarget = db.upsertNode('Company', 'compound-hot-target');
+    const compoundColdTarget = db.upsertNode('Company', 'compound-cold-target');
+    const compoundHotEdge = db.upsertEdge(compoundSource, compoundHotTarget, 'COMPOUND_WORKS_AT', {
+      props: { score: 90 },
+    });
+    db.upsertEdge(compoundSource, compoundColdTarget, 'COMPOUND_WORKS_AT', {
+      props: { score: 10 },
+    });
+
+    const compoundSpec = {
+      kind: 'range',
+      fields: [
+        { source: 'metadata', field: 'from' },
+        { source: 'property', key: 'score' },
+      ],
+    };
+    const info = db.ensureEdgePropertyIndex('COMPOUND_WORKS_AT', compoundSpec);
+    assert.equal(info.compound, true);
+    assert.deepEqual(info.fields, compoundSpec.fields);
+    const ready = await waitForEdgeIndexState(
+      db,
+      infos => infos.find(index => index.label === 'COMPOUND_WORKS_AT' && index.kind === 'range' && sameFields(index.fields, compoundSpec.fields))
+    );
+    assert.equal(ready.state, 'ready');
+    assert.equal(ready.compound, true);
+
+    const query = {
+      label: 'COMPOUND_WORKS_AT',
+      fromIds: [compoundSource],
+      filter: { property: 'score', gte: 80 },
+      limit: 10,
+    };
+    assert.deepEqual(Array.from(db.queryEdgeIds(query).items), [compoundHotEdge]);
+    const plan = db.explainEdgeQuery(query);
+    assert.ok(planHasKind(plan.root, 'compound_range_index'));
+    assert.equal(db.dropEdgePropertyIndex('COMPOUND_WORKS_AT', compoundSpec), true);
+    assert.equal(db.dropEdgePropertyIndex('COMPOUND_WORKS_AT', compoundSpec), false);
   });
 
   it('uses edge property indexes from direct edge queries and pattern explain', () => {
@@ -358,16 +499,36 @@ describe('edge property index APIs', () => {
   });
 
   it('supports async edge property index APIs', async () => {
-    const asyncEq = await db.ensureEdgePropertyIndexAsync('WORKS_AT', 'temp', 'equality');
+    const tempSpec = propertyIndexSpec('temp', 'equality');
+    const asyncEq = await db.ensureEdgePropertyIndexAsync('WORKS_AT', tempSpec);
     assert.equal(asyncEq.kind, 'equality');
     await waitForEdgeIndexState(
       db,
-      infos => infos.find(info => info.label === 'WORKS_AT' && info.propKey === 'temp' && info.kind === 'equality')
+      infos => infos.find(info => info.label === 'WORKS_AT' && hasPropertyField(info, 'temp') && info.kind === 'equality')
     );
 
     const listed = await db.listEdgePropertyIndexesAsync();
-    assert.ok(listed.some(info => info.propKey === 'temp' && info.kind === 'equality'));
+    assert.ok(listed.some(info => hasPropertyField(info, 'temp') && info.kind === 'equality'));
 
-    assert.equal(await db.dropEdgePropertyIndexAsync('WORKS_AT', 'temp', 'equality'), true);
+    const compoundSpec = {
+      kind: 'range',
+      fields: [
+        { source: 'metadata', field: 'from' },
+        { source: 'property', key: 'score' },
+      ],
+    };
+    const asyncCompound = await db.ensureEdgePropertyIndexAsync('WORKS_AT', compoundSpec);
+    assert.equal(asyncCompound.compound, true);
+    assert.deepEqual(asyncCompound.fields, compoundSpec.fields);
+    await waitForEdgeIndexState(
+      db,
+      infos => infos.find(info => info.label === 'WORKS_AT' && info.kind === 'range' && sameFields(info.fields, compoundSpec.fields))
+    );
+
+    const listedWithCompound = await db.listEdgePropertyIndexesAsync();
+    assert.ok(listedWithCompound.some(info => info.compound && sameFields(info.fields, compoundSpec.fields)));
+
+    assert.equal(await db.dropEdgePropertyIndexAsync('WORKS_AT', tempSpec), true);
+    assert.equal(await db.dropEdgePropertyIndexAsync('WORKS_AT', compoundSpec), true);
   });
 });

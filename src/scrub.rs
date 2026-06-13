@@ -1315,8 +1315,8 @@ mod tests {
         encode_manifest_envelope, SegmentComponentManifestV1, SegmentComponentRecordV1,
     };
     use crate::{
-        DatabaseEngine, DbOptions, NodeInput, PropValue, ScrubFindingType, SecondaryIndexKind,
-        UpsertEdgeOptions, UpsertNodeOptions,
+        DatabaseEngine, DbOptions, NodeInput, PropValue, ScrubFindingType, SecondaryIndexField,
+        SecondaryIndexKind, SecondaryIndexSpec, UpsertEdgeOptions, UpsertNodeOptions,
     };
     use std::collections::BTreeMap;
     use std::fs::OpenOptions;
@@ -1505,10 +1505,26 @@ mod tests {
         let db_path = dir.path().join("testdb");
         let db = open_test_db(&db_path);
         let eq = db
-            .ensure_node_property_index("Researcher", "status", SecondaryIndexKind::Equality)
+            .ensure_node_property_index(
+                "Researcher",
+                SecondaryIndexSpec {
+                    fields: vec![SecondaryIndexField::Property {
+                        key: ("status").to_string(),
+                    }],
+                    kind: SecondaryIndexKind::Equality,
+                },
+            )
             .unwrap();
         let range = db
-            .ensure_node_property_index("Researcher", "score", SecondaryIndexKind::Range)
+            .ensure_node_property_index(
+                "Researcher",
+                SecondaryIndexSpec {
+                    fields: vec![SecondaryIndexField::Property {
+                        key: ("score").to_string(),
+                    }],
+                    kind: SecondaryIndexKind::Range,
+                },
+            )
             .unwrap();
         db.shutdown_secondary_index_worker();
 
@@ -1778,7 +1794,15 @@ mod tests {
 
         let (ready_rx, release_tx) = db.set_secondary_index_build_pause();
         let info = db
-            .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+            .ensure_node_property_index(
+                "Person",
+                SecondaryIndexSpec {
+                    fields: vec![SecondaryIndexField::Property {
+                        key: ("status").to_string(),
+                    }],
+                    kind: SecondaryIndexKind::Equality,
+                },
+            )
             .unwrap();
         assert_eq!(info.state, SecondaryIndexState::Building);
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();

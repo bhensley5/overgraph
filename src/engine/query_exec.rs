@@ -321,6 +321,8 @@ fn edge_plan_is_filter_source(plan: &EdgePhysicalPlan) -> bool {
                 | EdgeQueryCandidateSourceKind::EdgeValidToIndex
                 | EdgeQueryCandidateSourceKind::EdgePropertyEqualityIndex
                 | EdgeQueryCandidateSourceKind::EdgePropertyRangeIndex
+                | EdgeQueryCandidateSourceKind::CompoundEqualityIndex
+                | EdgeQueryCandidateSourceKind::CompoundRangeIndex
                 | EdgeQueryCandidateSourceKind::EdgeMetadataScan
         ),
         EdgePhysicalPlan::Intersect(inputs) | EdgePhysicalPlan::Union(inputs) => {
@@ -339,6 +341,8 @@ fn edge_materialization_uses_limited_probe(materialization: &EdgeCandidateMateri
             | EdgeCandidateMaterialization::EdgeValidToIndex { .. }
             | EdgeCandidateMaterialization::EdgePropertyEqualityIndex { .. }
             | EdgeCandidateMaterialization::EdgePropertyRangeIndex { .. }
+            | EdgeCandidateMaterialization::CompoundPrefixIndex { .. }
+            | EdgeCandidateMaterialization::CompoundRangeIndex { .. }
     )
 }
 
@@ -383,6 +387,28 @@ fn finalize_verified_edge_page(
         ids,
         edges,
         next_cursor,
+    }
+}
+
+fn followup_is_compound_sidecar_failure(followup: &SecondaryIndexReadFollowup) -> bool {
+    matches!(
+        followup,
+        SecondaryIndexReadFollowup::CompoundEqualitySidecarFailure { .. }
+            | SecondaryIndexReadFollowup::CompoundRangeSidecarFailure { .. }
+    )
+}
+
+fn edge_physical_plan_contains_compound(plan: &EdgePhysicalPlan) -> bool {
+    match plan {
+        EdgePhysicalPlan::Empty => false,
+        EdgePhysicalPlan::Source(source) => matches!(
+            source.materialization,
+            EdgeCandidateMaterialization::CompoundPrefixIndex { .. }
+                | EdgeCandidateMaterialization::CompoundRangeIndex { .. }
+        ),
+        EdgePhysicalPlan::Intersect(inputs) | EdgePhysicalPlan::Union(inputs) => {
+            inputs.iter().any(edge_physical_plan_contains_compound)
+        }
     }
 }
 
@@ -506,7 +532,97 @@ fn collect_node_filter_property_keys(filter: &NormalizedNodeFilter, keys: &mut V
         NormalizedNodeFilter::Not(child) => collect_node_filter_property_keys(child, keys),
         NormalizedNodeFilter::AlwaysTrue
         | NormalizedNodeFilter::AlwaysFalse
+        | NormalizedNodeFilter::IdRange { .. }
+        | NormalizedNodeFilter::KeyEquals(_)
+        | NormalizedNodeFilter::KeyIn { .. }
+        | NormalizedNodeFilter::WeightRange { .. }
+        | NormalizedNodeFilter::CreatedAtRange { .. }
         | NormalizedNodeFilter::UpdatedAtRange { .. } => {}
+    }
+}
+
+fn u64_flexible_range_matches(
+    value: u64,
+    lower: Option<u64>,
+    upper: Option<u64>,
+    lower_inclusive: bool,
+    upper_inclusive: bool,
+) -> bool {
+    if let Some(lower) = lower {
+        if value < lower || (value == lower && !lower_inclusive) {
+            return false;
+        }
+    }
+    if let Some(upper) = upper {
+        if value > upper || (value == upper && !upper_inclusive) {
+            return false;
+        }
+    }
+    true
+}
+
+fn i64_flexible_range_matches(
+    value: i64,
+    lower: Option<i64>,
+    upper: Option<i64>,
+    lower_inclusive: bool,
+    upper_inclusive: bool,
+) -> bool {
+    if let Some(lower) = lower {
+        if value < lower || (value == lower && !lower_inclusive) {
+            return false;
+        }
+    }
+    if let Some(upper) = upper {
+        if value > upper || (value == upper && !upper_inclusive) {
+            return false;
+        }
+    }
+    true
+}
+
+fn f32_flexible_range_matches(
+    value: f32,
+    lower: Option<f32>,
+    upper: Option<f32>,
+    lower_inclusive: bool,
+    upper_inclusive: bool,
+) -> bool {
+    if value.is_nan() {
+        return false;
+    }
+    if let Some(lower) = lower {
+        if value < lower || (value == lower && !lower_inclusive) {
+            return false;
+        }
+    }
+    if let Some(upper) = upper {
+        if value > upper || (value == upper && !upper_inclusive) {
+            return false;
+        }
+    }
+    true
+}
+
+fn node_filter_needs_key(filter: &NormalizedNodeFilter) -> bool {
+    match filter {
+        NormalizedNodeFilter::KeyEquals(_) | NormalizedNodeFilter::KeyIn { .. } => true,
+        NormalizedNodeFilter::And(children) | NormalizedNodeFilter::Or(children) => {
+            children.iter().any(node_filter_needs_key)
+        }
+        NormalizedNodeFilter::Not(child) => node_filter_needs_key(child),
+        _ => false,
+    }
+}
+
+fn node_filter_needs_created_at(filter: &NormalizedNodeFilter) -> bool {
+    match filter {
+        NormalizedNodeFilter::CreatedAtRange { .. } => true,
+        NormalizedNodeFilter::And(children) | NormalizedNodeFilter::Or(children) => {
+            children.iter().any(node_filter_needs_created_at)
+        }
+        NormalizedNodeFilter::Not(child) => node_filter_needs_created_at(child),
+        _ => false,
     }
 }
 
@@ -517,6 +633,30 @@ fn node_filter_metadata_outcome(
     match filter {
         NormalizedNodeFilter::AlwaysTrue => Some(true),
         NormalizedNodeFilter::AlwaysFalse => Some(false),
+        NormalizedNodeFilter::IdRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => Some(u64_flexible_range_matches(
+            meta.id,
+            *lower,
+            *upper,
+            *lower_inclusive,
+            *upper_inclusive,
+        )),
+        NormalizedNodeFilter::WeightRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => Some(f32_flexible_range_matches(
+            meta.weight,
+            *lower,
+            *upper,
+            *lower_inclusive,
+            *upper_inclusive,
+        )),
         NormalizedNodeFilter::UpdatedAtRange { lower_ms, upper_ms } => {
             Some(meta.updated_at >= *lower_ms && meta.updated_at <= *upper_ms)
         }
@@ -549,7 +689,10 @@ fn node_filter_metadata_outcome(
         | NormalizedNodeFilter::PropertyIn { .. }
         | NormalizedNodeFilter::PropertyRange { .. }
         | NormalizedNodeFilter::PropertyExists { .. }
-        | NormalizedNodeFilter::PropertyMissing { .. } => None,
+        | NormalizedNodeFilter::PropertyMissing { .. }
+        | NormalizedNodeFilter::KeyEquals(_)
+        | NormalizedNodeFilter::KeyIn { .. }
+        | NormalizedNodeFilter::CreatedAtRange { .. } => None,
     }
 }
 
@@ -560,6 +703,25 @@ fn node_filter_projected_matches(
     match filter {
         NormalizedNodeFilter::AlwaysTrue => true,
         NormalizedNodeFilter::AlwaysFalse => false,
+        NormalizedNodeFilter::IdRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => u64_flexible_range_matches(
+            selected.meta.id,
+            *lower,
+            *upper,
+            *lower_inclusive,
+            *upper_inclusive,
+        ),
+        NormalizedNodeFilter::KeyEquals(value) => {
+            selected.key.as_deref() == Some(value.as_str())
+        }
+        NormalizedNodeFilter::KeyIn { values } => selected
+            .key
+            .as_ref()
+            .is_some_and(|key| values.binary_search(key).is_ok()),
         NormalizedNodeFilter::PropertyEquals { key, value } => selected
             .props
             .get(key)
@@ -582,6 +744,32 @@ fn node_filter_projected_matches(
         NormalizedNodeFilter::UpdatedAtRange { lower_ms, upper_ms } => {
             selected.meta.updated_at >= *lower_ms && selected.meta.updated_at <= *upper_ms
         }
+        NormalizedNodeFilter::WeightRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => f32_flexible_range_matches(
+            selected.meta.weight,
+            *lower,
+            *upper,
+            *lower_inclusive,
+            *upper_inclusive,
+        ),
+        NormalizedNodeFilter::CreatedAtRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => selected.created_at.is_some_and(|created_at| {
+            i64_flexible_range_matches(
+                created_at,
+                *lower,
+                *upper,
+                *lower_inclusive,
+                *upper_inclusive,
+            )
+        }),
         NormalizedNodeFilter::And(children) => children
             .iter()
             .all(|child| node_filter_projected_matches(child, selected)),
@@ -663,7 +851,8 @@ fn edge_filter_requires_hydration(filter: &NormalizedEdgeFilter) -> bool {
         | NormalizedEdgeFilter::PropertyIn { .. }
         | NormalizedEdgeFilter::PropertyRange { .. }
         | NormalizedEdgeFilter::PropertyExists { .. }
-        | NormalizedEdgeFilter::PropertyMissing { .. } => true,
+        | NormalizedEdgeFilter::PropertyMissing { .. }
+        | NormalizedEdgeFilter::CreatedAtRange { .. } => true,
         NormalizedEdgeFilter::And(children) | NormalizedEdgeFilter::Or(children) => {
             children.iter().any(edge_filter_requires_hydration)
         }
@@ -679,11 +868,24 @@ fn edge_filter_metadata_outcome(
     match filter {
         NormalizedEdgeFilter::AlwaysTrue => Some(true),
         NormalizedEdgeFilter::AlwaysFalse => Some(false),
+        NormalizedEdgeFilter::IdRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => Some(u64_flexible_range_matches(
+            meta.id,
+            *lower,
+            *upper,
+            *lower_inclusive,
+            *upper_inclusive,
+        )),
         NormalizedEdgeFilter::PropertyEquals { .. }
         | NormalizedEdgeFilter::PropertyIn { .. }
         | NormalizedEdgeFilter::PropertyRange { .. }
         | NormalizedEdgeFilter::PropertyExists { .. }
-        | NormalizedEdgeFilter::PropertyMissing { .. } => None,
+        | NormalizedEdgeFilter::PropertyMissing { .. }
+        | NormalizedEdgeFilter::CreatedAtRange { .. } => None,
         NormalizedEdgeFilter::WeightRange { lower, upper } => {
             Some(edge_weight_range_matches(meta.weight, *lower, *upper))
         }
@@ -740,6 +942,18 @@ fn edge_filter_matches(filter: &NormalizedEdgeFilter, edge: &EdgeRecord) -> bool
     match filter {
         NormalizedEdgeFilter::AlwaysTrue => true,
         NormalizedEdgeFilter::AlwaysFalse => false,
+        NormalizedEdgeFilter::IdRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => u64_flexible_range_matches(
+            edge.id,
+            *lower,
+            *upper,
+            *lower_inclusive,
+            *upper_inclusive,
+        ),
         NormalizedEdgeFilter::PropertyEquals { key, value } => edge
             .props
             .get(key)
@@ -765,6 +979,18 @@ fn edge_filter_matches(filter: &NormalizedEdgeFilter, edge: &EdgeRecord) -> bool
         NormalizedEdgeFilter::UpdatedAtRange { lower_ms, upper_ms } => {
             i64_range_matches(edge.updated_at, *lower_ms, *upper_ms)
         }
+        NormalizedEdgeFilter::CreatedAtRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => i64_flexible_range_matches(
+            edge.created_at,
+            *lower,
+            *upper,
+            *lower_inclusive,
+            *upper_inclusive,
+        ),
         NormalizedEdgeFilter::ValidAt { epoch_ms } => {
             edge.valid_from <= *epoch_ms && *epoch_ms < edge.valid_to
         }
@@ -803,11 +1029,24 @@ fn collect_edge_filter_property_keys(filter: &NormalizedEdgeFilter, keys: &mut V
         NormalizedEdgeFilter::Not(child) => collect_edge_filter_property_keys(child, keys),
         NormalizedEdgeFilter::AlwaysTrue
         | NormalizedEdgeFilter::AlwaysFalse
+        | NormalizedEdgeFilter::IdRange { .. }
         | NormalizedEdgeFilter::WeightRange { .. }
+        | NormalizedEdgeFilter::CreatedAtRange { .. }
         | NormalizedEdgeFilter::UpdatedAtRange { .. }
         | NormalizedEdgeFilter::ValidAt { .. }
         | NormalizedEdgeFilter::ValidFromRange { .. }
         | NormalizedEdgeFilter::ValidToRange { .. } => {}
+    }
+}
+
+fn edge_filter_needs_created_at(filter: &NormalizedEdgeFilter) -> bool {
+    match filter {
+        NormalizedEdgeFilter::CreatedAtRange { .. } => true,
+        NormalizedEdgeFilter::And(children) | NormalizedEdgeFilter::Or(children) => {
+            children.iter().any(edge_filter_needs_created_at)
+        }
+        NormalizedEdgeFilter::Not(child) => edge_filter_needs_created_at(child),
+        _ => false,
     }
 }
 
@@ -818,6 +1057,18 @@ fn edge_filter_projected_matches(
     match filter {
         NormalizedEdgeFilter::AlwaysTrue => true,
         NormalizedEdgeFilter::AlwaysFalse => false,
+        NormalizedEdgeFilter::IdRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => u64_flexible_range_matches(
+            selected.meta.id,
+            *lower,
+            *upper,
+            *lower_inclusive,
+            *upper_inclusive,
+        ),
         NormalizedEdgeFilter::PropertyEquals { key, value } => selected
             .props
             .get(key)
@@ -843,6 +1094,20 @@ fn edge_filter_projected_matches(
         NormalizedEdgeFilter::UpdatedAtRange { lower_ms, upper_ms } => {
             i64_range_matches(selected.meta.updated_at, *lower_ms, *upper_ms)
         }
+        NormalizedEdgeFilter::CreatedAtRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => selected.created_at.is_some_and(|created_at| {
+            i64_flexible_range_matches(
+                created_at,
+                *lower,
+                *upper,
+                *lower_inclusive,
+                *upper_inclusive,
+            )
+        }),
         NormalizedEdgeFilter::ValidAt { epoch_ms } => {
             selected.meta.valid_from <= *epoch_ms && *epoch_ms < selected.meta.valid_to
         }
@@ -2779,6 +3044,29 @@ fn graph_row_fingerprint_node_filter_inner(
     filter: &NodeFilterExpr,
 ) {
     match filter {
+        NodeFilterExpr::IdRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => {
+            writer.tag(13);
+            graph_row_fingerprint_opt_u64(writer, *lower);
+            graph_row_fingerprint_opt_u64(writer, *upper);
+            writer.bool(*lower_inclusive);
+            writer.bool(*upper_inclusive);
+        }
+        NodeFilterExpr::KeyEquals(key) => {
+            writer.tag(14);
+            writer.str(key);
+        }
+        NodeFilterExpr::KeyIn(keys) => {
+            writer.tag(15);
+            writer.len(keys.len());
+            for key in keys {
+                writer.str(key);
+            }
+        }
         NodeFilterExpr::PropertyEquals { key, value } => {
             writer.tag(0);
             writer.str(key);
@@ -2810,6 +3098,30 @@ fn graph_row_fingerprint_node_filter_inner(
             writer.tag(5);
             graph_row_fingerprint_opt_i64(writer, *lower_ms);
             graph_row_fingerprint_opt_i64(writer, *upper_ms);
+        }
+        NodeFilterExpr::WeightRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => {
+            writer.tag(16);
+            graph_row_fingerprint_opt_f32(writer, *lower);
+            graph_row_fingerprint_opt_f32(writer, *upper);
+            writer.bool(*lower_inclusive);
+            writer.bool(*upper_inclusive);
+        }
+        NodeFilterExpr::CreatedAtRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => {
+            writer.tag(17);
+            graph_row_fingerprint_opt_i64(writer, *lower);
+            graph_row_fingerprint_opt_i64(writer, *upper);
+            writer.bool(*lower_inclusive);
+            writer.bool(*upper_inclusive);
         }
         NodeFilterExpr::And(filters) => {
             writer.tag(6);
@@ -2850,6 +3162,18 @@ fn graph_row_fingerprint_edge_filter_inner(
     filter: &EdgeFilterExpr,
 ) {
     match filter {
+        EdgeFilterExpr::IdRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => {
+            writer.tag(13);
+            graph_row_fingerprint_opt_u64(writer, *lower);
+            graph_row_fingerprint_opt_u64(writer, *upper);
+            writer.bool(*lower_inclusive);
+            writer.bool(*upper_inclusive);
+        }
         EdgeFilterExpr::PropertyEquals { key, value } => {
             writer.tag(0);
             writer.str(key);
@@ -2886,6 +3210,18 @@ fn graph_row_fingerprint_edge_filter_inner(
             writer.tag(6);
             graph_row_fingerprint_opt_i64(writer, *lower_ms);
             graph_row_fingerprint_opt_i64(writer, *upper_ms);
+        }
+        EdgeFilterExpr::CreatedAtRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => {
+            writer.tag(14);
+            graph_row_fingerprint_opt_i64(writer, *lower);
+            graph_row_fingerprint_opt_i64(writer, *upper);
+            writer.bool(*lower_inclusive);
+            writer.bool(*upper_inclusive);
         }
         EdgeFilterExpr::ValidAt { epoch_ms } => {
             writer.tag(7);
@@ -3047,6 +3383,16 @@ fn graph_row_fingerprint_opt_i64(writer: &mut GraphRowFingerprintWriter, value: 
         Some(value) => {
             writer.tag(1);
             writer.i64(value);
+        }
+        None => writer.tag(0),
+    }
+}
+
+fn graph_row_fingerprint_opt_u64(writer: &mut GraphRowFingerprintWriter, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            writer.tag(1);
+            writer.u64(value);
         }
         None => writer.tag(0),
     }
@@ -3999,6 +4345,7 @@ impl ReadView {
         query: &NormalizedNodeQuery,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
         include_key: bool,
+        include_created_at: bool,
         property_keys: &[String],
         ids: &mut Vec<u64>,
         target: usize,
@@ -4033,6 +4380,7 @@ impl ReadView {
                 &projected_candidate_ids,
                 &NodeSelectedFieldNeeds {
                     key: include_key,
+                    created_at: include_created_at,
                     props: PropertySelection::Keys(property_keys.to_vec()),
                     ..NodeSelectedFieldNeeds::default()
                 },
@@ -4071,7 +4419,8 @@ impl ReadView {
         let target = page_verify_target(limit);
         let start = first_candidate_after(candidate_ids, query.page.after);
         let mut ids = Vec::with_capacity(if limit > 0 { limit } else { 0 });
-        let include_key = !query.keys.is_empty();
+        let include_key = !query.keys.is_empty() || node_filter_needs_key(&query.filter);
+        let include_created_at = node_filter_needs_created_at(&query.filter);
         let mut property_keys = Vec::new();
         collect_node_filter_property_keys(&query.filter, &mut property_keys);
 
@@ -4082,6 +4431,7 @@ impl ReadView {
                     query,
                     policy_cutoffs,
                     include_key,
+                    include_created_at,
                     &property_keys,
                     &mut ids,
                     target,
@@ -4113,7 +4463,8 @@ impl ReadView {
             _ => QUERY_VERIFY_CHUNK,
         };
         let mut ids = Vec::with_capacity(if limit > 0 { limit } else { 0 });
-        let include_key = !query.keys.is_empty();
+        let include_key = !query.keys.is_empty() || node_filter_needs_key(&query.filter);
+        let include_created_at = node_filter_needs_created_at(&query.filter);
         let mut property_keys = Vec::new();
         collect_node_filter_property_keys(&query.filter, &mut property_keys);
 
@@ -4127,6 +4478,7 @@ impl ReadView {
                     query,
                     policy_cutoffs,
                     include_key,
+                    include_created_at,
                     &property_keys,
                     &mut ids,
                     target,
@@ -4241,7 +4593,8 @@ impl ReadView {
             _ => QUERY_VERIFY_CHUNK,
         };
         let mut ids = Vec::with_capacity(if limit > 0 { limit } else { 0 });
-        let include_key = !query.keys.is_empty();
+        let include_key = !query.keys.is_empty() || node_filter_needs_key(&query.filter);
+        let include_created_at = node_filter_needs_created_at(&query.filter);
         let mut property_keys = Vec::new();
         collect_node_filter_property_keys(&query.filter, &mut property_keys);
 
@@ -4251,6 +4604,7 @@ impl ReadView {
                 query,
                 policy_cutoffs,
                 include_key,
+                include_created_at,
                 &property_keys,
                 &mut ids,
                 target,
@@ -4274,7 +4628,7 @@ impl ReadView {
         match &source.materialization {
             NodeCandidateMaterialization::Precomputed(ids) => {
                 Ok(CandidateMaterializationResult::Ready {
-                    ids: ids.clone(),
+                    ids: ids.as_ref().clone(),
                     followups: Vec::new(),
                 })
             }
@@ -4359,6 +4713,78 @@ impl ReadView {
                     })
                 }
             }
+            NodeCandidateMaterialization::CompoundPrefixIndex { entry, bounds, .. } => {
+                let mut sets = Vec::with_capacity(bounds.len());
+                let mut followups = Vec::new();
+                for bound in bounds {
+                    match self.sources().node_ids_by_compound_prefix_limited(
+                        entry,
+                        bound,
+                        eager_cap.saturating_add(1),
+                    ) {
+                        Ok(crate::source_list::LimitedCompoundIndexRead::Ready(ids)) => {
+                            sets.push(ids);
+                        }
+                        Ok(crate::source_list::LimitedCompoundIndexRead::TooBroad) => {
+                            return Ok(CandidateMaterializationResult::TooBroad { followups });
+                        }
+                        Ok(crate::source_list::LimitedCompoundIndexRead::MissingSidecar) => {
+                            followups.extend(materialization_followups(
+                                self.compound_sidecar_failure_followup(entry, None),
+                            ));
+                            return Ok(CandidateMaterializationResult::TooBroad { followups });
+                        }
+                        Err(error) => {
+                            followups.extend(materialization_followups(
+                                self.compound_sidecar_failure_followup(entry, Some(error)),
+                            ));
+                            return Ok(CandidateMaterializationResult::TooBroad { followups });
+                        }
+                    }
+                }
+                let ids = union_candidate_sets(&sets);
+                if ids.len() > eager_cap {
+                    Ok(CandidateMaterializationResult::TooBroad { followups })
+                } else {
+                    Ok(CandidateMaterializationResult::Ready { ids, followups })
+                }
+            }
+            NodeCandidateMaterialization::CompoundRangeIndex { entry, bounds, .. } => {
+                let mut sets = Vec::with_capacity(bounds.len());
+                let mut followups = Vec::new();
+                for bound in bounds {
+                    match self.sources().node_ids_by_compound_range_limited(
+                        entry,
+                        bound,
+                        eager_cap.saturating_add(1),
+                    ) {
+                        Ok(crate::source_list::LimitedCompoundIndexRead::Ready(ids)) => {
+                            sets.push(ids);
+                        }
+                        Ok(crate::source_list::LimitedCompoundIndexRead::TooBroad) => {
+                            return Ok(CandidateMaterializationResult::TooBroad { followups });
+                        }
+                        Ok(crate::source_list::LimitedCompoundIndexRead::MissingSidecar) => {
+                            followups.extend(materialization_followups(
+                                self.compound_sidecar_failure_followup(entry, None),
+                            ));
+                            return Ok(CandidateMaterializationResult::TooBroad { followups });
+                        }
+                        Err(error) => {
+                            followups.extend(materialization_followups(
+                                self.compound_sidecar_failure_followup(entry, Some(error)),
+                            ));
+                            return Ok(CandidateMaterializationResult::TooBroad { followups });
+                        }
+                    }
+                }
+                let ids = union_candidate_sets(&sets);
+                if ids.len() > eager_cap {
+                    Ok(CandidateMaterializationResult::TooBroad { followups })
+                } else {
+                    Ok(CandidateMaterializationResult::Ready { ids, followups })
+                }
+            }
             NodeCandidateMaterialization::NodeLabelAny { .. }
             | NodeCandidateMaterialization::NodeLabelIndex { .. }
             | NodeCandidateMaterialization::FallbackNodeLabelScan { .. }
@@ -4413,7 +4839,11 @@ impl ReadView {
                 let mut materialized = Vec::with_capacity(inputs.len());
                 let mut followups = Vec::new();
                 let mut total_len = 0usize;
-                let union_cap = cap_context.union_total_cap(query.page.limit, plan.estimate());
+                let union_cap = cap_context.union_total_cap(
+                    plan.members_are_eager_index_sources(),
+                    query.page.limit,
+                    plan.estimate(),
+                );
                 for input in inputs {
                     match self.materialize_node_physical_plan(query, cap_context, input)? {
                         CandidateMaterializationResult::Ready {
@@ -4453,6 +4883,7 @@ impl ReadView {
         source: &PlannedNodeCandidateSource,
         query: &NormalizedNodeQuery,
         cap_context: QueryCapContext,
+        legal_universe_fallback: Option<&PlannedNodeCandidateSource>,
         hydrate: bool,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
     ) -> Result<(VerifiedNodePage, Vec<SecondaryIndexReadFollowup>), EngineError> {
@@ -4505,12 +4936,24 @@ impl ReadView {
                     CandidateMaterializationResult::TooBroad {
                         followups: mut materialization_followups,
                     } => {
-                        let (page, mut fallback_followups) = self.query_node_page_from_legal_universe(
-                            query,
-                            cap_context,
-                            hydrate,
-                            policy_cutoffs,
-                        )?;
+                        let (page, mut fallback_followups) =
+                            if let Some(fallback_source) = legal_universe_fallback {
+                                self.query_node_page_from_source_driver(
+                                    fallback_source,
+                                    query,
+                                    cap_context,
+                                    None,
+                                    hydrate,
+                                    policy_cutoffs,
+                                )?
+                            } else {
+                                self.query_node_page_from_legal_universe(
+                                    query,
+                                    cap_context,
+                                    hydrate,
+                                    policy_cutoffs,
+                                )?
+                            };
                         materialization_followups.append(&mut fallback_followups);
                         Ok((page, materialization_followups))
                     }
@@ -4539,6 +4982,7 @@ impl ReadView {
                     source,
                     query,
                     cap_context,
+                    None,
                     hydrate,
                     policy_cutoffs,
                 )
@@ -4557,6 +5001,7 @@ impl ReadView {
         let PlannedNodeQuery {
             driver,
             cap_context,
+            legal_universe_fallback,
             warnings: _,
             mut followups,
         } = planned;
@@ -4575,6 +5020,7 @@ impl ReadView {
                     source,
                     query,
                     cap_context,
+                    legal_universe_fallback.as_ref(),
                     hydrate,
                     policy_cutoffs,
                 )?;
@@ -4599,12 +5045,24 @@ impl ReadView {
                     CandidateMaterializationResult::TooBroad {
                         followups: mut materialization_followups,
                     } => {
-                        let (page, mut fallback_followups) = self.query_node_page_from_legal_universe(
-                            query,
-                            cap_context,
-                            hydrate,
-                            policy_cutoffs,
-                        )?;
+                        let (page, mut fallback_followups) =
+                            if let Some(fallback_source) = legal_universe_fallback.as_ref() {
+                                self.query_node_page_from_source_driver(
+                                    fallback_source,
+                                    query,
+                                    cap_context,
+                                    None,
+                                    hydrate,
+                                    policy_cutoffs,
+                                )?
+                            } else {
+                                self.query_node_page_from_legal_universe(
+                                    query,
+                                    cap_context,
+                                    hydrate,
+                                    policy_cutoffs,
+                                )?
+                            };
                         followups.append(&mut materialization_followups);
                         followups.append(&mut fallback_followups);
                         Ok((page, followups))
@@ -4709,7 +5167,7 @@ impl ReadView {
         let ids = match &source.materialization {
             EdgeCandidateMaterialization::Precomputed(ids) => {
                 return Ok(CandidateMaterializationResult::Ready {
-                    ids: ids.clone(),
+                    ids: ids.as_ref().clone(),
                     followups: Vec::new(),
                 });
             }
@@ -4817,6 +5275,76 @@ impl ReadView {
                 }
                 return Ok(CandidateMaterializationResult::Ready { ids, followups });
             }
+            EdgeCandidateMaterialization::CompoundPrefixIndex { entry, bounds, .. } => {
+                let mut sets = Vec::with_capacity(bounds.len());
+                let mut followups = Vec::new();
+                for bound in bounds {
+                    match sources.edge_ids_by_compound_prefix_limited(
+                        entry,
+                        bound,
+                        cap.saturating_add(1),
+                    ) {
+                        Ok(crate::source_list::LimitedCompoundIndexRead::Ready(ids)) => {
+                            sets.push(ids);
+                        }
+                        Ok(crate::source_list::LimitedCompoundIndexRead::TooBroad) => {
+                            return Ok(CandidateMaterializationResult::TooBroad { followups });
+                        }
+                        Ok(crate::source_list::LimitedCompoundIndexRead::MissingSidecar) => {
+                            followups.extend(materialization_followups(
+                                self.compound_sidecar_failure_followup(entry, None),
+                            ));
+                            return Ok(CandidateMaterializationResult::TooBroad { followups });
+                        }
+                        Err(error) => {
+                            followups.extend(materialization_followups(
+                                self.compound_sidecar_failure_followup(entry, Some(error)),
+                            ));
+                            return Ok(CandidateMaterializationResult::TooBroad { followups });
+                        }
+                    }
+                }
+                let ids = union_candidate_sets(&sets);
+                if ids.len() > cap {
+                    return Ok(CandidateMaterializationResult::TooBroad { followups });
+                }
+                return Ok(CandidateMaterializationResult::Ready { ids, followups });
+            }
+            EdgeCandidateMaterialization::CompoundRangeIndex { entry, bounds, .. } => {
+                let mut sets = Vec::with_capacity(bounds.len());
+                let mut followups = Vec::new();
+                for bound in bounds {
+                    match sources.edge_ids_by_compound_range_limited(
+                        entry,
+                        bound,
+                        cap.saturating_add(1),
+                    ) {
+                        Ok(crate::source_list::LimitedCompoundIndexRead::Ready(ids)) => {
+                            sets.push(ids);
+                        }
+                        Ok(crate::source_list::LimitedCompoundIndexRead::TooBroad) => {
+                            return Ok(CandidateMaterializationResult::TooBroad { followups });
+                        }
+                        Ok(crate::source_list::LimitedCompoundIndexRead::MissingSidecar) => {
+                            followups.extend(materialization_followups(
+                                self.compound_sidecar_failure_followup(entry, None),
+                            ));
+                            return Ok(CandidateMaterializationResult::TooBroad { followups });
+                        }
+                        Err(error) => {
+                            followups.extend(materialization_followups(
+                                self.compound_sidecar_failure_followup(entry, Some(error)),
+                            ));
+                            return Ok(CandidateMaterializationResult::TooBroad { followups });
+                        }
+                    }
+                }
+                let ids = union_candidate_sets(&sets);
+                if ids.len() > cap {
+                    return Ok(CandidateMaterializationResult::TooBroad { followups });
+                }
+                return Ok(CandidateMaterializationResult::Ready { ids, followups });
+            }
             EdgeCandidateMaterialization::FallbackFullEdgeScan => unreachable!("handled above"),
         }?;
         if ids.len() > cap {
@@ -4907,7 +5435,11 @@ impl ReadView {
                 let mut sets = Vec::with_capacity(inputs.len());
                 let mut followups = Vec::new();
                 let mut total_len = 0usize;
-                let cap = cap_context.union_total_cap(query.page.limit, plan.estimate());
+                let cap = cap_context.union_total_cap(
+                    plan.members_are_eager_index_sources(),
+                    query.page.limit,
+                    plan.estimate(),
+                );
                 for input in inputs {
                     match self.materialize_edge_physical_plan(query, cap_context, input)? {
                         CandidateMaterializationResult::Ready {
@@ -5188,6 +5720,7 @@ impl ReadView {
         let mut property_candidate_ids = Vec::new();
         let mut property_keys = Vec::new();
         collect_edge_filter_property_keys(&query.filter, &mut property_keys);
+        let include_created_at = edge_filter_needs_created_at(&query.filter);
 
         for meta in metas {
             if !endpoint_cache.edge_endpoints_visible(meta) {
@@ -5220,21 +5753,22 @@ impl ReadView {
                     metadata_by_property_candidate.insert(*edge_id, *query_meta);
                 }
             }
-            let projected = self
-                .sources()
-                .find_edge_properties(&property_candidate_ids, &property_keys)?;
-            for (&edge_id, props) in property_candidate_ids.iter().zip(projected) {
-                let Some(props) = props else {
+            let projected = self.sources().find_edge_projected_fields(
+                &property_candidate_ids,
+                &EdgeSelectedFieldNeeds {
+                    created_at: include_created_at,
+                    props: PropertySelection::Keys(property_keys.clone()),
+                },
+            )?;
+            for (&edge_id, selected) in property_candidate_ids.iter().zip(projected) {
+                let Some(selected) = selected else {
                     continue;
                 };
                 let Some(query_meta) = metadata_by_property_candidate.get(&edge_id) else {
                     continue;
                 };
-                let selected = SelectedEdgeFields {
-                    meta: *query_meta,
-                    props,
-                    created_at: None,
-                };
+                let mut selected = selected;
+                selected.meta = *query_meta;
                 if edge_filter_projected_matches(&query.filter, &selected) {
                     property_matches.insert(edge_id);
                 }
@@ -5425,6 +5959,7 @@ impl ReadView {
         source: &PlannedEdgeCandidateSource,
         query: &NormalizedEdgeQuery,
         cap_context: EdgeQueryCapContext,
+        legal_universe_fallback: Option<&PlannedEdgeCandidateSource>,
         hydrate: bool,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
     ) -> Result<(VerifiedEdgePage, Vec<SecondaryIndexReadFollowup>), EngineError> {
@@ -5491,12 +6026,24 @@ impl ReadView {
                 CandidateMaterializationResult::TooBroad {
                     followups: mut materialization_followups,
                 } => {
-                    let (page, mut fallback_followups) = self.query_edge_page_from_legal_universe(
-                        query,
-                        cap_context,
-                        hydrate,
-                        policy_cutoffs,
-                    )?;
+                    let (page, mut fallback_followups) =
+                        if let Some(fallback_source) = legal_universe_fallback {
+                            self.query_edge_page_from_source_driver(
+                                fallback_source,
+                                query,
+                                cap_context,
+                                None,
+                                hydrate,
+                                policy_cutoffs,
+                            )?
+                        } else {
+                            self.query_edge_page_from_legal_universe(
+                                query,
+                                cap_context,
+                                hydrate,
+                                policy_cutoffs,
+                            )?
+                        };
                     materialization_followups.append(&mut fallback_followups);
                     Ok((page, materialization_followups))
                 }
@@ -5518,7 +6065,7 @@ impl ReadView {
                     .into(),
             ));
         }
-        sources.sort_by_key(|source| EdgePhysicalPlan::source(source.clone()).plan_cost());
+        sources.sort_by_cached_key(|source| EdgePhysicalPlan::source(source.clone()).plan_cost());
         let source = sources
             .first()
             .expect("legal edge universe sources must be non-empty");
@@ -5526,6 +6073,7 @@ impl ReadView {
             source,
             query,
             cap_context,
+            None,
             hydrate,
             policy_cutoffs,
         )
@@ -5541,6 +6089,7 @@ impl ReadView {
         let PlannedEdgeQuery {
             driver,
             cap_context,
+            legal_universe_fallback,
             warnings: _,
             mut followups,
         } = planned;
@@ -5550,6 +6099,7 @@ impl ReadView {
                 source,
                 query,
                 cap_context,
+                legal_universe_fallback.as_ref(),
                 hydrate,
                 policy_cutoffs,
             )?;
@@ -5574,12 +6124,24 @@ impl ReadView {
             CandidateMaterializationResult::TooBroad {
                 followups: mut materialization_followups,
             } => {
-                let (page, mut fallback_followups) = self.query_edge_page_from_legal_universe(
-                    query,
-                    cap_context,
-                    hydrate,
-                    policy_cutoffs,
-                )?;
+                let (page, mut fallback_followups) =
+                    if let Some(fallback_source) = legal_universe_fallback.as_ref() {
+                        self.query_edge_page_from_source_driver(
+                            fallback_source,
+                            query,
+                            cap_context,
+                            None,
+                            hydrate,
+                            policy_cutoffs,
+                        )?
+                    } else {
+                        self.query_edge_page_from_legal_universe(
+                            query,
+                            cap_context,
+                            hydrate,
+                            policy_cutoffs,
+                        )?
+                    };
                 followups.append(&mut materialization_followups);
                 followups.append(&mut fallback_followups);
                 Ok((page, followups))
@@ -6144,7 +6706,8 @@ impl ReadView {
         let selection_capacity = graph_row_selection_capacity(query, &cursor_state)?;
 
         let runtime = self.normalize_graph_row_runtime_plan(query)?;
-        let physical_plan = self.plan_graph_row_physical(query, &runtime)?;
+        let physical_plan =
+            self.plan_graph_row_physical(query, &runtime, query.options.include_plan)?;
         let policy_cutoffs = self.query_policy_cutoffs();
         let mut explain_trace = if query.options.include_plan {
             let mut trace = GraphRowExplainTrace::default();
@@ -6984,7 +7547,9 @@ impl ReadView {
         if unique.is_empty() {
             return Ok(NodeIdSet::default());
         }
-        let include_key = !anchor.query.keys.is_empty();
+        let include_key =
+            !anchor.query.keys.is_empty() || node_filter_needs_key(&anchor.query.filter);
+        let include_created_at = node_filter_needs_created_at(&anchor.query.filter);
         let mut property_keys = Vec::new();
         collect_node_filter_property_keys(&anchor.query.filter, &mut property_keys);
         property_keys.sort();
@@ -6996,6 +7561,7 @@ impl ReadView {
                 &anchor.query,
                 policy_cutoffs,
                 include_key,
+                include_created_at,
                 &property_keys,
                 &mut verified,
                 usize::MAX,
@@ -7031,7 +7597,8 @@ impl ReadView {
             return Ok(left_rows);
         }
 
-        let group_physical_plan = self.plan_graph_row_physical(query, &group.runtime)?;
+        let group_physical_plan =
+            self.plan_graph_row_physical(query, &group.runtime, query.options.include_plan)?;
         if group.dependency_slots.is_empty() {
             return self.graph_row_execute_uncorrelated_optional_group(
                 query,
@@ -8732,9 +9299,11 @@ impl ReadView {
             both,
             edge.label_filter_ids.as_deref(),
         );
-        let Some((edge_cost, _, _)) = self.graph_row_edge_source_plan_cost(query, edge)? else {
+        let Some(edge_source_cost) = self.graph_row_edge_source_plan_cost(query, edge, false)?
+        else {
             return Ok(GraphRowEdgeCandidateSourceChoice::EndpointAdjacency);
         };
+        let edge_cost = edge_source_cost.cost;
         let Some(edge_candidates) = edge_cost.estimated_candidates else {
             return Ok(GraphRowEdgeCandidateSourceChoice::EndpointAdjacency);
         };
@@ -8786,11 +9355,11 @@ impl ReadView {
         };
         let source = PlannedEdgeCandidateSource::endpoint_adjacency(
             EdgeQueryCandidateSourceKind::AnyEndpointAdjacency,
-            Vec::new(),
+            Arc::new(Vec::new()),
             label_filter_ids.map(Vec::from),
             estimate,
         );
-        EdgePhysicalPlan::source(source).plan_cost()
+        source.plan_cost()
     }
 
     fn graph_row_materialize_edge_candidate_source(
@@ -8854,7 +9423,10 @@ impl ReadView {
             if matches!(
                 &planned.driver,
                 EdgePhysicalPlan::Source(source)
-                    if source.kind == EdgeQueryCandidateSourceKind::FallbackFullEdgeScan
+                    if matches!(
+                        source.materialization,
+                        EdgeCandidateMaterialization::FallbackFullEdgeScan
+                    )
             ) && planned
                 .estimated_candidate_count()
                 .is_some_and(|count| count <= cap as u64)
@@ -8863,13 +9435,13 @@ impl ReadView {
                     self.query_edge_page_planned(&normalized, planned, false, policy_cutoffs)?;
                 followups.append(&mut source_followups);
                 all_ids.extend(page.ids);
-                sources.push(planned_source);
+                sources.push(planned_source.clone());
                 all_ids.sort_unstable();
                 all_ids.dedup();
                 if all_ids.len() > cap {
                     return Ok(GraphRowEdgeSourceRead::TooBroad {
                         followups,
-                        planned_source: "FallbackFullEdgeScan".to_string(),
+                        planned_source,
                     });
                 }
                 graph_row_record_frontier_cap_peak(
@@ -8880,19 +9452,65 @@ impl ReadView {
                 )?;
                 continue;
             }
-            match self.materialize_edge_physical_plan(
+            let mut materialized = self.materialize_edge_physical_plan(
                 &normalized,
                 planned.cap_context,
                 &planned.driver,
-            )? {
+            )?;
+            let mut effective_source = planned_source;
+            let mut effective_subset_source = subset_source;
+            let compound_sidecar_failed = match &materialized {
+                CandidateMaterializationResult::Ready { followups, .. }
+                | CandidateMaterializationResult::TooBroad { followups } => followups
+                    .iter()
+                    .any(followup_is_compound_sidecar_failure),
+            };
+            let compound_too_broad = matches!(
+                &materialized,
+                CandidateMaterializationResult::TooBroad { .. }
+            ) && edge_physical_plan_contains_compound(&planned.driver);
+            if compound_sidecar_failed || compound_too_broad {
+                // The selected compound source failed (missing/corrupt
+                // sidecar) or returned more raw candidates than the cap
+                // (stale postings or a genuinely broad tuple scan). Neither
+                // is frontier breadth: the materialized result is TooBroad or
+                // built from broad unverified fallback candidates. Replan
+                // without compound candidates and stream the verified page
+                // through the remaining legal edge sources so the frontier
+                // cap applies to verified matches, not to the raw size of
+                // the compound or fallback scan. Failure followups are kept
+                // so lifecycle reconciliation still runs.
+                let mut failure_followups = match materialized {
+                    CandidateMaterializationResult::Ready { followups, .. }
+                    | CandidateMaterializationResult::TooBroad { followups } => followups,
+                };
+                let replanned =
+                    self.plan_normalized_edge_query_excluding_compound(&normalized)?;
+                effective_source = format!("{:?}", replanned.driver.plan_node());
+                effective_subset_source = None;
+                let (page, mut retry_followups) =
+                    self.query_edge_page_planned(&normalized, replanned, false, policy_cutoffs)?;
+                failure_followups.append(&mut retry_followups);
+                materialized = if page.ids.len() > cap {
+                    CandidateMaterializationResult::TooBroad {
+                        followups: failure_followups,
+                    }
+                } else {
+                    CandidateMaterializationResult::Ready {
+                        ids: page.ids,
+                        followups: failure_followups,
+                    }
+                };
+            }
+            match materialized {
                 CandidateMaterializationResult::Ready {
                     mut ids,
                     followups: mut source_followups,
                 } => {
                     followups.append(&mut source_followups);
                     all_ids.append(&mut ids);
-                    sources.push(planned_source);
-                    if let Some(subset_source) = subset_source {
+                    sources.push(effective_source);
+                    if let Some(subset_source) = effective_subset_source {
                         subset_sources.push(subset_source);
                     }
                     all_ids.sort_unstable();
@@ -8919,7 +9537,7 @@ impl ReadView {
                     followups.append(&mut source_followups);
                     return Ok(GraphRowEdgeSourceRead::TooBroad {
                         followups,
-                        planned_source,
+                        planned_source: effective_source,
                     });
                 }
             }
@@ -9049,6 +9667,7 @@ impl ReadView {
 
             let mut property_matches = NodeIdSet::default();
             if !property_candidate_ids.is_empty() {
+                let include_created_at = edge_filter_needs_created_at(filter);
                 let mut metadata_by_edge_id = NodeIdMap::with_capacity_and_hasher(
                     property_candidate_ids.len(),
                     Default::default(),
@@ -9058,21 +9677,22 @@ impl ReadView {
                         metadata_by_edge_id.insert(meta.id, *meta);
                     }
                 }
-                let projected = self
-                    .sources()
-                    .find_edge_properties(&property_candidate_ids, &property_keys)?;
-                for (&edge_id, props) in property_candidate_ids.iter().zip(projected) {
-                    let Some(props) = props else {
+                let projected = self.sources().find_edge_projected_fields(
+                    &property_candidate_ids,
+                    &EdgeSelectedFieldNeeds {
+                        created_at: include_created_at,
+                        props: PropertySelection::Keys(property_keys.clone()),
+                    },
+                )?;
+                for (&edge_id, selected) in property_candidate_ids.iter().zip(projected) {
+                    let Some(selected) = selected else {
                         continue;
                     };
                     let Some(query_meta) = metadata_by_edge_id.get(&edge_id) else {
                         continue;
                     };
-                    let selected = SelectedEdgeFields {
-                        meta: *query_meta,
-                        props,
-                        created_at: None,
-                    };
+                    let mut selected = selected;
+                    selected.meta = *query_meta;
                     if edge_filter_projected_matches(filter, &selected) {
                         property_matches.insert(edge_id);
                     }
@@ -9100,12 +9720,15 @@ impl ReadView {
         let mut verified = Vec::new();
         let mut property_keys = Vec::new();
         collect_node_filter_property_keys(&node.query.filter, &mut property_keys);
+        let include_key = !node.query.keys.is_empty() || node_filter_needs_key(&node.query.filter);
+        let include_created_at = node_filter_needs_created_at(&node.query.filter);
         for chunk in candidate_ids.chunks(QUERY_VERIFY_CHUNK) {
             let _ = self.verify_node_candidate_chunk(
                 chunk,
                 &node.query,
                 policy_cutoffs,
-                false,
+                include_key,
+                include_created_at,
                 &property_keys,
                 &mut verified,
                 usize::MAX,

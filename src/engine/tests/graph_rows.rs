@@ -162,6 +162,28 @@ fn insert_graph_row_edge(
         .unwrap()
 }
 
+fn insert_graph_row_weighted_edge(
+    engine: &DatabaseEngine,
+    from: u64,
+    to: u64,
+    label: &str,
+    entries: &[(&str, PropValue)],
+    weight: f32,
+) -> u64 {
+    engine
+        .upsert_edge(
+            from,
+            to,
+            label,
+            UpsertEdgeOptions {
+                props: graph_row_props(entries),
+                weight,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+}
+
 fn set_graph_row_edge_updated_at(engine: &DatabaseEngine, edge_id: u64, updated_at: i64) {
     let edge = internal_edge_record(engine, edge_id).unwrap().unwrap();
     write_internal_wal_op(
@@ -7962,11 +7984,7 @@ fn graph_row_optional_stale_edge_property_index_candidates_are_verified_away() {
         );
         engine.flush().unwrap();
         let index = engine
-            .ensure_edge_property_index(
-                "GRAPH_ROW_OPTIONAL_STALE_EDGE",
-                "color",
-                SecondaryIndexKind::Equality,
-            )
+            .ensure_edge_property_index("GRAPH_ROW_OPTIONAL_STALE_EDGE", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_edge_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
         index_id = index.index_id;
@@ -8863,11 +8881,7 @@ fn graph_row_execution_does_not_call_public_node_or_edge_queries() {
     );
     engine.flush().unwrap();
     let index = engine
-        .ensure_edge_property_index(
-            "GRAPH_ROW_NO_PUBLIC_EDGE",
-            "status",
-            SecondaryIndexKind::Equality,
-        )
+        .ensure_edge_property_index("GRAPH_ROW_NO_PUBLIC_EDGE", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
 
@@ -8920,11 +8934,7 @@ fn graph_row_unbound_edge_filters_use_planner_before_candidate_cap() {
     }
     engine.flush().unwrap();
     let index = engine
-        .ensure_edge_property_index(
-            "GRAPH_ROW_PLANNER_EDGE",
-            "status",
-            SecondaryIndexKind::Equality,
-        )
+        .ensure_edge_property_index("GRAPH_ROW_PLANNER_EDGE", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
 
@@ -9770,11 +9780,7 @@ fn graph_row_stale_edge_property_index_candidates_are_verified_away() {
         );
         engine.flush().unwrap();
         let index = engine
-            .ensure_edge_property_index(
-                "GRAPH_ROW_STALE_EDGE",
-                "color",
-                SecondaryIndexKind::Equality,
-            )
+            .ensure_edge_property_index("GRAPH_ROW_STALE_EDGE", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_edge_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
         index_id = index.index_id;
@@ -9851,11 +9857,7 @@ fn graph_row_stale_node_property_index_candidates_are_verified_away() {
         );
         engine.flush().unwrap();
         let index = engine
-            .ensure_node_property_index(
-                "GRAPH_ROW_STALE_NODE",
-                "color",
-                SecondaryIndexKind::Equality,
-            )
+            .ensure_node_property_index("GRAPH_ROW_STALE_NODE", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
         index_id = index.index_id;
@@ -10230,6 +10232,20 @@ fn graph_row_explain_reports_both_direction_self_loop_and_repeated_node_projecti
         "GRAPH_ROW_EXPLAIN_LOOP",
         &[("kind", PropValue::String("loop".to_string()))],
     );
+    // Extra same-label edges between unrelated nodes keep the edge-label
+    // anchor strictly more expensive than the node anchor, so the plan
+    // drives from the node and reports the Both-direction adjacency step.
+    let outside_a = insert_graph_row_node(&engine, "ExplainLoopOutside", "loop-outside-a", &[]);
+    let outside_b = insert_graph_row_node(&engine, "ExplainLoopOutside", "loop-outside-b", &[]);
+    for _ in 0..5 {
+        insert_graph_row_edge(
+            &engine,
+            outside_a,
+            outside_b,
+            "GRAPH_ROW_EXPLAIN_LOOP",
+            &[("kind", PropValue::String("loop".to_string()))],
+        );
+    }
 
     let mut query = graph_query(
         &["same"],
@@ -10265,6 +10281,70 @@ fn graph_row_explain_reports_both_direction_self_loop_and_repeated_node_projecti
         graph_row_single_u64_column(engine.query_graph_rows(&query).unwrap()),
         vec![keep_edge]
     );
+}
+
+#[test]
+fn graph_row_unflushed_write_keeps_estimate_driven_edge_order() {
+    // Planner review P5: one unflushed edge write downgrades every adjacency
+    // fanout to GlobalFallback coverage, and the old pair-state comparator
+    // then ignored estimates entirely and expanded edges in query order —
+    // hub-first here. Estimates must stay decisive under fallback coverage.
+    let (_dir, engine) = graph_row_test_engine();
+    let anchor = insert_graph_row_node(&engine, "P5Anchor", "anchor", &[]);
+    for index in 0..50 {
+        let hub_target =
+            insert_graph_row_node(&engine, "P5Hub", &format!("hub-{index}"), &[]);
+        insert_graph_row_edge(&engine, anchor, hub_target, "P5_HUB_REL", &[]);
+    }
+    let tiny_target = insert_graph_row_node(&engine, "P5Tiny", "tiny", &[]);
+    insert_graph_row_edge(&engine, anchor, tiny_target, "P5_TINY_REL", &[]);
+    engine.flush().unwrap();
+
+    // One unrelated unflushed edge forces fallback fanout coverage.
+    let noise_a = insert_graph_row_node(&engine, "P5Noise", "noise-a", &[]);
+    let noise_b = insert_graph_row_node(&engine, "P5Noise", "noise-b", &[]);
+    insert_graph_row_edge(&engine, noise_a, noise_b, "P5_NOISE_REL", &[]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while engine.published_read_view_for_test().memtable.edge_count() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "published view never reflected the unflushed edge"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    // Hub edge first in query order; the tiny edge must still expand first.
+    let mut query = graph_query(
+        &["a", "h", "t"],
+        vec![
+            GraphPatternPiece::Edge(GraphEdgePattern {
+                alias: Some("hub".to_string()),
+                from_alias: "a".to_string(),
+                to_alias: "h".to_string(),
+                direction: Direction::Outgoing,
+                label_filter: vec!["P5_HUB_REL".to_string()],
+                filter: None,
+            }),
+            GraphPatternPiece::Edge(GraphEdgePattern {
+                alias: Some("tiny".to_string()),
+                from_alias: "a".to_string(),
+                to_alias: "t".to_string(),
+                direction: Direction::Outgoing,
+                label_filter: vec!["P5_TINY_REL".to_string()],
+                filter: None,
+            }),
+        ],
+    );
+    query.nodes[0] = graph_node_with_label("a", "P5Anchor");
+    query.nodes[1] = graph_node_with_label("h", "P5Hub");
+    query.nodes[2] = graph_node_with_label("t", "P5Tiny");
+
+    let explain = engine.explain_graph_rows(&query).unwrap();
+    assert_graph_row_explain_contains(
+        &explain,
+        "physical_edge_order=[\"alias:tiny\", \"alias:hub\"]",
+    );
+    assert_eq!(engine.query_graph_rows(&query).unwrap().rows.len(), 10);
 }
 
 #[test]
@@ -10577,11 +10657,7 @@ fn graph_row_explain_reports_exists_missing_boolean_fallback_sources() {
     insert_graph_row_edge(&engine, a, c, "GRAPH_ROW_EXPLAIN_EXISTS", &[]);
     engine.flush().unwrap();
     let index = engine
-        .ensure_edge_property_index(
-            "GRAPH_ROW_EXPLAIN_EXISTS",
-            "flag",
-            SecondaryIndexKind::Equality,
-        )
+        .ensure_edge_property_index("GRAPH_ROW_EXPLAIN_EXISTS", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("flag").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
 
@@ -10630,6 +10706,730 @@ fn graph_row_explain_reports_exists_missing_boolean_fallback_sources() {
 }
 
 #[test]
+fn graph_row_compound_node_anchor_wins_when_selective() {
+    let (_dir, engine) = graph_row_test_engine();
+    let target = insert_graph_row_node(&engine, "CompoundGraphTarget", "node-anchor-target", &[]);
+    let keep = insert_graph_row_node(
+        &engine,
+        "CompoundGraphPerson",
+        "node-anchor-keep",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("active".to_string())),
+        ],
+    );
+    let other_status = insert_graph_row_node(
+        &engine,
+        "CompoundGraphPerson",
+        "node-anchor-other-status",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("inactive".to_string())),
+        ],
+    );
+    let other_tenant = insert_graph_row_node(
+        &engine,
+        "CompoundGraphPerson",
+        "node-anchor-other-tenant",
+        &[
+            ("tenant", PropValue::String("globex".to_string())),
+            ("status", PropValue::String("active".to_string())),
+        ],
+    );
+    insert_graph_row_edge(&engine, keep, target, "GRAPH_ROW_COMPOUND_NODE", &[]);
+    insert_graph_row_edge(
+        &engine,
+        other_status,
+        target,
+        "GRAPH_ROW_COMPOUND_NODE",
+        &[],
+    );
+    insert_graph_row_edge(
+        &engine,
+        other_tenant,
+        target,
+        "GRAPH_ROW_COMPOUND_NODE",
+        &[],
+    );
+    engine.flush().unwrap();
+    let index = engine
+        .ensure_node_property_index(
+            "CompoundGraphPerson",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("status"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
+
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![graph_edge_with_label(
+            Some("rel"),
+            "source",
+            "target",
+            "GRAPH_ROW_COMPOUND_NODE",
+        )],
+    );
+    query.nodes[0] = graph_node_with_label("source", "CompoundGraphPerson");
+    query.nodes[0].filter = Some(NodeFilterExpr::And(vec![
+        NodeFilterExpr::PropertyEquals {
+            key: "tenant".to_string(),
+            value: PropValue::String("acme".to_string()),
+        },
+        NodeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("active".to_string()),
+        },
+    ]));
+    query.nodes[1] = graph_node_with_label("target", "CompoundGraphTarget");
+    query.options.allow_full_scan = false;
+    query.return_items = Some(vec![graph_return_binding(
+        "source",
+        GraphReturnProjection::IdOnly,
+    )]);
+
+    let explain = engine.explain_graph_rows(&query).unwrap();
+    assert_graph_row_explain_contains(&explain, "initial_driver=NodeAnchor(alias=source");
+    assert_graph_row_explain_contains(&explain, "CompoundEqualityIndex");
+    assert_graph_row_explain_contains(&explain, "final_verification: true");
+
+    assert_eq!(
+        graph_row_single_u64_column(engine.query_graph_rows(&query).unwrap()),
+        vec![keep]
+    );
+}
+
+#[test]
+fn graph_row_compound_multi_label_any_anchor_unions_per_label() {
+    let (_dir, engine) = graph_row_test_engine();
+    let target = insert_graph_row_node(&engine, "AnyAnchorTarget", "any-anchor-target", &[]);
+    let tuple_props = [
+        ("tenant", PropValue::String("acme".to_string())),
+        ("status", PropValue::String("active".to_string())),
+    ];
+    let a_match = insert_graph_row_node(&engine, "AnyAnchorA", "any-anchor-a", &tuple_props);
+    let b_match = insert_graph_row_node(&engine, "AnyAnchorB", "any-anchor-b", &tuple_props);
+    let a_other = insert_graph_row_node(
+        &engine,
+        "AnyAnchorA",
+        "any-anchor-a-other",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("inactive".to_string())),
+        ],
+    );
+    for source in [a_match, b_match, a_other] {
+        insert_graph_row_edge(&engine, source, target, "GRAPH_ROW_ANY_ANCHOR", &[]);
+    }
+    // Extra unconnected targets keep the target anchor from being trivially
+    // cheapest; memtable-only data keeps compound estimates exact.
+    for index in 0..8 {
+        insert_graph_row_node(
+            &engine,
+            "AnyAnchorTarget",
+            &format!("any-anchor-target-extra-{index}"),
+            &[],
+        );
+    }
+    let spec = || {
+        SecondaryIndexSpec::equality(vec![
+            SecondaryIndexField::property("tenant"),
+            SecondaryIndexField::property("status"),
+        ])
+    };
+    let index_a = engine
+        .ensure_node_property_index("AnyAnchorA", spec())
+        .unwrap();
+    wait_for_property_index_state(&engine, index_a.index_id, SecondaryIndexState::Ready);
+    let index_b = engine
+        .ensure_node_property_index("AnyAnchorB", spec())
+        .unwrap();
+    wait_for_property_index_state(&engine, index_b.index_id, SecondaryIndexState::Ready);
+
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![graph_edge_with_label(
+            Some("rel"),
+            "source",
+            "target",
+            "GRAPH_ROW_ANY_ANCHOR",
+        )],
+    );
+    query.nodes[0] = GraphNodePattern {
+        alias: "source".to_string(),
+        label_filter: Some(NodeLabelFilter {
+            labels: vec!["AnyAnchorA".to_string(), "AnyAnchorB".to_string()],
+            mode: LabelMatchMode::Any,
+        }),
+        ids: Vec::new(),
+        keys: Vec::new(),
+        filter: Some(NodeFilterExpr::And(vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("acme".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("active".to_string()),
+            },
+        ])),
+    };
+    query.nodes[1] = graph_node_with_label("target", "AnyAnchorTarget");
+    query.options.allow_full_scan = false;
+    query.return_items = Some(vec![graph_return_binding(
+        "source",
+        GraphReturnProjection::IdOnly,
+    )]);
+
+    // No dropped rows: both Any labels contribute matches through the
+    // compound union anchor (or a correct fallback).
+    let mut rows = graph_row_single_u64_column(engine.query_graph_rows(&query).unwrap());
+    rows.sort_unstable();
+    let mut expected = vec![a_match, b_match];
+    expected.sort_unstable();
+    assert_eq!(rows, expected);
+
+    let explain = engine.explain_graph_rows(&query).unwrap();
+    assert_graph_row_explain_contains(&explain, "CompoundEqualityIndex");
+}
+
+#[test]
+fn graph_row_compound_edge_anchor_wins_when_selective() {
+    let (_dir, engine) = graph_row_test_engine();
+    let mut expected = None;
+    for index in 0..80 {
+        let from = insert_graph_row_node(
+            &engine,
+            "CompoundGraphEdgeFrom",
+            &format!("edge-anchor-from-{index}"),
+            &[],
+        );
+        let to = insert_graph_row_node(
+            &engine,
+            "CompoundGraphEdgeTo",
+            &format!("edge-anchor-to-{index}"),
+            &[],
+        );
+        let status = if index == 37 { "hot" } else { "cold" };
+        let edge = insert_graph_row_weighted_edge(
+            &engine,
+            from,
+            to,
+            "GRAPH_ROW_COMPOUND_EDGE_ANCHOR",
+            &[("status", PropValue::String(status.to_string()))],
+            1.0,
+        );
+        if index == 37 {
+            expected = Some(edge);
+        }
+    }
+    engine.flush().unwrap();
+    let index = engine
+        .ensure_edge_property_index(
+            "GRAPH_ROW_COMPOUND_EDGE_ANCHOR",
+            SecondaryIndexSpec::range(vec![
+                SecondaryIndexField::property("status"),
+                SecondaryIndexField::edge_meta(EdgeMetadataIndexField::Weight),
+            ]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
+
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![GraphPatternPiece::Edge(GraphEdgePattern {
+            alias: Some("edge".to_string()),
+            from_alias: "source".to_string(),
+            to_alias: "target".to_string(),
+            direction: Direction::Outgoing,
+            label_filter: vec!["GRAPH_ROW_COMPOUND_EDGE_ANCHOR".to_string()],
+            filter: Some(EdgeFilterExpr::And(vec![
+                EdgeFilterExpr::PropertyEquals {
+                    key: "status".to_string(),
+                    value: PropValue::String("hot".to_string()),
+                },
+                EdgeFilterExpr::WeightRange {
+                    lower: Some(0.0),
+                    upper: Some(2.0),
+                },
+            ])),
+        })],
+    );
+    query.options.allow_full_scan = false;
+    query.return_items = Some(vec![graph_return_binding(
+        "edge",
+        GraphReturnProjection::IdOnly,
+    )]);
+
+    let explain = engine.explain_graph_rows(&query).unwrap();
+    assert_graph_row_explain_contains(&explain, "initial_driver=EdgeAnchor(edge=alias:edge");
+    assert_graph_row_explain_contains(&explain, "source=EdgeCandidateSource");
+    assert_graph_row_explain_contains(&explain, "CompoundRangeIndex");
+    assert_graph_row_explain_contains(&explain, "final_verification: true");
+
+    assert_eq!(
+        graph_row_single_u64_column(engine.query_graph_rows(&query).unwrap()),
+        vec![expected.unwrap()]
+    );
+}
+
+#[test]
+fn graph_row_compound_node_anchor_missing_sidecar_falls_back_to_legal_source() {
+    let (_dir, engine) = graph_row_test_engine();
+    let target = insert_graph_row_node(&engine, "NodeAnchorMissingTarget", "missing-target", &[]);
+    let keep = insert_graph_row_node(
+        &engine,
+        "NodeAnchorMissingPerson",
+        "missing-keep",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("active".to_string())),
+        ],
+    );
+    let other_status = insert_graph_row_node(
+        &engine,
+        "NodeAnchorMissingPerson",
+        "missing-other-status",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("inactive".to_string())),
+        ],
+    );
+    insert_graph_row_edge(&engine, keep, target, "GRAPH_ROW_COMPOUND_NODE_MISSING", &[]);
+    insert_graph_row_edge(
+        &engine,
+        other_status,
+        target,
+        "GRAPH_ROW_COMPOUND_NODE_MISSING",
+        &[],
+    );
+    engine.flush().unwrap();
+    let index = engine
+        .ensure_node_property_index(
+            "NodeAnchorMissingPerson",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("status"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
+
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![graph_edge_with_label(
+            Some("rel"),
+            "source",
+            "target",
+            "GRAPH_ROW_COMPOUND_NODE_MISSING",
+        )],
+    );
+    query.nodes[0] = graph_node_with_label("source", "NodeAnchorMissingPerson");
+    query.nodes[0].filter = Some(NodeFilterExpr::And(vec![
+        NodeFilterExpr::PropertyEquals {
+            key: "tenant".to_string(),
+            value: PropValue::String("acme".to_string()),
+        },
+        NodeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("active".to_string()),
+        },
+    ]));
+    query.nodes[1] = graph_node_with_label("target", "NodeAnchorMissingTarget");
+    query.options.allow_full_scan = false;
+    query.return_items = Some(vec![graph_return_binding(
+        "source",
+        GraphReturnProjection::IdOnly,
+    )]);
+
+    let explain = engine.explain_graph_rows(&query).unwrap();
+    assert_graph_row_explain_contains(&explain, "initial_driver=NodeAnchor(alias=source");
+    assert_graph_row_explain_contains(&explain, "CompoundEqualityIndex");
+    assert_eq!(
+        graph_row_single_u64_column(engine.query_graph_rows(&query).unwrap()),
+        vec![keep]
+    );
+
+    // Remove the segment compound sidecar while the declaration is still
+    // published Ready: the planned compound node anchor must fall back to a
+    // legal non-compound source and keep the row set identical.
+    let segment_id = engine.segments_for_test()[0].segment_id;
+    let sidecar_path = crate::segment_writer::node_compound_eq_sidecar_path(
+        &crate::segment_writer::segment_dir(engine.path(), segment_id),
+        index.index_id,
+    );
+    std::fs::remove_file(&sidecar_path).unwrap();
+
+    assert_eq!(
+        graph_row_single_u64_column(engine.query_graph_rows(&query).unwrap()),
+        vec![keep]
+    );
+}
+
+fn seed_compound_edge_fallback_graph(
+    engine: &DatabaseEngine,
+    label: &str,
+) -> (u64, EdgePropertyIndexInfo, GraphRowQuery) {
+    let mut expected = None;
+    for index in 0..80 {
+        let from = insert_graph_row_node(
+            engine,
+            &format!("{label}From"),
+            &format!("edge-fallback-from-{index}"),
+            &[],
+        );
+        let to = insert_graph_row_node(
+            engine,
+            &format!("{label}To"),
+            &format!("edge-fallback-to-{index}"),
+            &[],
+        );
+        let status = if index == 37 { "hot" } else { "cold" };
+        let edge = insert_graph_row_weighted_edge(
+            engine,
+            from,
+            to,
+            label,
+            &[("status", PropValue::String(status.to_string()))],
+            1.0,
+        );
+        if index == 37 {
+            expected = Some(edge);
+        }
+    }
+    engine.flush().unwrap();
+    let info = engine
+        .ensure_edge_property_index(
+            label,
+            SecondaryIndexSpec::range(vec![
+                SecondaryIndexField::property("status"),
+                SecondaryIndexField::edge_meta(EdgeMetadataIndexField::Weight),
+            ]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(engine, info.index_id, SecondaryIndexState::Ready);
+
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![GraphPatternPiece::Edge(GraphEdgePattern {
+            alias: Some("edge".to_string()),
+            from_alias: "source".to_string(),
+            to_alias: "target".to_string(),
+            direction: Direction::Outgoing,
+            label_filter: vec![label.to_string()],
+            filter: Some(EdgeFilterExpr::And(vec![
+                EdgeFilterExpr::PropertyEquals {
+                    key: "status".to_string(),
+                    value: PropValue::String("hot".to_string()),
+                },
+                EdgeFilterExpr::WeightRange {
+                    lower: Some(0.0),
+                    upper: Some(2.0),
+                },
+            ])),
+        })],
+    );
+    query.options.allow_full_scan = false;
+    // Tight frontier cap: the selective compound source fits comfortably, but
+    // raw label-scan candidate materialization (80 edges) does not. Fallback
+    // must therefore stream verified matches instead of reporting the sidecar
+    // failure as a max_frontier violation.
+    query.options.max_frontier = 16;
+    query.return_items = Some(vec![graph_return_binding(
+        "edge",
+        GraphReturnProjection::IdOnly,
+    )]);
+    (expected.unwrap(), info, query)
+}
+
+#[test]
+fn graph_row_compound_edge_anchor_missing_sidecar_falls_back_to_legal_source() {
+    let (_dir, engine) = graph_row_test_engine();
+    let (expected, info, query) =
+        seed_compound_edge_fallback_graph(&engine, "GraphRowCompoundEdgeMissing");
+
+    let explain = engine.explain_graph_rows(&query).unwrap();
+    assert_graph_row_explain_contains(&explain, "source=EdgeCandidateSource");
+    assert_graph_row_explain_contains(&explain, "CompoundRangeIndex");
+    assert_eq!(
+        graph_row_single_u64_column(engine.query_graph_rows(&query).unwrap()),
+        vec![expected]
+    );
+
+    // Remove the segment compound sidecar while the declaration is still
+    // published Ready: the planned compound edge source must fall back to a
+    // legal non-compound source instead of failing as too broad.
+    let segment_id = engine.segments_for_test()[0].segment_id;
+    let sidecar_path = crate::segment_writer::edge_compound_range_sidecar_path(
+        &crate::segment_writer::segment_dir(engine.path(), segment_id),
+        info.index_id,
+    );
+    std::fs::remove_file(&sidecar_path).unwrap();
+
+    assert_eq!(
+        graph_row_single_u64_column(engine.query_graph_rows(&query).unwrap()),
+        vec![expected]
+    );
+}
+
+#[test]
+fn graph_row_compound_edge_anchor_corrupt_sidecar_falls_back_to_legal_source() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let (expected, info, query) =
+        seed_compound_edge_fallback_graph(&engine, "GraphRowCompoundEdgeCorrupt");
+
+    let segment_id = engine.segments_for_test()[0].segment_id;
+    let sidecar_path = crate::segment_writer::edge_compound_range_sidecar_path(
+        &crate::segment_writer::segment_dir(&db_path, segment_id),
+        info.index_id,
+    );
+    engine.close().unwrap();
+    corrupt_compound_sidecar_payload_only_in_place(&sidecar_path);
+
+    // Payload-only corruption passes lightweight reopen validation, so the
+    // planner still selects the compound source; execution must fall back.
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    wait_for_edge_property_index_state(&reopened, info.index_id, SecondaryIndexState::Ready);
+    let explain = reopened.explain_graph_rows(&query).unwrap();
+    assert_graph_row_explain_contains(&explain, "CompoundRangeIndex");
+    assert_eq!(
+        graph_row_single_u64_column(reopened.query_graph_rows(&query).unwrap()),
+        vec![expected]
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn graph_row_too_broad_compound_edge_source_streams_verified_fallback() {
+    let (_dir, engine) = graph_row_test_engine();
+    let a = insert_graph_row_node(&engine, "CompoundGraphBroadFrom", "broad-from", &[]);
+    let b = insert_graph_row_node(&engine, "CompoundGraphBroadTo", "broad-to", &[]);
+
+    // More matching tuples than the planner's per-source candidate cap: the
+    // compound prefix scan and the raw label scan both materialize TooBroad
+    // with no sidecar-failure followup, while only one edge actually passes
+    // final verification.
+    let total = crate::planner_stats::PLANNER_STATS_DEFAULT_SELECTED_SOURCE_CAP + 100;
+    let mut inputs = Vec::with_capacity(total);
+    for index in 0..total {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "status".to_string(),
+            PropValue::String("hot".to_string()),
+        );
+        if index == 1234 {
+            props.insert("marker".to_string(), PropValue::Int(1));
+        }
+        inputs.push(EdgeInput {
+            from: a,
+            to: b,
+            label: "GRAPH_ROW_COMPOUND_BROAD".to_string(),
+            props,
+            weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+        });
+    }
+    let edge_ids = engine.batch_upsert_edges(inputs).unwrap();
+    let expected = edge_ids[1234];
+
+    let info = engine
+        .ensure_edge_property_index(
+            "GRAPH_ROW_COMPOUND_BROAD",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("status"),
+                SecondaryIndexField::edge_meta(EdgeMetadataIndexField::Weight),
+            ]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![GraphPatternPiece::Edge(GraphEdgePattern {
+            alias: Some("edge".to_string()),
+            from_alias: "source".to_string(),
+            to_alias: "target".to_string(),
+            direction: Direction::Outgoing,
+            label_filter: vec!["GRAPH_ROW_COMPOUND_BROAD".to_string()],
+            filter: Some(EdgeFilterExpr::And(vec![
+                EdgeFilterExpr::PropertyEquals {
+                    key: "status".to_string(),
+                    value: PropValue::String("hot".to_string()),
+                },
+                EdgeFilterExpr::PropertyEquals {
+                    key: "marker".to_string(),
+                    value: PropValue::Int(1),
+                },
+            ])),
+        })],
+    );
+    query.options.allow_full_scan = false;
+    query.options.max_frontier = 16;
+    query.return_items = Some(vec![graph_return_binding(
+        "edge",
+        GraphReturnProjection::IdOnly,
+    )]);
+
+    assert_eq!(
+        graph_row_single_u64_column(engine.query_graph_rows(&query).unwrap()),
+        vec![expected]
+    );
+}
+
+#[test]
+fn graph_row_endpoint_adjacency_beats_broad_compound_edge_source() {
+    let (_dir, engine) = graph_row_test_engine();
+    let source = insert_graph_row_node(&engine, "CompoundGraphEndpoint", "endpoint-source", &[]);
+    let target = insert_graph_row_node(&engine, "CompoundGraphEndpoint", "endpoint-target", &[]);
+    let keep = insert_graph_row_edge(
+        &engine,
+        source,
+        target,
+        "GRAPH_ROW_COMPOUND_ADJACENCY",
+        &[("status", PropValue::String("hot".to_string()))],
+    );
+    for index in 0..96 {
+        let from = insert_graph_row_node(
+            &engine,
+            "CompoundGraphEndpointOther",
+            &format!("endpoint-other-from-{index}"),
+            &[],
+        );
+        let to = insert_graph_row_node(
+            &engine,
+            "CompoundGraphEndpointOther",
+            &format!("endpoint-other-to-{index}"),
+            &[],
+        );
+        insert_graph_row_edge(
+            &engine,
+            from,
+            to,
+            "GRAPH_ROW_COMPOUND_ADJACENCY",
+            &[("status", PropValue::String("hot".to_string()))],
+        );
+    }
+    engine.flush().unwrap();
+    let index = engine
+        .ensure_edge_property_index(
+            "GRAPH_ROW_COMPOUND_ADJACENCY",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("status"),
+                SecondaryIndexField::edge_meta(EdgeMetadataIndexField::Weight),
+            ]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
+
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![GraphPatternPiece::Edge(GraphEdgePattern {
+            alias: Some("edge".to_string()),
+            from_alias: "source".to_string(),
+            to_alias: "target".to_string(),
+            direction: Direction::Outgoing,
+            label_filter: vec!["GRAPH_ROW_COMPOUND_ADJACENCY".to_string()],
+            filter: Some(EdgeFilterExpr::And(vec![
+                EdgeFilterExpr::PropertyEquals {
+                    key: "status".to_string(),
+                    value: PropValue::String("hot".to_string()),
+                },
+                EdgeFilterExpr::WeightRange {
+                    lower: Some(0.0),
+                    upper: Some(2.0),
+                },
+            ])),
+        })],
+    );
+    query.nodes[0].ids = vec![source];
+    query.options.allow_full_scan = false;
+    query.return_items = Some(vec![graph_return_binding(
+        "edge",
+        GraphReturnProjection::IdOnly,
+    )]);
+
+    let explain = engine.explain_graph_rows(&query).unwrap();
+    assert_graph_row_explain_contains(&explain, "initial_driver=NodeAnchor(alias=source");
+    assert_graph_row_explain_contains(&explain, "source=EndpointAdjacency");
+
+    assert_eq!(
+        graph_row_single_u64_column(engine.query_graph_rows(&query).unwrap()),
+        vec![keep]
+    );
+}
+
+#[test]
+fn graph_row_optional_compound_miss_preserves_null_row() {
+    let (_dir, engine) = graph_row_test_engine();
+    let a = insert_graph_row_node(&engine, "CompoundGraphOptional", "optional-a", &[]);
+    let b = insert_graph_row_node(&engine, "CompoundGraphOptional", "optional-b", &[]);
+    let c = insert_graph_row_node(&engine, "CompoundGraphOptional", "optional-c", &[]);
+    insert_graph_row_edge(&engine, a, b, "GRAPH_ROW_COMPOUND_REQUIRED", &[]);
+    insert_graph_row_weighted_edge(
+        &engine,
+        b,
+        c,
+        "GRAPH_ROW_COMPOUND_OPTIONAL",
+        &[("status", PropValue::String("present".to_string()))],
+        1.0,
+    );
+    engine.flush().unwrap();
+    let index = engine
+        .ensure_edge_property_index(
+            "GRAPH_ROW_COMPOUND_OPTIONAL",
+            SecondaryIndexSpec::range(vec![
+                SecondaryIndexField::property("status"),
+                SecondaryIndexField::edge_meta(EdgeMetadataIndexField::Weight),
+            ]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
+
+    let mut optional_edge = match graph_edge_with_label(
+        Some("optional"),
+        "b",
+        "c",
+        "GRAPH_ROW_COMPOUND_OPTIONAL",
+    ) {
+        GraphPatternPiece::Edge(edge) => edge,
+        _ => unreachable!(),
+    };
+    optional_edge.filter = Some(EdgeFilterExpr::And(vec![
+        EdgeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("missing".to_string()),
+        },
+        EdgeFilterExpr::WeightRange {
+            lower: Some(0.0),
+            upper: Some(2.0),
+        },
+    ]));
+    let mut query = graph_query(
+        &["a", "b", "c"],
+        vec![
+            graph_edge_with_label(Some("required"), "a", "b", "GRAPH_ROW_COMPOUND_REQUIRED"),
+            graph_optional(vec![GraphPatternPiece::Edge(optional_edge)], None),
+        ],
+    );
+    query.nodes[0].ids = vec![a];
+    query.options.allow_full_scan = false;
+    query.return_items = Some(vec![graph_return_binding(
+        "optional",
+        GraphReturnProjection::IdOnly,
+    )]);
+
+    assert_eq!(
+        graph_row_value_rows(engine.query_graph_rows(&query).unwrap()),
+        vec![vec![GraphValue::Null]]
+    );
+}
+
+#[test]
 fn graph_row_explain_reports_edge_property_sidecar_fallbacks_and_followups() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
@@ -10648,11 +11448,7 @@ fn graph_row_explain_reports_edge_property_sidecar_fallbacks_and_followups() {
         );
         engine.flush().unwrap();
         let index = engine
-            .ensure_edge_property_index(
-                "GRAPH_ROW_EXPLAIN_SIDECAR",
-                "status",
-                SecondaryIndexKind::Equality,
-            )
+            .ensure_edge_property_index("GRAPH_ROW_EXPLAIN_SIDECAR", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_edge_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
         index_id = index.index_id;
@@ -10736,11 +11532,7 @@ fn graph_row_explain_reports_node_candidate_sidecar_followup_without_old_edge_an
         );
         engine.flush().unwrap();
         let index = engine
-            .ensure_node_property_index(
-                "ExplainNodeSidecar",
-                "status",
-                SecondaryIndexKind::Equality,
-            )
+            .ensure_node_property_index("ExplainNodeSidecar", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
         index_id = index.index_id;
@@ -11143,11 +11935,7 @@ fn graph_row_planner_target_filter_selectivity_reduces_fanout_cost() {
     }
     engine.flush().unwrap();
     let index = engine
-        .ensure_node_property_index(
-            "GRAPH_ROW_TARGET_SELECTIVE_RARE",
-            "status",
-            SecondaryIndexKind::Equality,
-        )
+        .ensure_node_property_index("GRAPH_ROW_TARGET_SELECTIVE_RARE", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
 
@@ -11299,11 +12087,7 @@ fn graph_row_planner_edge_property_equality_materializes_edge_source() {
     }
     engine.flush().unwrap();
     let index = engine
-        .ensure_edge_property_index(
-            "GRAPH_ROW_EDGE_EQ_REL",
-            "bucket",
-            SecondaryIndexKind::Equality,
-        )
+        .ensure_edge_property_index("GRAPH_ROW_EDGE_EQ_REL", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("bucket").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
 
@@ -11373,11 +12157,7 @@ fn graph_row_explain_standalone_reports_edge_source_choice() {
     }
     engine.flush().unwrap();
     let index = engine
-        .ensure_edge_property_index(
-            "GRAPH_ROW_EXPLAIN_BOUND_EDGE_REL",
-            "bucket",
-            SecondaryIndexKind::Equality,
-        )
+        .ensure_edge_property_index("GRAPH_ROW_EXPLAIN_BOUND_EDGE_REL", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("bucket").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
 
@@ -11429,11 +12209,7 @@ fn graph_row_planner_edge_property_range_materializes_edge_source() {
     }
     engine.flush().unwrap();
     let index = engine
-        .ensure_edge_property_index(
-            "GRAPH_ROW_EDGE_RANGE_REL",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_edge_property_index("GRAPH_ROW_EDGE_RANGE_REL", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_edge_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
 
@@ -11508,11 +12284,7 @@ fn graph_row_planner_bound_by_prior_edge_explains_selective_edge_source() {
     }
     engine.flush().unwrap();
     let first_index = engine
-        .ensure_edge_property_index(
-            "GRAPH_ROW_PRIOR_BOUND_FIRST",
-            "bucket",
-            SecondaryIndexKind::Equality,
-        )
+        .ensure_edge_property_index("GRAPH_ROW_PRIOR_BOUND_FIRST", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("bucket").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(
         &engine,
@@ -11520,11 +12292,7 @@ fn graph_row_planner_bound_by_prior_edge_explains_selective_edge_source() {
         SecondaryIndexState::Ready,
     );
     let second_index = engine
-        .ensure_edge_property_index(
-            "GRAPH_ROW_PRIOR_BOUND_SECOND",
-            "bucket",
-            SecondaryIndexKind::Equality,
-        )
+        .ensure_edge_property_index("GRAPH_ROW_PRIOR_BOUND_SECOND", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("bucket").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(
         &engine,
@@ -11628,11 +12396,7 @@ fn graph_row_planner_edge_property_in_anchor_preserves_signed_zero() {
     }
     engine.flush().unwrap();
     let index = engine
-        .ensure_edge_property_index(
-            "GRAPH_ROW_EDGE_IN_ZERO_REL",
-            "z",
-            SecondaryIndexKind::Equality,
-        )
+        .ensure_edge_property_index("GRAPH_ROW_EDGE_IN_ZERO_REL", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("z").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
 
@@ -11715,11 +12479,7 @@ fn graph_row_planner_broad_edge_property_source_stays_with_adjacency() {
     }
     engine.flush().unwrap();
     let index = engine
-        .ensure_edge_property_index(
-            "GRAPH_ROW_BROAD_EDGE_REL",
-            "bucket",
-            SecondaryIndexKind::Equality,
-        )
+        .ensure_edge_property_index("GRAPH_ROW_BROAD_EDGE_REL", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("bucket").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
 
@@ -12165,11 +12925,7 @@ fn graph_row_explain_reports_mixed_sources_dedupe_newest_props_and_numeric_verif
     );
     engine.flush().unwrap();
     let eq_index = engine
-        .ensure_edge_property_index(
-            "GRAPH_ROW_EXPLAIN_MIXED",
-            "status",
-            SecondaryIndexKind::Equality,
-        )
+        .ensure_edge_property_index("GRAPH_ROW_EXPLAIN_MIXED", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, eq_index.index_id, SecondaryIndexState::Ready);
     set_query_edge_props(
@@ -12234,11 +12990,7 @@ fn graph_row_explain_reports_range_numeric_equivalence_and_order_cursor_row_ops(
     );
     engine.flush().unwrap();
     let range = engine
-        .ensure_edge_property_index(
-            "GRAPH_ROW_EXPLAIN_RANGE",
-            "metric",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_edge_property_index("GRAPH_ROW_EXPLAIN_RANGE", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("metric").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_edge_property_index_state(&engine, range.index_id, SecondaryIndexState::Ready);
 

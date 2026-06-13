@@ -1,5 +1,14 @@
 use crate::error::EngineError;
-use crate::types::{SecondaryIndexKind, SecondaryIndexManifestEntry, SecondaryIndexTarget};
+use crate::secondary_index_key::{
+    public_canonical_field_name, public_field_source, COMPOUND_INDEX_KEY_ENCODING_VERSION,
+    COMPOUND_INDEX_METADATA_ENUM_VERSION, COMPOUND_INDEX_SENTINEL_ORDERING_VERSION,
+    MAX_COMPOUND_COMPONENT_BYTES, MAX_COMPOUND_TUPLE_BYTES,
+    MAX_SECONDARY_INDEX_FIELDS as MAX_COMPOUND_SECONDARY_INDEX_FIELDS,
+};
+use crate::types::{
+    SecondaryIndexFieldManifest, SecondaryIndexKind, SecondaryIndexManifestEntry,
+    SecondaryIndexTarget,
+};
 use crc32fast::Hasher as Crc32Hasher;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -31,6 +40,7 @@ const SOURCE_GROUP_DIGEST_DOMAIN: &[u8] = b"overgraph.component.source_group.v1"
 const SEGMENT_DATA_DIGEST_DOMAIN: &[u8] = b"overgraph.segment_data.v1";
 const SEMANTIC_FINGERPRINT_DOMAIN: &[u8] = b"overgraph.semantic_fingerprint.v1";
 const SECONDARY_DECLARATION_FINGERPRINT_DOMAIN: &[u8] = b"overgraph.secondary_index_declaration.v1";
+const SECONDARY_DECLARATION_FINGERPRINT_V2_DOMAIN: &[u8] = b"secondary-index-declaration-v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SegmentComponentBuildKind {
@@ -169,6 +179,78 @@ pub(crate) enum SegmentComponentKind {
     EdgePropertyEqualityIndex { index_id: u64 },
     EdgePropertyRangeIndex { index_id: u64 },
     PackedSegmentContainer,
+    NodeCompoundEqualityIndex { index_id: u64 },
+    NodeCompoundRangeIndex { index_id: u64 },
+    EdgeCompoundEqualityIndex { index_id: u64 },
+    EdgeCompoundRangeIndex { index_id: u64 },
+}
+
+/// Map a secondary index manifest entry to its sidecar component kind.
+///
+/// Single source of truth for the (target, kind) → component mapping used by
+/// both the writer (flush/compaction sidecar emission) and the reader
+/// (sidecar discovery and validation).
+pub(crate) fn secondary_index_component_kind_for_entry(
+    entry: &SecondaryIndexManifestEntry,
+) -> Option<SegmentComponentKind> {
+    match (&entry.target, &entry.kind) {
+        (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Equality) => {
+            Some(SegmentComponentKind::NodePropertyEqualityIndex {
+                index_id: entry.index_id,
+            })
+        }
+        (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Range) => {
+            Some(SegmentComponentKind::NodePropertyRangeIndex {
+                index_id: entry.index_id,
+            })
+        }
+        (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Equality) => {
+            Some(SegmentComponentKind::EdgePropertyEqualityIndex {
+                index_id: entry.index_id,
+            })
+        }
+        (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range) => {
+            Some(SegmentComponentKind::EdgePropertyRangeIndex {
+                index_id: entry.index_id,
+            })
+        }
+        (SecondaryIndexTarget::NodeFieldIndex { .. }, SecondaryIndexKind::Equality) => {
+            Some(SegmentComponentKind::NodeCompoundEqualityIndex {
+                index_id: entry.index_id,
+            })
+        }
+        (SecondaryIndexTarget::NodeFieldIndex { .. }, SecondaryIndexKind::Range) => {
+            Some(SegmentComponentKind::NodeCompoundRangeIndex {
+                index_id: entry.index_id,
+            })
+        }
+        (SecondaryIndexTarget::EdgeFieldIndex { .. }, SecondaryIndexKind::Equality) => {
+            Some(SegmentComponentKind::EdgeCompoundEqualityIndex {
+                index_id: entry.index_id,
+            })
+        }
+        (SecondaryIndexTarget::EdgeFieldIndex { .. }, SecondaryIndexKind::Range) => {
+            Some(SegmentComponentKind::EdgeCompoundRangeIndex {
+                index_id: entry.index_id,
+            })
+        }
+    }
+}
+
+/// Like [`secondary_index_component_kind_for_entry`], but only for compound
+/// (field-index) declarations; property-target entries map to `None`.
+pub(crate) fn compound_component_kind_for_entry(
+    entry: &SecondaryIndexManifestEntry,
+) -> Option<SegmentComponentKind> {
+    match &entry.target {
+        SecondaryIndexTarget::NodeFieldIndex { .. }
+        | SecondaryIndexTarget::EdgeFieldIndex { .. } => {
+            secondary_index_component_kind_for_entry(entry)
+        }
+        SecondaryIndexTarget::NodeProperty { .. } | SecondaryIndexTarget::EdgeProperty { .. } => {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -806,41 +888,166 @@ pub(crate) fn secondary_index_declaration_fingerprint(
     fingerprint_from_digest(hasher.finalize().into())
 }
 
-pub(crate) fn secondary_declaration_dependency(
+pub(crate) fn secondary_index_declaration_fingerprint_for_entry(
     entry: &SecondaryIndexManifestEntry,
-) -> ComponentDependencyV1 {
-    let (target_kind, target_label_id, prop_key) = match &entry.target {
-        SecondaryIndexTarget::NodeProperty { label_id, prop_key } => (
-            SecondaryIndexTargetKindForComponents::Node,
-            *label_id,
-            prop_key,
-        ),
-        SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => (
-            SecondaryIndexTargetKindForComponents::Edge,
-            *label_id,
-            prop_key,
-        ),
-    };
-    let (kind, range_key_schema, value_encoding_version) = match entry.kind {
+) -> u64 {
+    match &entry.target {
+        SecondaryIndexTarget::NodeProperty { label_id, prop_key } => {
+            secondary_index_declaration_fingerprint_for_single_property(
+                entry.index_id,
+                SecondaryIndexTargetKindForComponents::Node,
+                *label_id,
+                prop_key.as_bytes(),
+                &entry.kind,
+            )
+        }
+        SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => {
+            secondary_index_declaration_fingerprint_for_single_property(
+                entry.index_id,
+                SecondaryIndexTargetKindForComponents::Edge,
+                *label_id,
+                prop_key.as_bytes(),
+                &entry.kind,
+            )
+        }
+        SecondaryIndexTarget::NodeFieldIndex { label_id, fields } => {
+            secondary_index_declaration_fingerprint_v2(
+                entry.index_id,
+                SecondaryIndexTargetKindForComponents::Node,
+                *label_id,
+                &entry.kind,
+                fields,
+            )
+        }
+        SecondaryIndexTarget::EdgeFieldIndex { label_id, fields } => {
+            secondary_index_declaration_fingerprint_v2(
+                entry.index_id,
+                SecondaryIndexTargetKindForComponents::Edge,
+                *label_id,
+                &entry.kind,
+                fields,
+            )
+        }
+    }
+}
+
+fn secondary_index_declaration_fingerprint_for_single_property(
+    index_id: u64,
+    target_kind: SecondaryIndexTargetKindForComponents,
+    target_label_id: u32,
+    property_key: &[u8],
+    kind: &SecondaryIndexKind,
+) -> u64 {
+    let (kind, range_key_schema, value_encoding_version) = match kind {
         SecondaryIndexKind::Equality => (SecondaryIndexKindFingerprint::Equality, 0, 2),
         SecondaryIndexKind::Range => (SecondaryIndexKindFingerprint::Range, 0, 2),
     };
-    let fingerprint = secondary_index_declaration_fingerprint(
-        entry.index_id,
+    secondary_index_declaration_fingerprint(
+        index_id,
         target_kind,
         target_label_id,
-        prop_key.as_bytes(),
+        property_key,
         kind,
         range_key_schema,
         1,
         value_encoding_version,
+    )
+}
+
+fn secondary_index_declaration_fingerprint_v2(
+    index_id: u64,
+    target_kind: SecondaryIndexTargetKindForComponents,
+    target_label_id: u32,
+    kind: &SecondaryIndexKind,
+    fields: &[SecondaryIndexFieldManifest],
+) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(SECONDARY_DECLARATION_FINGERPRINT_V2_DOMAIN);
+    put_u64(&mut hasher, index_id);
+    put_u8(
+        &mut hasher,
+        match kind {
+            SecondaryIndexKind::Equality => SecondaryIndexKindFingerprint::Equality.tag(),
+            SecondaryIndexKind::Range => SecondaryIndexKindFingerprint::Range.tag(),
+        },
     );
+    put_u8(&mut hasher, target_kind.tag());
+    put_u32(&mut hasher, target_label_id);
+    put_u64(&mut hasher, fields.len() as u64);
+    for field in fields {
+        let public = field.to_public();
+        put_u8(&mut hasher, public_field_source(&public).tag());
+        put_bytes_with_len(&mut hasher, public_canonical_field_name(&public).as_bytes());
+    }
+    put_u64(&mut hasher, COMPOUND_INDEX_KEY_ENCODING_VERSION as u64);
+    put_u64(&mut hasher, COMPOUND_INDEX_SENTINEL_ORDERING_VERSION as u64);
+    put_u64(&mut hasher, COMPOUND_INDEX_METADATA_ENUM_VERSION as u64);
+    put_u64(&mut hasher, MAX_COMPOUND_SECONDARY_INDEX_FIELDS as u64);
+    put_u64(&mut hasher, MAX_COMPOUND_COMPONENT_BYTES as u64);
+    put_u64(&mut hasher, MAX_COMPOUND_TUPLE_BYTES as u64);
+    fingerprint_from_digest(hasher.finalize().into())
+}
+
+pub(crate) fn secondary_declaration_dependency(
+    entry: &SecondaryIndexManifestEntry,
+) -> ComponentDependencyV1 {
+    let target_kind = match &entry.target {
+        SecondaryIndexTarget::NodeProperty { .. } | SecondaryIndexTarget::NodeFieldIndex { .. } => {
+            SecondaryIndexTargetKindForComponents::Node
+        }
+        SecondaryIndexTarget::EdgeProperty { .. } | SecondaryIndexTarget::EdgeFieldIndex { .. } => {
+            SecondaryIndexTargetKindForComponents::Edge
+        }
+    };
+    let kind = match entry.kind {
+        SecondaryIndexKind::Equality => SecondaryIndexKindFingerprint::Equality,
+        SecondaryIndexKind::Range => SecondaryIndexKindFingerprint::Range,
+    };
+    let fingerprint = secondary_index_declaration_fingerprint_for_entry(entry);
     ComponentDependencyV1::SecondaryIndexDeclaration {
         index_id: entry.index_id,
         target_kind,
         kind,
         fingerprint,
     }
+}
+
+pub(crate) fn secondary_index_component_dependencies_for_entry(
+    entry: &SecondaryIndexManifestEntry,
+    source_groups: &SegmentComponentSourceGroups,
+) -> Vec<ComponentDependencyV1> {
+    let source_group = match &entry.target {
+        SecondaryIndexTarget::NodeProperty { .. } | SecondaryIndexTarget::NodeFieldIndex { .. } => {
+            (
+                SegmentSourceGroupKind::NodePropertyContentSource,
+                source_groups.node_property_content_source,
+            )
+        }
+        SecondaryIndexTarget::EdgeProperty { .. } => (
+            SegmentSourceGroupKind::EdgeSource,
+            source_groups.edge_source,
+        ),
+        SecondaryIndexTarget::EdgeFieldIndex { fields, .. } => {
+            if fields
+                .iter()
+                .any(|field| matches!(field, SecondaryIndexFieldManifest::Property { .. }))
+            {
+                (
+                    SegmentSourceGroupKind::EdgeSource,
+                    source_groups.edge_source,
+                )
+            } else {
+                (
+                    SegmentSourceGroupKind::EdgeMetadataSource,
+                    source_groups.edge_metadata_source,
+                )
+            }
+        }
+    };
+    vec![
+        source_group_dependency(source_group.0, source_group.1),
+        secondary_declaration_dependency(entry),
+    ]
 }
 
 pub(crate) fn source_group_dependency(
@@ -973,6 +1180,10 @@ pub(crate) fn is_refreshable_external_component_kind(kind: &SegmentComponentKind
             | SegmentComponentKind::SparsePostings
             | SegmentComponentKind::EdgePropertyEqualityIndex { .. }
             | SegmentComponentKind::EdgePropertyRangeIndex { .. }
+            | SegmentComponentKind::NodeCompoundEqualityIndex { .. }
+            | SegmentComponentKind::NodeCompoundRangeIndex { .. }
+            | SegmentComponentKind::EdgeCompoundEqualityIndex { .. }
+            | SegmentComponentKind::EdgeCompoundRangeIndex { .. }
     )
 }
 
@@ -1261,6 +1472,10 @@ impl SegmentComponentKind {
             SegmentComponentKind::EdgePropertyEqualityIndex { .. } => 32,
             SegmentComponentKind::EdgePropertyRangeIndex { .. } => 33,
             SegmentComponentKind::PackedSegmentContainer => 34,
+            SegmentComponentKind::NodeCompoundEqualityIndex { .. } => 35,
+            SegmentComponentKind::NodeCompoundRangeIndex { .. } => 36,
+            SegmentComponentKind::EdgeCompoundEqualityIndex { .. } => 37,
+            SegmentComponentKind::EdgeCompoundRangeIndex { .. } => 38,
         }
     }
 
@@ -1269,7 +1484,11 @@ impl SegmentComponentKind {
             SegmentComponentKind::NodePropertyEqualityIndex { index_id }
             | SegmentComponentKind::NodePropertyRangeIndex { index_id }
             | SegmentComponentKind::EdgePropertyEqualityIndex { index_id }
-            | SegmentComponentKind::EdgePropertyRangeIndex { index_id } => Some(*index_id),
+            | SegmentComponentKind::EdgePropertyRangeIndex { index_id }
+            | SegmentComponentKind::NodeCompoundEqualityIndex { index_id }
+            | SegmentComponentKind::NodeCompoundRangeIndex { index_id }
+            | SegmentComponentKind::EdgeCompoundEqualityIndex { index_id }
+            | SegmentComponentKind::EdgeCompoundRangeIndex { index_id } => Some(*index_id),
             _ => None,
         }
     }
@@ -1341,6 +1560,18 @@ impl SegmentComponentKind {
                 index_id,
                 SegmentComponentKind::PackedSegmentContainer,
             )?,
+            35 => SegmentComponentKind::NodeCompoundEqualityIndex {
+                index_id: require_index(kind_tag, index_id)?,
+            },
+            36 => SegmentComponentKind::NodeCompoundRangeIndex {
+                index_id: require_index(kind_tag, index_id)?,
+            },
+            37 => SegmentComponentKind::EdgeCompoundEqualityIndex {
+                index_id: require_index(kind_tag, index_id)?,
+            },
+            38 => SegmentComponentKind::EdgeCompoundRangeIndex {
+                index_id: require_index(kind_tag, index_id)?,
+            },
             _ => return Ok(None),
         };
         Ok(Some(known))
@@ -2139,6 +2370,26 @@ mod tests {
                 Some(94),
             ),
             (SegmentComponentKind::PackedSegmentContainer, 34, None),
+            (
+                SegmentComponentKind::NodeCompoundEqualityIndex { index_id: 95 },
+                35,
+                Some(95),
+            ),
+            (
+                SegmentComponentKind::NodeCompoundRangeIndex { index_id: 96 },
+                36,
+                Some(96),
+            ),
+            (
+                SegmentComponentKind::EdgeCompoundEqualityIndex { index_id: 97 },
+                37,
+                Some(97),
+            ),
+            (
+                SegmentComponentKind::EdgeCompoundRangeIndex { index_id: 98 },
+                38,
+                Some(98),
+            ),
         ];
         let mut tags = HashSet::new();
         for (kind, expected_tag, expected_index_id) in snapshot {
@@ -2156,16 +2407,28 @@ mod tests {
 
     #[test]
     fn indexed_kind_manifest_round_trip_preserves_index_id() {
-        let record = known_component(
-            SegmentComponentKind::NodePropertyEqualityIndex { index_id: 77 },
-            digest(1),
+        let manifest = manifest_with_components(
+            vec![
+                known_component(
+                    SegmentComponentKind::NodePropertyEqualityIndex { index_id: 77 },
+                    digest(1),
+                ),
+                known_component(
+                    SegmentComponentKind::NodeCompoundRangeIndex { index_id: 88 },
+                    digest(2),
+                ),
+            ],
+            vec![],
         );
-        let manifest = manifest_with_components(vec![record], vec![]);
         let decoded =
             decode_manifest_envelope(&encode_manifest_envelope(&manifest).unwrap()).unwrap();
         assert_eq!(
             decoded.components[0].kind,
             SegmentComponentKind::NodePropertyEqualityIndex { index_id: 77 }
+        );
+        assert_eq!(
+            decoded.components[1].kind,
+            SegmentComponentKind::NodeCompoundRangeIndex { index_id: 88 }
         );
     }
 
@@ -2735,6 +2998,202 @@ mod tests {
                 4,
             )
         );
+    }
+
+    #[test]
+    fn tuple_declaration_fingerprint_uses_v2_field_identity() {
+        let property_entry = SecondaryIndexManifestEntry {
+            index_id: 7,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 3,
+                prop_key: "updated_at".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: crate::types::SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let field_entry = SecondaryIndexManifestEntry {
+            index_id: 7,
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 3,
+                fields: vec![SecondaryIndexFieldManifest::Property {
+                    key: "updated_at".to_string(),
+                }],
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: crate::types::SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let metadata_entry = SecondaryIndexManifestEntry {
+            index_id: 7,
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 3,
+                fields: vec![SecondaryIndexFieldManifest::NodeMetadata {
+                    field: crate::types::NodeMetadataIndexFieldManifest::UpdatedAt,
+                }],
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: crate::types::SecondaryIndexState::Ready,
+            last_error: None,
+        };
+
+        let property_fingerprint =
+            secondary_index_declaration_fingerprint_for_entry(&property_entry);
+        let field_fingerprint = secondary_index_declaration_fingerprint_for_entry(&field_entry);
+        let metadata_fingerprint =
+            secondary_index_declaration_fingerprint_for_entry(&metadata_entry);
+        assert_ne!(property_fingerprint, field_fingerprint);
+        assert_ne!(field_fingerprint, metadata_fingerprint);
+        assert_eq!(
+            field_fingerprint,
+            secondary_index_declaration_fingerprint_for_entry(&field_entry)
+        );
+
+        let ComponentDependencyV1::SecondaryIndexDeclaration { fingerprint, .. } =
+            secondary_declaration_dependency(&field_entry)
+        else {
+            panic!("secondary declaration dependency expected");
+        };
+        assert_eq!(fingerprint, field_fingerprint);
+    }
+
+    #[test]
+    fn tuple_declaration_fingerprint_golden_snapshots() {
+        let property_only = SecondaryIndexManifestEntry {
+            index_id: 11,
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 3,
+                fields: vec![SecondaryIndexFieldManifest::Property {
+                    key: "tenant".to_string(),
+                }],
+            },
+            kind: crate::types::SecondaryIndexKind::Equality,
+            state: crate::types::SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let metadata_only = SecondaryIndexManifestEntry {
+            index_id: 12,
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 3,
+                fields: vec![SecondaryIndexFieldManifest::NodeMetadata {
+                    field: crate::types::NodeMetadataIndexFieldManifest::UpdatedAt,
+                }],
+            },
+            kind: crate::types::SecondaryIndexKind::Equality,
+            state: crate::types::SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let mixed_equality = SecondaryIndexManifestEntry {
+            index_id: 13,
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 3,
+                fields: vec![
+                    SecondaryIndexFieldManifest::Property {
+                        key: "tenant".to_string(),
+                    },
+                    SecondaryIndexFieldManifest::NodeMetadata {
+                        field: crate::types::NodeMetadataIndexFieldManifest::UpdatedAt,
+                    },
+                ],
+            },
+            kind: crate::types::SecondaryIndexKind::Equality,
+            state: crate::types::SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let mixed_range = SecondaryIndexManifestEntry {
+            kind: crate::types::SecondaryIndexKind::Range,
+            ..mixed_equality.clone()
+        };
+
+        let snapshots = [
+            (&property_only, 7885699672810247875u64),
+            (&metadata_only, 16445049732461440943u64),
+            (&mixed_equality, 8860785994094260266u64),
+            (&mixed_range, 6677797123317768889u64),
+        ];
+        for (entry, expected) in snapshots {
+            assert_eq!(
+                secondary_index_declaration_fingerprint_for_entry(entry),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn tuple_component_source_dependencies_match_spec() {
+        let source_groups = SegmentComponentSourceGroups {
+            node_source: digest(1),
+            edge_source: digest(2),
+            node_property_content_source: digest(3),
+            node_property_hash_source: digest(4),
+            edge_metadata_source: digest(5),
+            degree_source: digest(6),
+            dense_vector_source: digest(7),
+            sparse_vector_source: digest(8),
+            segment_data_id: digest(9),
+        };
+        let node_metadata_only = SecondaryIndexManifestEntry {
+            index_id: 1,
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 1,
+                fields: vec![SecondaryIndexFieldManifest::NodeMetadata {
+                    field: crate::types::NodeMetadataIndexFieldManifest::UpdatedAt,
+                }],
+            },
+            kind: SecondaryIndexKind::Range,
+            state: crate::types::SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let edge_metadata_only = SecondaryIndexManifestEntry {
+            index_id: 2,
+            target: SecondaryIndexTarget::EdgeFieldIndex {
+                label_id: 1,
+                fields: vec![SecondaryIndexFieldManifest::EdgeMetadata {
+                    field: crate::types::EdgeMetadataIndexFieldManifest::UpdatedAt,
+                }],
+            },
+            kind: SecondaryIndexKind::Range,
+            state: crate::types::SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let edge_mixed = SecondaryIndexManifestEntry {
+            index_id: 3,
+            target: SecondaryIndexTarget::EdgeFieldIndex {
+                label_id: 1,
+                fields: vec![
+                    SecondaryIndexFieldManifest::EdgeMetadata {
+                        field: crate::types::EdgeMetadataIndexFieldManifest::UpdatedAt,
+                    },
+                    SecondaryIndexFieldManifest::Property {
+                        key: "status".to_string(),
+                    },
+                ],
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: crate::types::SecondaryIndexState::Ready,
+            last_error: None,
+        };
+
+        let node_deps =
+            secondary_index_component_dependencies_for_entry(&node_metadata_only, &source_groups);
+        assert!(node_deps.contains(&source_group_dependency(
+            SegmentSourceGroupKind::NodePropertyContentSource,
+            source_groups.node_property_content_source,
+        )));
+
+        let edge_meta_deps =
+            secondary_index_component_dependencies_for_entry(&edge_metadata_only, &source_groups);
+        assert!(edge_meta_deps.contains(&source_group_dependency(
+            SegmentSourceGroupKind::EdgeMetadataSource,
+            source_groups.edge_metadata_source,
+        )));
+
+        let edge_mixed_deps =
+            secondary_index_component_dependencies_for_entry(&edge_mixed, &source_groups);
+        assert!(edge_mixed_deps.contains(&source_group_dependency(
+            SegmentSourceGroupKind::EdgeSource,
+            source_groups.edge_source,
+        )));
     }
 
     #[test]

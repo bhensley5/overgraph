@@ -1426,9 +1426,9 @@ fn test_metadata_writes_checkpoint_existing_wal_tokens() {
     assert!(disk_manifest.node_label_tokens.is_empty());
     assert!(disk_manifest.edge_label_tokens.is_empty());
 
-    db.ensure_node_property_index("Article", "status", SecondaryIndexKind::Equality)
+    db.ensure_node_property_index("Article", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
-    db.ensure_edge_property_index("MENTIONS", "rank", SecondaryIndexKind::Equality)
+    db.ensure_edge_property_index("MENTIONS", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("rank").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     db.set_prune_policy(
         "expiring",
@@ -2065,34 +2065,34 @@ fn test_property_index_apis_use_names_and_persist_metadata() {
     {
         let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let node_info = db
-            .ensure_node_property_index("Article", "status", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Article", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         assert_eq!(node_info.label, "Article");
-        assert_eq!(node_info.prop_key, "status");
+        assert_eq!(node_info.fields, property_index_fields("status"));
         assert_eq!(db.get_node_label_id("Article").unwrap(), Some(1));
 
         let edge_info = db
-            .ensure_edge_property_index("MENTIONS", "rank", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("MENTIONS", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("rank").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         assert_eq!(edge_info.label, "MENTIONS");
-        assert_eq!(edge_info.prop_key, "rank");
+        assert_eq!(edge_info.fields, property_index_fields("rank"));
         assert_eq!(db.get_edge_label_id("MENTIONS").unwrap(), Some(1));
 
         assert_eq!(
             db.list_node_property_indexes()
                 .unwrap()
                 .iter()
-                .map(|info| (info.label.as_str(), info.prop_key.as_str()))
+                .map(|info| (info.label.clone(), info.fields.clone()))
                 .collect::<Vec<_>>(),
-            vec![("Article", "status")]
+            vec![("Article".to_string(), property_index_fields("status"))]
         );
         assert_eq!(
             db.list_edge_property_indexes()
                 .unwrap()
                 .iter()
-                .map(|info| (info.label.as_str(), info.prop_key.as_str()))
+                .map(|info| (info.label.clone(), info.fields.clone()))
                 .collect::<Vec<_>>(),
-            vec![("MENTIONS", "rank")]
+            vec![("MENTIONS".to_string(), property_index_fields("rank"))]
         );
         db.close().unwrap();
     }
@@ -2105,18 +2105,164 @@ fn test_property_index_apis_use_names_and_persist_metadata() {
             db.list_node_property_indexes()
                 .unwrap()
                 .iter()
-                .map(|info| (info.label.as_str(), info.prop_key.as_str()))
+                .map(|info| (info.label.clone(), info.fields.clone()))
                 .collect::<Vec<_>>(),
-            vec![("Article", "status")]
+            vec![("Article".to_string(), property_index_fields("status"))]
         );
         assert_eq!(
             db.list_edge_property_indexes()
                 .unwrap()
                 .iter()
-                .map(|info| (info.label.as_str(), info.prop_key.as_str()))
+                .map(|info| (info.label.clone(), info.fields.clone()))
                 .collect::<Vec<_>>(),
-            vec![("MENTIONS", "rank")]
+            vec![("MENTIONS".to_string(), property_index_fields("rank"))]
         );
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn test_field_list_property_index_contract_routes_lists_and_drops() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("catalog_db");
+
+    {
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+        let single_property_spec =
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]);
+        let single = db
+            .ensure_node_property_index("Article", single_property_spec.clone())
+            .unwrap();
+        assert_eq!(single.fields, property_index_fields("status"));
+        assert!(!single.compound);
+
+        let node_metadata_spec = SecondaryIndexSpec::equality(vec![SecondaryIndexField::node_meta(
+            NodeMetadataIndexField::UpdatedAt,
+        )]);
+        let node_metadata = db
+            .ensure_node_property_index("Article", node_metadata_spec.clone())
+            .unwrap();
+        assert_eq!(
+            node_metadata.fields,
+            vec![SecondaryIndexField::node_meta(
+                NodeMetadataIndexField::UpdatedAt
+            )]
+        );
+        assert!(!node_metadata.compound);
+        assert_eq!(node_metadata.state, SecondaryIndexState::Building);
+
+        let node_compound_spec = SecondaryIndexSpec::equality(vec![
+            SecondaryIndexField::property("status"),
+            SecondaryIndexField::node_meta(NodeMetadataIndexField::UpdatedAt),
+        ]);
+        let node_compound = db
+            .ensure_node_property_index("Article", node_compound_spec.clone())
+            .unwrap();
+        assert!(node_compound.compound);
+        assert_eq!(node_compound.state, SecondaryIndexState::Building);
+        assert_eq!(
+            db.ensure_node_property_index("Article", node_compound_spec.clone())
+                .unwrap()
+                .index_id,
+            node_compound.index_id
+        );
+
+        let edge_metadata_spec = SecondaryIndexSpec::range(vec![SecondaryIndexField::edge_meta(
+            EdgeMetadataIndexField::ValidFrom,
+        )]);
+        let edge_metadata = db
+            .ensure_edge_property_index("MENTIONS", edge_metadata_spec.clone())
+            .unwrap();
+        assert_eq!(
+            edge_metadata.fields,
+            vec![SecondaryIndexField::edge_meta(
+                EdgeMetadataIndexField::ValidFrom
+            )]
+        );
+        assert_eq!(edge_metadata.state, SecondaryIndexState::Building);
+
+        let disk_manifest = load_manifest_readonly(&db_path).unwrap().unwrap();
+        assert!(disk_manifest.secondary_indexes.iter().any(|entry| {
+            entry.target
+                == SecondaryIndexTarget::NodeProperty {
+                    label_id: 1,
+                    prop_key: "status".to_string(),
+                }
+        }));
+        assert!(disk_manifest.secondary_indexes.iter().any(|entry| {
+            matches!(
+                &entry.target,
+                SecondaryIndexTarget::NodeFieldIndex { label_id: 1, fields }
+                    if fields
+                        == &vec![SecondaryIndexFieldManifest::NodeMetadata {
+                            field: NodeMetadataIndexFieldManifest::UpdatedAt,
+                        }]
+            )
+        }));
+        assert!(disk_manifest.secondary_indexes.iter().any(|entry| {
+            matches!(
+                &entry.target,
+                SecondaryIndexTarget::NodeFieldIndex { label_id: 1, fields }
+                    if fields.len() == 2
+            )
+        }));
+        assert!(disk_manifest.secondary_indexes.iter().any(|entry| {
+            matches!(
+                &entry.target,
+                SecondaryIndexTarget::EdgeFieldIndex { label_id: 1, fields }
+                    if fields
+                        == &vec![SecondaryIndexFieldManifest::EdgeMetadata {
+                            field: EdgeMetadataIndexFieldManifest::ValidFrom,
+                        }]
+            )
+        }));
+
+        let node_indexes = db.list_node_property_indexes().unwrap();
+        assert!(node_indexes
+            .iter()
+            .any(|info| info.index_id == single.index_id && !info.compound));
+        assert!(node_indexes
+            .iter()
+            .any(|info| info.index_id == node_metadata.index_id && !info.compound));
+        assert!(node_indexes
+            .iter()
+            .any(|info| info.index_id == node_compound.index_id && info.compound));
+
+        assert!(db
+            .drop_node_property_index("Article", node_metadata_spec.clone())
+            .unwrap());
+        assert!(!db
+            .drop_node_property_index("Article", node_metadata_spec)
+            .unwrap());
+        assert!(db
+            .drop_edge_property_index("MENTIONS", edge_metadata_spec.clone())
+            .unwrap());
+        assert!(!db
+            .drop_edge_property_index("MENTIONS", edge_metadata_spec)
+            .unwrap());
+        db.close().unwrap();
+    }
+
+    {
+        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let node_indexes = db.list_node_property_indexes().unwrap();
+        assert_eq!(node_indexes.len(), 2);
+        assert!(node_indexes.iter().any(|info| {
+            info.fields == property_index_fields("status")
+                && matches!(info.kind, SecondaryIndexKind::Equality)
+        }));
+        assert!(node_indexes.iter().any(|info| {
+            info.fields
+                == vec![
+                    SecondaryIndexField::property("status"),
+                    SecondaryIndexField::node_meta(NodeMetadataIndexField::UpdatedAt),
+                ]
+                && info.compound
+                && matches!(info.state, SecondaryIndexState::Ready)
+                && info.last_error.is_none()
+        }));
+        assert!(db.list_edge_property_indexes().unwrap().is_empty());
         db.close().unwrap();
     }
 }
@@ -2128,18 +2274,18 @@ fn test_property_index_drop_unknown_label_is_read_only() {
     let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     assert!(!db
-        .drop_node_property_index("Missing", "status", SecondaryIndexKind::Equality)
+        .drop_node_property_index("Missing", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap());
     assert!(!db
-        .drop_edge_property_index("MISSING", "status", SecondaryIndexKind::Equality)
+        .drop_edge_property_index("MISSING", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap());
     assert_eq!(db.get_node_label_id("Missing").unwrap(), None);
     assert_eq!(db.get_edge_label_id("MISSING").unwrap(), None);
     assert!(db
-        .drop_node_property_index(" Missing", "status", SecondaryIndexKind::Equality)
+        .drop_node_property_index(" Missing", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .is_err());
     assert!(db
-        .drop_edge_property_index("MISSING\n", "status", SecondaryIndexKind::Equality)
+        .drop_edge_property_index("MISSING\n", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .is_err());
 }
 

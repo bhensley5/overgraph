@@ -3,10 +3,12 @@
 use crate::engine::GraphFixedPathBinding;
 use crate::error::EngineError;
 use crate::gql::ast::*;
+use crate::gql::metadata::{GqlElementMapMetadataKey, GqlMetadataFunction};
 use crate::gql::params::{validate_referenced_gql_mutation_params, validate_referenced_gql_params};
 use crate::gql::semantic::{
-    bind_mutation, bind_query, bind_subquery_pipeline_for_outer_aliases, expression_output_name,
-    gql_semantic_error, variable_name, GqlAliasBinding, GqlAliasKind, GqlAliasOrigin,
+    bind_mutation, bind_query, bind_subquery_pipeline_for_outer_aliases, edge_endpoint_id_call,
+    expression_output_name, gql_semantic_error, variable_name, GqlAliasBinding, GqlAliasKind,
+    GqlAliasOrigin,
     GqlAliasTable, GqlBoundCallSubquery, GqlBoundCreateEdge, GqlBoundCreateNode,
     GqlBoundEdgePattern, GqlBoundMatchClause, GqlBoundMergeClause, GqlBoundMergePattern,
     GqlBoundMutationClause, GqlBoundNodePattern, GqlBoundPattern, GqlBoundPipelineClause,
@@ -167,6 +169,8 @@ pub(crate) struct GqlCreatePatternPlan {
 pub(crate) struct GqlCreateNodePlan {
     pub(crate) alias: String,
     pub(crate) labels: Vec<String>,
+    pub(crate) element_key: Option<GqlMutationExprRef>,
+    pub(crate) weight: Option<GqlMutationExprRef>,
     pub(crate) property_keys: Vec<String>,
     pub(crate) property_values: BTreeMap<String, GqlMutationExprRef>,
     pub(crate) created: bool,
@@ -178,6 +182,9 @@ pub(crate) struct GqlCreateEdgePlan {
     pub(crate) from_alias: String,
     pub(crate) to_alias: String,
     pub(crate) label: String,
+    pub(crate) weight: Option<GqlMutationExprRef>,
+    pub(crate) valid_from: Option<GqlMutationExprRef>,
+    pub(crate) valid_to: Option<GqlMutationExprRef>,
     pub(crate) property_keys: Vec<String>,
     pub(crate) property_values: BTreeMap<String, GqlMutationExprRef>,
 }
@@ -188,6 +195,12 @@ pub(crate) enum GqlSetItemPlan {
         alias: String,
         kind: GqlAliasKind,
         property: String,
+        value: GqlMutationExprRef,
+    },
+    Metadata {
+        alias: String,
+        kind: GqlAliasKind,
+        field: GqlMetadataFunction,
         value: GqlMutationExprRef,
     },
     MapMerge {
@@ -1253,7 +1266,7 @@ fn collect_pipeline_graph_nodes(
     let mut reused_constraints = Vec::new();
     for node in &pattern.nodes {
         if node_indexes.contains_key(&node.alias) {
-            reused_constraints.extend(reused_node_constraint_exprs(node));
+            reused_constraints.extend(reused_node_constraint_exprs(node)?);
         } else {
             let index = nodes.len();
             node_indexes.insert(node.alias.clone(), index);
@@ -1497,12 +1510,12 @@ fn mutation_read_prefix_query(
                     continue;
                 };
                 items.push(internal_return_item(
-                    path_function_expr("node_ids", alias, &binding.span),
+                    path_function_expr("nodeIds", alias, &binding.span),
                     format!("_gql_mut_path_nodes_{alias}"),
                     &binding.span,
                 ));
                 items.push(internal_return_item(
-                    path_function_expr("edge_ids", alias, &binding.span),
+                    path_function_expr("edgeIds", alias, &binding.span),
                     format!("_gql_mut_path_edges_{alias}"),
                     &binding.span,
                 ));
@@ -1815,6 +1828,7 @@ fn collect_set_target_aliases(
     for item in items {
         match item {
             GqlBoundSetItem::Property { alias, value, .. }
+            | GqlBoundSetItem::Metadata { alias, value, .. }
             | GqlBoundSetItem::MapMerge { alias, value, .. } => {
                 maybe_insert_read_prefix_alias(semantic, alias, required_aliases);
                 collect_read_prefix_aliases_from_expr(semantic, value, required_aliases);
@@ -1975,7 +1989,9 @@ fn collect_set_value_exprs(
 ) {
     for item in items {
         match item {
-            GqlBoundSetItem::Property { value, .. } | GqlBoundSetItem::MapMerge { value, .. } => {
+            GqlBoundSetItem::Property { value, .. }
+            | GqlBoundSetItem::Metadata { value, .. }
+            | GqlBoundSetItem::MapMerge { value, .. } => {
                 exprs.push(GqlMutationOperationExpr {
                     expr: value.clone(),
                     late: allow_late && expr_references_created_or_merged_alias(value, semantic),
@@ -2129,24 +2145,71 @@ fn lower_merge_clause(merge: &GqlBoundMergeClause, expr_cursor: &mut usize) -> G
     }
 }
 
+/// Splits a CREATE/MERGE element map into metadata expr refs and user-property entries.
+/// Expr refs MUST be assigned in map-entry order to stay aligned with
+/// `collect_map_value_exprs`, regardless of whether an entry is metadata or a property.
+struct LoweredElementMap {
+    element_key: Option<GqlMutationExprRef>,
+    weight: Option<GqlMutationExprRef>,
+    valid_from: Option<GqlMutationExprRef>,
+    valid_to: Option<GqlMutationExprRef>,
+    property_keys: Vec<String>,
+    property_values: BTreeMap<String, GqlMutationExprRef>,
+}
+
+fn lower_element_map(map: Option<&MapLiteral>, expr_cursor: &mut usize) -> LoweredElementMap {
+    let mut lowered = LoweredElementMap {
+        element_key: None,
+        weight: None,
+        valid_from: None,
+        valid_to: None,
+        property_keys: Vec::new(),
+        property_values: BTreeMap::new(),
+    };
+    let Some(map) = map else {
+        return lowered;
+    };
+    for entry in &map.entries {
+        let expr_ref = next_expr_ref(expr_cursor);
+        match GqlElementMapMetadataKey::from_key(&entry.key.name) {
+            Some(GqlElementMapMetadataKey::ElementKey) => lowered.element_key = Some(expr_ref),
+            Some(GqlElementMapMetadataKey::Weight) => lowered.weight = Some(expr_ref),
+            Some(GqlElementMapMetadataKey::ValidFrom) => lowered.valid_from = Some(expr_ref),
+            Some(GqlElementMapMetadataKey::ValidTo) => lowered.valid_to = Some(expr_ref),
+            None => {
+                lowered.property_keys.push(entry.key.name.clone());
+                lowered.property_values.insert(entry.key.name.clone(), expr_ref);
+            }
+        }
+    }
+    lowered
+}
+
 fn lower_create_node(node: &GqlBoundCreateNode, expr_cursor: &mut usize) -> GqlCreateNodePlan {
+    let map = lower_element_map(node.properties.as_ref(), expr_cursor);
     GqlCreateNodePlan {
         alias: node.alias.clone(),
         labels: node.labels.iter().map(|label| label.name.clone()).collect(),
-        property_keys: map_property_keys(node.properties.as_ref()),
-        property_values: map_property_values(node.properties.as_ref(), expr_cursor),
+        element_key: map.element_key,
+        weight: map.weight,
+        property_keys: map.property_keys,
+        property_values: map.property_values,
         created: node.created,
     }
 }
 
 fn lower_create_edge(edge: &GqlBoundCreateEdge, expr_cursor: &mut usize) -> GqlCreateEdgePlan {
+    let map = lower_element_map(edge.properties.as_ref(), expr_cursor);
     GqlCreateEdgePlan {
         alias: edge.alias.clone(),
         from_alias: edge.from_alias.clone(),
         to_alias: edge.to_alias.clone(),
         label: edge.rel_type.name.clone(),
-        property_keys: map_property_keys(edge.properties.as_ref()),
-        property_values: map_property_values(edge.properties.as_ref(), expr_cursor),
+        weight: map.weight,
+        valid_from: map.valid_from,
+        valid_to: map.valid_to,
+        property_keys: map.property_keys,
+        property_values: map.property_values,
     }
 }
 
@@ -2161,6 +2224,17 @@ fn lower_set_item(item: &GqlBoundSetItem, expr_cursor: &mut usize) -> GqlSetItem
             alias: alias.clone(),
             kind: *target_kind,
             property: property.name.clone(),
+            value: next_expr_ref(expr_cursor),
+        },
+        GqlBoundSetItem::Metadata {
+            alias,
+            target_kind,
+            field,
+            ..
+        } => GqlSetItemPlan::Metadata {
+            alias: alias.clone(),
+            kind: *target_kind,
+            field: *field,
             value: next_expr_ref(expr_cursor),
         },
         GqlBoundSetItem::MapMerge {
@@ -2194,29 +2268,6 @@ fn lower_remove_item(item: &GqlBoundRemoveItem) -> GqlRemoveItemPlan {
             label: label.name.clone(),
         },
     }
-}
-
-fn map_property_keys(map: Option<&MapLiteral>) -> Vec<String> {
-    map.map(|map| {
-        map.entries
-            .iter()
-            .map(|entry| entry.key.name.clone())
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
-fn map_property_values(
-    map: Option<&MapLiteral>,
-    expr_cursor: &mut usize,
-) -> BTreeMap<String, GqlMutationExprRef> {
-    map.map(|map| {
-        map.entries
-            .iter()
-            .map(|entry| (entry.key.name.clone(), next_expr_ref(expr_cursor)))
-            .collect()
-    })
-    .unwrap_or_default()
 }
 
 fn next_expr_ref(expr_cursor: &mut usize) -> GqlMutationExprRef {
@@ -2294,7 +2345,7 @@ impl<'a> LoweringState<'a> {
         let mut reused_constraints = Vec::new();
         for node in &pattern.nodes {
             if node_indexes.contains_key(&node.alias) {
-                reused_constraints.extend(reused_node_constraint_exprs(node));
+                reused_constraints.extend(reused_node_constraint_exprs(node)?);
             } else {
                 let index = nodes.len();
                 node_indexes.insert(node.alias.clone(), index);
@@ -2596,6 +2647,32 @@ impl<'a> LoweringState<'a> {
             return Ok(());
         };
         for entry in &properties.entries {
+            if let Some(metadata) = GqlElementMapMetadataKey::from_key(&entry.key.name) {
+                if !metadata.valid_for_node() {
+                    return Err(gql_semantic_error(
+                        GqlSemanticErrorCode::InvalidPropertyAccess,
+                        format!(
+                            "element map metadata '{}' is valid only for relationships",
+                            metadata.canonical_name()
+                        ),
+                        entry.key.span.clone(),
+                    ));
+                }
+                match (metadata, constant_prop_value(&entry.value, self.params)?) {
+                    (GqlElementMapMetadataKey::ElementKey, Some(PropValue::String(value))) => {
+                        filter_parts.push(NodeFilterExpr::KeyEquals(value.clone()));
+                        self.pushed_down.push(GqlPushedPredicate {
+                            alias: alias.to_string(),
+                            target_kind: GqlAliasKind::Node,
+                            summary: format!("elementKey({alias}) = {value:?}"),
+                        });
+                    }
+                    _ => self
+                        .residual_predicates
+                        .push(metadata_map_entry_predicate(alias, metadata, entry)),
+                }
+                continue;
+            }
             match constant_prop_value(&entry.value, self.params)? {
                 Some(value) if !matches!(value, PropValue::Null) => {
                     filter_parts.push(NodeFilterExpr::PropertyEquals {
@@ -2626,6 +2703,54 @@ impl<'a> LoweringState<'a> {
             return Ok(());
         };
         for entry in &properties.entries {
+            if let Some(metadata) = GqlElementMapMetadataKey::from_key(&entry.key.name) {
+                if !metadata.valid_for_edge() {
+                    return Err(gql_semantic_error(
+                        GqlSemanticErrorCode::InvalidPropertyAccess,
+                        format!(
+                            "element map metadata '{}' is valid only for nodes",
+                            metadata.canonical_name()
+                        ),
+                        entry.key.span.clone(),
+                    ));
+                }
+                let field = match metadata {
+                    GqlElementMapMetadataKey::Weight => EdgeMetadataField::Weight,
+                    GqlElementMapMetadataKey::ValidFrom => EdgeMetadataField::ValidFrom,
+                    GqlElementMapMetadataKey::ValidTo => EdgeMetadataField::ValidTo,
+                    GqlElementMapMetadataKey::ElementKey => {
+                        unreachable!("elementKey rejected for edges above")
+                    }
+                };
+                let constant = constant_prop_value(&entry.value, self.params)?;
+                let eq_filter = constant
+                    .as_ref()
+                    .and_then(|value| edge_metadata_eq_filter(field, value));
+                match eq_filter {
+                    Some(filter) => {
+                        filter_parts.push(filter);
+                        let explain_alias = edge_explain_alias(alias);
+                        let value = constant.expect("eq filter requires a constant value");
+                        self.pushed_down.push(GqlPushedPredicate {
+                            alias: explain_alias.to_string(),
+                            target_kind: GqlAliasKind::Edge,
+                            summary: format!("{} = {:?}", field.summary_expr(explain_alias), value),
+                        });
+                    }
+                    None if alias == DIRECT_EDGE_ALIAS => {
+                        return Err(gql_semantic_error(
+                            GqlSemanticErrorCode::InvalidPropertyAccess,
+                            "anonymous relationship property constraints must lower to native filters"
+                                .to_string(),
+                            entry.span.clone(),
+                        ));
+                    }
+                    None => self
+                        .residual_predicates
+                        .push(metadata_map_entry_predicate(alias, metadata, entry)),
+                }
+                continue;
+            }
             match constant_prop_value(&entry.value, self.params)? {
                 Some(value) if !matches!(value, PropValue::Null) => {
                     filter_parts.push(EdgeFilterExpr::PropertyEquals {
@@ -2982,7 +3107,7 @@ impl<'a> LoweringState<'a> {
                     self.pushed_down.push(GqlPushedPredicate {
                         alias: alias.clone(),
                         target_kind: GqlAliasKind::Node,
-                        summary: format!("{}.{} = {id}", alias, field.as_str()),
+                        summary: format!("{} = {id}", field.summary_expr(&alias)),
                     });
                     Ok(PushFilter::NodeIds {
                         alias,
@@ -3005,7 +3130,7 @@ impl<'a> LoweringState<'a> {
                     self.pushed_down.push(GqlPushedPredicate {
                         alias: alias.clone(),
                         target_kind: GqlAliasKind::Node,
-                        summary: format!("{}.{} = {value}", alias, field.as_str()),
+                        summary: format!("{} = {value}", field.summary_expr(&alias)),
                     });
                     Ok(PushFilter::Node {
                         alias,
@@ -3051,7 +3176,7 @@ impl<'a> LoweringState<'a> {
                 self.pushed_down.push(GqlPushedPredicate {
                     alias: alias.clone(),
                     target_kind: GqlAliasKind::Edge,
-                    summary: format!("{}.{} = {:?}", alias, field.as_str(), value),
+                    summary: format!("{} = {:?}", field.summary_expr(&alias), value),
                 });
                 Ok(PushFilter::Edge { alias, filter })
             }
@@ -3128,7 +3253,7 @@ impl<'a> LoweringState<'a> {
                     self.pushed_down.push(GqlPushedPredicate {
                         alias: alias.clone(),
                         target_kind: GqlAliasKind::Node,
-                        summary: format!("{}.{} IN {:?}", alias, field.as_str(), ids),
+                        summary: format!("{} IN {:?}", field.summary_expr(&alias), ids),
                     });
                     Ok(PushFilter::NodeIds { alias, ids })
                 }
@@ -3229,7 +3354,7 @@ impl<'a> LoweringState<'a> {
                 self.pushed_down.push(GqlPushedPredicate {
                     alias: alias.clone(),
                     target_kind: GqlAliasKind::Node,
-                    summary: format!("{}.{} {}", alias, field.as_str(), range_op_text(op)),
+                    summary: format!("{} {}", field.summary_expr(&alias), range_op_text(op)),
                 });
                 Ok(PushFilter::Node { alias, filter })
             }
@@ -3253,7 +3378,7 @@ impl<'a> LoweringState<'a> {
                 self.pushed_down.push(GqlPushedPredicate {
                     alias: alias.clone(),
                     target_kind: GqlAliasKind::Edge,
-                    summary: format!("{}.{} {}", alias, field.as_str(), range_op_text(op)),
+                    summary: format!("{} {}", field.summary_expr(&alias), range_op_text(op)),
                 });
                 Ok(PushFilter::Edge { alias, filter })
             }
@@ -3363,15 +3488,16 @@ enum NodeMetadataField {
 }
 
 impl NodeMetadataField {
-    fn as_str(self) -> &'static str {
-        match self {
+    fn summary_expr(self, alias: &str) -> String {
+        let function = match self {
             Self::Id => "id",
             Self::Labels => "labels",
-            Self::Key => "key",
+            Self::Key => "elementKey",
             Self::Weight => "weight",
-            Self::CreatedAt => "created_at",
-            Self::UpdatedAt => "updated_at",
-        }
+            Self::CreatedAt => "createdAt",
+            Self::UpdatedAt => "updatedAt",
+        };
+        format!("{function}({alias})")
     }
 }
 
@@ -3382,10 +3508,10 @@ enum EdgeEndpointField {
 }
 
 impl EdgeEndpointField {
-    fn as_str(self) -> &'static str {
+    fn summary_expr(self, alias: &str) -> String {
         match self {
-            Self::From => "from",
-            Self::To => "to",
+            Self::From => format!("id(startNode({alias}))"),
+            Self::To => format!("id(endNode({alias}))"),
         }
     }
 }
@@ -3400,14 +3526,15 @@ enum EdgeMetadataField {
 }
 
 impl EdgeMetadataField {
-    fn as_str(self) -> &'static str {
-        match self {
+    fn summary_expr(self, alias: &str) -> String {
+        let function = match self {
             Self::Weight => "weight",
-            Self::CreatedAt => "created_at",
-            Self::UpdatedAt => "updated_at",
-            Self::ValidFrom => "valid_from",
-            Self::ValidTo => "valid_to",
-        }
+            Self::CreatedAt => "createdAt",
+            Self::UpdatedAt => "updatedAt",
+            Self::ValidFrom => "validFrom",
+            Self::ValidTo => "validTo",
+        };
+        format!("{function}({alias})")
     }
 }
 
@@ -3840,8 +3967,10 @@ pub(crate) fn gql_expr_to_graph_expr(
             }
         }
         ExprKind::FunctionCall { name, args } => {
-            if name.name.eq_ignore_ascii_case("node_ids")
-                || name.name.eq_ignore_ascii_case("edge_ids")
+            if let Some(metadata_expr) = gql_metadata_call_to_graph_expr(name, args, alias_kinds)? {
+                metadata_expr
+            } else if name.name.eq_ignore_ascii_case("nodeids")
+                || name.name.eq_ignore_ascii_case("edgeids")
             {
                 if args.len() != 1 {
                     return Err(gql_semantic_error(
@@ -3859,7 +3988,7 @@ pub(crate) fn gql_expr_to_graph_expr(
                 })?;
                 GraphExpr::PathField {
                     alias: alias.to_string(),
-                    field: if name.name.eq_ignore_ascii_case("node_ids") {
+                    field: if name.name.eq_ignore_ascii_case("nodeids") {
                         GraphPathField::NodeIds
                     } else {
                         GraphPathField::EdgeIds
@@ -4003,8 +4132,10 @@ fn gql_expr_to_graph_expr_for_pipeline(
             }
         }
         ExprKind::FunctionCall { name, args } => {
-            if name.name.eq_ignore_ascii_case("node_ids")
-                || name.name.eq_ignore_ascii_case("edge_ids")
+            if let Some(metadata_expr) = gql_metadata_call_to_graph_expr(name, args, alias_kinds)? {
+                metadata_expr
+            } else if name.name.eq_ignore_ascii_case("nodeids")
+                || name.name.eq_ignore_ascii_case("edgeids")
             {
                 if args.len() != 1 {
                     return Err(gql_semantic_error(
@@ -4022,7 +4153,7 @@ fn gql_expr_to_graph_expr_for_pipeline(
                 })?;
                 GraphExpr::PathField {
                     alias: alias.to_string(),
-                    field: if name.name.eq_ignore_ascii_case("node_ids") {
+                    field: if name.name.eq_ignore_ascii_case("nodeids") {
                         GraphPathField::NodeIds
                     } else {
                         GraphPathField::EdgeIds
@@ -4278,93 +4409,88 @@ fn gql_alias_property_to_graph_expr(
     property: &Ident,
 ) -> Result<GraphExpr, EngineError> {
     match kind {
-        GqlAliasKind::Node => Ok(match property.name.as_str() {
-            "id" => GraphExpr::NodeField {
-                alias: alias.to_string(),
-                field: GraphNodeField::Id,
-            },
-            "labels" => GraphExpr::NodeField {
-                alias: alias.to_string(),
-                field: GraphNodeField::Labels,
-            },
-            "key" => GraphExpr::NodeField {
-                alias: alias.to_string(),
-                field: GraphNodeField::Key,
-            },
-            "weight" => GraphExpr::NodeField {
-                alias: alias.to_string(),
-                field: GraphNodeField::Weight,
-            },
-            "created_at" => GraphExpr::NodeField {
-                alias: alias.to_string(),
-                field: GraphNodeField::CreatedAt,
-            },
-            "updated_at" => GraphExpr::NodeField {
-                alias: alias.to_string(),
-                field: GraphNodeField::UpdatedAt,
-            },
-            _ => GraphExpr::Property {
-                alias: alias.to_string(),
-                key: property.name.clone(),
-            },
+        GqlAliasKind::Node | GqlAliasKind::Edge => Ok(GraphExpr::Property {
+            alias: alias.to_string(),
+            key: property.name.clone(),
         }),
-        GqlAliasKind::Edge => Ok(match property.name.as_str() {
-            "from" => GraphExpr::EdgeField {
-                alias: alias.to_string(),
-                field: GraphEdgeField::From,
-            },
-            "to" => GraphExpr::EdgeField {
-                alias: alias.to_string(),
-                field: GraphEdgeField::To,
-            },
-            "weight" => GraphExpr::EdgeField {
-                alias: alias.to_string(),
-                field: GraphEdgeField::Weight,
-            },
-            "created_at" => GraphExpr::EdgeField {
-                alias: alias.to_string(),
-                field: GraphEdgeField::CreatedAt,
-            },
-            "updated_at" => GraphExpr::EdgeField {
-                alias: alias.to_string(),
-                field: GraphEdgeField::UpdatedAt,
-            },
-            "valid_from" => GraphExpr::EdgeField {
-                alias: alias.to_string(),
-                field: GraphEdgeField::ValidFrom,
-            },
-            "valid_to" => GraphExpr::EdgeField {
-                alias: alias.to_string(),
-                field: GraphEdgeField::ValidTo,
-            },
-            _ => GraphExpr::Property {
-                alias: alias.to_string(),
-                key: property.name.clone(),
-            },
-        }),
-        GqlAliasKind::Path => Ok(match property.name.as_str() {
-            "node_ids" => GraphExpr::PathField {
-                alias: alias.to_string(),
-                field: GraphPathField::NodeIds,
-            },
-            "edge_ids" => GraphExpr::PathField {
-                alias: alias.to_string(),
-                field: GraphPathField::EdgeIds,
-            },
-            "length" => GraphExpr::PathField {
-                alias: alias.to_string(),
-                field: GraphPathField::Length,
-            },
-            _ => {
-                return Err(gql_semantic_error(
-                    GqlSemanticErrorCode::InvalidPropertyAccess,
-                    format!("unsupported path property '{}'", property.name),
-                    property.span.clone(),
-                ));
-            }
-        }),
+        GqlAliasKind::Path => Err(gql_semantic_error(
+            GqlSemanticErrorCode::InvalidPropertyAccess,
+            format!(
+                "paths do not have properties; use length(p), nodeIds(p), or edgeIds(p) instead of '.{}'",
+                property.name
+            ),
+            property.span.clone(),
+        )),
         GqlAliasKind::Scalar => Ok(GraphExpr::Binding(alias.to_string())),
     }
+}
+
+/// Lowers a metadata function call over a bound node/edge alias to the corresponding
+/// engine field expression. Returns None when the call is not a metadata access (the
+/// caller falls through to general function lowering).
+fn gql_metadata_call_to_graph_expr(
+    name: &Ident,
+    args: &[Expr],
+    alias_kinds: &BTreeMap<String, GqlAliasKind>,
+) -> Result<Option<GraphExpr>, EngineError> {
+    if let Some((endpoint, endpoint_arg)) = edge_endpoint_id_call(name, args) {
+        let alias = variable_name(endpoint_arg).expect("endpoint call shape checked");
+        if alias_kinds.get(alias).copied() == Some(GqlAliasKind::Edge) {
+            return Ok(Some(GraphExpr::EdgeField {
+                alias: alias.to_string(),
+                field: match endpoint {
+                    crate::gql::metadata::GqlEndpointFunction::StartNode => GraphEdgeField::From,
+                    crate::gql::metadata::GqlEndpointFunction::EndNode => GraphEdgeField::To,
+                },
+            }));
+        }
+        return Ok(None);
+    }
+    let Some(metadata) = GqlMetadataFunction::from_lower(&name.name.to_ascii_lowercase()) else {
+        return Ok(None);
+    };
+    if args.len() != 1 {
+        return Ok(None);
+    }
+    let Some(alias) = variable_name(&args[0]) else {
+        return Ok(None);
+    };
+    let Some(kind) = alias_kinds.get(alias).copied() else {
+        return Ok(None);
+    };
+    let expr = match kind {
+        GqlAliasKind::Node => {
+            let field = match metadata {
+                GqlMetadataFunction::Id => GraphNodeField::Id,
+                GqlMetadataFunction::ElementKey => GraphNodeField::Key,
+                GqlMetadataFunction::Weight => GraphNodeField::Weight,
+                GqlMetadataFunction::CreatedAt => GraphNodeField::CreatedAt,
+                GqlMetadataFunction::UpdatedAt => GraphNodeField::UpdatedAt,
+                GqlMetadataFunction::ValidFrom | GqlMetadataFunction::ValidTo => return Ok(None),
+            };
+            GraphExpr::NodeField {
+                alias: alias.to_string(),
+                field,
+            }
+        }
+        GqlAliasKind::Edge => {
+            let field = match metadata {
+                GqlMetadataFunction::Id => GraphEdgeField::Id,
+                GqlMetadataFunction::Weight => GraphEdgeField::Weight,
+                GqlMetadataFunction::CreatedAt => GraphEdgeField::CreatedAt,
+                GqlMetadataFunction::UpdatedAt => GraphEdgeField::UpdatedAt,
+                GqlMetadataFunction::ValidFrom => GraphEdgeField::ValidFrom,
+                GqlMetadataFunction::ValidTo => GraphEdgeField::ValidTo,
+                GqlMetadataFunction::ElementKey => return Ok(None),
+            };
+            GraphExpr::EdgeField {
+                alias: alias.to_string(),
+                field,
+            }
+        }
+        GqlAliasKind::Path | GqlAliasKind::Scalar => return Ok(None),
+    };
+    Ok(Some(expr))
 }
 
 fn gql_literal_to_graph_expr(literal: &Literal) -> GraphExpr {
@@ -4407,14 +4533,14 @@ fn gql_function_to_graph_function(
         "labels" => Ok(GraphFunction::Labels),
         "type" => Ok(GraphFunction::Type),
         "length" => Ok(GraphFunction::Length),
-        "start_node" => Ok(GraphFunction::StartNode),
-        "end_node" => Ok(GraphFunction::EndNode),
+        "startnode" => Ok(GraphFunction::StartNode),
+        "endnode" => Ok(GraphFunction::EndNode),
         "nodes" => Ok(GraphFunction::Nodes),
         "relationships" => Ok(GraphFunction::Relationships),
         "coalesce" => Ok(GraphFunction::Coalesce),
-        "to_string" => Ok(GraphFunction::ToString),
-        "to_integer" => Ok(GraphFunction::ToInteger),
-        "to_float" => Ok(GraphFunction::ToFloat),
+        "tostring" => Ok(GraphFunction::ToString),
+        "tointeger" => Ok(GraphFunction::ToInteger),
+        "tofloat" => Ok(GraphFunction::ToFloat),
         "abs" => Ok(GraphFunction::Abs),
         "floor" => Ok(GraphFunction::Floor),
         "ceil" => Ok(GraphFunction::Ceil),
@@ -4464,8 +4590,8 @@ fn node_key_pushdown_supported(label_filter: Option<&NodeLabelFilter>) -> bool {
 
 fn node_key_summary(alias: &str, keys: &[String]) -> String {
     match keys {
-        [key] => format!("{alias}.key = {key:?}"),
-        _ => format!("{alias}.key IN {:?}", keys),
+        [key] => format!("elementKey({alias}) = {key:?}"),
+        _ => format!("elementKey({alias}) IN {:?}", keys),
     }
 }
 
@@ -4478,8 +4604,8 @@ fn edge_id_summary(alias: &str, ids: &[u64]) -> String {
 
 fn edge_endpoint_summary(alias: &str, field: EdgeEndpointField, ids: &[u64]) -> String {
     match ids {
-        [id] => format!("{}.{} = {id}", alias, field.as_str()),
-        _ => format!("{}.{} IN {:?}", alias, field.as_str(), ids),
+        [id] => format!("{} = {id}", field.summary_expr(alias)),
+        _ => format!("{} IN {:?}", field.summary_expr(alias), ids),
     }
 }
 
@@ -4642,82 +4768,124 @@ fn entity_value_ref(
                 }
             })?;
             match kind {
-                GqlAliasKind::Node => node_metadata_field(&property.name)
-                    .map(|field| EntityValueRef::NodeMetadata {
-                        alias: alias.clone(),
-                        field,
-                    })
-                    .or_else(|| {
-                        Some(EntityValueRef::NodeProperty {
-                            alias,
-                            key: property.name.clone(),
-                        })
-                    }),
-                GqlAliasKind::Edge => edge_endpoint_field(&property.name)
-                    .map(|field| EntityValueRef::EdgeEndpoint {
-                        alias: alias.clone(),
-                        field,
-                    })
-                    .or_else(|| {
-                        edge_metadata_field(&property.name).map(|field| {
-                            EntityValueRef::EdgeMetadata {
-                                alias: alias.clone(),
-                                field,
-                            }
-                        })
-                    })
-                    .or_else(|| {
-                        Some(EntityValueRef::EdgeProperty {
-                            alias,
-                            key: property.name.clone(),
-                        })
-                    }),
+                GqlAliasKind::Node => Some(EntityValueRef::NodeProperty {
+                    alias,
+                    key: property.name.clone(),
+                }),
+                GqlAliasKind::Edge => Some(EntityValueRef::EdgeProperty {
+                    alias,
+                    key: property.name.clone(),
+                }),
                 GqlAliasKind::Path | GqlAliasKind::Scalar => None,
             }
         }
-        ExprKind::FunctionCall { name, args } if args.len() == 1 => {
+        ExprKind::FunctionCall { name, args } => {
+            if let Some((endpoint, endpoint_arg)) = edge_endpoint_id_call(name, args) {
+                let alias = variable_name(endpoint_arg)?.to_string();
+                let kind = alias_kinds.get(&alias).copied().or_else(|| {
+                    (alias == DIRECT_EDGE_ALIAS).then_some(GqlAliasKind::Edge)
+                })?;
+                if kind != GqlAliasKind::Edge {
+                    return None;
+                }
+                return Some(EntityValueRef::EdgeEndpoint {
+                    alias,
+                    field: match endpoint {
+                        crate::gql::metadata::GqlEndpointFunction::StartNode => {
+                            EdgeEndpointField::From
+                        }
+                        crate::gql::metadata::GqlEndpointFunction::EndNode => EdgeEndpointField::To,
+                    },
+                });
+            }
+            if args.len() != 1 {
+                return None;
+            }
             let alias = variable_name(&args[0])?.to_string();
-            match name.name.to_ascii_lowercase().as_str() {
-                "id" => match alias_kinds.get(&alias).copied() {
-                    Some(GqlAliasKind::Node) => Some(EntityValueRef::NodeId { alias }),
-                    Some(GqlAliasKind::Edge) => Some(EntityValueRef::EdgeId { alias }),
-                    Some(GqlAliasKind::Path | GqlAliasKind::Scalar) | None => None,
-                },
-                "type" => Some(EntityValueRef::RelationshipLabelFunction { alias }),
+            let kind = alias_kinds.get(&alias).copied().or_else(|| {
+                if alias == DIRECT_EDGE_ALIAS {
+                    Some(GqlAliasKind::Edge)
+                } else if alias == DIRECT_NODE_ALIAS {
+                    Some(GqlAliasKind::Node)
+                } else {
+                    None
+                }
+            });
+            let lower = name.name.to_ascii_lowercase();
+            if lower == "type" {
+                return Some(EntityValueRef::RelationshipLabelFunction { alias });
+            }
+            if lower == "labels" {
+                return (kind == Some(GqlAliasKind::Node)).then_some(EntityValueRef::NodeMetadata {
+                    alias,
+                    field: NodeMetadataField::Labels,
+                });
+            }
+            let metadata = GqlMetadataFunction::from_lower(&lower)?;
+            match (metadata, kind?) {
+                (GqlMetadataFunction::Id, GqlAliasKind::Node) => {
+                    Some(EntityValueRef::NodeId { alias })
+                }
+                (GqlMetadataFunction::Id, GqlAliasKind::Edge) => {
+                    Some(EntityValueRef::EdgeId { alias })
+                }
+                (GqlMetadataFunction::ElementKey, GqlAliasKind::Node) => {
+                    Some(EntityValueRef::NodeMetadata {
+                        alias,
+                        field: NodeMetadataField::Key,
+                    })
+                }
+                (GqlMetadataFunction::Weight, GqlAliasKind::Node) => {
+                    Some(EntityValueRef::NodeMetadata {
+                        alias,
+                        field: NodeMetadataField::Weight,
+                    })
+                }
+                (GqlMetadataFunction::CreatedAt, GqlAliasKind::Node) => {
+                    Some(EntityValueRef::NodeMetadata {
+                        alias,
+                        field: NodeMetadataField::CreatedAt,
+                    })
+                }
+                (GqlMetadataFunction::UpdatedAt, GqlAliasKind::Node) => {
+                    Some(EntityValueRef::NodeMetadata {
+                        alias,
+                        field: NodeMetadataField::UpdatedAt,
+                    })
+                }
+                (GqlMetadataFunction::Weight, GqlAliasKind::Edge) => {
+                    Some(EntityValueRef::EdgeMetadata {
+                        alias,
+                        field: EdgeMetadataField::Weight,
+                    })
+                }
+                (GqlMetadataFunction::CreatedAt, GqlAliasKind::Edge) => {
+                    Some(EntityValueRef::EdgeMetadata {
+                        alias,
+                        field: EdgeMetadataField::CreatedAt,
+                    })
+                }
+                (GqlMetadataFunction::UpdatedAt, GqlAliasKind::Edge) => {
+                    Some(EntityValueRef::EdgeMetadata {
+                        alias,
+                        field: EdgeMetadataField::UpdatedAt,
+                    })
+                }
+                (GqlMetadataFunction::ValidFrom, GqlAliasKind::Edge) => {
+                    Some(EntityValueRef::EdgeMetadata {
+                        alias,
+                        field: EdgeMetadataField::ValidFrom,
+                    })
+                }
+                (GqlMetadataFunction::ValidTo, GqlAliasKind::Edge) => {
+                    Some(EntityValueRef::EdgeMetadata {
+                        alias,
+                        field: EdgeMetadataField::ValidTo,
+                    })
+                }
                 _ => None,
             }
         }
-        _ => None,
-    }
-}
-
-fn node_metadata_field(name: &str) -> Option<NodeMetadataField> {
-    match name {
-        "id" => Some(NodeMetadataField::Id),
-        "labels" => Some(NodeMetadataField::Labels),
-        "key" => Some(NodeMetadataField::Key),
-        "weight" => Some(NodeMetadataField::Weight),
-        "created_at" => Some(NodeMetadataField::CreatedAt),
-        "updated_at" => Some(NodeMetadataField::UpdatedAt),
-        _ => None,
-    }
-}
-
-fn edge_endpoint_field(name: &str) -> Option<EdgeEndpointField> {
-    match name {
-        "from" => Some(EdgeEndpointField::From),
-        "to" => Some(EdgeEndpointField::To),
-        _ => None,
-    }
-}
-
-fn edge_metadata_field(name: &str) -> Option<EdgeMetadataField> {
-    match name {
-        "weight" => Some(EdgeMetadataField::Weight),
-        "created_at" => Some(EdgeMetadataField::CreatedAt),
-        "updated_at" => Some(EdgeMetadataField::UpdatedAt),
-        "valid_from" => Some(EdgeMetadataField::ValidFrom),
-        "valid_to" => Some(EdgeMetadataField::ValidTo),
         _ => None,
     }
 }
@@ -4830,6 +4998,37 @@ fn param_to_prop_value(value: &GqlParamValue) -> PropValue {
     }
 }
 
+/// Builds the residual predicate `metadataFn(alias) = value` for an element-map metadata
+/// entry that could not be lowered to a native filter.
+fn metadata_map_entry_predicate(
+    alias: &str,
+    metadata: GqlElementMapMetadataKey,
+    entry: &MapEntry,
+) -> Expr {
+    let arg = Expr {
+        kind: ExprKind::Variable(alias.to_string()),
+        span: entry.key.span.clone(),
+    };
+    let left = Expr {
+        kind: ExprKind::FunctionCall {
+            name: Ident {
+                name: metadata.canonical_name().to_string(),
+                span: entry.key.span.clone(),
+            },
+            args: vec![arg],
+        },
+        span: entry.key.span.clone(),
+    };
+    Expr {
+        kind: ExprKind::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(left),
+            right: Box::new(entry.value.clone()),
+        },
+        span: entry.span.clone(),
+    }
+}
+
 fn property_map_residual(alias: &str, entry: &MapEntry) -> Expr {
     let object = Expr {
         kind: ExprKind::Variable(alias.to_string()),
@@ -4855,20 +5054,32 @@ fn property_map_residual(alias: &str, entry: &MapEntry) -> Expr {
     }
 }
 
-fn reused_node_constraint_exprs(node: &GqlBoundNodePattern) -> Vec<Expr> {
+fn reused_node_constraint_exprs(node: &GqlBoundNodePattern) -> Result<Vec<Expr>, EngineError> {
     let mut constraints = Vec::new();
     for label in &node.labels {
         constraints.push(node_label_membership_expr(&node.alias, label));
     }
     if let Some(properties) = node.properties.as_ref() {
-        constraints.extend(
-            properties
-                .entries
-                .iter()
-                .map(|entry| property_map_residual(&node.alias, entry)),
-        );
+        for entry in &properties.entries {
+            match GqlElementMapMetadataKey::from_key(&entry.key.name) {
+                Some(metadata) => {
+                    if !metadata.valid_for_node() {
+                        return Err(gql_semantic_error(
+                            GqlSemanticErrorCode::InvalidPropertyAccess,
+                            format!(
+                                "element map metadata '{}' is valid only for relationships",
+                                metadata.canonical_name()
+                            ),
+                            entry.key.span.clone(),
+                        ));
+                    }
+                    constraints.push(metadata_map_entry_predicate(&node.alias, metadata, entry));
+                }
+                None => constraints.push(property_map_residual(&node.alias, entry)),
+            }
+        }
     }
-    constraints
+    Ok(constraints)
 }
 
 fn node_label_membership_expr(alias: &str, label: &Ident) -> Expr {
@@ -5379,19 +5590,26 @@ fn node_filter_is_proven_false(filter: &NodeFilterExpr) -> bool {
             !children.is_empty() && children.iter().all(node_filter_is_proven_false)
         }
         NodeFilterExpr::Not(_)
+        | NodeFilterExpr::IdRange { .. }
+        | NodeFilterExpr::KeyEquals(_)
+        | NodeFilterExpr::KeyIn(_)
         | NodeFilterExpr::PropertyEquals { .. }
         | NodeFilterExpr::PropertyIn { .. }
         | NodeFilterExpr::PropertyRange { .. }
         | NodeFilterExpr::PropertyExists { .. }
         | NodeFilterExpr::PropertyMissing { .. }
+        | NodeFilterExpr::WeightRange { .. }
+        | NodeFilterExpr::CreatedAtRange { .. }
         | NodeFilterExpr::UpdatedAtRange { .. } => false,
     }
 }
 
 fn edge_filter_has_metadata_anchor(filter: &EdgeFilterExpr) -> bool {
     match filter {
-        EdgeFilterExpr::WeightRange { .. }
+        EdgeFilterExpr::IdRange { .. }
+        | EdgeFilterExpr::WeightRange { .. }
         | EdgeFilterExpr::UpdatedAtRange { .. }
+        | EdgeFilterExpr::CreatedAtRange { .. }
         | EdgeFilterExpr::ValidAt { .. }
         | EdgeFilterExpr::ValidFromRange { .. }
         | EdgeFilterExpr::ValidToRange { .. } => true,
@@ -5555,7 +5773,7 @@ mod tests {
 
     #[test]
     fn lowers_create_only_mutation_without_read_prefix() {
-        let plan = lower_mut("CREATE (n:Person {key: 'ada', name: 'Ada'}) RETURN n").unwrap();
+        let plan = lower_mut("CREATE (n:Person {elementKey: 'ada', name: 'Ada'}) RETURN n").unwrap();
         assert!(plan.read_prefix.is_none());
         assert_eq!(plan.return_plan.as_ref().unwrap().columns, vec!["n"]);
         let [GqlMutationClausePlan::Create(patterns)] = plan.clauses.as_slice() else {
@@ -5564,19 +5782,50 @@ mod tests {
         assert_eq!(patterns.len(), 1);
         assert_eq!(patterns[0].nodes[0].alias, "n");
         assert_eq!(patterns[0].nodes[0].labels, vec!["Person"]);
+        // Metadata map entries split into dedicated plan fields; property_values holds
+        // only user properties. Expr refs are assigned in map-entry order across both.
         assert_eq!(
-            patterns[0].nodes[0].property_keys,
-            vec!["key".to_string(), "name".to_string()]
+            patterns[0].nodes[0].element_key.as_ref().map(|key| key.id),
+            Some(0)
         );
+        assert!(patterns[0].nodes[0].weight.is_none());
+        assert_eq!(patterns[0].nodes[0].property_keys, vec!["name".to_string()]);
         assert_eq!(plan.operation_exprs.len(), 2);
-        assert_eq!(patterns[0].nodes[0].property_values["key"].id, 0);
         assert_eq!(patterns[0].nodes[0].property_values["name"].id, 1);
+    }
+
+    #[test]
+    fn create_plans_split_metadata_map_entries_from_user_properties() {
+        let plan = lower_mut(
+            "CREATE (a:Person {elementKey: 'a', weight: 1.5, name: 'Ada'})-[r:R {since: 1, weight: 0.5, validFrom: 10, validTo: 20}]->(b:Person {elementKey: 'b'}) RETURN r",
+        )
+        .unwrap();
+        let [GqlMutationClausePlan::Create(patterns)] = plan.clauses.as_slice() else {
+            panic!("expected CREATE plan");
+        };
+        let node_a = &patterns[0].nodes[0];
+        assert_eq!(node_a.element_key.as_ref().map(|key| key.id), Some(0));
+        assert_eq!(node_a.weight.as_ref().map(|weight| weight.id), Some(1));
+        assert_eq!(node_a.property_keys, vec!["name".to_string()]);
+        assert_eq!(node_a.property_values["name"].id, 2);
+
+        // Expr refs cover all node maps first, then edge maps, in map-entry order.
+        let node_b = &patterns[0].nodes[1];
+        assert_eq!(node_b.element_key.as_ref().map(|key| key.id), Some(3));
+
+        let edge = &patterns[0].edges[0];
+        assert_eq!(edge.property_keys, vec!["since".to_string()]);
+        assert_eq!(edge.property_values["since"].id, 4);
+        assert_eq!(edge.weight.as_ref().map(|weight| weight.id), Some(5));
+        assert_eq!(edge.valid_from.as_ref().map(|from| from.id), Some(6));
+        assert_eq!(edge.valid_to.as_ref().map(|to| to.id), Some(7));
+        assert_eq!(plan.operation_exprs.len(), 8);
     }
 
     #[test]
     fn lowers_match_backed_mutation_read_prefix_to_graph_rows() {
         let plan = lower_mut(
-            "MATCH (n:Person {key: 'ada'}) OPTIONAL MATCH p = (n)-[r:KNOWS*1..1]->(m) SET n.name = m.name RETURN n, p",
+            "MATCH (n:Person {elementKey: 'ada'}) OPTIONAL MATCH p = (n)-[r:KNOWS*1..1]->(m) SET n.name = m.name RETURN n, p",
         )
         .unwrap();
         let read = plan.read_prefix.as_ref().expect("read prefix should lower");
@@ -5623,7 +5872,7 @@ mod tests {
     #[test]
     fn lowers_keyed_node_merge_actions_and_expr_order() {
         let plan = lower_mut(
-            "MERGE (n:Person {key: 'ada'}) ON CREATE SET n.status = 'new' ON MATCH SET n.status = 'seen' RETURN n",
+            "MERGE (n:Person {elementKey: 'ada'}) ON CREATE SET n.status = 'new' ON MATCH SET n.status = 'seen' RETURN n",
         )
         .unwrap();
         assert!(plan.read_prefix.is_none());
@@ -5648,10 +5897,67 @@ mod tests {
         ));
 
         let late = lower_mut(
-            "MERGE (n:Person {key: 'ada'}) ON MATCH SET n.count = coalesce(n.count, 0) + 1",
+            "MERGE (n:Person {elementKey: 'ada'}) ON MATCH SET n.count = coalesce(n.count, 0) + 1",
         )
         .unwrap();
         assert!(late.operation_exprs[1].late);
+    }
+
+    #[test]
+    fn lowers_metadata_set_items_to_explicit_metadata_plans() {
+        let plan = lower_mut(
+            "MATCH (a)-[r:KNOWS]->(b) SET weight(r) = 0.5, validFrom(r) = 10, validTo(r) = 20, weight(a) = 1.5, r.weight = 7",
+        )
+        .unwrap();
+        let [GqlMutationClausePlan::Set(items)] = plan.clauses.as_slice() else {
+            panic!("expected SET plan");
+        };
+        assert!(matches!(
+            &items[0],
+            GqlSetItemPlan::Metadata {
+                alias,
+                kind: GqlAliasKind::Edge,
+                field: GqlMetadataFunction::Weight,
+                value,
+            } if alias == "r" && value.id == 0
+        ));
+        assert!(matches!(
+            &items[1],
+            GqlSetItemPlan::Metadata {
+                alias,
+                kind: GqlAliasKind::Edge,
+                field: GqlMetadataFunction::ValidFrom,
+                value,
+            } if alias == "r" && value.id == 1
+        ));
+        assert!(matches!(
+            &items[2],
+            GqlSetItemPlan::Metadata {
+                alias,
+                kind: GqlAliasKind::Edge,
+                field: GqlMetadataFunction::ValidTo,
+                value,
+            } if alias == "r" && value.id == 2
+        ));
+        assert!(matches!(
+            &items[3],
+            GqlSetItemPlan::Metadata {
+                alias,
+                kind: GqlAliasKind::Node,
+                field: GqlMetadataFunction::Weight,
+                value,
+            } if alias == "a" && value.id == 3
+        ));
+        // Dot SET on a metadata-sounding name is a plain user property plan.
+        assert!(matches!(
+            &items[4],
+            GqlSetItemPlan::Property {
+                alias,
+                kind: GqlAliasKind::Edge,
+                property,
+                value,
+            } if alias == "r" && property == "weight" && value.id == 4
+        ));
     }
 
     #[test]
@@ -5674,7 +5980,7 @@ mod tests {
         ));
 
         let with_prefix =
-            lower_mut("MATCH (s:Person) WITH s MERGE (n:GqlMergeWith {key: s.key}) RETURN n")
+            lower_mut("MATCH (s:Person) WITH s MERGE (n:GqlMergeWith {elementKey: s.key}) RETURN n")
                 .unwrap();
         let read = with_prefix
             .read_prefix
@@ -5730,7 +6036,7 @@ mod tests {
 
     #[test]
     fn validates_missing_and_mismatched_parameters() {
-        let missing = lower("MATCH (n:Person {key: $key}) RETURN n")
+        let missing = lower("MATCH (n:Person {elementKey: $key}) RETURN n")
             .expect_err("missing parameter should fail");
         assert!(matches!(
             missing,
@@ -5858,6 +6164,22 @@ mod tests {
             }
         ));
         assert!(plan.residual_predicates.is_empty());
+    }
+
+    #[test]
+    fn reused_alias_map_rejects_kind_invalid_metadata_key() {
+        // Regression: a reused alias used to route edge-only metadata map keys into a
+        // residual validFrom(n) predicate that failed later with a generic
+        // unsupported-function error instead of the element-map kind error.
+        let err = lower("MATCH (n:Person {elementKey: 'x'}) MATCH (n {validFrom: 1}) RETURN n")
+            .expect_err("validFrom is edge-only metadata in element maps");
+        match err {
+            EngineError::GqlSemantic { code, message, .. } => {
+                assert_eq!(code, GqlSemanticErrorCode::InvalidPropertyAccess);
+                assert!(message.contains("valid only for relationships"), "{message}");
+            }
+            other => panic!("expected semantic error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -6147,7 +6469,7 @@ mod tests {
     fn node_metadata_predicates_push_down_only_when_native_semantics_match() {
         let plan = lower(
             "MATCH (n:Person) \
-             WHERE n.key = 'alice' AND n.updated_at >= 100 RETURN n",
+             WHERE elementKey(n) = 'alice' AND updatedAt(n) >= 100 RETURN n",
         )
         .unwrap();
         let query = &graph_target(&plan).query;
@@ -6169,10 +6491,10 @@ mod tests {
         assert!(plan
             .pushed_down
             .iter()
-            .any(|push| push.summary == "n.key = \"alice\""));
+            .any(|push| push.summary == "elementKey(n) = \"alice\""));
 
         let residual_key = lower_result_with_options(
-            "MATCH (n) WHERE n.key = 'alice' RETURN n",
+            "MATCH (n) WHERE elementKey(n) = 'alice' RETURN n",
             allow_full_scan(),
         )
         .unwrap();
@@ -6182,7 +6504,20 @@ mod tests {
         assert!(!residual_key
             .pushed_down
             .iter()
-            .any(|push| push.summary.starts_with("n.key")));
+            .any(|push| push.summary.starts_with("elementKey(n)")));
+
+        // Dot access on a metadata-sounding name is a plain property predicate now and
+        // must NOT reach the native key constraint.
+        let property_dot = lower("MATCH (n:Person) WHERE n.key = 'alice' RETURN n").unwrap();
+        let query = &graph_target(&property_dot).query;
+        assert!(query.nodes[0].keys.is_empty());
+        assert!(node_filter_contains(
+            &query.nodes[0].filter,
+            &NodeFilterExpr::PropertyEquals {
+                key: "key".to_string(),
+                value: PropValue::String("alice".to_string()),
+            }
+        ));
     }
 
     #[test]
@@ -6281,7 +6616,7 @@ mod tests {
 
     #[test]
     fn edge_metadata_and_type_predicates_push_down() {
-        let weight_plan = lower("MATCH ()-[r]->() WHERE r.weight > 0.5 RETURN r.since").unwrap();
+        let weight_plan = lower("MATCH ()-[r]->() WHERE weight(r) > 0.5 RETURN r.since").unwrap();
         let query = &graph_target(&weight_plan).query;
         let edge = graph_edge(query, 0);
         assert!(edge_filter_contains(
@@ -6322,7 +6657,10 @@ mod tests {
 
     #[test]
     fn direct_edge_endpoint_metadata_predicates_push_down_to_endpoint_ids() {
-        let plan = lower("MATCH ()-[r]->() WHERE r.from = 42 AND r.to IN [7, 8] RETURN r").unwrap();
+        let plan = lower(
+            "MATCH ()-[r]->() WHERE id(startNode(r)) = 42 AND id(endNode(r)) IN [7, 8] RETURN r",
+        )
+        .unwrap();
         let query = &graph_target(&plan).query;
         assert_eq!(query.nodes[0].ids, vec![42]);
         assert_eq!(query.nodes[1].ids, vec![7, 8]);
@@ -6331,11 +6669,11 @@ mod tests {
         assert!(plan
             .pushed_down
             .iter()
-            .any(|push| push.summary == "r.from = 42"));
+            .any(|push| push.summary == "id(startNode(r)) = 42"));
         assert!(plan
             .pushed_down
             .iter()
-            .any(|push| push.summary == "r.to IN [7, 8]"));
+            .any(|push| push.summary == "id(endNode(r)) IN [7, 8]"));
     }
 
     #[test]
@@ -6365,7 +6703,7 @@ mod tests {
     fn pattern_metadata_pushdown_is_truthful_for_supported_endpoint_orientation() {
         let directed = lower(
             "MATCH (a:Person)-[r:KNOWS]->(b) \
-             WHERE r.from = 42 AND b.updated_at < 100 RETURN r",
+             WHERE id(startNode(r)) = 42 AND updatedAt(b) < 100 RETURN r",
         )
         .unwrap();
         let query = &graph_target(&directed).query;
@@ -6379,19 +6717,21 @@ mod tests {
         ));
         assert!(directed.residual_predicates.is_empty());
 
-        let reverse = lower("MATCH (a)<-[r:KNOWS]-(b) WHERE r.from = 42 RETURN r").unwrap();
+        let reverse =
+            lower("MATCH (a)<-[r:KNOWS]-(b) WHERE id(startNode(r)) = 42 RETURN r").unwrap();
         let query = &graph_target(&reverse).query;
         assert!(query.nodes[0].ids.is_empty());
         assert_eq!(query.nodes[1].ids, vec![42]);
 
-        let undirected = lower("MATCH (a)-[r:KNOWS]-(b) WHERE r.from = 42 RETURN r").unwrap();
+        let undirected =
+            lower("MATCH (a)-[r:KNOWS]-(b) WHERE id(startNode(r)) = 42 RETURN r").unwrap();
         let query = &graph_target(&undirected).query;
         assert!(query.nodes.iter().all(|node| node.ids.is_empty()));
         assert_eq!(undirected.residual_predicates.len(), 1);
         assert!(!undirected
             .pushed_down
             .iter()
-            .any(|push| push.summary.starts_with("r.from")));
+            .any(|push| push.summary.starts_with("id(startNode(r))")));
     }
 
     #[test]
@@ -6435,7 +6775,7 @@ mod tests {
     fn fixed_multi_hop_path_assignment_lowers_to_fixed_path_composition() {
         let plan = lower(
             "MATCH p = (a)-[:R {kind: 'first'}]->(b)<-[s:S]-(c) \
-             RETURN p, node_ids(p), edge_ids(p), length(p)",
+             RETURN p, nodeIds(p), edgeIds(p), length(p)",
         )
         .unwrap();
         let target = graph_target(&plan);
@@ -6566,7 +6906,7 @@ mod tests {
         let plan = lower(
             "MATCH (a:Person) \
              OPTIONAL MATCH p = (a)-[:KNOWS*0..2]->(b:Person) WHERE length(p) >= 1 \
-             RETURN * ORDER BY node_ids(p)",
+             RETURN * ORDER BY nodeIds(p)",
         )
         .unwrap();
         assert_eq!(plan.native_target.kind(), GqlNativeTargetKind::GraphRows);
@@ -6606,7 +6946,7 @@ mod tests {
         );
         assert!(matches!(
             &plan.order_by[0].expr.kind,
-            ExprKind::FunctionCall { name, .. } if name.name == "node_ids"
+            ExprKind::FunctionCall { name, .. } if name.name == "nodeIds"
         ));
     }
 
@@ -6643,9 +6983,9 @@ mod tests {
         let plan = lower(
             "MATCH p = (a)-[:KNOWS*1..3]->(b) \
              WHERE length(p) > 0 \
-             RETURN length(p) AS hops, start_node(p) AS first, end_node(p) AS last, \
-                    nodes(p) AS ns, relationships(p) AS rs, node_ids(p) AS node_ids, edge_ids(p) AS edge_ids \
-             ORDER BY edge_ids(p)",
+             RETURN length(p) AS hops, startNode(p) AS first, endNode(p) AS last, \
+                    nodes(p) AS ns, relationships(p) AS rs, nodeIds(p) AS node_ids, edgeIds(p) AS edge_ids \
+             ORDER BY edgeIds(p)",
         )
         .unwrap();
         let query = &graph_target(&plan).query;
@@ -6709,7 +7049,7 @@ mod tests {
         ));
         assert!(matches!(
             &plan.order_by[0].expr.kind,
-            ExprKind::FunctionCall { name, .. } if name.name == "edge_ids"
+            ExprKind::FunctionCall { name, .. } if name.name == "edgeIds"
         ));
     }
 

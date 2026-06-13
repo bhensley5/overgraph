@@ -42,6 +42,22 @@ function byName(row) {
   return row.name;
 }
 
+function propertyIndexRowField(key) {
+  return { source: 'property', key };
+}
+
+function metadataIndexRowField(field) {
+  return { source: 'metadata', field };
+}
+
+function propertyIndexExplainField(key) {
+  return { source: 'property', key, field: null };
+}
+
+function metadataIndexExplainField(field) {
+  return { source: 'metadata', key: null, field };
+}
+
 describe('GQL connector API', () => {
   let tmpDir;
   let db;
@@ -187,13 +203,13 @@ describe('GQL connector API', () => {
       assert.equal(explain.schema.operation, 'check_graph_type_set');
       assert.equal(explain.schema.sideEffectFree, true);
 
-      const read = localDb.executeGql('MATCH (n:NeedsName) RETURN n.key AS key');
+      const read = localDb.executeGql('MATCH (n:NeedsName) RETURN elementKey(n) AS key');
       assert.equal(read.kind, 'query');
       assert.equal(read.schemaStats, null);
       assert.equal(read.indexStats, null);
 
       const mutation = localDb.executeGql(
-        "CREATE (n:Unconstrained {key: 'one'}) RETURN n.key AS key"
+        "CREATE (n:Unconstrained {elementKey: 'one'}) RETURN elementKey(n) AS key"
       );
       assert.equal(mutation.kind, 'mutation');
       assert.equal(mutation.schemaStats, null);
@@ -211,6 +227,8 @@ describe('GQL connector API', () => {
         'CREATE PROPERTY INDEX FOR (n:IndexPerson) ON (n.status) KIND EQUALITY';
       const edgeIndex =
         'CREATE PROPERTY INDEX FOR ()-[r:INDEX_WORKS_AT]-() ON (r.since) KIND RANGE';
+      const compoundIndex =
+        'CREATE PROPERTY INDEX FOR (n:IndexPerson) ON (n.group, updatedAt(n)) KIND RANGE';
       const dropEdge =
         'DROP PROPERTY INDEX FOR ()-[r:INDEX_WORKS_AT]-() ON (r.since) KIND RANGE';
 
@@ -220,12 +238,14 @@ describe('GQL connector API', () => {
         'operation',
         'target_kind',
         'label',
-        'prop_key',
+        'fields',
         'kind',
         'action',
         'state',
         'index_id',
         'last_error',
+        'compound',
+        'field_count',
       ]);
       assert.equal(create.mutationStats, null);
       assert.equal(create.schemaStats, null);
@@ -238,12 +258,14 @@ describe('GQL connector API', () => {
       assert.equal(create.rows[0].operation, 'create_property_index');
       assert.equal(create.rows[0].target_kind, 'node');
       assert.equal(create.rows[0].label, 'IndexPerson');
-      assert.equal(create.rows[0].prop_key, 'status');
+      assert.deepEqual(create.rows[0].fields, [propertyIndexRowField('status')]);
       assert.equal(create.rows[0].kind, 'equality');
       assert.equal(create.rows[0].action, 'ensured');
       assert.ok(['building', 'ready', 'failed'].includes(create.rows[0].state));
       assert.equal(typeof create.rows[0].index_id, 'number');
       assert.equal(create.rows[0].last_error, null);
+      assert.equal(create.rows[0].compound, false);
+      assert.equal(create.rows[0].field_count, 1);
 
       const planned = localDb.executeGql(personIndex, null, {
         includePlan: true,
@@ -259,9 +281,10 @@ describe('GQL connector API', () => {
         {
           targetKind: 'node',
           label: 'IndexPerson',
-          propKey: 'status',
+          fields: [propertyIndexExplainField('status')],
           kind: 'equality',
           action: 'ensure',
+          compound: false,
         },
       ]);
       assert.equal(planned.plan.index.usesCoreWriteQueue, true);
@@ -286,15 +309,35 @@ describe('GQL connector API', () => {
       assert.equal(edgeCreate.mutationStats, null);
       assert.equal(edgeCreate.schemaStats, null);
 
+      const compoundCreate = localDb.executeGql(compoundIndex);
+      assert.equal(compoundCreate.kind, 'index');
+      assert.deepEqual(compoundCreate.rows[0].fields, [
+        propertyIndexRowField('group'),
+        metadataIndexRowField('updatedAt'),
+      ]);
+      assert.equal(compoundCreate.rows[0].compound, true);
+      assert.equal(compoundCreate.rows[0].field_count, 2);
+
+      const compoundExplain = localDb.explainGql(compoundIndex);
+      assert.deepEqual(compoundExplain.index.targets[0], {
+        targetKind: 'node',
+        label: 'IndexPerson',
+        fields: [propertyIndexExplainField('group'), metadataIndexExplainField('updatedAt')],
+        kind: 'range',
+        action: 'ensure',
+        compound: true,
+      });
+
       const show = localDb.executeGql('SHOW PROPERTY INDEXES');
       assert.equal(show.kind, 'index');
       assert.equal(show.indexStats.operation, 'show_property_indexes');
-      assert.equal(show.indexStats.indexesReturned, 2);
+      assert.equal(show.indexStats.indexesReturned, 3);
       assert.deepEqual(
-        show.rows.map(row => [row.target_kind, row.label, row.prop_key, row.kind]),
+        show.rows.map(row => [row.target_kind, row.label, row.fields, row.kind, row.compound, row.field_count]),
         [
-          ['node', 'IndexPerson', 'status', 'equality'],
-          ['edge', 'INDEX_WORKS_AT', 'since', 'range'],
+          ['node', 'IndexPerson', [propertyIndexRowField('group'), metadataIndexRowField('updatedAt')], 'range', true, 2],
+          ['node', 'IndexPerson', [propertyIndexRowField('status')], 'equality', false, 1],
+          ['edge', 'INDEX_WORKS_AT', [propertyIndexRowField('since')], 'range', false, 1],
         ]
       );
       assert.ok(show.rows.every(row => ['building', 'ready', 'failed'].includes(row.state)));
@@ -306,9 +349,10 @@ describe('GQL connector API', () => {
         {
           targetKind: 'property_index_catalog',
           label: null,
-          propKey: null,
+          fields: [],
           kind: null,
           action: 'show',
+          compound: false,
         },
       ]);
       assert.equal(showExplain.index.usesCoreWriteQueue, false);
@@ -324,9 +368,10 @@ describe('GQL connector API', () => {
         {
           targetKind: 'edge',
           label: 'INDEX_WORKS_AT',
-          propKey: 'since',
+          fields: [propertyIndexExplainField('since')],
           kind: 'range',
           action: 'drop',
+          compound: false,
         },
       ]);
       assert.equal(dropExplain.index.usesCoreWriteQueue, true);
@@ -347,7 +392,7 @@ describe('GQL connector API', () => {
       const readOnlyShow = localDb.executeGql('SHOW PROPERTY INDEXES', null, {
         mode: 'readOnly',
       });
-      assert.equal(readOnlyShow.rows.length, 2);
+      assert.equal(readOnlyShow.rows.length, 3);
       assert.throws(
         () => localDb.executeGql('SHOW PROPERTY INDEXES', null, { cursor: 'locked' }),
         /GQL index statements do not accept cursors/
@@ -356,7 +401,7 @@ describe('GQL connector API', () => {
       const asyncShow = await localDb.executeGqlAsync('SHOW PROPERTY INDEXES');
       assert.equal(asyncShow.kind, 'index');
       assert.equal(asyncShow.indexStats.operation, 'show_property_indexes');
-      assert.equal(asyncShow.indexStats.indexesReturned, 2);
+      assert.equal(asyncShow.indexStats.indexesReturned, 3);
       const asyncExplain = await localDb.explainGqlAsync('SHOW PROPERTY INDEXES');
       assert.equal(asyncExplain.kind, 'index');
       assert.equal(asyncExplain.index.operation, 'show_property_indexes');
@@ -614,8 +659,8 @@ describe('GQL connector API', () => {
        WITH a, c
        MATCH p = shortestPath((a)-[:WORKS_AT*1..1]->(c))
        RETURN p,
-              node_ids(p) AS nodeIds,
-              edge_ids(p) AS edgeIds,
+              nodeIds(p) AS nodeIds,
+              edgeIds(p) AS edgeIds,
               length(p) AS hops,
               nodes(p) AS nodeHelper,
               relationships(p) AS relationshipHelper,
@@ -648,10 +693,10 @@ describe('GQL connector API', () => {
 
   it('executes keyed MERGE actions with mutation stats and result shape', () => {
     const created = db.executeGql(
-      `MERGE (n:NodeMergeParity {key: 'node'})
+      `MERGE (n:NodeMergeParity {elementKey: 'node'})
        ON CREATE SET n.status = 'created', n.count = 1
        ON MATCH SET n.status = 'matched', n.count = n.count + 1
-       RETURN n.key AS key, n.status AS status, n.count AS count`,
+       RETURN elementKey(n) AS key, n.status AS status, n.count AS count`,
       null,
       { includePlan: true, profile: true }
     );
@@ -663,10 +708,10 @@ describe('GQL connector API', () => {
     assert.equal(created.plan.mutation.usesWriteTxn, true);
 
     const matched = db.executeGql(
-      `MERGE (n:NodeMergeParity {key: 'node'})
+      `MERGE (n:NodeMergeParity {elementKey: 'node'})
        ON CREATE SET n.status = 'created-again', n.count = 1
        ON MATCH SET n.status = 'matched', n.count = n.count + 1
-       RETURN n.key AS key, n.status AS status, n.count AS count`
+       RETURN elementKey(n) AS key, n.status AS status, n.count AS count`
     );
     assert.equal(matched.kind, 'mutation');
     assert.deepEqual(matched.rows, [{ key: 'node', status: 'matched', count: 2 }]);
@@ -759,8 +804,8 @@ describe('GQL connector API', () => {
 
   it('executes sync CREATE RETURN with mutation stats, bytes, and embedded plan', () => {
     const result = db.executeGql(
-      `CREATE (n:NodeCreateReturn {key: 'created-one', name: $name, payload: $payload})
-       RETURN n.key AS key, n.name AS name, n.payload AS payload, n`,
+      `CREATE (n:NodeCreateReturn {elementKey: 'created-one', name: $name, payload: $payload})
+       RETURN elementKey(n) AS key, n.name AS name, n.payload AS payload, n`,
       { name: 'Created', payload: Buffer.from([9, 8, 7]) },
       { includePlan: true }
     );
@@ -797,7 +842,7 @@ describe('GQL connector API', () => {
       `MATCH (n:NodeSetRemoveReturn)
        SET n.status = $status
        REMOVE n.group
-       RETURN n.key AS key, n.status AS status, n.group AS group
+       RETURN elementKey(n) AS key, n.status AS status, n.group AS group
        ORDER BY n.rank SKIP 1 LIMIT 1`,
       { status: 'new' }
     );
@@ -831,7 +876,7 @@ describe('GQL connector API', () => {
 
     const detachDelete = db.executeGql(
       `MATCH (n:NodeDetachDelete)
-       WHERE n.key = 'hub'
+       WHERE elementKey(n) = 'hub'
        DETACH DELETE n`
     );
     assert.equal(detachDelete.kind, 'mutation');
@@ -843,7 +888,7 @@ describe('GQL connector API', () => {
 
   it('runs async mutation execution once and returns the final shape', async () => {
     const result = await db.executeGqlAsync(
-      `CREATE (n:NodeAsyncMutation {key: 'once', name: 'Async'})
+      `CREATE (n:NodeAsyncMutation {elementKey: 'once', name: 'Async'})
        RETURN n.name AS name`
     );
 
@@ -852,7 +897,7 @@ describe('GQL connector API', () => {
     assert.equal(result.mutationStats.nodesCreated, 1);
 
     const readBack = db.executeGql(
-      "MATCH (n:NodeAsyncMutation) WHERE n.key = 'once' RETURN n.name AS name"
+      "MATCH (n:NodeAsyncMutation) WHERE elementKey(n) = 'once' RETURN n.name AS name"
     );
     assert.deepEqual(readBack.rows, [{ name: 'Async' }]);
 
@@ -861,7 +906,7 @@ describe('GQL connector API', () => {
     });
     const update = await db.executeGqlAsync(
       `MATCH (n:NodeAsyncUpdate)
-       WHERE n.key = 'target'
+       WHERE elementKey(n) = 'target'
        SET n.status = 'new'
        REMOVE n.drop
        RETURN n.status AS status, n.drop AS dropped`
@@ -877,7 +922,7 @@ describe('GQL connector API', () => {
     db.upsertEdge(hub, leaf, 'ASYNC_DETACH');
     const detached = await db.executeGqlAsync(
       `MATCH (n:NodeAsyncDetach)
-       WHERE n.key = 'hub'
+       WHERE elementKey(n) = 'hub'
        DETACH DELETE n`
     );
     assert.equal(detached.kind, 'mutation');
@@ -886,7 +931,7 @@ describe('GQL connector API', () => {
     assert.equal(detached.mutationStats.edgesDeleted, 1);
 
     await assert.rejects(
-      db.executeGqlAsync("CREATE (n:NodeAsyncReadOnly {key: 'blocked'})", null, { mode: 'readOnly' }),
+      db.executeGqlAsync("CREATE (n:NodeAsyncReadOnly {elementKey: 'blocked'})", null, { mode: 'readOnly' }),
       /read.?only|ReadOnly/i
     );
   });
@@ -901,7 +946,7 @@ describe('GQL connector API', () => {
     assert.deepEqual(read.rows, [{ name: 'Ben' }]);
 
     assert.throws(
-      () => db.executeGql("CREATE (n:NodeReadOnly {key: 'blocked'})", null, { mode: 'readOnly' }),
+      () => db.executeGql("CREATE (n:NodeReadOnly {elementKey: 'blocked'})", null, { mode: 'readOnly' }),
       /read.?only|ReadOnly/i
     );
     assert.throws(
@@ -912,11 +957,11 @@ describe('GQL connector API', () => {
 
   it('forwards mutation, order, and path caps through Node options', () => {
     assert.throws(
-      () => db.executeGql("CREATE (n:NodeCapMutationRows {key: 'row-cap'})", null, { maxMutationRows: 0 }),
+      () => db.executeGql("CREATE (n:NodeCapMutationRows {elementKey: 'row-cap'})", null, { maxMutationRows: 0 }),
       /maxMutationRows|max_mutation_rows/i
     );
     assert.throws(
-      () => db.executeGql("CREATE (n:NodeCapMutationOps {key: 'op-cap'})", null, { maxMutationOps: 0 }),
+      () => db.executeGql("CREATE (n:NodeCapMutationOps {elementKey: 'op-cap'})", null, { maxMutationOps: 0 }),
       /maxMutationOps|max_mutation_ops/i
     );
     assert.throws(
@@ -941,8 +986,8 @@ describe('GQL connector API', () => {
 
   it('returns compact rows and vectors for mutation RETURN when requested', () => {
     const compact = db.executeGql(
-      `CREATE (n:NodeCompactMutation {key: 'compact', name: 'Compact'})
-       RETURN n.key AS key, n.name AS name`,
+      `CREATE (n:NodeCompactMutation {elementKey: 'compact', name: 'Compact'})
+       RETURN elementKey(n) AS key, n.name AS name`,
       null,
       { compactRows: true }
     );
@@ -982,7 +1027,7 @@ describe('GQL connector API', () => {
     assert.deepEqual(unchanged.rows, [{ planned: null }]);
 
     const asyncExplain = await db.explainGqlAsync(
-      "CREATE (n:NodeAsyncExplain {key: 'planned'}) RETURN n.key AS key"
+      "CREATE (n:NodeAsyncExplain {elementKey: 'planned'}) RETURN elementKey(n) AS key"
     );
     assert.equal(asyncExplain.kind, 'mutation');
     assert.equal(asyncExplain.read, null);
@@ -992,7 +1037,7 @@ describe('GQL connector API', () => {
   it('surfaces volatile mutation RETURN ORDER BY rejection through Node', () => {
     assert.throws(
       () => db.executeGql(
-        "CREATE (n:NodeVolatileOrder {key: 'bad-order'}) RETURN n.key ORDER BY n.id"
+        "CREATE (n:NodeVolatileOrder {elementKey: 'bad-order'}) RETURN elementKey(n) ORDER BY id(n)"
       ),
       /ORDER BY|commit|metadata|before commit|volatile/i
     );

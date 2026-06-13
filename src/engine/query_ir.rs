@@ -5,6 +5,8 @@ enum NodeQueryCandidateSourceKind {
     NodeLabelIndex,
     PropertyEqualityIndex,
     PropertyRangeIndex,
+    CompoundEqualityIndex,
+    CompoundRangeIndex,
     TimestampIndex,
     FallbackNodeLabelScan,
     FallbackFullNodeScan,
@@ -14,6 +16,16 @@ enum NodeQueryCandidateSourceKind {
 enum NormalizedNodeFilter {
     AlwaysTrue,
     AlwaysFalse,
+    IdRange {
+        lower: Option<u64>,
+        upper: Option<u64>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    },
+    KeyEquals(String),
+    KeyIn {
+        values: Vec<String>,
+    },
     PropertyEquals {
         key: String,
         value: PropValue,
@@ -38,6 +50,18 @@ enum NormalizedNodeFilter {
         lower_ms: i64,
         upper_ms: i64,
     },
+    WeightRange {
+        lower: Option<f32>,
+        upper: Option<f32>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    },
+    CreatedAtRange {
+        lower: Option<i64>,
+        upper: Option<i64>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    },
     And(Vec<NormalizedNodeFilter>),
     Or(Vec<NormalizedNodeFilter>),
     Not(Box<NormalizedNodeFilter>),
@@ -59,6 +83,12 @@ struct NormalizedNodeQuery {
 enum NormalizedEdgeFilter {
     AlwaysTrue,
     AlwaysFalse,
+    IdRange {
+        lower: Option<u64>,
+        upper: Option<u64>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    },
     PropertyEquals {
         key: String,
         value: PropValue,
@@ -86,6 +116,12 @@ enum NormalizedEdgeFilter {
     UpdatedAtRange {
         lower_ms: i64,
         upper_ms: i64,
+    },
+    CreatedAtRange {
+        lower: Option<i64>,
+        upper: Option<i64>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
     },
     ValidAt {
         epoch_ms: i64,
@@ -2326,6 +2362,30 @@ impl NormalizedNodeFilter {
         match self {
             Self::AlwaysTrue => key.push(0),
             Self::AlwaysFalse => key.push(1),
+            Self::IdRange {
+                lower,
+                upper,
+                lower_inclusive,
+                upper_inclusive,
+            } => {
+                key.push(11);
+                key.push(lower.is_some() as u8);
+                key.extend_from_slice(&lower.unwrap_or(0).to_be_bytes());
+                key.push(upper.is_some() as u8);
+                key.extend_from_slice(&upper.unwrap_or(0).to_be_bytes());
+                key.push(*lower_inclusive as u8);
+                key.push(*upper_inclusive as u8);
+            }
+            Self::KeyEquals(value) => {
+                key.push(12);
+                push_len_prefixed_bytes(&mut key, value.as_bytes());
+            }
+            Self::KeyIn { values } => {
+                key.push(13);
+                for value in values {
+                    push_len_prefixed_bytes(&mut key, value.as_bytes());
+                }
+            }
             Self::PropertyEquals { key: prop_key, value } => {
                 key.push(2);
                 push_len_prefixed_bytes(&mut key, prop_key.as_bytes());
@@ -2365,6 +2425,34 @@ impl NormalizedNodeFilter {
                 key.extend_from_slice(&lower_ms.to_be_bytes());
                 key.extend_from_slice(&upper_ms.to_be_bytes());
             }
+            Self::WeightRange {
+                lower,
+                upper,
+                lower_inclusive,
+                upper_inclusive,
+            } => {
+                key.push(14);
+                key.push(lower.is_some() as u8);
+                key.extend_from_slice(&lower.map(f32::to_bits).unwrap_or(0).to_be_bytes());
+                key.push(upper.is_some() as u8);
+                key.extend_from_slice(&upper.map(f32::to_bits).unwrap_or(0).to_be_bytes());
+                key.push(*lower_inclusive as u8);
+                key.push(*upper_inclusive as u8);
+            }
+            Self::CreatedAtRange {
+                lower,
+                upper,
+                lower_inclusive,
+                upper_inclusive,
+            } => {
+                key.push(15);
+                key.push(lower.is_some() as u8);
+                key.extend_from_slice(&lower.unwrap_or(0).to_be_bytes());
+                key.push(upper.is_some() as u8);
+                key.extend_from_slice(&upper.unwrap_or(0).to_be_bytes());
+                key.push(*lower_inclusive as u8);
+                key.push(*upper_inclusive as u8);
+            }
             Self::And(children) => {
                 key.push(8);
                 for child in children {
@@ -2397,8 +2485,10 @@ impl NormalizedEdgeFilter {
 
     fn has_metadata_anchor(&self) -> bool {
         match self {
-            Self::WeightRange { .. }
+            Self::IdRange { .. }
+            | Self::WeightRange { .. }
             | Self::UpdatedAtRange { .. }
+            | Self::CreatedAtRange { .. }
             | Self::ValidAt { .. }
             | Self::ValidFromRange { .. }
             | Self::ValidToRange { .. } => true,
@@ -2422,6 +2512,20 @@ impl NormalizedEdgeFilter {
         match self {
             Self::AlwaysTrue => key.push(0),
             Self::AlwaysFalse => key.push(1),
+            Self::IdRange {
+                lower,
+                upper,
+                lower_inclusive,
+                upper_inclusive,
+            } => {
+                key.push(15);
+                key.push(lower.is_some() as u8);
+                key.extend_from_slice(&lower.unwrap_or(0).to_be_bytes());
+                key.push(upper.is_some() as u8);
+                key.extend_from_slice(&upper.unwrap_or(0).to_be_bytes());
+                key.push(*lower_inclusive as u8);
+                key.push(*upper_inclusive as u8);
+            }
             Self::PropertyEquals { key: prop_key, value } => {
                 key.push(2);
                 push_len_prefixed_bytes(&mut key, prop_key.as_bytes());
@@ -2467,6 +2571,20 @@ impl NormalizedEdgeFilter {
                 key.push(8);
                 key.extend_from_slice(&lower_ms.to_be_bytes());
                 key.extend_from_slice(&upper_ms.to_be_bytes());
+            }
+            Self::CreatedAtRange {
+                lower,
+                upper,
+                lower_inclusive,
+                upper_inclusive,
+            } => {
+                key.push(16);
+                key.push(lower.is_some() as u8);
+                key.extend_from_slice(&lower.unwrap_or(0).to_be_bytes());
+                key.push(upper.is_some() as u8);
+                key.extend_from_slice(&upper.unwrap_or(0).to_be_bytes());
+                key.push(*lower_inclusive as u8);
+                key.push(*upper_inclusive as u8);
             }
             Self::ValidAt { epoch_ms } => {
                 key.push(9);
@@ -2652,8 +2770,130 @@ fn normalize_or_filter(children: &[NodeFilterExpr]) -> Result<NormalizedNodeFilt
     })
 }
 
+type FlexibleU64Range = Option<(Option<u64>, Option<u64>, bool, bool)>;
+type FlexibleI64Range = Option<(Option<i64>, Option<i64>, bool, bool)>;
+
+fn normalize_u64_flexible_range(
+    lower: Option<u64>,
+    upper: Option<u64>,
+    lower_inclusive: bool,
+    upper_inclusive: bool,
+    context: &str,
+) -> Result<FlexibleU64Range, EngineError> {
+    if lower.is_none() && upper.is_none() {
+        return Err(EngineError::InvalidOperation(format!(
+            "{context} range filters require at least one bound"
+        )));
+    }
+    if let (Some(lower), Some(upper)) = (lower, upper) {
+        if lower > upper || (lower == upper && (!lower_inclusive || !upper_inclusive)) {
+            return Ok(None);
+        }
+    }
+    Ok(Some((lower, upper, lower_inclusive, upper_inclusive)))
+}
+
+fn normalize_i64_flexible_range(
+    lower: Option<i64>,
+    upper: Option<i64>,
+    lower_inclusive: bool,
+    upper_inclusive: bool,
+    context: &str,
+) -> Result<FlexibleI64Range, EngineError> {
+    if lower.is_none() && upper.is_none() {
+        return Err(EngineError::InvalidOperation(format!(
+            "{context} range filters require at least one bound"
+        )));
+    }
+    if let (Some(lower), Some(upper)) = (lower, upper) {
+        if lower > upper || (lower == upper && (!lower_inclusive || !upper_inclusive)) {
+            return Ok(None);
+        }
+    }
+    Ok(Some((lower, upper, lower_inclusive, upper_inclusive)))
+}
+
+fn normalize_node_weight_range(
+    lower: Option<f32>,
+    upper: Option<f32>,
+    lower_inclusive: bool,
+    upper_inclusive: bool,
+) -> Result<NormalizedNodeFilter, EngineError> {
+    if lower.is_none() && upper.is_none() {
+        return Err(EngineError::InvalidOperation(
+            "node weight range filters require at least one bound".into(),
+        ));
+    }
+    if lower.is_some_and(f32::is_nan) || upper.is_some_and(f32::is_nan) {
+        return Err(EngineError::InvalidOperation(
+            "node weight range bounds must not be NaN".into(),
+        ));
+    }
+    if let (Some(lower), Some(upper)) = (lower, upper) {
+        if lower > upper || (lower == upper && (!lower_inclusive || !upper_inclusive)) {
+            return Ok(NormalizedNodeFilter::AlwaysFalse);
+        }
+    }
+    Ok(NormalizedNodeFilter::WeightRange {
+        lower,
+        upper,
+        lower_inclusive,
+        upper_inclusive,
+    })
+}
+
 fn normalize_node_filter_expr(expr: &NodeFilterExpr) -> Result<NormalizedNodeFilter, EngineError> {
     match expr {
+        NodeFilterExpr::IdRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => {
+            let Some((lower, upper, lower_inclusive, upper_inclusive)) = normalize_u64_flexible_range(
+                *lower,
+                *upper,
+                *lower_inclusive,
+                *upper_inclusive,
+                "node id",
+            )?
+            else {
+                return Ok(NormalizedNodeFilter::AlwaysFalse);
+            };
+            Ok(NormalizedNodeFilter::IdRange {
+                lower,
+                upper,
+                lower_inclusive,
+                upper_inclusive,
+            })
+        }
+        NodeFilterExpr::KeyEquals(value) => {
+            if value.is_empty() {
+                return Err(EngineError::InvalidOperation(
+                    "node key equals filters require a non-empty key".into(),
+                ));
+            }
+            Ok(NormalizedNodeFilter::KeyEquals(value.clone()))
+        }
+        NodeFilterExpr::KeyIn(values) => {
+            if values.is_empty() {
+                return Err(EngineError::InvalidOperation(
+                    "node key in filters must contain at least one value".into(),
+                ));
+            }
+            if values.iter().any(String::is_empty) {
+                return Err(EngineError::InvalidOperation(
+                    "node key in filters require non-empty keys".into(),
+                ));
+            }
+            let mut values = values.clone();
+            values.sort();
+            values.dedup();
+            if values.len() == 1 {
+                return Ok(NormalizedNodeFilter::KeyEquals(values.pop().unwrap()));
+            }
+            Ok(NormalizedNodeFilter::KeyIn { values })
+        }
         NodeFilterExpr::PropertyEquals { key, value } => {
             require_non_empty_filter_key(key, "property equals filter")?;
             Ok(NormalizedNodeFilter::PropertyEquals {
@@ -2720,6 +2960,40 @@ fn normalize_node_filter_expr(expr: &NodeFilterExpr) -> Result<NormalizedNodeFil
                 return Ok(NormalizedNodeFilter::AlwaysFalse);
             }
             Ok(NormalizedNodeFilter::UpdatedAtRange { lower_ms, upper_ms })
+        }
+        NodeFilterExpr::WeightRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => normalize_node_weight_range(
+            *lower,
+            *upper,
+            *lower_inclusive,
+            *upper_inclusive,
+        ),
+        NodeFilterExpr::CreatedAtRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => {
+            let Some((lower, upper, lower_inclusive, upper_inclusive)) = normalize_i64_flexible_range(
+                *lower,
+                *upper,
+                *lower_inclusive,
+                *upper_inclusive,
+                "node created-at",
+            )?
+            else {
+                return Ok(NormalizedNodeFilter::AlwaysFalse);
+            };
+            Ok(NormalizedNodeFilter::CreatedAtRange {
+                lower,
+                upper,
+                lower_inclusive,
+                upper_inclusive,
+            })
         }
         NodeFilterExpr::And(children) => normalize_and_filter(children),
         NodeFilterExpr::Or(children) => normalize_or_filter(children),
@@ -2902,6 +3176,29 @@ fn normalize_weight_range(
 
 fn normalize_edge_filter_expr(expr: &EdgeFilterExpr) -> Result<NormalizedEdgeFilter, EngineError> {
     match expr {
+        EdgeFilterExpr::IdRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => {
+            let Some((lower, upper, lower_inclusive, upper_inclusive)) = normalize_u64_flexible_range(
+                *lower,
+                *upper,
+                *lower_inclusive,
+                *upper_inclusive,
+                "edge id",
+            )?
+            else {
+                return Ok(NormalizedEdgeFilter::AlwaysFalse);
+            };
+            Ok(NormalizedEdgeFilter::IdRange {
+                lower,
+                upper,
+                lower_inclusive,
+                upper_inclusive,
+            })
+        }
         EdgeFilterExpr::PropertyEquals { key, value } => {
             require_non_empty_filter_key(key, "edge property equals filter")?;
             Ok(NormalizedEdgeFilter::PropertyEquals {
@@ -2962,6 +3259,29 @@ fn normalize_edge_filter_expr(expr: &EdgeFilterExpr) -> Result<NormalizedEdgeFil
                 return Ok(NormalizedEdgeFilter::AlwaysFalse);
             };
             Ok(NormalizedEdgeFilter::UpdatedAtRange { lower_ms, upper_ms })
+        }
+        EdgeFilterExpr::CreatedAtRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => {
+            let Some((lower, upper, lower_inclusive, upper_inclusive)) = normalize_i64_flexible_range(
+                *lower,
+                *upper,
+                *lower_inclusive,
+                *upper_inclusive,
+                "edge created-at",
+            )?
+            else {
+                return Ok(NormalizedEdgeFilter::AlwaysFalse);
+            };
+            Ok(NormalizedEdgeFilter::CreatedAtRange {
+                lower,
+                upper,
+                lower_inclusive,
+                upper_inclusive,
+            })
         }
         EdgeFilterExpr::ValidAt { epoch_ms } => {
             Ok(NormalizedEdgeFilter::ValidAt { epoch_ms: *epoch_ms })

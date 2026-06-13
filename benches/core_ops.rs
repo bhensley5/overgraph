@@ -6,9 +6,9 @@ use overgraph::{
     NodeKeyQuery, NodeLabelFilter, NodeSchema, NumericFieldSchema, PageRequest, PprAlgorithm,
     PprOptions, PropValue, PropertyRangeBound, PropertySchema, PrunePolicy,
     SchemaAdditionalProperties, SchemaCheckOptions, SchemaNumericBound, SchemaSetOptions,
-    SchemaValueType, SecondaryIndexKind, SecondaryIndexState, ShortestPathOptions, TopKOptions,
-    TraverseOptions, TxnIntent, TxnLocalRef, TxnNodeRef, UpsertEdgeOptions, UpsertNodeOptions,
-    WalSyncMode,
+    SchemaValueType, SecondaryIndexField, SecondaryIndexSpec, SecondaryIndexState,
+    ShortestPathOptions, TopKOptions, TraverseOptions, TxnIntent, TxnLocalRef, TxnNodeRef,
+    UpsertEdgeOptions, UpsertNodeOptions, WalSyncMode,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -455,7 +455,10 @@ fn bench_find_nodes(c: &mut Criterion) {
         let (_dir, mut engine) = temp_db();
         let label = bench_node_label(1);
         let eq = engine
-            .ensure_node_property_index(&label, "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index(
+                &label,
+                SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("color")]),
+            )
             .unwrap();
         wait_for_property_index_state(&engine, eq.index_id, SecondaryIndexState::Ready);
         build_find_graph(&mut engine);
@@ -480,7 +483,10 @@ fn bench_find_nodes(c: &mut Criterion) {
         let (_dir, mut engine) = temp_db();
         let label = bench_node_label(1);
         let eq = engine
-            .ensure_node_property_index(&label, "color", SecondaryIndexKind::Equality)
+            .ensure_node_property_index(
+                &label,
+                SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("color")]),
+            )
             .unwrap();
         wait_for_property_index_state(&engine, eq.index_id, SecondaryIndexState::Ready);
         build_find_graph(&mut engine);
@@ -1078,7 +1084,7 @@ fn temp_active_edge_schema_db(
         .map(|i| {
             engine
                 .upsert_node(
-                    &bench_node_label(11),
+                    bench_node_label(11),
                     &format!("active_edge_from_{i}"),
                     UpsertNodeOptions::default(),
                 )
@@ -1089,7 +1095,7 @@ fn temp_active_edge_schema_db(
         .map(|i| {
             engine
                 .upsert_node(
-                    &bench_node_label(12),
+                    bench_node_label(12),
                     &format!("active_edge_to_{i}"),
                     UpsertNodeOptions::default(),
                 )
@@ -1229,7 +1235,7 @@ fn bench_schema_active_validation(c: &mut Criterion) {
             black_box(
                 engine
                     .upsert_node(
-                        &bench_node_label(10),
+                        bench_node_label(10),
                         &format!("active_schema_node_{i}"),
                         UpsertNodeOptions {
                             props: schema_bench_node_props(i),
@@ -1376,8 +1382,9 @@ fn ensure_property_query_declarations(engine: &mut DatabaseEngine) {
     let eq = engine
         .ensure_node_property_index(
             &label,
-            PROPERTY_EQ_DECLARED_KEY,
-            SecondaryIndexKind::Equality,
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property(
+                PROPERTY_EQ_DECLARED_KEY,
+            )]),
         )
         .unwrap();
     wait_for_property_index_state(engine, eq.index_id, SecondaryIndexState::Ready);
@@ -1385,8 +1392,9 @@ fn ensure_property_query_declarations(engine: &mut DatabaseEngine) {
     let range = engine
         .ensure_node_property_index(
             &label,
-            PROPERTY_RANGE_DECLARED_KEY,
-            SecondaryIndexKind::Range,
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property(
+                PROPERTY_RANGE_DECLARED_KEY,
+            )]),
         )
         .unwrap();
     wait_for_property_index_state(engine, range.index_id, SecondaryIndexState::Ready);

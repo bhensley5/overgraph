@@ -13,6 +13,7 @@ use crate::error::EngineError;
 use crate::memtable::Memtable;
 use crate::property_value_semantics::NumericRangeSortKey;
 use crate::row_projection::{EdgeSelectedFieldNeeds, NodeSelectedFieldNeeds, PropertySelection};
+use crate::secondary_index_key::{CompoundPrefixBounds, CompoundRangeBounds};
 use crate::segment_reader::{SegmentAdjPostingCursor, SegmentReader};
 use crate::types::*;
 use std::cmp::Reverse;
@@ -32,6 +33,12 @@ pub struct SourceList<'a> {
 }
 
 pub(crate) enum LimitedEdgeIndexRead {
+    Ready(Vec<u64>),
+    TooBroad,
+    MissingSidecar,
+}
+
+pub(crate) enum LimitedCompoundIndexRead {
     Ready(Vec<u64>),
     TooBroad,
     MissingSidecar,
@@ -1875,13 +1882,16 @@ impl<'a> SourceList<'a> {
                     result,
                 )));
             }
+            // A memtable read that consumed the whole remaining budget may
+            // have been silently truncated; later loops cannot recover the
+            // postings this read dropped, so report TooBroad now.
+            if raw_remaining == 0 {
+                return Ok(LimitedEdgeIndexRead::TooBroad);
+            }
         }
 
         for (index, epoch) in self.immutable.iter().enumerate() {
             for &value_hash in value_hashes {
-                if raw_remaining == 0 {
-                    return Ok(LimitedEdgeIndexRead::TooBroad);
-                }
                 let ids = epoch.memtable.find_secondary_eq_edges_by_hash_at_limited(
                     index_id,
                     value_hash,
@@ -1896,6 +1906,9 @@ impl<'a> SourceList<'a> {
                     return Ok(LimitedEdgeIndexRead::Ready(Self::finalize_edge_matches(
                         result,
                     )));
+                }
+                if raw_remaining == 0 {
+                    return Ok(LimitedEdgeIndexRead::TooBroad);
                 }
             }
         }
@@ -2017,6 +2030,190 @@ impl<'a> SourceList<'a> {
         Ok(Some(Self::finalize_edge_matches(result)))
     }
 
+    pub(crate) fn node_ids_by_compound_prefix_limited(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+        bounds: &CompoundPrefixBounds,
+        limit: usize,
+    ) -> Result<LimitedCompoundIndexRead, EngineError> {
+        self.compound_ids_limited(
+            entry,
+            limit,
+            |memtable| {
+                memtable.find_node_compound_prefix_at(entry.index_id, bounds, self.snapshot_seq)
+            },
+            |segment, remaining| {
+                segment.compound_prefix_candidates_if_present_limited(entry, bounds, remaining)
+            },
+            false,
+        )
+    }
+
+    pub(crate) fn node_ids_by_compound_range_limited(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+        bounds: &CompoundRangeBounds,
+        limit: usize,
+    ) -> Result<LimitedCompoundIndexRead, EngineError> {
+        self.compound_ids_limited(
+            entry,
+            limit,
+            |memtable| {
+                memtable.find_node_compound_range_at(entry.index_id, bounds, self.snapshot_seq)
+            },
+            |segment, remaining| {
+                segment.compound_range_candidates_if_present_limited(entry, bounds, remaining)
+            },
+            false,
+        )
+    }
+
+    pub(crate) fn edge_ids_by_compound_prefix_limited(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+        bounds: &CompoundPrefixBounds,
+        limit: usize,
+    ) -> Result<LimitedCompoundIndexRead, EngineError> {
+        self.compound_ids_limited(
+            entry,
+            limit,
+            |memtable| {
+                memtable.find_edge_compound_prefix_at(entry.index_id, bounds, self.snapshot_seq)
+            },
+            |segment, remaining| {
+                segment.compound_prefix_candidates_if_present_limited(entry, bounds, remaining)
+            },
+            true,
+        )
+    }
+
+    pub(crate) fn edge_ids_by_compound_range_limited(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+        bounds: &CompoundRangeBounds,
+        limit: usize,
+    ) -> Result<LimitedCompoundIndexRead, EngineError> {
+        self.compound_ids_limited(
+            entry,
+            limit,
+            |memtable| {
+                memtable.find_edge_compound_range_at(entry.index_id, bounds, self.snapshot_seq)
+            },
+            |segment, remaining| {
+                segment.compound_range_candidates_if_present_limited(entry, bounds, remaining)
+            },
+            true,
+        )
+    }
+
+    fn compound_ids_limited<M, S>(
+        &self,
+        _entry: &SecondaryIndexManifestEntry,
+        limit: usize,
+        mut memtable_lookup: M,
+        mut segment_lookup: S,
+        edge: bool,
+    ) -> Result<LimitedCompoundIndexRead, EngineError>
+    where
+        M: FnMut(&Memtable) -> Vec<u64>,
+        S: FnMut(&SegmentReader, usize) -> Result<Option<Vec<u64>>, EngineError>,
+    {
+        // Tombstones are suppressed with per-candidate newer-source probes so
+        // they do not consume candidate-cap budget or force materializing the
+        // full delete set of every source. Stale live postings from older
+        // sources are intentionally kept: final verification hydrates the
+        // latest visible record and re-checks the full filter, matching the
+        // single-property candidate paths.
+        let is_deleted_above_immutable = |id: u64, imm_idx: usize| {
+            if edge {
+                self.active.is_edge_deleted_at(id, self.snapshot_seq)
+                    || self.immutable[..imm_idx]
+                        .iter()
+                        .any(|epoch| epoch.memtable.is_edge_deleted_at(id, self.snapshot_seq))
+            } else {
+                self.active.is_node_deleted_at(id, self.snapshot_seq)
+                    || self.immutable[..imm_idx]
+                        .iter()
+                        .any(|epoch| epoch.memtable.is_node_deleted_at(id, self.snapshot_seq))
+            }
+        };
+        let is_deleted_above_segment = |id: u64, seg_idx: usize| {
+            is_deleted_above_immutable(id, self.immutable.len())
+                || self.segments[..seg_idx].iter().any(|segment| {
+                    if edge {
+                        segment.is_edge_deleted(id)
+                    } else {
+                        segment.is_node_deleted(id)
+                    }
+                })
+        };
+
+        let mut seen = NodeIdSet::default();
+        let mut result = Vec::new();
+
+        fn push_unseen(
+            result: &mut Vec<u64>,
+            seen: &mut NodeIdSet,
+            ids: impl IntoIterator<Item = u64>,
+            limit: usize,
+        ) -> bool {
+            for id in ids {
+                if seen.insert(id) {
+                    result.push(id);
+                }
+            }
+            result.len() >= limit
+        }
+
+        fn finalize(mut ids: Vec<u64>) -> Vec<u64> {
+            ids.sort_unstable();
+            ids
+        }
+
+        if push_unseen(&mut result, &mut seen, memtable_lookup(self.active), limit) {
+            return Ok(LimitedCompoundIndexRead::Ready(finalize(result)));
+        }
+        for (imm_idx, epoch) in self.immutable.iter().enumerate() {
+            let ids = memtable_lookup(&epoch.memtable);
+            if push_unseen(
+                &mut result,
+                &mut seen,
+                ids.into_iter()
+                    .filter(|&id| !is_deleted_above_immutable(id, imm_idx)),
+                limit,
+            ) {
+                return Ok(LimitedCompoundIndexRead::Ready(finalize(result)));
+            }
+        }
+        for (seg_idx, segment) in self.segments.iter().enumerate() {
+            // Request one posting beyond what is still needed so an exactly
+            // exhausted scan is distinguishable from a truncated one.
+            let requested = limit.saturating_sub(result.len()).saturating_add(1);
+            let Some(ids) = segment_lookup(segment, requested)? else {
+                return Ok(LimitedCompoundIndexRead::MissingSidecar);
+            };
+            let truncated = ids.len() >= requested;
+            if push_unseen(
+                &mut result,
+                &mut seen,
+                ids.into_iter()
+                    .filter(|&id| !is_deleted_above_segment(id, seg_idx)),
+                limit,
+            ) {
+                return Ok(LimitedCompoundIndexRead::Ready(finalize(result)));
+            }
+            if truncated {
+                // The scan stopped at the requested cap, but tombstone
+                // suppression or cross-source dedup dropped some of its
+                // postings and the rest of this segment was never visited, so
+                // the result cannot claim completeness.
+                return Ok(LimitedCompoundIndexRead::TooBroad);
+            }
+        }
+        Ok(LimitedCompoundIndexRead::Ready(finalize(result)))
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn find_edge_properties(
         &self,
         ids: &[u64],

@@ -43,7 +43,7 @@ Graph structure and vector similarity can live in the same engine, so you can as
 - **Explicit write transactions.** Stage ordered node and edge mutations locally, read your own staged writes, then commit atomically with optimistic conflict detection through the Node.js API.
 - **Native Node.js, one engine.** Rust core with napi-rs bindings. Not a wrapper around a REST API. Actual FFI into the same Rust engine with minimal overhead.
 - **Full queries as functions.** Use regular APIs for direct lookups, full boolean node/edge queries, and `queryGraphRows` for row-shaped graph patterns, optional matches, and bounded paths.
-- **GQL Beta.** Use `executeGql` / `executeGqlAsync` for GQL/Cypher-style graph reads, writes, graph-schema DDL, and property-index DDL. Use `MATCH`, `WITH`, `DISTINCT`, aggregation, `UNION`, read-only subqueries, constrained shortest paths, `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE r`, `DETACH DELETE n`, mutation returns, `ALTER` / `CHECK` / `SHOW CURRENT GRAPH TYPE`, and `CREATE` / `DROP` / `SHOW PROPERTY INDEXES`.
+- **GQL.** Use `executeGql` / `executeGqlAsync` for GQL/Cypher-style graph reads, writes, graph-schema DDL, and property-index DDL. Use `MATCH`, `WITH`, `DISTINCT`, aggregation, `UNION`, read-only subqueries, constrained shortest paths, `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE r`, `DETACH DELETE n`, mutation returns, `ALTER` / `CHECK` / `SHOW CURRENT GRAPH TYPE`, and `CREATE` / `DROP` / `SHOW PROPERTY INDEXES`.
 
 ## Performance
 
@@ -105,15 +105,15 @@ hits.forEach(h => console.log(`node ${h.nodeId} score ${h.score.toFixed(4)}`));
 db.close();
 ```
 
-## GQL Beta
+## GQL
 
-The Node.js connector includes **GQL Beta**: a GQL/Cypher-style query language for graph reads, writes, graph-schema DDL, and property-index DDL. Use it when a graph operation is easier to read as text: create records, match patterns, shape rows with `WITH`, aggregate, combine branches with `UNION`, run read-only subqueries, use constrained shortest paths, return mutation results, manage the current graph type with `ALTER`, `CHECK`, `DROP`, and `SHOW`, or manage property-index declarations with `CREATE`, `DROP`, and `SHOW PROPERTY INDEXES`.
+The Node.js connector includes **GQL**: a GQL/Cypher-style query language for graph reads, writes, graph-schema DDL, and property-index DDL. Use it when a graph operation is easier to read as text: create records, match patterns, shape rows with `WITH`, aggregate, combine branches with `UNION`, run read-only subqueries, use constrained shortest paths, return mutation results, manage the current graph type with `ALTER`, `CHECK`, `DROP`, and `SHOW`, or manage property-index declarations with `CREATE`, `DROP`, and `SHOW PROPERTY INDEXES`.
 
 ```javascript
 const created = db.executeGql(
-  `CREATE (p:Person {key: 'gql-ada', name: 'Ada', status: 'active'})
+  `CREATE (p:Person {elementKey: 'gql-ada', name: 'Ada', status: 'active'})
           -[r:WORKS_AT {role: 'engineer', since: 2026}]->
-          (c:Company {key: 'gql-overgraph', name: 'OverGraph'})
+          (c:Company {elementKey: 'gql-overgraph', name: 'OverGraph'})
    RETURN p.name AS person, c.name AS company, r.role AS role`
 );
 
@@ -139,7 +139,7 @@ const asyncResult = await db.executeGqlAsync(
 );
 ```
 
-GQL Beta is available across Rust, Node.js, and Python. It supports params, read cursors, compact rows, vector opt-in for returned node values, explain/profile, read-only execution, mutation stats, schema stats, index stats, async connector calls, and consistent result shapes across languages. See the full [GQL Beta API reference](../docs/api-reference.md#gql-beta) for syntax, result shapes, options, and examples.
+GQL is available across Rust, Node.js, and Python. It supports params, read cursors, compact rows, vector opt-in for returned node values, explain/profile, read-only execution, mutation stats, schema stats, index stats, async connector calls, and consistent result shapes across languages. See the full [GQL API reference](../docs/api-reference.md#gql) for syntax, result shapes, options, and examples.
 
 ### Async support
 
@@ -175,9 +175,9 @@ The Node.js connector includes `Async` suffixed variants for every API, such as 
 - **Connected components.** `connectedComponents()` returns a global WCC labelling (union-find, near-linear). `componentOf(node)` returns the members of a single node's component via BFS. Both support edge-label, node-label, and temporal filters.
 - **Degree counts.** Count edges, sum weights, and compute averages without materializing neighbor lists. Batch `degrees` for bulk analysis.
 - **Direct property queries.** `findNodes` and `findNodesPaged` do focused equality lookups with semantic numeric equality for finite scalars. `findNodesRange` and `findNodesRangePaged` do domainless numeric range scans with exact bound and cursor semantics.
-- **Optional property indexes.** Declare node or edge equality/range indexes only where they pay off. Range indexes cover finite scalar numeric values across signed integers, unsigned integers, and finite floats; non-finite floats and non-numeric values are excluded. Use `ensureNodePropertyIndex` / `ensureEdgePropertyIndex`, list APIs, and drop APIs to manage them. Public query APIs stay index-transparent: when a matching declaration is `Ready`, OverGraph uses the declaration-backed path; otherwise it falls back to the same public API.
+- **Optional property indexes.** Declare node or edge equality/range indexes only where they pay off. Declarations can cover a single property, or an ordered field list over properties plus supported node/edge metadata; compound queries use left-prefix matching. Public query APIs stay index-transparent: when a matching declaration is `Ready`, OverGraph uses the declaration-backed path; otherwise it falls back to the same public API.
 - **Optional schemas and constraints.** Databases stay open by default; label-scoped `setNodeSchema` / `setEdgeSchema` constraints validate required properties, value types, metadata, and endpoint labels through the shared Rust write path, including GQL mutations. Use `setGraphSchema` / `alterGraphSchema` for atomic multi-target schema changes or the supported GQL current-graph-type DDL subset when text is clearer.
-- **Full query APIs.** `queryNodeIds`, `queryNodes`, `queryEdgeIds`, `queryEdges`, `queryGraphRows`, and explain APIs combine IDs, keys, node label filters (`{ labels, mode: 'any' | 'all' }`), edge labels, endpoint constraints, property equality/IN/range/exists/missing filters, edge metadata filters, updated-at ranges, row-shaped graph patterns, optional groups, and bounded paths. `executeGql` adds GQL Beta for query-string reads and mutations. OverGraph chooses the cheapest legal path with available indexes and planner stats, then verifies results against visible records.
+- **Full query APIs.** `queryNodeIds`, `queryNodes`, `queryEdgeIds`, `queryEdges`, `queryGraphRows`, and explain APIs combine IDs, keys, node label filters (`{ labels, mode: 'any' | 'all' }`), edge labels, endpoint constraints, property equality/IN/range/exists/missing filters, edge metadata filters, updated-at ranges, row-shaped graph patterns, optional groups, and bounded paths. `executeGql` adds GQL for query-string reads and mutations. OverGraph chooses the cheapest legal path with available indexes and planner stats, then verifies results against visible records.
 - **Time-range queries.** Find nodes created or updated within a time window. Sorted timestamp index for efficient range scans.
 
 ### Pagination
@@ -197,11 +197,11 @@ ID-keyed collection APIs use keyset pagination with `limit` and `after`. `traver
 
 ## How it works
 
-OverGraph uses a log-structured storage engine purpose-built from scratch in pure Rust. Unlike generic LSM key-value stores, every segment is a fully indexed graph structure. Adjacency lists, label indexes, temporal indexes, and vector indexes are all materialized at flush time, not just at compaction. Reads are near-optimal the moment data hits disk, while writes stay append-only and fast.
+OverGraph uses a log-structured storage engine purpose-built from scratch in pure Rust. Unlike generic LSM key-value stores, every segment is a fully indexed graph structure. Adjacency lists, label indexes, temporal indexes, declared property indexes, and vector indexes are all materialized at flush time when applicable, not just at compaction. Reads are near-optimal the moment data hits disk, while writes stay append-only and fast.
 
-**Write path:** Mutations are appended to a write-ahead log and applied to an in-memory memtable. When the memtable reaches its threshold, it's frozen and flushed to disk as an immutable segment in the background. Writes continue unblocked against a fresh memtable. Each segment ships with pre-built adjacency indexes (inbound and outbound), optional declared property-index sidecars, optional advisory planner statistics, optional signed degree-delta sidecars for degree/weight fast paths, and, when the segment contains vectors, HNSW and sparse posting-list indexes.
+**Write path:** Mutations are appended to a write-ahead log and applied to an in-memory memtable. When the memtable reaches its threshold, it's frozen and flushed to disk as an immutable segment in the background. Writes continue unblocked against a fresh memtable. Each segment ships with pre-built adjacency indexes (inbound and outbound), optional declared single-field and compound property-index sidecars, optional advisory planner statistics, optional signed degree-delta sidecars for degree/weight fast paths, and, when the segment contains vectors, HNSW and sparse posting-list indexes.
 
-**Read path:** Queries check the memtable first (freshest data), then merge results across immutable segments using the per-segment indexes. Because every segment carries its own adjacency index, a neighbor query is a handful of index lookups, not a scan across sorted keys. Vector search follows the same model: memtable candidates are found by exact brute-force scan, segment candidates via HNSW or posting-list indexes, then the engine merges and deduplicates across all sources. Property equality and domainless numeric range queries stay index-transparent too: if a matching optional property-index declaration is `Ready`, the engine uses the declaration-backed path, otherwise it falls back to a label-scoped scan through the same public API. Pagination uses early termination to avoid unnecessary work, and index candidates are verified against the latest visible records before results are returned.
+**Read path:** Queries check the memtable first (freshest data), then merge results across immutable segments using the per-segment indexes. Because every segment carries its own adjacency index, a neighbor query is a handful of index lookups, not a scan across sorted keys. Vector search follows the same model: memtable candidates are found by exact brute-force scan, segment candidates via HNSW or posting-list indexes, then the engine merges and deduplicates across all sources. Single-property and compound property equality/range queries stay index-transparent too: if a matching optional property-index declaration is `Ready`, the engine uses the declaration-backed path, otherwise it falls back to a label-scoped scan through the same public API. Pagination uses early termination to avoid unnecessary work, and index candidates are verified against the latest visible records before results are returned.
 
 **Compaction:** A background thread merges older segments together, applying tombstones, prune policies, and deduplication. The compaction path uses packed metadata payloads to plan merges and raw-copies winning records without full deserialization, then rebuilds unified indexes from metadata. This includes rebuilding HNSW and sparse posting-list indexes for the merged output. Fewer segments after compaction means fewer index lookups per query, but even before compaction, reads are fast because every segment is self-indexed.
 
@@ -214,7 +214,7 @@ my-graph/
     seg_0001/
       segment_manifest.dat # component table of contents
       segment.core        # packed immutable core records, metadata, and maintained indexes
-      secondary_indexes/  # optional declared equality/range property-index sidecars
+      secondary_indexes/  # optional declared single-field/compound property-index sidecars
       planner_stats.dat   # optional advisory planner statistics, refreshable
       degree_delta.dat    # optional signed degree deltas for fast degree/weight reads
       dense_hnsw_meta.dat # optional dense-vector HNSW metadata

@@ -3,6 +3,7 @@
 use crate::error::EngineError;
 use crate::gql::ast::*;
 use crate::gql::lexer::{lex, Keyword, Token, TokenKind};
+use crate::gql::metadata::{GqlEndpointFunction, GqlMetadataFunction};
 use crate::types::{GqlStatementKind, SourceSpan};
 
 #[derive(Clone, Debug)]
@@ -80,6 +81,16 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
     options: &'a GqlParseOptions,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PropertyIndexTargetKindForParse {
+    Node,
+    Edge,
+}
+
+fn compound_index_ddl_message() -> &'static str {
+    "GQL index DDL error: use CREATE PROPERTY INDEX ... ON (property or metadata function, ...) KIND EQUALITY|RANGE for compound secondary indexes"
 }
 
 struct ParsedExpr {
@@ -449,16 +460,15 @@ impl<'a> Parser<'a> {
             "expected ')' after node property index target",
         )?;
         self.expect_keyword(Keyword::On, "expected ON after index target")?;
-        let (on_variable, prop_key, property_ref_span) =
-            self.parse_property_index_property_ref()?;
-        let span = self.span_between(&start.span, &property_ref_span);
+        let (fields, field_list_span) =
+            self.parse_property_index_field_list(PropertyIndexTargetKindForParse::Node)?;
+        let span = self.span_between(&start.span, &field_list_span);
         let _target_pattern_span = self.span_between(&start.span, &close.span);
         Ok(GqlPropertyIndexTarget::Node {
             variable,
             label,
-            on_variable,
-            prop_key,
-            property_ref_span,
+            fields,
+            field_list_span,
             span,
         })
     }
@@ -537,15 +547,14 @@ impl<'a> Parser<'a> {
         )?;
         self.parse_empty_property_index_edge_endpoint()?;
         self.expect_keyword(Keyword::On, "expected ON after index target")?;
-        let (on_variable, prop_key, property_ref_span) =
-            self.parse_property_index_property_ref()?;
+        let (fields, field_list_span) =
+            self.parse_property_index_field_list(PropertyIndexTargetKindForParse::Edge)?;
         Ok(GqlPropertyIndexTarget::Edge {
             variable,
             label,
-            on_variable,
-            prop_key,
-            property_ref_span: property_ref_span.clone(),
-            span: self.span_between(&start.span, &property_ref_span),
+            fields,
+            field_list_span: field_list_span.clone(),
+            span: self.span_between(&start.span, &field_list_span),
         })
     }
 
@@ -565,42 +574,183 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn parse_property_index_property_ref(
+    fn parse_property_index_field_list(
         &mut self,
-    ) -> Result<(Ident, GqlIndexName, SourceSpan), EngineError> {
+        target_kind: PropertyIndexTargetKindForParse,
+    ) -> Result<(Vec<GqlPropertyIndexField>, SourceSpan), EngineError> {
         let open = self.expect_kind(
             |kind| matches!(kind, TokenKind::LParen),
             "expected '(' after ON",
         )?;
         self.reject_index_parameter_here()?;
-        if self.at_kind(|kind| matches!(kind, TokenKind::LParen | TokenKind::LBracket)) {
-            return Err(self.unsupported_current(
-                "compound property indexes",
-                "compound property indexes are not supported",
-            ));
+        if self.at_kind(|kind| matches!(kind, TokenKind::RParen)) {
+            return Err(
+                self.gql_index_ddl_error_current("index ON field list must contain 1 to 8 fields")
+            );
         }
-        let variable = self.parse_ident("expected variable in index ON property reference")?;
-        self.expect_kind(
-            |kind| matches!(kind, TokenKind::Dot),
-            "expected '.' in index ON property reference",
-        )?;
-        self.reject_index_parameter_here()?;
-        let prop_key = self.parse_index_name("expected property key after '.'")?;
-        if self.at_kind(|kind| matches!(kind, TokenKind::Comma)) {
-            return Err(self.unsupported_current(
-                "compound property indexes",
-                "compound property indexes are not supported",
-            ));
+
+        let mut fields = Vec::new();
+        loop {
+            fields.push(self.parse_property_index_field(target_kind)?);
+            if fields.len() > 8 {
+                return Err(self.gql_index_ddl_error_current(
+                    "compound secondary indexes support at most 8 fields",
+                ));
+            }
+            if self
+                .consume_if(|kind| matches!(kind, TokenKind::Comma))
+                .is_none()
+            {
+                break;
+            }
+            self.reject_index_parameter_here()?;
+            if self.at_kind(|kind| matches!(kind, TokenKind::RParen)) {
+                return Err(self.gql_index_ddl_error_current(
+                    "index ON field list must contain 1 to 8 fields",
+                ));
+            }
         }
         let close = self.expect_kind(
             |kind| matches!(kind, TokenKind::RParen),
-            "expected ')' after index ON property reference",
+            "expected ')' after index ON field list",
         )?;
-        Ok((
+        Ok((fields, self.span_between(&open.span, &close.span)))
+    }
+
+    fn parse_property_index_field(
+        &mut self,
+        target_kind: PropertyIndexTargetKindForParse,
+    ) -> Result<GqlPropertyIndexField, EngineError> {
+        self.reject_index_parameter_here()?;
+        if self.next_is(|kind| matches!(kind, TokenKind::Dot)) {
+            let start = self.current().span.clone();
+            let variable = self.parse_ident("expected variable in index ON property reference")?;
+            self.expect_kind(
+                |kind| matches!(kind, TokenKind::Dot),
+                "expected '.' in index ON property reference",
+            )?;
+            self.reject_index_parameter_here()?;
+            let key = self.parse_index_name("expected property key after '.'")?;
+            return Ok(GqlPropertyIndexField::Property {
+                span: self.span_between(&start, &key.span),
+                variable,
+                key,
+            });
+        }
+
+        if self.next_is(|kind| matches!(kind, TokenKind::LParen)) {
+            return self.parse_property_index_metadata_field(target_kind);
+        }
+
+        Err(self.parse_error_current("expected index field"))
+    }
+
+    fn parse_property_index_metadata_field(
+        &mut self,
+        target_kind: PropertyIndexTargetKindForParse,
+    ) -> Result<GqlPropertyIndexField, EngineError> {
+        let function = self.current().clone();
+        let function_name = self.source_for_span(&function.span).to_string();
+        self.advance();
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::LParen),
+            "expected '(' after index metadata function",
+        )?;
+
+        if function_name.eq_ignore_ascii_case("id")
+            && self
+                .current_word_exact()
+                .as_deref()
+                .and_then(|word| GqlEndpointFunction::from_lower(&word.to_ascii_lowercase()))
+                .is_some()
+            && self.next_is(|kind| matches!(kind, TokenKind::LParen))
+        {
+            if target_kind != PropertyIndexTargetKindForParse::Edge {
+                return Err(self.gql_index_ddl_error_current(
+                    "endpoint metadata functions are valid only for edge property indexes",
+                ));
+            }
+            let endpoint_token = self.current().clone();
+            let endpoint_name = self.source_for_span(&endpoint_token.span).to_string();
+            let endpoint = GqlEndpointFunction::from_lower(&endpoint_name.to_ascii_lowercase())
+                .expect("endpoint lookahead already checked");
+            self.advance();
+            self.expect_kind(
+                |kind| matches!(kind, TokenKind::LParen),
+                "expected '(' after endpoint metadata function",
+            )?;
+            self.reject_index_parameter_here()?;
+            let variable = self.parse_ident("expected variable in endpoint metadata function")?;
+            self.expect_kind(
+                |kind| matches!(kind, TokenKind::RParen),
+                "expected ')' after endpoint metadata function variable",
+            )?;
+            let close = self.expect_kind(
+                |kind| matches!(kind, TokenKind::RParen),
+                "expected ')' after id(endpoint) metadata function",
+            )?;
+            return Ok(GqlPropertyIndexField::EndpointId {
+                endpoint,
+                function_span: function.span.clone(),
+                endpoint_span: endpoint_token.span,
+                variable,
+                span: self.span_between(&function.span, &close.span),
+            });
+        }
+
+        self.reject_index_parameter_here()?;
+        let variable = self.parse_ident("expected variable in index metadata function")?;
+        let close = self.expect_kind(
+            |kind| matches!(kind, TokenKind::RParen),
+            "expected ')' after index metadata function variable",
+        )?;
+        let parsed_function = self.parse_property_index_metadata_function(
+            &function_name,
+            &function.span,
+            target_kind,
+        )?;
+        Ok(GqlPropertyIndexField::Metadata {
+            function: parsed_function,
+            function_span: function.span.clone(),
             variable,
-            prop_key,
-            self.span_between(&open.span, &close.span),
-        ))
+            span: self.span_between(&function.span, &close.span),
+        })
+    }
+
+    fn parse_property_index_metadata_function(
+        &self,
+        name: &str,
+        span: &SourceSpan,
+        target_kind: PropertyIndexTargetKindForParse,
+    ) -> Result<GqlPropertyIndexMetadataFunction, EngineError> {
+        let lower = name.to_ascii_lowercase();
+        let Some(function) = GqlMetadataFunction::from_lower(&lower) else {
+            if matches!(lower.as_str(), "labels" | "type" | "startnode" | "endnode") {
+                return Err(self.gql_index_ddl_error_at(
+                    span.clone(),
+                    format!("{name} is not a supported scalar index field"),
+                ));
+            }
+            return Err(self.gql_index_ddl_error_at(
+                span.clone(),
+                format!("unsupported metadata function '{name}' in index ON field list"),
+            ));
+        };
+        match target_kind {
+            PropertyIndexTargetKindForParse::Node if !function.valid_for_node() => {
+                Err(self.gql_index_ddl_error_at(
+                    span.clone(),
+                    "validity metadata is valid only for edge property indexes",
+                ))
+            }
+            PropertyIndexTargetKindForParse::Edge if !function.valid_for_edge() => {
+                Err(self.gql_index_ddl_error_at(
+                    span.clone(),
+                    "elementKey metadata is valid only for node property indexes",
+                ))
+            }
+            _ => Ok(function),
+        }
     }
 
     fn parse_index_name(&mut self, message: &str) -> Result<GqlIndexName, EngineError> {
@@ -1298,6 +1448,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_set_item(&mut self) -> Result<SetItem, EngineError> {
+        if self.next_is(|kind| matches!(kind, TokenKind::LParen)) {
+            return self.parse_set_metadata_item();
+        }
         let alias = self.parse_ident("expected alias in SET item")?;
         if self
             .consume_if(|kind| matches!(kind, TokenKind::PlusEquals))
@@ -1335,6 +1488,31 @@ impl<'a> Parser<'a> {
         Ok(SetItem::Property {
             alias,
             property,
+            value,
+            span,
+        })
+    }
+
+    fn parse_set_metadata_item(&mut self) -> Result<SetItem, EngineError> {
+        let function = self.parse_ident("expected metadata function in SET item")?;
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::LParen),
+            "expected '(' after metadata function in SET item",
+        )?;
+        let alias = self.parse_ident("expected alias in SET metadata function")?;
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::RParen),
+            "expected ')' after SET metadata function alias",
+        )?;
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::Equals),
+            "expected '=' in SET metadata item",
+        )?;
+        let value = self.parse_expression(0)?.expr;
+        let span = self.span_between(&function.span, &value.span);
+        Ok(SetItem::Metadata {
+            function,
+            alias,
             value,
             span,
         })
@@ -3140,6 +3318,19 @@ impl<'a> Parser<'a> {
             return None;
         }
         if self.at_keyword(Keyword::Create) {
+            if (self.token_word_eq(self.pos + 1, "compound")
+                || self.token_word_eq(self.pos + 1, "composite"))
+                && self.token_word_eq(self.pos + 2, "index")
+            {
+                return Some(EngineError::GqlParse {
+                    message: compound_index_ddl_message().to_string(),
+                    span: self
+                        .tokens
+                        .get(self.pos + 1)
+                        .map(|token| token.span.clone())
+                        .unwrap_or_else(|| self.current().span.clone()),
+                });
+            }
             if self.token_word_eq(self.pos + 1, "index") {
                 return Some(self.unsupported_at(
                     self.pos + 1,
@@ -3168,6 +3359,21 @@ impl<'a> Parser<'a> {
             }
         }
         if self.at_keyword(Keyword::Show) {
+            if self.token_word_eq(self.pos + 1, "compound")
+                && self.token_word_eq(self.pos + 2, "property")
+                && self.token_is_index_or_indexes(self.pos + 3)
+            {
+                return Some(EngineError::GqlParse {
+                    message:
+                        "GQL index DDL error: compound indexes are shown through SHOW PROPERTY INDEXES"
+                            .to_string(),
+                    span: self
+                        .tokens
+                        .get(self.pos + 1)
+                        .map(|token| token.span.clone())
+                        .unwrap_or_else(|| self.current().span.clone()),
+                });
+            }
             if self.token_is_index_or_indexes(self.pos + 1) {
                 return Some(self.unsupported_at(
                     self.pos + 1,
@@ -3229,6 +3435,17 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn gql_index_ddl_error_current(&self, message: impl Into<String>) -> EngineError {
+        self.gql_index_ddl_error_at(self.current().span.clone(), message)
+    }
+
+    fn gql_index_ddl_error_at(&self, span: SourceSpan, message: impl Into<String>) -> EngineError {
+        EngineError::GqlParse {
+            message: format!("GQL index DDL error: {}", message.into()),
+            span,
+        }
+    }
+
     fn at_kind(&self, predicate: impl Fn(&TokenKind) -> bool) -> bool {
         predicate(&self.current().kind)
     }
@@ -3261,6 +3478,15 @@ impl<'a> Parser<'a> {
     fn current_ident_name(&self) -> Option<&str> {
         match &self.current().kind {
             TokenKind::Ident(name) => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    fn current_word_exact(&self) -> Option<String> {
+        match &self.current().kind {
+            TokenKind::Ident(_) | TokenKind::Keyword(_) => {
+                Some(self.source_for_span(&self.current().span).to_string())
+            }
             _ => None,
         }
     }
@@ -3326,6 +3552,7 @@ impl<'a> Parser<'a> {
 fn set_item_span(item: &SetItem) -> &SourceSpan {
     match item {
         SetItem::Property { span, .. }
+        | SetItem::Metadata { span, .. }
         | SetItem::MapMerge { span, .. }
         | SetItem::NodeLabel { span, .. } => span,
     }
@@ -3515,33 +3742,33 @@ fn aggregate_function_from_name(lower: &str) -> Option<AggregateFunction> {
 }
 
 fn is_supported_function(lower: &str) -> bool {
-    matches!(
-        lower,
-        "id" | "labels"
-            | "type"
-            | "length"
-            | "start_node"
-            | "end_node"
-            | "nodes"
-            | "relationships"
-            | "node_ids"
-            | "edge_ids"
-            | "coalesce"
-            | "to_string"
-            | "to_integer"
-            | "to_float"
-            | "abs"
-            | "floor"
-            | "ceil"
-            | "round"
-            | "lower"
-            | "upper"
-            | "trim"
-            | "substring"
-            | "size"
-            | "head"
-            | "last"
-    )
+    GqlMetadataFunction::from_lower(lower).is_some()
+        || GqlEndpointFunction::from_lower(lower).is_some()
+        || matches!(
+            lower,
+            "labels"
+                | "type"
+                | "length"
+                | "nodes"
+                | "relationships"
+                | "nodeids"
+                | "edgeids"
+                | "coalesce"
+                | "tostring"
+                | "tointeger"
+                | "tofloat"
+                | "abs"
+                | "floor"
+                | "ceil"
+                | "round"
+                | "lower"
+                | "upper"
+                | "trim"
+                | "substring"
+                | "size"
+                | "head"
+                | "last"
+        )
 }
 
 fn is_shortest_path_function(name: &str) -> bool {
@@ -3607,13 +3834,13 @@ mod tests {
 
     #[test]
     fn parses_supported_fixed_node_patterns() {
-        let query = parse_ok(r#"MATCH (n:Person {key: $key, status: "active"}) RETURN n"#);
+        let query = parse_ok(r#"MATCH (n:Person {elementKey: $key, status: "active"}) RETURN n"#);
         let pattern = &query.match_clauses[0].patterns[0];
         assert_eq!(pattern.start.variable.as_ref().unwrap().name, "n");
         assert_eq!(pattern.start.labels[0].name, "Person");
         let props = pattern.start.properties.as_ref().unwrap();
         assert_eq!(props.entries.len(), 2);
-        assert_eq!(props.entries[0].key.name, "key");
+        assert_eq!(props.entries[0].key.name, "elementKey");
         assert!(matches!(
             props.entries[0].value.kind,
             ExprKind::Parameter(ref name) if name == "key"
@@ -3648,7 +3875,7 @@ mod tests {
     #[test]
     fn parses_ordered_optional_match_clauses() {
         let query = parse_ok(
-            "MATCH (a) WHERE a.id = $id OPTIONAL MATCH (a)-[:KNOWS]->(b) WHERE b.active = true OPTIONAL MATCH (b)-[:LIKES]->(c) RETURN a, b, c",
+            "MATCH (a) WHERE id(a) = $id OPTIONAL MATCH (a)-[:KNOWS]->(b) WHERE b.active = true OPTIONAL MATCH (b)-[:LIKES]->(c) RETURN a, b, c",
         );
         assert_eq!(query.match_clauses.len(), 3);
         assert!(!query.match_clauses[0].optional);
@@ -3683,7 +3910,7 @@ mod tests {
     #[test]
     fn parses_supported_path_functions() {
         let query = parse_ok(
-            "MATCH p = (a)-[:KNOWS*1..3]->(b) RETURN length(p), start_node(p), end_node(p), nodes(p), relationships(p), node_ids(p), edge_ids(p)",
+            "MATCH p = (a)-[:KNOWS*1..3]->(b) RETURN length(p), startNode(p), endNode(p), nodes(p), relationships(p), nodeIds(p), edgeIds(p)",
         );
         let ReturnBody::Items(items) = &query.return_clause.body else {
             panic!("expected explicit return items");
@@ -3699,14 +3926,44 @@ mod tests {
             names,
             vec![
                 "length",
-                "start_node",
-                "end_node",
+                "startNode",
+                "endNode",
                 "nodes",
                 "relationships",
-                "node_ids",
-                "edge_ids"
+                "nodeIds",
+                "edgeIds"
             ]
         );
+    }
+
+    #[test]
+    fn rejects_removed_snake_case_function_spellings() {
+        for (source, function) in [
+            (
+                "MATCH p = (a)-[:K*1..2]->(b) RETURN start_node(p)",
+                "start_node",
+            ),
+            (
+                "MATCH p = (a)-[:K*1..2]->(b) RETURN end_node(p)",
+                "end_node",
+            ),
+            (
+                "MATCH p = (a)-[:K*1..2]->(b) RETURN node_ids(p)",
+                "node_ids",
+            ),
+            (
+                "MATCH p = (a)-[:K*1..2]->(b) RETURN edge_ids(p)",
+                "edge_ids",
+            ),
+            ("MATCH (n) RETURN to_string(1)", "to_string"),
+            ("MATCH (n) RETURN to_integer('1')", "to_integer"),
+            ("MATCH (n) RETURN to_float('1')", "to_float"),
+            ("MATCH (n) WHERE updated_at(n) > 1 RETURN n", "updated_at"),
+            ("MATCH ()-[r]->() RETURN valid_from(r)", "valid_from"),
+            ("MATCH (n) RETURN element_key(n)", "element_key"),
+        ] {
+            expect_unsupported(source, &format!("function {function}"));
+        }
     }
 
     #[test]
@@ -3869,7 +4126,7 @@ mod tests {
     #[test]
     fn parses_string_predicates_case_and_scalar_functions() {
         let query = parse_ok(
-            "MATCH (n) WHERE lower(n.name) STARTS WITH 'a' AND n.name ENDS WITH 'z' AND n.name CONTAINS 'd' RETURN CASE WHEN n.age > 1 THEN upper(n.name) ELSE trim(' x ') END AS generic, CASE n.status WHEN 'a' THEN to_string(1) END AS simple, substring(n.name, 1, 2) AS sub",
+            "MATCH (n) WHERE lower(n.name) STARTS WITH 'a' AND n.name ENDS WITH 'z' AND n.name CONTAINS 'd' RETURN CASE WHEN n.age > 1 THEN upper(n.name) ELSE trim(' x ') END AS generic, CASE n.status WHEN 'a' THEN toString(1) END AS simple, substring(n.name, 1, 2) AS sub",
         );
         let where_expr = query.match_clauses[0].where_clause.as_ref().unwrap();
         assert!(format!("{:?}", where_expr.kind).contains("StartsWith"));
@@ -4030,7 +4287,7 @@ mod tests {
     fn rejects_return_mixed_star_projections_for_reads_and_mutations() {
         for source in [
             "MATCH (n) RETURN *, n",
-            "CREATE (n:Person {key: 'n'}) RETURN *, n",
+            "CREATE (n:Person {elementKey: 'n'}) RETURN *, n",
         ] {
             match parse_statement_err(source) {
                 EngineError::GqlUnsupported { feature, span, .. } => {
@@ -4620,8 +4877,8 @@ mod tests {
     #[test]
     fn parse_statement_accepts_basic_mutation_skeletons() {
         let cases = [
-            "CREATE (n:Person {key: $key}) RETURN n",
-            "MERGE (n:Person {key: $key}) RETURN n",
+            "CREATE (n:Person {elementKey: $key}) RETURN n",
+            "MERGE (n:Person {elementKey: $key}) RETURN n",
             "MATCH (a:Person) MATCH (b:Person) MERGE (a)-[r:KNOWS]->(b) RETURN r",
             "MATCH (n:Person) SET n.name = $name RETURN n",
             "MATCH (n:Person) SET n += $map RETURN n",
@@ -4650,7 +4907,7 @@ mod tests {
     #[test]
     fn parse_statement_parses_merge_actions() {
         let statement = parse_statement_ok(
-            "MERGE (n:Person {key: $key}) ON CREATE SET n.created = true ON MATCH SET n.seen = $seen RETURN n",
+            "MERGE (n:Person {elementKey: $key}) ON CREATE SET n.created = true ON MATCH SET n.seen = $seen RETURN n",
         );
         let GqlStatementBody::Mutation(mutation) = statement.body else {
             panic!("expected mutation statement");
@@ -4664,7 +4921,7 @@ mod tests {
             merge.pattern.start.properties.as_ref().unwrap().entries[0]
                 .key
                 .name,
-            "key"
+            "elementKey"
         );
         assert_eq!(merge.on_create.as_ref().unwrap().items.len(), 1);
         assert_eq!(merge.on_match.as_ref().unwrap().items.len(), 1);
@@ -4705,7 +4962,7 @@ mod tests {
 
     #[test]
     fn parse_statement_rejects_read_after_write_matching() {
-        match parse_statement_err("MATCH (n) CREATE (m:Person {key: 'm'}) MATCH (m) RETURN m") {
+        match parse_statement_err("MATCH (n) CREATE (m:Person {elementKey: 'm'}) MATCH (m) RETURN m") {
             EngineError::GqlUnsupported { feature, span, .. } => {
                 assert_eq!(feature, "read-after-write clauses");
                 assert!(span.length > 0);
@@ -4730,7 +4987,9 @@ mod tests {
 
     #[test]
     fn parse_statement_rejects_mutation_multistatement_scripts() {
-        match parse_statement_err("CREATE (n:Person {key: 'n'}); CREATE (m:Person {key: 'm'})") {
+        match parse_statement_err(
+            "CREATE (n:Person {elementKey: 'n'}); CREATE (m:Person {elementKey: 'm'})",
+        ) {
             EngineError::GqlParse { message, span } => {
                 assert_eq!(message, "multiple statements are not supported");
                 assert!(span.length > 0);
@@ -4742,7 +5001,10 @@ mod tests {
     #[test]
     fn parse_statement_rejects_unsupported_mutation_clauses() {
         for (source, expected_feature) in [
-            ("UNWIND [1] AS n CREATE (m:Person {key: 'm'})", "UNWIND"),
+            (
+                "UNWIND [1] AS n CREATE (m:Person {elementKey: 'm'})",
+                "UNWIND",
+            ),
             ("CALL db.labels()", "CALL"),
             (
                 "CREATE TEXT INDEX node_status FOR (n:User) ON (n.status)",
@@ -4766,6 +5028,63 @@ mod tests {
             panic!("expected index statement for {source}");
         };
         index
+    }
+
+    fn index_target_fields(target: &GqlPropertyIndexTarget) -> &[GqlPropertyIndexField] {
+        match target {
+            GqlPropertyIndexTarget::Node { fields, .. }
+            | GqlPropertyIndexTarget::Edge { fields, .. } => fields,
+        }
+    }
+
+    fn assert_property_field(field: &GqlPropertyIndexField, variable: &str, key: &str) {
+        match field {
+            GqlPropertyIndexField::Property {
+                variable: actual_variable,
+                key: actual_key,
+                ..
+            } => {
+                assert_eq!(actual_variable.name, variable);
+                assert_eq!(actual_key.name, key);
+            }
+            other => panic!("expected property field, got {other:?}"),
+        }
+    }
+
+    fn assert_metadata_field(
+        field: &GqlPropertyIndexField,
+        variable: &str,
+        function: GqlPropertyIndexMetadataFunction,
+    ) {
+        match field {
+            GqlPropertyIndexField::Metadata {
+                variable: actual_variable,
+                function: actual_function,
+                ..
+            } => {
+                assert_eq!(actual_variable.name, variable);
+                assert_eq!(*actual_function, function);
+            }
+            other => panic!("expected metadata field, got {other:?}"),
+        }
+    }
+
+    fn assert_endpoint_field(
+        field: &GqlPropertyIndexField,
+        variable: &str,
+        endpoint: GqlPropertyIndexEndpointFunction,
+    ) {
+        match field {
+            GqlPropertyIndexField::EndpointId {
+                variable: actual_variable,
+                endpoint: actual_endpoint,
+                ..
+            } => {
+                assert_eq!(actual_variable.name, variable);
+                assert_eq!(*actual_endpoint, endpoint);
+            }
+            other => panic!("expected endpoint metadata field, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4820,14 +5139,13 @@ mod tests {
             GqlPropertyIndexTarget::Node {
                 variable,
                 label,
-                on_variable,
-                prop_key,
+                fields,
                 ..
             } => {
                 assert_eq!(variable.name, "n");
                 assert_eq!(label.name, "Display\nLabel");
-                assert_eq!(on_variable.name, "m");
-                assert_eq!(prop_key.name, "external-id");
+                assert_eq!(fields.len(), 1);
+                assert_property_field(&fields[0], "m", "external-id");
             }
             other => panic!("expected node target, got {other:?}"),
         }
@@ -4843,14 +5161,13 @@ mod tests {
             GqlPropertyIndexTarget::Edge {
                 variable,
                 label,
-                on_variable,
-                prop_key,
+                fields,
                 ..
             } => {
                 assert_eq!(variable.name, "r");
                 assert_eq!(label.name, "WORKED WITH");
-                assert_eq!(on_variable.name, "r");
-                assert_eq!(prop_key.name, "since-ms");
+                assert_eq!(fields.len(), 1);
+                assert_property_field(&fields[0], "r", "since-ms");
             }
             other => panic!("expected edge target, got {other:?}"),
         }
@@ -4868,6 +5185,70 @@ mod tests {
             };
             assert_eq!(show.scope, scope);
         }
+    }
+
+    #[test]
+    fn parse_statement_parses_gql_property_index_compound_fields_in_order() {
+        let node = parse_index_statement_ok(
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (n.tenant_id, updatedAt(n), n.\"external-id\") KIND RANGE",
+        );
+        let GqlIndexStatement::Create(create) = node else {
+            panic!("expected create index statement");
+        };
+        let fields = index_target_fields(&create.target);
+        assert_eq!(fields.len(), 3);
+        assert_property_field(&fields[0], "n", "tenant_id");
+        assert_metadata_field(&fields[1], "n", GqlPropertyIndexMetadataFunction::UpdatedAt);
+        assert_property_field(&fields[2], "n", "external-id");
+
+        let edge = parse_index_statement_ok(
+            "DROP PROPERTY INDEX FOR ()-[r:WORKS_ON]-() ON (r.status, validTo(r), id(startNode(r)), id(endNode(r))) KIND RANGE",
+        );
+        let GqlIndexStatement::Drop(drop) = edge else {
+            panic!("expected drop index statement");
+        };
+        let fields = index_target_fields(&drop.target);
+        assert_eq!(fields.len(), 4);
+        assert_property_field(&fields[0], "r", "status");
+        assert_metadata_field(&fields[1], "r", GqlPropertyIndexMetadataFunction::ValidTo);
+        assert_endpoint_field(&fields[2], "r", GqlPropertyIndexEndpointFunction::StartNode);
+        assert_endpoint_field(&fields[3], "r", GqlPropertyIndexEndpointFunction::EndNode);
+    }
+
+    #[test]
+    fn parse_statement_parses_metadata_functions_and_dot_metadata_names_disambiguated() {
+        let node = parse_index_statement_ok(
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (id(n), elementKey(n), weight(n), createdAt(n), updatedAt(n), n.updated_at) KIND EQUALITY",
+        );
+        let GqlIndexStatement::Create(create) = node else {
+            panic!("expected create index statement");
+        };
+        let fields = index_target_fields(&create.target);
+        assert_metadata_field(&fields[0], "n", GqlPropertyIndexMetadataFunction::Id);
+        assert_metadata_field(
+            &fields[1],
+            "n",
+            GqlPropertyIndexMetadataFunction::ElementKey,
+        );
+        assert_metadata_field(&fields[2], "n", GqlPropertyIndexMetadataFunction::Weight);
+        assert_metadata_field(&fields[3], "n", GqlPropertyIndexMetadataFunction::CreatedAt);
+        assert_metadata_field(&fields[4], "n", GqlPropertyIndexMetadataFunction::UpdatedAt);
+        assert_property_field(&fields[5], "n", "updated_at");
+
+        let edge = parse_index_statement_ok(
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_ON]-() ON (id(r), weight(r), createdAt(r), updatedAt(r), validFrom(r), validTo(r), r.valid_from) KIND RANGE",
+        );
+        let GqlIndexStatement::Create(create) = edge else {
+            panic!("expected create index statement");
+        };
+        let fields = index_target_fields(&create.target);
+        assert_metadata_field(&fields[0], "r", GqlPropertyIndexMetadataFunction::Id);
+        assert_metadata_field(&fields[1], "r", GqlPropertyIndexMetadataFunction::Weight);
+        assert_metadata_field(&fields[2], "r", GqlPropertyIndexMetadataFunction::CreatedAt);
+        assert_metadata_field(&fields[3], "r", GqlPropertyIndexMetadataFunction::UpdatedAt);
+        assert_metadata_field(&fields[4], "r", GqlPropertyIndexMetadataFunction::ValidFrom);
+        assert_metadata_field(&fields[5], "r", GqlPropertyIndexMetadataFunction::ValidTo);
+        assert_property_field(&fields[6], "r", "valid_from");
     }
 
     #[test]
@@ -4972,21 +5353,6 @@ mod tests {
         }
 
         for source in [
-            "CREATE PROPERTY INDEX FOR (n:Person) ON (n.a, n.b) KIND EQUALITY",
-            "CREATE PROPERTY INDEX FOR (n:Person) ON ([n.a]) KIND EQUALITY",
-            "CREATE PROPERTY INDEX FOR (n:Person) ON ((n.a)) KIND EQUALITY",
-        ] {
-            match parse_statement_err(source) {
-                EngineError::GqlUnsupported { message, .. } => {
-                    assert!(message.contains("compound property indexes are not supported"))
-                }
-                err => {
-                    panic!("expected compound index unsupported error for {source}, got {err:?}")
-                }
-            }
-        }
-
-        for source in [
             "CREATE PROPERTY INDEX FOR ()-[r:WORKS_AT]->() ON (r.status) KIND EQUALITY",
             "CREATE PROPERTY INDEX FOR ()<-[r:WORKS_AT]-() ON (r.status) KIND EQUALITY",
         ] {
@@ -5024,6 +5390,76 @@ mod tests {
                 }
                 err => panic!("expected property-map parse error for {source}, got {err:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn parse_statement_rejects_gql_property_index_malformed_field_lists() {
+        for source in [
+            "CREATE PROPERTY INDEX FOR (n:Person) ON () KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (n.a,) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person) ON ([n.a]) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person) ON ((n.a)) KIND EQUALITY",
+        ] {
+            assert!(
+                matches!(parse_statement_err(source), EngineError::GqlParse { .. }),
+                "source: {source}"
+            );
+        }
+
+        let nine_fields = "CREATE PROPERTY INDEX FOR (n:Person) ON (n.a, n.b, n.c, n.d, n.e, n.f, n.g, n.h, n.i) KIND EQUALITY";
+        match parse_statement_err(nine_fields) {
+            EngineError::GqlParse { message, .. } => assert_eq!(
+                message,
+                "GQL index DDL error: compound secondary indexes support at most 8 fields"
+            ),
+            err => panic!("expected field-count parse error, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_rejects_gql_property_index_unsupported_metadata_fields() {
+        for source in [
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (updated_at(n)) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_ON]-() ON (valid_from(r)) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (labels(n)) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_ON]-() ON (type(r)) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_ON]-() ON (startNode(r)) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_ON]-() ON (endNode(r)) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_ON]-() ON (id(id(r))) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (validFrom(n)) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR ()-[r:WORKS_ON]-() ON (elementKey(r)) KIND EQUALITY",
+            "CREATE PROPERTY INDEX FOR (n:Person) ON (id(startNode(n))) KIND EQUALITY",
+        ] {
+            match parse_statement_err(source) {
+                EngineError::GqlParse { message, .. } => {
+                    assert!(
+                        message.starts_with("GQL index DDL error")
+                            || message.contains("expected ')'"),
+                        "source: {source}, message: {message}"
+                    );
+                }
+                err => panic!("expected metadata parse error for {source}, got {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_statement_rejects_compound_composite_aliases_with_locked_message() {
+        for source in ["CREATE COMPOUND INDEX", "CREATE COMPOSITE INDEX"] {
+            match parse_statement_err(source) {
+                EngineError::GqlParse { message, .. } => {
+                    assert_eq!(message, compound_index_ddl_message());
+                }
+                err => panic!("expected locked compound/composite parse error, got {err:?}"),
+            }
+        }
+        match parse_statement_err("SHOW COMPOUND PROPERTY INDEXES") {
+            EngineError::GqlParse { message, .. } => assert_eq!(
+                message,
+                "GQL index DDL error: compound indexes are shown through SHOW PROPERTY INDEXES"
+            ),
+            err => panic!("expected SHOW COMPOUND unsupported parse error, got {err:?}"),
         }
     }
 

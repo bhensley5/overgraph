@@ -859,6 +859,94 @@ fn edge_query_reads_segment_and_active_memtable_sources() {
 }
 
 #[test]
+fn edge_query_id_range_and_created_at_range_anchor_metadata_scan_without_full_scan() {
+    let (_dir, engine) = query_test_engine();
+    let a = insert_query_node(&engine, "Person", "meta-anchor-a", &[], 1.0);
+    let b = insert_query_node(&engine, "Person", "meta-anchor-b", &[], 1.0);
+
+    let first = engine
+        .upsert_edge(a, b, "KNOWS", UpsertEdgeOptions::default())
+        .unwrap();
+    let second = engine
+        .upsert_edge(b, a, "LIKES", UpsertEdgeOptions::default())
+        .unwrap();
+    engine.flush().unwrap();
+    let third = engine
+        .upsert_edge(a, b, "BLOCKS", UpsertEdgeOptions::default())
+        .unwrap();
+
+    let id_range_only = EdgeQuery {
+        filter: Some(EdgeFilterExpr::IdRange {
+            lower: Some(second),
+            upper: None,
+            lower_inclusive: true,
+            upper_inclusive: true,
+        }),
+        ..Default::default()
+    };
+    let ids = engine.query_edge_ids(&id_range_only).unwrap();
+    assert_eq!(ids.edge_ids, vec![second, third]);
+    let plan = engine.explain_edge_query(&id_range_only).unwrap();
+    assert!(plan_contains_node(&plan.root, &QueryPlanNode::EdgeMetadataScan));
+
+    let exclusive_id_range_only = EdgeQuery {
+        filter: Some(EdgeFilterExpr::IdRange {
+            lower: Some(first),
+            upper: Some(third),
+            lower_inclusive: false,
+            upper_inclusive: false,
+        }),
+        ..Default::default()
+    };
+    let ids = engine.query_edge_ids(&exclusive_id_range_only).unwrap();
+    assert_eq!(ids.edge_ids, vec![second]);
+
+    let created_at_range_only = EdgeQuery {
+        filter: Some(EdgeFilterExpr::CreatedAtRange {
+            lower: Some(1),
+            upper: None,
+            lower_inclusive: true,
+            upper_inclusive: true,
+        }),
+        ..Default::default()
+    };
+    let ids = engine.query_edge_ids(&created_at_range_only).unwrap();
+    assert_eq!(ids.edge_ids, vec![first, second, third]);
+    let plan = engine.explain_edge_query(&created_at_range_only).unwrap();
+    assert!(plan_contains_node(&plan.root, &QueryPlanNode::EdgeMetadataScan));
+
+    let empty_created_at_range_only = EdgeQuery {
+        filter: Some(EdgeFilterExpr::CreatedAtRange {
+            lower: None,
+            upper: Some(0),
+            lower_inclusive: true,
+            upper_inclusive: true,
+        }),
+        ..Default::default()
+    };
+    let ids = engine.query_edge_ids(&empty_created_at_range_only).unwrap();
+    assert!(ids.edge_ids.is_empty());
+
+    let or_with_unindexed_anchor = EdgeQuery {
+        filter: Some(EdgeFilterExpr::Or(vec![
+            EdgeFilterExpr::IdRange {
+                lower: Some(third),
+                upper: None,
+                lower_inclusive: true,
+                upper_inclusive: true,
+            },
+            EdgeFilterExpr::WeightRange {
+                lower: Some(2.0),
+                upper: None,
+            },
+        ])),
+        ..Default::default()
+    };
+    let ids = engine.query_edge_ids(&or_with_unindexed_anchor).unwrap();
+    assert_eq!(ids.edge_ids, vec![third]);
+}
+
+#[test]
 fn edge_query_metadata_sidecar_unavailable_falls_back_at_engine_level() {
     #[derive(Clone, Copy)]
     enum SidecarRewrite {
@@ -1133,7 +1221,7 @@ fn edge_query_uses_ready_edge_property_equality_index() {
     engine.flush().unwrap();
 
     let info = engine
-        .ensure_edge_property_index("EDGE_LABEL_82", "status", SecondaryIndexKind::Equality)
+        .ensure_edge_property_index("EDGE_LABEL_82", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -1167,7 +1255,7 @@ fn edge_query_uses_ready_edge_property_equality_index() {
 fn edge_active_equality_index_uses_semantic_hashes() {
     let (_dir, engine) = query_test_engine();
     let info = engine
-        .ensure_edge_property_index("EDGE_SEMANTIC_ACTIVE", "score", SecondaryIndexKind::Equality)
+        .ensure_edge_property_index("EDGE_SEMANTIC_ACTIVE", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -1323,11 +1411,11 @@ fn semantic_equality_sidecars_survive_flush_reopen_and_compaction_for_nodes_and_
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         node_index = engine
-            .ensure_node_property_index("Person", "score", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap()
             .index_id;
         edge_index = engine
-            .ensure_edge_property_index("EDGE_SEMANTIC_SEG", "score", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("EDGE_SEMANTIC_SEG", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap()
             .index_id;
         wait_for_property_index_state(&engine, node_index, SecondaryIndexState::Ready);
@@ -1507,10 +1595,7 @@ fn edge_query_uses_ready_edge_property_range_index() {
     engine.flush().unwrap();
 
     let info = engine
-        .ensure_edge_property_index("EDGE_LABEL_83",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_edge_property_index("EDGE_LABEL_83", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -1602,10 +1687,7 @@ fn edge_property_range_index_query_paginates_by_edge_id_cursor() {
     engine.flush().unwrap();
 
     let info = engine
-        .ensure_edge_property_index("SPECIAL_EDGE_831",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_edge_property_index("SPECIAL_EDGE_831", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -1642,7 +1724,7 @@ fn edge_property_range_index_query_paginates_by_edge_id_cursor() {
 fn edge_property_index_does_not_make_filter_only_edge_query_legal() {
     let (_dir, engine) = query_test_engine();
     let info = engine
-        .ensure_edge_property_index("EDGE_LABEL_84", "status", SecondaryIndexKind::Equality)
+        .ensure_edge_property_index("EDGE_LABEL_84", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -1755,7 +1837,7 @@ fn edge_property_in_uses_index_union_and_preserves_signed_zero() {
     engine.flush().unwrap();
 
     let info = engine
-        .ensure_edge_property_index("EDGE_LABEL_86", "z", SecondaryIndexKind::Equality)
+        .ensure_edge_property_index("EDGE_LABEL_86", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("z").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -1802,10 +1884,7 @@ fn edge_property_range_uses_ready_v2_numeric_range_sidecar() {
     engine.flush().unwrap();
 
     let info = engine
-        .ensure_edge_property_index("EDGE_LABEL_87",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_edge_property_index("EDGE_LABEL_87", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -1861,7 +1940,7 @@ fn edge_property_or_with_verifier_branch_falls_back_whole_or() {
     engine.flush().unwrap();
 
     let info = engine
-        .ensure_edge_property_index("EDGE_LABEL_88", "status", SecondaryIndexKind::Equality)
+        .ensure_edge_property_index("EDGE_LABEL_88", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -1956,7 +2035,7 @@ fn edge_property_indexed_not_filters_use_bounded_positive_universe_only() {
         .unwrap();
 
     let info = engine
-        .ensure_edge_property_index("EDGE_LABEL_89", "status", SecondaryIndexKind::Equality)
+        .ensure_edge_property_index("EDGE_LABEL_89", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -2047,7 +2126,7 @@ fn edge_property_index_visibility_merges_active_frozen_and_segments() {
         .map(|idx| insert_query_node(&engine, "Person",  &format!("edge-vis-{idx}"), &[], 1.0))
         .collect::<Vec<_>>();
     let info = engine
-        .ensure_edge_property_index("EDGE_LABEL_89", "status", SecondaryIndexKind::Equality)
+        .ensure_edge_property_index("EDGE_LABEL_89", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -2180,7 +2259,7 @@ fn edge_property_equality_verifier_filters_stale_or_colliding_postings() {
         engine.flush().unwrap();
 
         let info = engine
-            .ensure_edge_property_index("EDGE_LABEL_90", "color", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("EDGE_LABEL_90", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
@@ -2241,7 +2320,7 @@ fn edge_property_query_falls_back_and_marks_corrupt_equality_sidecar_failed() {
         engine.flush().unwrap();
 
         let info = engine
-            .ensure_edge_property_index("EDGE_LABEL_91", "status", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("EDGE_LABEL_91", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
@@ -2305,7 +2384,7 @@ fn edge_property_query_enqueues_planning_followup_for_corrupt_equality_sidecar()
         engine.flush().unwrap();
 
         let info = engine
-            .ensure_edge_property_index("EDGE_LABEL_94", "status", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("EDGE_LABEL_94", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
@@ -2387,10 +2466,7 @@ fn edge_property_query_enqueues_planning_followup_for_corrupt_range_sidecar() {
         engine.flush().unwrap();
 
         let info = engine
-            .ensure_edge_property_index("EDGE_LABEL_95",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_edge_property_index("EDGE_LABEL_95", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
@@ -2473,10 +2549,7 @@ fn edge_property_query_falls_back_and_marks_corrupt_range_sidecar_failed() {
         engine.flush().unwrap();
 
         let info = engine
-            .ensure_edge_property_index("EDGE_LABEL_96",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_edge_property_index("EDGE_LABEL_96", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
@@ -2545,7 +2618,7 @@ fn edge_property_query_uses_sidecar_counts_when_planner_stats_are_missing() {
         engine.flush().unwrap();
 
         let info = engine
-            .ensure_edge_property_index("EDGE_LABEL_92", "status", SecondaryIndexKind::Equality)
+            .ensure_edge_property_index("EDGE_LABEL_92", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
         engine.close().unwrap();
@@ -2616,7 +2689,7 @@ fn edge_property_in_union_materializes_when_union_cap_allows_it() {
     engine.flush().unwrap();
 
     let info = engine
-        .ensure_edge_property_index("EDGE_LABEL_93", "bucket", SecondaryIndexKind::Equality)
+        .ensure_edge_property_index("EDGE_LABEL_93", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("bucket").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -3570,6 +3643,28 @@ fn oracle_node_matches(query: &NodeQuery, node: &NodeView) -> bool {
 
 fn oracle_filter_matches(filter: &NodeFilterExpr, node: &NodeView) -> bool {
     match filter {
+        NodeFilterExpr::IdRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => {
+            lower.is_none_or(|lower| {
+                if *lower_inclusive {
+                    node.id >= lower
+                } else {
+                    node.id > lower
+                }
+            }) && upper.is_none_or(|upper| {
+                if *upper_inclusive {
+                    node.id <= upper
+                } else {
+                    node.id < upper
+                }
+            })
+        }
+        NodeFilterExpr::KeyEquals(key) => node.key == *key,
+        NodeFilterExpr::KeyIn(keys) => keys.iter().any(|key| key == &node.key),
         NodeFilterExpr::PropertyEquals { key, value } => {
             node.props.get(key).is_some_and(|candidate| candidate == value)
         }
@@ -3604,6 +3699,46 @@ fn oracle_filter_matches(filter: &NodeFilterExpr, node: &NodeView) -> bool {
         NodeFilterExpr::UpdatedAtRange { lower_ms, upper_ms } => {
             lower_ms.is_none_or(|lower| node.updated_at >= lower)
                 && upper_ms.is_none_or(|upper| node.updated_at <= upper)
+        }
+        NodeFilterExpr::WeightRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => {
+            lower.is_none_or(|lower| {
+                if *lower_inclusive {
+                    node.weight >= lower
+                } else {
+                    node.weight > lower
+                }
+            }) && upper.is_none_or(|upper| {
+                if *upper_inclusive {
+                    node.weight <= upper
+                } else {
+                    node.weight < upper
+                }
+            })
+        }
+        NodeFilterExpr::CreatedAtRange {
+            lower,
+            upper,
+            lower_inclusive,
+            upper_inclusive,
+        } => {
+            lower.is_none_or(|lower| {
+                if *lower_inclusive {
+                    node.created_at >= lower
+                } else {
+                    node.created_at > lower
+                }
+            }) && upper.is_none_or(|upper| {
+                if *upper_inclusive {
+                    node.created_at <= upper
+                } else {
+                    node.created_at < upper
+                }
+            })
         }
         NodeFilterExpr::PropertyExists { key } => node.props.contains_key(key),
         NodeFilterExpr::PropertyMissing { key } => !node.props.contains_key(key),
@@ -3742,6 +3877,2352 @@ fn assert_plan_includes_input_nodes(plan: &QueryPlan, expected: &[QueryPlanNode]
             .unwrap_or_else(|| panic!("expected plan to include {expected_node:?}; got {actual:?}"));
         actual.remove(position);
     }
+}
+
+fn find_compound_details(
+    node: &QueryPlanNode,
+    range: bool,
+) -> Option<&CompoundIndexPlanDetails> {
+    match node {
+        QueryPlanNode::CompoundEqualityIndex { details } if !range => Some(details),
+        QueryPlanNode::CompoundRangeIndex { details } if range => Some(details),
+        QueryPlanNode::Intersect { inputs } | QueryPlanNode::Union { inputs } => inputs
+            .iter()
+            .find_map(|input| find_compound_details(input, range)),
+        QueryPlanNode::VerifyNodeFilter { input }
+        | QueryPlanNode::VerifyEdgeFilter { input }
+        | QueryPlanNode::VerifyEdgePredicates { input } => {
+            find_compound_details(input, range)
+        }
+        _ => None,
+    }
+}
+
+fn compound_equality_details(plan: &QueryPlan) -> &CompoundIndexPlanDetails {
+    find_compound_details(&plan.root, false)
+        .unwrap_or_else(|| panic!("expected compound equality plan, got {:?}", plan.root))
+}
+
+fn compound_range_details(plan: &QueryPlan) -> &CompoundIndexPlanDetails {
+    find_compound_details(&plan.root, true)
+        .unwrap_or_else(|| panic!("expected compound range plan, got {:?}", plan.root))
+}
+
+#[test]
+fn test_compound_node_equality_plans_executes_and_explains() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let keep = insert_query_node(
+        &engine,
+        "Person",
+        "keep",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("active".to_string())),
+        ],
+        1.0,
+    );
+    let other_status = insert_query_node(
+        &engine,
+        "Person",
+        "other-status",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("inactive".to_string())),
+        ],
+        1.0,
+    );
+    let other_tenant = insert_query_node(
+        &engine,
+        "Person",
+        "other-tenant",
+        &[
+            ("tenant", PropValue::String("globex".to_string())),
+            ("status", PropValue::String("active".to_string())),
+        ],
+        1.0,
+    );
+
+    let info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("status"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let query = query_ids(
+        Some("Person"),
+        vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("acme".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("active".to_string()),
+            },
+        ],
+        false,
+    );
+
+    assert_eq!(engine.query_node_ids(&query).unwrap().items, vec![keep]);
+    let plan = engine.explain_node_query(&query).unwrap();
+    let details = compound_equality_details(&plan);
+    assert_eq!(details.index_id, info.index_id);
+    assert_eq!(details.target_kind, QueryPlanCompoundTargetKind::Node);
+    assert_eq!(details.matched_prefix_len, 2);
+    assert_eq!(details.in_expansions, 1);
+    // Both predicates are consumed by the index prefix; nothing is residual.
+    assert_eq!(details.residual_predicates, 0);
+    assert!(details.final_verification);
+    assert_eq!(details.range_field, None);
+    assert_eq!(details.fallback_reason, None);
+    assert_eq!(
+        engine.query_node_ids(&query).unwrap().items,
+        oracle_query_ids(&engine, &[keep, other_status, other_tenant], &query)
+    );
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_node_range_and_in_cap_planning() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut expected = Vec::new();
+    for score in 0..80 {
+        let tenant = if score < 70 { "acme" } else { "globex" };
+        let id = insert_query_node(
+            &engine,
+            "Person",
+            &format!("person-{score}"),
+            &[
+                ("tenant", PropValue::String(tenant.to_string())),
+                ("score", PropValue::Int(score)),
+            ],
+            1.0,
+        );
+        if (10..=20).contains(&score) {
+            expected.push(id);
+        }
+    }
+
+    let range_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::range(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("score"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, range_info.index_id, SecondaryIndexState::Ready);
+    let equality_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("score"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, equality_info.index_id, SecondaryIndexState::Ready);
+
+    let range_query = query_ids(
+        Some("Person"),
+        vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("acme".to_string()),
+            },
+            NodeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(10))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(20))),
+            },
+        ],
+        false,
+    );
+    assert_eq!(engine.query_node_ids(&range_query).unwrap().items, expected);
+    let plan = engine.explain_node_query(&range_query).unwrap();
+    let details = compound_range_details(&plan);
+    assert_eq!(details.index_id, range_info.index_id);
+    assert_eq!(details.matched_prefix_len, 1);
+    assert_eq!(
+        details.range_field,
+        Some(SecondaryIndexField::property("score"))
+    );
+    // The tenant equality and score range are both consumed by the scan.
+    assert_eq!(details.residual_predicates, 0);
+    assert!(details.final_verification);
+
+    let in_64_values = (0..64).map(PropValue::Int).collect::<Vec<_>>();
+    let in_64_query = query_ids(
+        Some("Person"),
+        vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("acme".to_string()),
+            },
+            NodeFilterExpr::PropertyIn {
+                key: "score".to_string(),
+                values: in_64_values,
+            },
+        ],
+        false,
+    );
+    let in_64_plan = engine.explain_node_query(&in_64_query).unwrap();
+    let in_64_details = find_compound_details(&in_64_plan.root, false)
+        .or_else(|| find_compound_details(&in_64_plan.root, true))
+        .unwrap_or_else(|| panic!("expected compound IN=64 plan, got {:?}", in_64_plan.root));
+    assert_eq!(in_64_details.in_expansions, 64);
+
+    let in_65_values = (0..65).map(PropValue::Int).collect::<Vec<_>>();
+    let in_65_query = query_ids(
+        Some("Person"),
+        vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("acme".to_string()),
+            },
+            NodeFilterExpr::PropertyIn {
+                key: "score".to_string(),
+                values: in_65_values,
+            },
+        ],
+        false,
+    );
+    let in_65_plan = engine.explain_node_query(&in_65_query).unwrap();
+    assert!(find_compound_details(&in_65_plan.root, false).is_none());
+    // DEC-37-014: exceeding the IN expansion cap is a broad-skip, not a
+    // prefix-not-satisfied condition (the prefix IS constrained here).
+    assert!(in_65_plan
+        .warnings
+        .contains(&QueryPlanWarning::IndexSkippedAsBroad));
+    assert!(!in_65_plan
+        .warnings
+        .contains(&QueryPlanWarning::CompoundIndexPrefixNotSatisfied));
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_single_predicate_query_uses_compound_prefix() {
+    // CP37.5 review S2 / planner review P1 (user-ratified): one predicate
+    // constraining the leading declaration field drives a compound prefix
+    // scan instead of a fallback label scan.
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let acme_a = insert_query_node(
+        &engine,
+        "Person",
+        "acme-a",
+        &[("tenant", PropValue::String("acme".to_string()))],
+        1.0,
+    );
+    let acme_b = insert_query_node(
+        &engine,
+        "Person",
+        "acme-b",
+        &[("tenant", PropValue::String("acme".to_string()))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "Person",
+        "globex",
+        &[("tenant", PropValue::String("globex".to_string()))],
+        1.0,
+    );
+    let info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("status"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let query = query_ids(
+        Some("Person"),
+        vec![NodeFilterExpr::PropertyEquals {
+            key: "tenant".to_string(),
+            value: PropValue::String("acme".to_string()),
+        }],
+        false,
+    );
+    let plan = engine.explain_node_query(&query).unwrap();
+    let details = compound_equality_details(&plan);
+    assert_eq!(details.index_id, info.index_id);
+    assert_eq!(details.matched_prefix_len, 1);
+    assert_eq!(
+        engine.query_node_ids(&query).unwrap().items,
+        vec![acme_a, acme_b]
+    );
+
+    // Same plan and results once the postings live in a segment sidecar.
+    engine.flush().unwrap();
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert_eq!(compound_equality_details(&plan).index_id, info.index_id);
+    assert_eq!(
+        engine.query_node_ids(&query).unwrap().items,
+        vec![acme_a, acme_b]
+    );
+
+    // A predicate on a non-leading declaration field still cannot use the
+    // compound index: the left prefix is unconstrained.
+    let non_prefix_query = query_ids(
+        Some("Person"),
+        vec![NodeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("active".to_string()),
+        }],
+        false,
+    );
+    let non_prefix_plan = engine.explain_node_query(&non_prefix_query).unwrap();
+    assert!(find_compound_details(&non_prefix_plan.root, false).is_none());
+    assert!(non_prefix_plan
+        .warnings
+        .contains(&QueryPlanWarning::CompoundIndexPrefixNotSatisfied));
+    assert!(engine.query_node_ids(&non_prefix_query).unwrap().items.is_empty());
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_edge_single_predicate_with_anchor_uses_compound_prefix() {
+    // Edge twin of the single-predicate rule: endpoint anchors satisfy the
+    // leading `from` field, so one property predicate is enough to drive a
+    // compound prefix scan instead of adjacency expansion plus verify.
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let from = insert_query_node(&engine, "Person", "anchor-from", &[], 1.0);
+    let mut hot = None;
+    for index in 0..30 {
+        let to = insert_query_node(&engine, "Person", &format!("anchor-to-{index}"), &[], 1.0);
+        let status = if index == 17 { "hot" } else { "cold" };
+        let edge = engine
+            .upsert_edge(
+                from,
+                to,
+                "ANCHORED_REL",
+                UpsertEdgeOptions {
+                    props: query_test_props(&[(
+                        "status",
+                        PropValue::String(status.to_string()),
+                    )]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        if index == 17 {
+            hot = Some(edge);
+        }
+    }
+    let info = engine
+        .ensure_edge_property_index(
+            "ANCHORED_REL",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::edge_meta(EdgeMetadataIndexField::From),
+                SecondaryIndexField::property("status"),
+            ]),
+        )
+        .unwrap();
+    wait_for_published_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let query = EdgeQuery {
+        label: Some("ANCHORED_REL".to_string()),
+        from_ids: vec![from],
+        filter: Some(EdgeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("hot".to_string()),
+        }),
+        ..Default::default()
+    };
+    let plan = engine.explain_edge_query(&query).unwrap();
+    let details = find_compound_details(&plan.root, false)
+        .unwrap_or_else(|| panic!("expected compound equality plan, got {:?}", plan.root));
+    assert_eq!(details.index_id, info.index_id);
+    assert_eq!(details.matched_prefix_len, 2);
+    assert_eq!(
+        engine.query_edge_ids(&query).unwrap().edge_ids,
+        vec![hot.unwrap()]
+    );
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_one_field_metadata_key_index_plans_and_executes() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let keep = insert_query_node(
+        &engine,
+        "Person",
+        "alpha",
+        &[("tenant", PropValue::String("acme".to_string()))],
+        1.0,
+    );
+    let other_key = insert_query_node(
+        &engine,
+        "Person",
+        "beta",
+        &[("tenant", PropValue::String("acme".to_string()))],
+        1.0,
+    );
+    let other_label = insert_query_node(
+        &engine,
+        "Company",
+        "alpha",
+        &[("tenant", PropValue::String("acme".to_string()))],
+        1.0,
+    );
+
+    // A one-field metadata declaration persists as NodeFieldIndex and remains
+    // usable by the planner.
+    let info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::node_meta(
+                NodeMetadataIndexField::Key,
+            )]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let query = query_ids(
+        Some("Person"),
+        vec![
+            NodeFilterExpr::KeyEquals("alpha".to_string()),
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("acme".to_string()),
+            },
+        ],
+        false,
+    );
+    assert_eq!(engine.query_node_ids(&query).unwrap().items, vec![keep]);
+    let plan = engine.explain_node_query(&query).unwrap();
+    let details = compound_equality_details(&plan);
+    assert_eq!(details.index_id, info.index_id);
+    assert_eq!(details.matched_prefix_len, 1);
+    assert!(details.compound);
+    assert_eq!(
+        details.fields,
+        vec![SecondaryIndexField::node_meta(NodeMetadataIndexField::Key)]
+    );
+    // The key leaf is consumed by the scan; the tenant leaf stays residual.
+    assert_eq!(details.residual_predicates, 1);
+    assert_eq!(details.range_field, None);
+    assert!(details.final_verification);
+    assert_eq!(details.fallback_reason, None);
+    assert_eq!(
+        engine.query_node_ids(&query).unwrap().items,
+        oracle_query_ids(&engine, &[keep, other_key, other_label], &query)
+    );
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_edge_in_cap_skips_as_broad() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let from = insert_query_node(&engine, "Person", "edge-in-cap-from", &[], 1.0);
+    let to = insert_query_node(&engine, "Person", "edge-in-cap-to", &[], 1.0);
+    engine
+        .upsert_edge(
+            from,
+            to,
+            "EDGE_IN_CAP_REL",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("status", PropValue::String("keep".to_string()))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let info = engine
+        .ensure_edge_property_index(
+            "EDGE_IN_CAP_REL",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::edge_meta(EdgeMetadataIndexField::From),
+                SecondaryIndexField::property("status"),
+            ]),
+        )
+        .unwrap();
+    wait_for_published_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let in_65_values = (0..65)
+        .map(|value| PropValue::String(format!("status-{value}")))
+        .collect::<Vec<_>>();
+    let query = EdgeQuery {
+        label: Some("EDGE_IN_CAP_REL".to_string()),
+        from_ids: vec![from],
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyIn {
+                key: "status".to_string(),
+                values: in_65_values,
+            },
+            EdgeFilterExpr::WeightRange {
+                lower: Some(0.0),
+                upper: Some(2.0),
+            },
+        ])),
+        ..Default::default()
+    };
+    let plan = engine.explain_edge_query(&query).unwrap();
+    assert!(find_compound_details(&plan.root, false).is_none());
+    // DEC-37-014: an IN product above the expansion cap is a broad-skip.
+    assert!(plan
+        .warnings
+        .contains(&QueryPlanWarning::IndexSkippedAsBroad));
+    assert!(!plan
+        .warnings
+        .contains(&QueryPlanWarning::CompoundIndexPrefixNotSatisfied));
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_non_prefix_predicates_warn_prefix_not_satisfied() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    insert_query_node(
+        &engine,
+        "Person",
+        "prefix-unsat",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("score", PropValue::Int(5)),
+            ("region", PropValue::String("east".to_string())),
+        ],
+        1.0,
+    );
+    let info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("score"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    // Predicates only on the second field cannot satisfy a left prefix.
+    let query = query_ids(
+        Some("Person"),
+        vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "score".to_string(),
+                value: PropValue::Int(5),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+        ],
+        false,
+    );
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert!(find_compound_details(&plan.root, false).is_none());
+    assert!(plan
+        .warnings
+        .contains(&QueryPlanWarning::CompoundIndexPrefixNotSatisfied));
+    assert!(!plan
+        .warnings
+        .contains(&QueryPlanWarning::IndexSkippedAsBroad));
+
+    engine.close().unwrap();
+}
+
+fn collect_compound_index_ids(node: &QueryPlanNode, ids: &mut Vec<u64>) {
+    match node {
+        QueryPlanNode::CompoundEqualityIndex { details }
+        | QueryPlanNode::CompoundRangeIndex { details } => ids.push(details.index_id),
+        QueryPlanNode::Intersect { inputs } | QueryPlanNode::Union { inputs } => {
+            for input in inputs {
+                collect_compound_index_ids(input, ids);
+            }
+        }
+        QueryPlanNode::VerifyNodeFilter { input }
+        | QueryPlanNode::VerifyEdgeFilter { input }
+        | QueryPlanNode::VerifyEdgePredicates { input } => {
+            collect_compound_index_ids(input, ids);
+        }
+        _ => {}
+    }
+}
+
+fn tenant_status_props(tenant: &str, status: &str) -> Vec<(&'static str, PropValue)> {
+    vec![
+        ("tenant", PropValue::String(tenant.to_string())),
+        ("status", PropValue::String(status.to_string())),
+    ]
+}
+
+fn tenant_status_filter() -> Vec<NodeFilterExpr> {
+    vec![
+        NodeFilterExpr::PropertyEquals {
+            key: "tenant".to_string(),
+            value: PropValue::String("acme".to_string()),
+        },
+        NodeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("active".to_string()),
+        },
+    ]
+}
+
+#[test]
+fn test_compound_three_field_prefix_only_planning() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut expected_prefix = Vec::new();
+    for index in 0..12 {
+        let region = if index % 2 == 0 { "east" } else { "west" };
+        let tenant = if index < 8 { "acme" } else { "globex" };
+        let id = insert_query_node(
+            &engine,
+            "Person",
+            &format!("three-field-{index}"),
+            &[
+                ("tenant", PropValue::String(tenant.to_string())),
+                ("region", PropValue::String(region.to_string())),
+                ("score", PropValue::Int(index)),
+            ],
+            1.0,
+        );
+        if tenant == "acme" && region == "east" {
+            expected_prefix.push(id);
+        }
+    }
+
+    let info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("region"),
+                SecondaryIndexField::property("score"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    // Constraining the first two of three fields uses a left-prefix scan.
+    let prefix_query = query_ids(
+        Some("Person"),
+        vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("acme".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+        ],
+        false,
+    );
+    assert_eq!(
+        engine.query_node_ids(&prefix_query).unwrap().items,
+        expected_prefix
+    );
+    let plan = engine.explain_node_query(&prefix_query).unwrap();
+    let details = compound_equality_details(&plan);
+    assert_eq!(details.index_id, info.index_id);
+    assert_eq!(details.matched_prefix_len, 2);
+    assert!(details.compound);
+    assert_eq!(details.residual_predicates, 0);
+
+    // A gap in the prefix (tenant + score, skipping region) stops the prefix
+    // after the first field; the score predicate stays residual.
+    let gap_query = query_ids(
+        Some("Person"),
+        vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("acme".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "score".to_string(),
+                value: PropValue::Int(4),
+            },
+        ],
+        false,
+    );
+    let gap_expected = oracle_query_ids(
+        &engine,
+        &engine.query_node_ids(&query_ids(Some("Person"), vec![], true)).unwrap().items,
+        &gap_query,
+    );
+    assert_eq!(engine.query_node_ids(&gap_query).unwrap().items, gap_expected);
+    let gap_plan = engine.explain_node_query(&gap_query).unwrap();
+    let gap_details = compound_equality_details(&gap_plan);
+    assert_eq!(gap_details.matched_prefix_len, 1);
+    assert_eq!(gap_details.residual_predicates, 1);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_multi_label_any_union_plans_and_executes() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let a_match =
+        insert_query_node(&engine, "AnyA", "a-match", &tenant_status_props("acme", "active"), 1.0);
+    let a_other = insert_query_node(
+        &engine,
+        "AnyA",
+        "a-other",
+        &tenant_status_props("acme", "inactive"),
+        1.0,
+    );
+    let b_match =
+        insert_query_node(&engine, "AnyB", "b-match", &tenant_status_props("acme", "active"), 1.0);
+    let b_other = insert_query_node(
+        &engine,
+        "AnyB",
+        "b-other",
+        &tenant_status_props("globex", "active"),
+        1.0,
+    );
+    let outside = insert_query_node(
+        &engine,
+        "AnyC",
+        "c-match",
+        &tenant_status_props("acme", "active"),
+        1.0,
+    );
+
+    let spec = || {
+        SecondaryIndexSpec::equality(vec![
+            SecondaryIndexField::property("tenant"),
+            SecondaryIndexField::property("status"),
+        ])
+    };
+    let info_a = engine.ensure_node_property_index("AnyA", spec()).unwrap();
+    wait_for_property_index_state(&engine, info_a.index_id, SecondaryIndexState::Ready);
+    let info_b = engine.ensure_node_property_index("AnyB", spec()).unwrap();
+    wait_for_property_index_state(&engine, info_b.index_id, SecondaryIndexState::Ready);
+
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["AnyA", "AnyB"], LabelMatchMode::Any)),
+        filter: filter_from_conjunction(tenant_status_filter()),
+        ..Default::default()
+    };
+    assert_eq!(
+        engine.query_node_ids(&query).unwrap().items,
+        vec![a_match, b_match]
+    );
+    let plan = engine.explain_node_query(&query).unwrap();
+    let mut compound_ids = Vec::new();
+    collect_compound_index_ids(&plan.root, &mut compound_ids);
+    compound_ids.sort_unstable();
+    let mut expected_ids = vec![info_a.index_id, info_b.index_id];
+    expected_ids.sort_unstable();
+    // One union branch per Any label, each backed by that label's declaration.
+    assert_eq!(compound_ids, expected_ids);
+    assert_eq!(
+        engine.query_node_ids(&query).unwrap().items,
+        oracle_query_ids(
+            &engine,
+            &[a_match, a_other, b_match, b_other, outside],
+            &query
+        )
+    );
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_multi_label_any_falls_back_when_label_uncovered() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let a_match = insert_query_node(
+        &engine,
+        "UncovA",
+        "a-match",
+        &tenant_status_props("acme", "active"),
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "UncovA",
+        "a-other",
+        &tenant_status_props("acme", "inactive"),
+        1.0,
+    );
+    let b_match = insert_query_node(
+        &engine,
+        "UncovB",
+        "b-match",
+        &tenant_status_props("acme", "active"),
+        1.0,
+    );
+
+    // Only one of the two Any labels has a Ready declaration: a partial
+    // union would drop UncovB rows, so the planner must not use compound
+    // sources at all.
+    let info = engine
+        .ensure_node_property_index(
+            "UncovA",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("status"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["UncovA", "UncovB"], LabelMatchMode::Any)),
+        filter: filter_from_conjunction(tenant_status_filter()),
+        ..Default::default()
+    };
+    let plan = engine.explain_node_query(&query).unwrap();
+    let mut compound_ids = Vec::new();
+    collect_compound_index_ids(&plan.root, &mut compound_ids);
+    assert!(compound_ids.is_empty(), "partial Any union must not be used");
+    assert_eq!(
+        engine.query_node_ids(&query).unwrap().items,
+        vec![a_match, b_match]
+    );
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_multi_label_all_uses_one_declaration_and_verifies_rest() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let both = insert_query_node_with_labels(
+        &engine,
+        &["AllA", "AllB"],
+        "both",
+        &tenant_status_props("acme", "active"),
+        1.0,
+    );
+    let only_a = insert_query_node(
+        &engine,
+        "AllA",
+        "only-a",
+        &tenant_status_props("acme", "active"),
+        1.0,
+    );
+
+    let info = engine
+        .ensure_node_property_index(
+            "AllA",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("status"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["AllA", "AllB"], LabelMatchMode::All)),
+        filter: filter_from_conjunction(tenant_status_filter()),
+        ..Default::default()
+    };
+    // The AllA declaration provides a superset; AllB membership is verified.
+    assert_eq!(engine.query_node_ids(&query).unwrap().items, vec![both]);
+    let plan = engine.explain_node_query(&query).unwrap();
+    let mut compound_ids = Vec::new();
+    collect_compound_index_ids(&plan.root, &mut compound_ids);
+    assert_eq!(compound_ids, vec![info.index_id]);
+    assert_eq!(
+        engine.query_node_ids(&query).unwrap().items,
+        oracle_query_ids(&engine, &[both, only_a], &query)
+    );
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_index_suppresses_stale_segment_postings() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let keep = insert_query_node(
+        &engine,
+        "Person",
+        "keep",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("active".to_string())),
+        ],
+        1.0,
+    );
+    let deleted = insert_query_node(
+        &engine,
+        "Person",
+        "deleted",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("active".to_string())),
+        ],
+        1.0,
+    );
+    let updated = insert_query_node(
+        &engine,
+        "Person",
+        "updated",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("active".to_string())),
+        ],
+        1.0,
+    );
+
+    let info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("status"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+    engine.flush().unwrap();
+
+    // The flushed segment sidecar now holds postings for all three nodes.
+    // Shadow them from newer sources: a tombstone, an update that no longer
+    // matches the tuple, and one fresh memtable match.
+    engine.delete_node(deleted).unwrap();
+    insert_query_node(
+        &engine,
+        "Person",
+        "updated",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("inactive".to_string())),
+        ],
+        1.0,
+    );
+    let fresh = insert_query_node(
+        &engine,
+        "Person",
+        "fresh",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("active".to_string())),
+        ],
+        1.0,
+    );
+
+    let query = query_ids(
+        Some("Person"),
+        vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("acme".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("active".to_string()),
+            },
+        ],
+        false,
+    );
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert!(find_compound_details(&plan.root, false).is_some());
+    assert_eq!(
+        engine.query_node_ids(&query).unwrap().items,
+        vec![keep, fresh]
+    );
+    assert_eq!(
+        engine.query_node_ids(&query).unwrap().items,
+        oracle_query_ids(&engine, &[keep, deleted, updated, fresh], &query)
+    );
+
+    // Flush again so the tombstone and the stale-tuple update live in a newer
+    // segment than the original postings.
+    engine.flush().unwrap();
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert!(find_compound_details(&plan.root, false).is_some());
+    assert_eq!(
+        engine.query_node_ids(&query).unwrap().items,
+        vec![keep, fresh]
+    );
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_truncated_segment_scan_reports_too_broad_not_partial_ready() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut ids = Vec::new();
+    for ordinal in 0..5 {
+        ids.push(insert_query_node(
+            &engine,
+            "Person",
+            &format!("n{ordinal}"),
+            &[
+                ("tenant", PropValue::String("acme".to_string())),
+                ("status", PropValue::String("active".to_string())),
+            ],
+            1.0,
+        ));
+    }
+    let info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("status"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+    engine.flush().unwrap();
+
+    // Tombstone the two lowest IDs so a truncated segment scan returns
+    // postings that newer-source suppression then drops.
+    engine.delete_node(ids[0]).unwrap();
+    engine.delete_node(ids[1]).unwrap();
+
+    let view = engine.published_read_view_for_test();
+    let entry = view
+        .secondary_index_entries
+        .iter()
+        .find(|entry| entry.index_id == info.index_id)
+        .unwrap();
+    let context =
+        crate::secondary_index_key::CompoundTupleContext::from_manifest_entry(entry).unwrap();
+    let tenant = PropValue::String("acme".to_string());
+    let status = PropValue::String("active".to_string());
+    let prefix = crate::secondary_index_key::encode_compound_tuple_prefix(
+        &context,
+        &[
+            crate::secondary_index_key::CompoundFieldValue::Property(Some(&tenant)),
+            crate::secondary_index_key::CompoundFieldValue::Property(Some(&status)),
+        ],
+    )
+    .unwrap();
+    let bounds = crate::secondary_index_key::compound_prefix_bounds(&prefix);
+
+    // A limit below the live match count truncates the segment scan right
+    // after the suppressed postings; the read must report TooBroad rather
+    // than a silently incomplete Ready set.
+    match view
+        .sources()
+        .node_ids_by_compound_prefix_limited(entry, &bounds, 3)
+        .unwrap()
+    {
+        crate::source_list::LimitedCompoundIndexRead::TooBroad => {}
+        crate::source_list::LimitedCompoundIndexRead::Ready(read_ids) => {
+            panic!("truncated compound scan returned Ready({read_ids:?}) instead of TooBroad")
+        }
+        crate::source_list::LimitedCompoundIndexRead::MissingSidecar => {
+            panic!("compound sidecar unexpectedly missing")
+        }
+    }
+
+    // With budget for the full posting list the same read returns the
+    // complete tombstone-suppressed result.
+    match view
+        .sources()
+        .node_ids_by_compound_prefix_limited(entry, &bounds, 10)
+        .unwrap()
+    {
+        crate::source_list::LimitedCompoundIndexRead::Ready(read_ids) => {
+            assert_eq!(read_ids, vec![ids[2], ids[3], ids[4]]);
+        }
+        _ => panic!("untruncated compound scan should be Ready"),
+    }
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_equality_query_returns_all_memtable_matches_above_verify_chunk() {
+    // Planner review N1: the raw-limited equality path clamped each memtable
+    // read to one verify chunk (256) without a truncation signal, silently
+    // dropping every memtable match past the clamp.
+    let (_dir, engine) = query_test_engine();
+    let info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let total = 600usize;
+    let mut inputs = Vec::with_capacity(total + 200);
+    for ordinal in 0..total {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("active-{ordinal}"),
+            props: query_test_props(&[("status", PropValue::String("active".to_string()))]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    // Non-matching rows keep the equality index strictly cheaper than the
+    // label scan so the index stays the selected driver.
+    for ordinal in 0..200 {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("inactive-{ordinal}"),
+            props: query_test_props(&[("status", PropValue::String("inactive".to_string()))]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let ids = engine.batch_upsert_nodes(inputs).unwrap();
+    let mut expected: Vec<u64> = ids[..total].to_vec();
+    expected.sort_unstable();
+
+    let mut query = query_ids(
+        Some("Person"),
+        vec![NodeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("active".to_string()),
+        }],
+        false,
+    );
+    query.page = PageRequest {
+        limit: Some(1000),
+        after: None,
+    };
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert!(
+        plan_contains_node(&plan.root, &QueryPlanNode::PropertyEqualityIndex),
+        "test requires the equality index driver, got {plan:?}"
+    );
+    let page = engine.query_node_ids(&query).unwrap();
+    assert_eq!(
+        page.items.len(),
+        total,
+        "equality matches beyond one verify chunk must not be silently dropped"
+    );
+    assert_eq!(page.items, expected);
+    assert_eq!(page.next_cursor, None);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_equality_query_merges_segment_and_memtable_matches_above_verify_chunk() {
+    // Planner review N1 (mixed tiers): the segment tier drains fully while an
+    // unflushed memtable holding more than one verify chunk of matches lost
+    // everything past 256.
+    let (_dir, engine) = query_test_engine();
+    let info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let flushed = 700usize;
+    let unflushed = 500usize;
+    let mut inputs = Vec::with_capacity(flushed + 300);
+    for ordinal in 0..flushed {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("flushed-{ordinal}"),
+            props: query_test_props(&[("status", PropValue::String("active".to_string()))]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    for ordinal in 0..300 {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("inactive-{ordinal}"),
+            props: query_test_props(&[("status", PropValue::String("inactive".to_string()))]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let flushed_ids = engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+
+    let mut memtable_inputs = Vec::with_capacity(unflushed);
+    for ordinal in 0..unflushed {
+        memtable_inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("memtable-{ordinal}"),
+            props: query_test_props(&[("status", PropValue::String("active".to_string()))]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let memtable_ids = engine.batch_upsert_nodes(memtable_inputs).unwrap();
+
+    let mut expected: Vec<u64> = flushed_ids[..flushed]
+        .iter()
+        .chain(memtable_ids.iter())
+        .copied()
+        .collect();
+    expected.sort_unstable();
+
+    let mut query = query_ids(
+        Some("Person"),
+        vec![NodeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("active".to_string()),
+        }],
+        false,
+    );
+    query.page = PageRequest {
+        limit: Some(2000),
+        after: None,
+    };
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert!(
+        plan_contains_node(&plan.root, &QueryPlanNode::PropertyEqualityIndex),
+        "test requires the equality index driver, got {plan:?}"
+    );
+    let page = engine.query_node_ids(&query).unwrap();
+    assert_eq!(
+        page.items.len(),
+        flushed + unflushed,
+        "memtable matches beyond one verify chunk must merge with segment matches"
+    );
+    assert_eq!(page.items, expected);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_selective_index_above_default_cap_drives_under_write_load() {
+    // Planner review P3: one unflushed write anywhere downgraded stats
+    // confidence to Medium database-wide, which kept the 4096 default cap and
+    // discarded selective index probes as CandidateCapExceeded in favor of a
+    // full label scan. Trusted posting upper bounds must uncap regardless of
+    // confidence class.
+    let (_dir, engine) = query_test_engine();
+    let info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let hot = QUERY_RANGE_CANDIDATE_CAP + 8;
+    let mut inputs = Vec::with_capacity(hot + 400);
+    for ordinal in 0..hot {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("hot-{ordinal}"),
+            props: query_test_props(&[("status", PropValue::String("hot".to_string()))]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    for ordinal in 0..400 {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("cold-{ordinal}"),
+            props: query_test_props(&[("status", PropValue::String("cold".to_string()))]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+
+    // The unflushed write that previously suppressed the uncap.
+    insert_query_node(
+        &engine,
+        "Person",
+        "unflushed",
+        &[("status", PropValue::String("cold".to_string()))],
+        1.0,
+    );
+
+    let query = query_ids(
+        Some("Person"),
+        vec![NodeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("hot".to_string()),
+        }],
+        false,
+    );
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert!(
+        !plan
+            .warnings
+            .contains(&QueryPlanWarning::CandidateCapExceeded),
+        "selective index must not be discarded under write load, got {:?}",
+        plan.warnings
+    );
+    assert!(
+        plan_contains_node(&plan.root, &QueryPlanNode::PropertyEqualityIndex),
+        "equality index should drive, got {plan:?}"
+    );
+    assert_eq!(engine.query_node_ids(&query).unwrap().items.len(), hot);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_intersection_uses_semantic_equality_across_numeric_forms() {
+    // Planner review N2: intersecting same-field equality lists with
+    // structural PartialEq dropped values the verifier and tuple encoding
+    // treat as equal (Int(2) vs Float(2.0)), driving an under-inclusive
+    // compound scan whose lost rows verification cannot recover.
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let x1 = insert_query_node(
+        &engine,
+        "Person",
+        "x1",
+        &[("x", PropValue::Int(1)), ("y", PropValue::Int(0))],
+        1.0,
+    );
+    let x2 = insert_query_node(
+        &engine,
+        "Person",
+        "x2",
+        &[("x", PropValue::Int(2)), ("y", PropValue::Int(0))],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "Person",
+        "x9",
+        &[("x", PropValue::Int(9)), ("y", PropValue::Int(0))],
+        1.0,
+    );
+    let info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("x"),
+                SecondaryIndexField::property("y"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let query = query_ids(
+        Some("Person"),
+        vec![
+            NodeFilterExpr::PropertyIn {
+                key: "x".to_string(),
+                values: vec![PropValue::Int(1), PropValue::Int(2)],
+            },
+            NodeFilterExpr::PropertyIn {
+                key: "x".to_string(),
+                values: vec![PropValue::Int(1), PropValue::Float(2.0), PropValue::Int(3)],
+            },
+        ],
+        false,
+    );
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert_eq!(compound_equality_details(&plan).index_id, info.index_id);
+    assert_eq!(engine.query_node_ids(&query).unwrap().items, vec![x1, x2]);
+
+    // Same intersection once the postings live in a segment sidecar.
+    engine.flush().unwrap();
+    assert_eq!(engine.query_node_ids(&query).unwrap().items, vec![x1, x2]);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_edge_triple_index_estimate_ranks_first_in_intersect() {
+    // Planner review P6: the triple source carried an unknown estimate, so it
+    // ranked dead last and broad index inputs materialized ahead of the
+    // cheapest probe in the engine.
+    let (_dir, engine) = query_test_engine();
+    let a = insert_query_node(&engine, "Person", "a", &[], 1.0);
+    let b = insert_query_node(&engine, "Person", "b", &[], 1.0);
+    let keep_edge = engine
+        .upsert_edge(
+            a,
+            b,
+            "RELATES_TO",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("status", PropValue::String("keep".to_string()))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Broad postings under the same property value with other endpoints so the
+    // equality index input is clearly more expensive than the triple probe.
+    for index in 0..300 {
+        let to = insert_query_node(&engine, "Person", &format!("to-{index}"), &[], 1.0);
+        engine
+            .upsert_edge(
+                a,
+                to,
+                "RELATES_TO",
+                UpsertEdgeOptions {
+                    props: query_test_props(&[(
+                        "status",
+                        PropValue::String("keep".to_string()),
+                    )]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let info = engine
+        .ensure_edge_property_index(
+            "RELATES_TO",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    wait_for_published_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let query = EdgeQuery {
+        label: Some("RELATES_TO".to_string()),
+        from_ids: vec![a],
+        to_ids: vec![b],
+        filter: Some(EdgeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("keep".to_string()),
+        }),
+        ..Default::default()
+    };
+    let plan = engine.explain_edge_query(&query).unwrap();
+    let QueryPlanNode::VerifyEdgeFilter { input } = &plan.root else {
+        panic!("expected VerifyEdgeFilter root, got {:?}", plan.root)
+    };
+    let QueryPlanNode::Intersect { inputs } = input.as_ref() else {
+        panic!("expected Intersect input, got {input:?}")
+    };
+    assert_eq!(
+        inputs.first(),
+        Some(&QueryPlanNode::EdgeTripleIndex),
+        "triple probe should be the cheapest intersect input, got {inputs:?}"
+    );
+    assert_eq!(engine.query_edge_ids(&query).unwrap().edge_ids, vec![keep_edge]);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_edge_query_explicit_anchor_skips_filter_planning_and_index_scan() {
+    // Planner review P7: a tiny explicit-edge-ids anchor always wins the
+    // driver sort, so filter planning (index probes, compound search) is
+    // wasted work — and must not touch index sidecars at all.
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let from = insert_query_node(&engine, "Person", "from", &[], 1.0);
+    let to = insert_query_node(&engine, "Person", "to", &[], 1.0);
+    let edge = engine
+        .upsert_edge(
+            from,
+            to,
+            "RELATES_TO",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("status", PropValue::String("keep".to_string()))]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+    let info = engine
+        .ensure_edge_property_index(
+            "RELATES_TO",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    wait_for_published_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    // Removing the sidecar makes any equality-index probe observable as a
+    // followup; the explicit-anchor plan must not generate one.
+    let segment_id = engine.segments_for_test()[0].segment_id;
+    let seg_dir = segment_dir(&db_path, segment_id);
+    let sidecar_path = segment_component_path(
+        &seg_dir,
+        crate::segment_components::SegmentComponentKind::EdgePropertyEqualityIndex {
+            index_id: info.index_id,
+        },
+    );
+    corrupt_planner_stats_for_segment(&db_path, segment_id);
+    std::fs::remove_file(&sidecar_path).unwrap();
+    engine
+        .reopen_segment_reader_and_rebuild_sources_for_test(segment_id)
+        .unwrap();
+
+    let query = EdgeQuery {
+        ids: vec![edge],
+        filter: Some(EdgeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("keep".to_string()),
+        }),
+        ..Default::default()
+    };
+
+    let (_followup_ready_rx, followup_release_tx) = engine.set_runtime_publish_pause();
+    assert_eq!(engine.query_edge_ids(&query).unwrap().edge_ids, vec![edge]);
+    assert_eq!(engine.pending_secondary_index_followup_count_for_test(), 0);
+    followup_release_tx.send(()).unwrap();
+
+    let plan = engine.explain_edge_query(&query).unwrap();
+    assert!(
+        plan_contains_node(&plan.root, &QueryPlanNode::ExplicitEdgeIds),
+        "explicit ids should drive, got {plan:?}"
+    );
+    assert!(
+        !plan_contains_node(&plan.root, &QueryPlanNode::EdgePropertyEqualityIndex),
+        "filter planning should be skipped for tiny explicit anchors, got {plan:?}"
+    );
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_estimate_counts_sidecar_postings_when_stats_uncovered() {
+    // Planner review P4: a stats-uncovered segment previously charged the
+    // whole label cardinality, so a selective compound candidate was skipped
+    // as broad during stats gaps. The estimator must count real postings from
+    // the compound sidecar key table instead.
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let mut acme_ids = Vec::new();
+    for ordinal in 0..40 {
+        acme_ids.push(insert_query_node(
+            &engine,
+            "Person",
+            &format!("acme-{ordinal}"),
+            &[
+                ("tenant", PropValue::String("acme".to_string())),
+                ("status", PropValue::String("active".to_string())),
+            ],
+            1.0,
+        ));
+    }
+    for ordinal in 0..200 {
+        insert_query_node(
+            &engine,
+            "Person",
+            &format!("globex-{ordinal}"),
+            &[
+                ("tenant", PropValue::String("globex".to_string())),
+                ("status", PropValue::String("active".to_string())),
+            ],
+            1.0,
+        );
+    }
+    let info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("status"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+    engine.flush().unwrap();
+
+    // Remove the segment's planner stats so the compound rollup loses
+    // coverage while the compound sidecar itself stays intact.
+    let segment_id = engine.segments_for_test()[0].segment_id;
+    let seg_dir = segment_dir(&db_path, segment_id);
+    let stats_path = segment_component_path(
+        &seg_dir,
+        crate::segment_components::SegmentComponentKind::PlannerStats,
+    );
+    engine.close().unwrap();
+    std::fs::remove_file(&stats_path).unwrap();
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    assert!(engine.segments_for_test()[0].planner_stats().is_none());
+
+    let query = query_ids(
+        Some("Person"),
+        vec![NodeFilterExpr::PropertyEquals {
+            key: "tenant".to_string(),
+            value: PropValue::String("acme".to_string()),
+        }],
+        false,
+    );
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert!(
+        !plan.warnings.contains(&QueryPlanWarning::IndexSkippedAsBroad),
+        "selective compound candidate must not be skipped during stats gaps, got {:?}",
+        plan.warnings
+    );
+    let details = compound_equality_details(&plan);
+    assert_eq!(details.index_id, info.index_id);
+    assert_eq!(
+        details.estimated_candidates,
+        Some(40),
+        "estimate should count real sidecar postings, not the label cardinality"
+    );
+    assert_eq!(engine.query_node_ids(&query).unwrap().items, acme_ids);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_edge_equality_truncated_epoch_read_reports_too_broad_not_partial_ready() {
+    // Planner review N3: an immutable-memtable read that consumed the whole
+    // raw budget could fall through to Ready when no segments followed,
+    // silently dropping the postings the truncated read never returned.
+    let (_dir, engine) = query_test_engine();
+    let info = engine
+        .ensure_edge_property_index(
+            "RELATES_TO",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    wait_for_published_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let from = insert_query_node(&engine, "Person", "from", &[], 1.0);
+    let mut to_ids = Vec::new();
+    let mut edge_ids = Vec::new();
+    for index in 0..6 {
+        let to = insert_query_node(&engine, "Person", &format!("to-{index}"), &[], 1.0);
+        to_ids.push(to);
+        edge_ids.push(
+            engine
+                .upsert_edge(
+                    from,
+                    to,
+                    "RELATES_TO",
+                    UpsertEdgeOptions {
+                        props: query_test_props(&[(
+                            "status",
+                            PropValue::String("x".to_string()),
+                        )]),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+        );
+    }
+    engine.freeze_memtable().unwrap();
+    // Shadow the two lowest edge ids with active-memtable tombstones so a
+    // truncated epoch read loses net postings to shadow filtering.
+    engine.delete_edge(edge_ids[0]).unwrap();
+    engine.delete_edge(edge_ids[1]).unwrap();
+
+    // Publication is asynchronous; wait until the published view reflects the
+    // frozen epoch and the two shadowing tombstones.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let view = loop {
+        let view = engine.published_read_view_for_test();
+        if view.immutable_epochs.len() == 1
+            && view
+                .sources()
+                .edge_ids_by_secondary_eq_hashes_limited_read(
+                    info.index_id,
+                    &[crate::property_value_semantics::hash_prop_equality_key(
+                        &PropValue::String("x".to_string()),
+                    )],
+                    16,
+                )
+                .ok()
+                .is_some_and(|read| {
+                    matches!(
+                        read,
+                        crate::source_list::LimitedEdgeIndexRead::Ready(ref ids)
+                            if *ids == edge_ids[2..]
+                    )
+                })
+        {
+            break view;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "published view never reflected the frozen epoch and tombstones"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    let hashes = vec![crate::property_value_semantics::hash_prop_equality_key(
+        &PropValue::String("x".to_string()),
+    )];
+    // A budget of 5 truncates the 6-posting epoch read; shadow filtering then
+    // drops two ids, so the result stays under the budget. The read must
+    // report TooBroad rather than a silently incomplete Ready set.
+    match view
+        .sources()
+        .edge_ids_by_secondary_eq_hashes_limited_read(info.index_id, &hashes, 5)
+        .unwrap()
+    {
+        crate::source_list::LimitedEdgeIndexRead::TooBroad => {}
+        crate::source_list::LimitedEdgeIndexRead::Ready(read_ids) => {
+            panic!("truncated epoch read returned Ready({read_ids:?}) instead of TooBroad")
+        }
+        crate::source_list::LimitedEdgeIndexRead::MissingSidecar => {
+            panic!("edge equality sidecar unexpectedly missing")
+        }
+    }
+
+    // With budget for every raw posting the same read returns the complete
+    // shadow-filtered result.
+    match view
+        .sources()
+        .edge_ids_by_secondary_eq_hashes_limited_read(info.index_id, &hashes, 16)
+        .unwrap()
+    {
+        crate::source_list::LimitedEdgeIndexRead::Ready(read_ids) => {
+            assert_eq!(read_ids, edge_ids[2..].to_vec());
+        }
+        _ => panic!("untruncated epoch read should be Ready"),
+    }
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_edge_endpoint_property_source_wins_when_selective() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let from = insert_query_node(&engine, "Person", "from", &[], 1.0);
+    let mut edge_ids = Vec::new();
+    for index in 0..100 {
+        let to = insert_query_node(&engine, "Person", &format!("to-{index}"), &[], 1.0);
+        let status = if index == 42 { "keep" } else { "skip" };
+        edge_ids.push(
+            engine
+                .upsert_edge(
+                    from,
+                    to,
+                    "RELATES_TO",
+                    UpsertEdgeOptions {
+                        props: query_test_props(&[(
+                            "status",
+                            PropValue::String(status.to_string()),
+                        )]),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+        );
+    }
+    let expected = vec![edge_ids[42]];
+
+    let info = engine
+        .ensure_edge_property_index(
+            "RELATES_TO",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::edge_meta(EdgeMetadataIndexField::From),
+                SecondaryIndexField::property("status"),
+            ]),
+        )
+        .unwrap();
+    wait_for_published_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let query = EdgeQuery {
+        label: Some("RELATES_TO".to_string()),
+        from_ids: vec![from],
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("keep".to_string()),
+            },
+            EdgeFilterExpr::WeightRange {
+                lower: Some(0.0),
+                upper: Some(2.0),
+            },
+        ])),
+        ..Default::default()
+    };
+    assert_eq!(engine.query_edge_ids(&query).unwrap().edge_ids, expected);
+    let plan = engine.explain_edge_query(&query).unwrap();
+    let details = compound_equality_details(&plan);
+    assert_eq!(details.index_id, info.index_id);
+    assert_eq!(details.target_kind, QueryPlanCompoundTargetKind::Edge);
+    assert_eq!(details.matched_prefix_len, 2);
+    // The weight range predicate is not part of the prefix and stays residual.
+    assert_eq!(details.residual_predicates, 1);
+    assert!(details.final_verification);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_planned_query_pages_with_cursor_across_sources() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    // 15 matches flushed into a segment, then 10 more matches plus noise left
+    // in the memtable, so cursor pages cross posting lists and sources.
+    let mut expected = Vec::new();
+    for ordinal in 0..15 {
+        expected.push(insert_query_node(
+            &engine,
+            "CompoundPagePerson",
+            &format!("seg-{ordinal}"),
+            &[
+                ("tenant", PropValue::String("acme".to_string())),
+                ("status", PropValue::String("active".to_string())),
+            ],
+            1.0,
+        ));
+    }
+    let info = engine
+        .ensure_node_property_index(
+            "CompoundPagePerson",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("status"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+    engine.flush().unwrap();
+    for ordinal in 0..10 {
+        expected.push(insert_query_node(
+            &engine,
+            "CompoundPagePerson",
+            &format!("mem-{ordinal}"),
+            &[
+                ("tenant", PropValue::String("acme".to_string())),
+                ("status", PropValue::String("active".to_string())),
+            ],
+            1.0,
+        ));
+        insert_query_node(
+            &engine,
+            "CompoundPagePerson",
+            &format!("mem-noise-{ordinal}"),
+            &[
+                ("tenant", PropValue::String("acme".to_string())),
+                ("status", PropValue::String("inactive".to_string())),
+            ],
+            1.0,
+        );
+    }
+
+    let mut query = query_ids(
+        Some("CompoundPagePerson"),
+        vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("acme".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("active".to_string()),
+            },
+        ],
+        false,
+    );
+    query.page.limit = Some(4);
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert!(find_compound_details(&plan.root, false).is_some());
+
+    let mut collected = Vec::new();
+    let mut pages = 0usize;
+    loop {
+        let page = engine.query_node_ids(&query).unwrap();
+        assert!(page.items.len() <= 4);
+        assert!(
+            page.items.windows(2).all(|pair| pair[0] < pair[1]),
+            "page items must be strictly ascending"
+        );
+        if let (Some(first), Some(after)) = (page.items.first(), query.page.after) {
+            assert!(*first > after, "page must start after the cursor");
+        }
+        let next_cursor = page.next_cursor;
+        collected.extend(page.items);
+        pages += 1;
+        assert!(pages <= 25, "cursor pagination failed to terminate");
+        match next_cursor {
+            Some(cursor) => query.page.after = Some(cursor),
+            None => break,
+        }
+    }
+    assert!(pages >= 7, "expected multiple pages, got {pages}");
+    assert_eq!(collected, expected);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_value_dedup_handles_large_endpoint_lists() {
+    // Past the IN-expansion cap, dedup switches to canonical byte keys; it
+    // must still preserve first-occurrence order and exact uniqueness.
+    let mut values: Vec<CompoundOwnedValue> = (0..600)
+        .map(|ordinal| CompoundOwnedValue::U64(ordinal % 150))
+        .collect();
+    dedup_compound_values(&mut values);
+    assert_eq!(
+        values,
+        (0..150).map(CompoundOwnedValue::U64).collect::<Vec<_>>()
+    );
+
+    let mut mixed: Vec<CompoundOwnedValue> = (0..400)
+        .map(|ordinal| CompoundOwnedValue::Property(PropValue::Int(ordinal % 80)))
+        .collect();
+    dedup_compound_values(&mut mixed);
+    assert_eq!(
+        mixed,
+        (0..80)
+            .map(|ordinal| CompoundOwnedValue::Property(PropValue::Int(ordinal)))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_compound_source_not_cheapest_skips_to_verifier_instead_of_intersect() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    // 8 rare acme nodes, 12 common acme nodes (compound prefix `tenant=acme`
+    // matches 20 — within the 4x broad-source factor of the 8-candidate
+    // status index but not cheaper), and 80 other-tenant nodes so the
+    // compound prefix stays well under the label count.
+    let mut rare_ids = Vec::new();
+    for ordinal in 0..8 {
+        rare_ids.push(insert_query_node(
+            &engine,
+            "IntersectPerson",
+            &format!("rare-{ordinal}"),
+            &[
+                ("tenant", PropValue::String("acme".to_string())),
+                ("status", PropValue::String("rare".to_string())),
+                ("score", PropValue::Int(ordinal)),
+            ],
+            1.0,
+        ));
+    }
+    for ordinal in 0..12 {
+        insert_query_node(
+            &engine,
+            "IntersectPerson",
+            &format!("common-{ordinal}"),
+            &[
+                ("tenant", PropValue::String("acme".to_string())),
+                ("status", PropValue::String("common".to_string())),
+                ("score", PropValue::Int(ordinal)),
+            ],
+            1.0,
+        );
+    }
+    for ordinal in 0..80 {
+        insert_query_node(
+            &engine,
+            "IntersectPerson",
+            &format!("other-{ordinal}"),
+            &[
+                ("tenant", PropValue::String("other".to_string())),
+                ("status", PropValue::String("common".to_string())),
+                ("score", PropValue::Int(ordinal)),
+            ],
+            1.0,
+        );
+    }
+
+    let status_info = engine
+        .ensure_node_property_index(
+            "IntersectPerson",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let compound_info = engine
+        .ensure_node_property_index(
+            "IntersectPerson",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("score"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_property_index_state(&engine, compound_info.index_id, SecondaryIndexState::Ready);
+    engine.flush().unwrap();
+
+    // `status = rare` is far more selective than the compound prefix
+    // `tenant = acme`, so the compound source is not the cheapest input. It
+    // must skip to the verifier rather than execute a second sidecar scan
+    // alongside the cheaper driver.
+    let query = query_ids(
+        Some("IntersectPerson"),
+        vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("acme".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("rare".to_string()),
+            },
+        ],
+        false,
+    );
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert!(
+        find_compound_details(&plan.root, false).is_none()
+            && find_compound_details(&plan.root, true).is_none(),
+        "non-cheapest compound source must not execute: {:?}",
+        plan.root
+    );
+    assert_eq!(engine.query_node_ids(&query).unwrap().items, rare_ids);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_weight_range_demotes_to_prefix_and_matches_infinite_weight() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let a = insert_query_node(&engine, "Person", "weight-a", &[], 1.0);
+    let b = insert_query_node(&engine, "Person", "weight-b", &[], 1.0);
+    let finite = engine
+        .upsert_edge(
+            a,
+            b,
+            "WEIGHTED_REL",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("status", PropValue::String("hot".to_string()))]),
+                weight: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let infinite = engine
+        .upsert_edge(
+            b,
+            a,
+            "WEIGHTED_REL",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("status", PropValue::String("hot".to_string()))]),
+                weight: f32::INFINITY,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine
+        .upsert_edge(
+            a,
+            b,
+            "WEIGHTED_REL",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("status", PropValue::String("cold".to_string()))]),
+                weight: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let info = engine
+        .ensure_edge_property_index(
+            "WEIGHTED_REL",
+            SecondaryIndexSpec::range(vec![
+                SecondaryIndexField::property("status"),
+                SecondaryIndexField::edge_meta(EdgeMetadataIndexField::Weight),
+            ]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+    engine.flush().unwrap();
+
+    // The infinite weight is stored as an EqualityHash-class tuple component
+    // that Numeric-class range scans never visit, while the public verifier
+    // matches it. The planner must keep the equality-prefix compound
+    // candidate and verify the weight range residually so plan choice cannot
+    // change results.
+    let query = EdgeQuery {
+        label: Some("WEIGHTED_REL".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::WeightRange {
+                lower: Some(0.5),
+                upper: None,
+            },
+        ])),
+        ..Default::default()
+    };
+    let plan = engine.explain_edge_query(&query).unwrap();
+    let details = compound_range_details(&plan);
+    assert_eq!(details.index_id, info.index_id);
+    assert_eq!(details.matched_prefix_len, 1);
+    assert_eq!(
+        details.range_field, None,
+        "weight must not drive a compound range scan"
+    );
+    let mut edge_ids = engine.query_edge_ids(&query).unwrap().edge_ids;
+    edge_ids.sort_unstable();
+    let mut expected = vec![finite, infinite];
+    expected.sort_unstable();
+    assert_eq!(edge_ids, expected);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_edge_corrupt_sidecar_falls_back_and_enqueues_followup() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let a = insert_query_node(&engine, "Person", "compound-corrupt-a", &[], 1.0);
+    let b = insert_query_node(&engine, "Person", "compound-corrupt-b", &[], 1.0);
+    let keep = engine
+        .upsert_edge(
+            a,
+            b,
+            "COMPOUND_CORRUPT_REL",
+            UpsertEdgeOptions {
+                props: query_test_props(&[("status", PropValue::String("hot".to_string()))]),
+                weight: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+    let info = engine
+        .ensure_edge_property_index(
+            "COMPOUND_CORRUPT_REL",
+            SecondaryIndexSpec::range(vec![
+                SecondaryIndexField::property("status"),
+                SecondaryIndexField::edge_meta(EdgeMetadataIndexField::Weight),
+            ]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let query = EdgeQuery {
+        label: Some("COMPOUND_CORRUPT_REL".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::WeightRange {
+                lower: Some(0.0),
+                upper: Some(2.0),
+            },
+        ])),
+        ..Default::default()
+    };
+    let plan = engine.explain_edge_query(&query).unwrap();
+    assert_eq!(compound_range_details(&plan).index_id, info.index_id);
+
+    let segment_id = engine.segments_for_test()[0].segment_id;
+    let sidecar_path = crate::segment_writer::edge_compound_range_sidecar_path(
+        &crate::segment_writer::segment_dir(&db_path, segment_id),
+        info.index_id,
+    );
+    engine.close().unwrap();
+    corrupt_compound_sidecar_payload_only_in_place(&sidecar_path);
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    wait_for_edge_property_index_state(&reopened, info.index_id, SecondaryIndexState::Ready);
+    let plan = reopened.explain_edge_query(&query).unwrap();
+    assert_eq!(compound_range_details(&plan).index_id, info.index_id);
+    assert_single_read_followup_enqueued(&reopened, || {
+        assert_eq!(reopened.query_edge_ids(&query).unwrap().edge_ids, vec![keep]);
+    });
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_compound_node_missing_sidecar_falls_back_and_enqueues_followup() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let keep = insert_query_node(
+        &engine,
+        "CompoundMissingPerson",
+        "compound-missing-keep",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("active".to_string())),
+        ],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "CompoundMissingPerson",
+        "compound-missing-skip",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("inactive".to_string())),
+        ],
+        1.0,
+    );
+    engine.flush().unwrap();
+    let info = engine
+        .ensure_node_property_index(
+            "CompoundMissingPerson",
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("status"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    let query = query_ids(
+        Some("CompoundMissingPerson"),
+        vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("acme".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("active".to_string()),
+            },
+        ],
+        false,
+    );
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert_eq!(compound_equality_details(&plan).index_id, info.index_id);
+
+    let segment_id = engine.segments_for_test()[0].segment_id;
+    let sidecar_path = crate::segment_writer::node_compound_eq_sidecar_path(
+        &crate::segment_writer::segment_dir(&db_path, segment_id),
+        info.index_id,
+    );
+    std::fs::remove_file(&sidecar_path).unwrap();
+
+    assert_single_read_followup_enqueued(&engine, || {
+        assert_eq!(engine.query_node_ids(&query).unwrap().items, vec![keep]);
+    });
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_compound_range_declaration_prefix_scan_missing_sidecar_self_repairs() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+
+    let keep = insert_query_node(
+        &engine,
+        "CompoundRangeRepairPerson",
+        "range-repair-keep",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("active".to_string())),
+            ("score", PropValue::Int(7)),
+        ],
+        1.0,
+    );
+    insert_query_node(
+        &engine,
+        "CompoundRangeRepairPerson",
+        "range-repair-skip",
+        &[
+            ("tenant", PropValue::String("acme".to_string())),
+            ("status", PropValue::String("inactive".to_string())),
+            ("score", PropValue::Int(3)),
+        ],
+        1.0,
+    );
+    engine.flush().unwrap();
+    let info = engine
+        .ensure_node_property_index(
+            "CompoundRangeRepairPerson",
+            SecondaryIndexSpec::range(vec![
+                SecondaryIndexField::property("tenant"),
+                SecondaryIndexField::property("score"),
+            ]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+
+    // The equality on `status` is outside the declaration, so the Range-kind
+    // declaration is selected for a prefix-only scan on `tenant`.
+    let query = query_ids(
+        Some("CompoundRangeRepairPerson"),
+        vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("acme".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("active".to_string()),
+            },
+        ],
+        false,
+    );
+    let plan = engine.explain_node_query(&query).unwrap();
+    let details = compound_range_details(&plan);
+    assert_eq!(details.index_id, info.index_id);
+    assert_eq!(details.matched_prefix_len, 1);
+    assert_eq!(details.range_field, None);
+
+    let segment_id = engine.segments_for_test()[0].segment_id;
+    let sidecar_path = crate::segment_writer::node_compound_range_sidecar_path(
+        &crate::segment_writer::segment_dir(&db_path, segment_id),
+        info.index_id,
+    );
+    std::fs::remove_file(&sidecar_path).unwrap();
+
+    // A missing sidecar on a prefix-only scan must still enqueue the
+    // Range-kind repair followup: fallback keeps results correct and the
+    // declaration rebuilds back to Ready instead of silently falling back
+    // forever.
+    assert_single_read_followup_enqueued(&engine, || {
+        assert_eq!(engine.query_node_ids(&query).unwrap().items, vec![keep]);
+    });
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+    let rebuilt_path = crate::segment_writer::node_compound_range_sidecar_path(
+        &crate::segment_writer::segment_dir(&db_path, segment_id),
+        info.index_id,
+    );
+    assert!(rebuilt_path.exists(), "repair must rebuild the sidecar");
+    assert_eq!(engine.query_node_ids(&query).unwrap().items, vec![keep]);
+
+    engine.close().unwrap();
 }
 
 #[test]
@@ -3898,7 +6379,7 @@ fn test_planner_stats_corruption_degrades_without_index_repair_followup() {
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let info = engine
-            .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
         insert_query_node(&engine, "Person",
@@ -3961,7 +6442,7 @@ fn node_property_query_enqueues_planning_followup_for_corrupt_equality_sidecar()
         );
         engine.flush().unwrap();
         let info = engine
-            .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
@@ -4020,10 +6501,7 @@ fn node_property_query_enqueues_planning_followup_for_corrupt_range_sidecar() {
         );
         engine.flush().unwrap();
         let info = engine
-            .ensure_node_property_index("Person",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
@@ -4082,7 +6560,7 @@ fn node_property_query_enqueues_planning_followup_for_missing_equality_sidecar()
     );
     engine.flush().unwrap();
     let info = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -4138,7 +6616,7 @@ fn test_planner_stats_zero_is_advisory_not_empty_result() {
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let info = engine
-            .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         index_id = info.index_id;
         wait_for_property_index_state(&engine, index_id, SecondaryIndexState::Ready);
@@ -4204,7 +6682,7 @@ fn test_planner_stats_low_equality_estimate_uses_capped_materialization() {
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let info = engine
-            .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         index_id = info.index_id;
         wait_for_property_index_state(&engine, index_id, SecondaryIndexState::Ready);
@@ -4833,7 +7311,7 @@ fn test_node_query_multi_label_all_uses_requested_label_property_index() {
     engine.flush().unwrap();
 
     let status = engine
-        .ensure_node_property_index("Employee", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Employee", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready);
 
@@ -4914,11 +7392,7 @@ fn test_node_query_multi_label_all_uses_requested_label_range_and_timestamp_inde
     engine.flush().unwrap();
 
     let score = engine
-        .ensure_node_property_index(
-            "Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready);
 
@@ -4980,7 +7454,7 @@ fn test_node_query_multi_label_all_large_explicit_ids_can_use_property_index() {
     engine.flush().unwrap();
 
     let status = engine
-        .ensure_node_property_index("Employee", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Employee", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready);
 
@@ -5074,14 +7548,11 @@ fn test_active_memtable_only_estimates_are_exact_cheap() {
     let db_path = dir.path().join("testdb");
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let status = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready);
     let score = engine
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready);
 
@@ -5174,7 +7645,7 @@ fn test_planner_stats_equality_heavy_hitter_and_residual_explain_estimates() {
     let db_path = dir.path().join("testdb");
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let info = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -5248,7 +7719,7 @@ fn test_planner_stats_rare_residual_equality_beats_broad_label_source() {
     let db_path = dir.path().join("testdb");
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let info = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -5305,7 +7776,7 @@ fn test_planner_stats_broad_heavy_hitter_equality_uses_cheaper_label_scan() {
     let db_path = dir.path().join("testdb");
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let info = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -5354,10 +7825,7 @@ fn test_planner_stats_range_and_timestamp_explain_use_no_planning_probe() {
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let score = engine
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready);
@@ -5418,10 +7886,7 @@ fn test_planner_stats_range_and_timestamp_mixed_coverage_probe_uncovered_segment
     {
         let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
         let score = engine
-            .ensure_node_property_index("Person",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         wait_for_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready);
         wait_for_published_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready);
@@ -5533,10 +7998,7 @@ fn test_planner_stats_adaptive_cap_allows_high_confidence_range_above_default() 
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let score = engine
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready);
@@ -5596,13 +8058,10 @@ fn test_direct_read_apis_are_unchanged_with_planner_stats_sidecars() {
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
 
     let status = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let score = engine
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready);
     wait_for_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready);
@@ -6043,7 +8502,7 @@ fn test_query_filter_in_dedupes_by_canonical_value_and_uses_union() {
     let _missing = insert_query_node(&engine, "Person",  "missing", &[], 1.0);
 
     let index = engine
-        .ensure_node_property_index("Person", "kind", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("kind").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
 
@@ -6258,7 +8717,7 @@ fn test_query_indexed_float_signed_zero_equality_matches_verifier_semantics() {
     engine.flush().unwrap();
 
     let index = engine
-        .ensure_node_property_index("Person", "temperature", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("temperature").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
 
@@ -6321,7 +8780,7 @@ fn test_query_filter_or_and_in_extract_complete_index_candidates() {
         1.0,
     );
     let index = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
 
@@ -6455,7 +8914,7 @@ fn test_query_filter_or_in_union_final_verification_and_pagination() {
     }
     engine.flush().unwrap();
     let index = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, index.index_id, SecondaryIndexState::Ready);
 
@@ -6572,13 +9031,10 @@ fn test_query_filter_and_of_or_intersects_range() {
     );
     engine.flush().unwrap();
     let status_index = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let score_index = engine
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&engine, status_index.index_id, SecondaryIndexState::Ready);
     wait_for_property_index_state(&engine, score_index.index_id, SecondaryIndexState::Ready);
@@ -6658,7 +9114,7 @@ fn test_query_filter_fallback_budget_and_empty_plan_edges() {
     }
     engine.flush().unwrap();
     let status_index = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, status_index.index_id, SecondaryIndexState::Ready);
 
@@ -6774,7 +9230,7 @@ fn test_query_or_unknown_branch_falls_back_without_partial_union() {
     );
     let other = insert_query_node(&engine, "Person",  "other", &[], 1.0);
     let status = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready);
 
@@ -6861,7 +9317,7 @@ fn test_query_filter_verify_only_uses_expected_legal_universe() {
     );
 
     let status_index = engine
-        .ensure_node_property_index("Article", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Article", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, status_index.index_id, SecondaryIndexState::Ready);
 
@@ -7005,10 +9461,7 @@ fn test_query_filter_range_and_timestamp_probe_budget_overflow_is_cumulative() {
     engine.batch_upsert_nodes(inputs).unwrap();
     engine.flush().unwrap();
     let score_index = engine
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&engine, score_index.index_id, SecondaryIndexState::Ready);
     let segment_id = engine.segments_for_test()[0].segment_id;
@@ -7022,10 +9475,14 @@ fn test_query_filter_range_and_timestamp_probe_budget_overflow_is_cumulative() {
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     assert!(engine.segments_for_test()[0].planner_stats().is_none());
 
+    // Every leaf must cover the whole label so each one individually exceeds
+    // the candidate cap and runs an ID-materializing probe: selective leaves
+    // with trusted upper bounds below the legal universe become bounded
+    // sources directly and never touch the probe budget.
     let range_query = NodeQuery {
         label_filter: Some(NodeLabelFilter { labels: vec!["Person".to_string()], mode: LabelMatchMode::All }),
         filter: Some(NodeFilterExpr::And(
-            (0..5)
+            (-4..1)
                 .map(|lower| NodeFilterExpr::PropertyRange {
                     key: "score".to_string(),
                     lower: Some(PropertyRangeBound::Included(PropValue::Int(lower))),
@@ -7308,7 +9765,7 @@ fn test_query_explain_omits_label_scan_when_property_index_drives_execution() {
     );
 
     let status = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready);
 
@@ -7851,7 +10308,7 @@ fn node_query_property_index_candidates_verify_key_from_selected_fields() {
         1.0,
     );
     let info = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
     let person_id = engine.get_node_label_id("Person").unwrap().unwrap();
@@ -7877,6 +10334,7 @@ fn node_query_property_index_candidates_verify_key_from_selected_fields() {
             PlannerEstimate::upper_bound(2),
         )),
         cap_context,
+        legal_universe_fallback: None,
         warnings: Vec::new(),
         followups: Vec::new(),
     };
@@ -8105,10 +10563,10 @@ fn test_query_intersects_ready_equality_indexes_against_oracle() {
     );
 
     let status = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let tier = engine
-        .ensure_node_property_index("Person", "tier", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("tier").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready);
     wait_for_property_index_state(&engine, tier.index_id, SecondaryIndexState::Ready);
@@ -8184,13 +10642,10 @@ fn test_query_intersects_equality_and_range_indexes_against_oracle() {
     );
 
     let status = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let score = engine
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready);
     wait_for_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready);
@@ -8271,16 +10726,13 @@ fn test_query_intersects_equality_equality_and_range_indexes() {
     );
 
     let status = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let tier = engine
-        .ensure_node_property_index("Person", "tier", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("tier").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     let score = engine
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     wait_for_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready);
     wait_for_property_index_state(&engine, tier.index_id, SecondaryIndexState::Ready);
@@ -8355,7 +10807,7 @@ fn test_query_intersects_timestamp_and_property_sources() {
     set_query_node_updated_at(&engine, d, 2_500);
 
     let status = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready);
 
@@ -8473,13 +10925,10 @@ fn test_query_ready_index_sources_match_oracle_across_storage_states() {
 
     fn ensure_lifecycle_indexes(engine: &DatabaseEngine) {
         let status = engine
-            .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         let score = engine
-            .ensure_node_property_index("Person",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         wait_for_property_index_state(engine, status.index_id, SecondaryIndexState::Ready);
         wait_for_property_index_state(engine, score.index_id, SecondaryIndexState::Ready);
@@ -8567,13 +11016,10 @@ fn test_query_selective_ready_indexes_match_oracle_across_storage_states() {
 
     fn ensure_selective_indexes(engine: &DatabaseEngine) {
         let status = engine
-            .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         let score = engine
-            .ensure_node_property_index("Person",
-                "score",
-                SecondaryIndexKind::Range,
-            )
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
         wait_for_property_index_state(engine, status.index_id, SecondaryIndexState::Ready);
         wait_for_property_index_state(engine, score.index_id, SecondaryIndexState::Ready);
@@ -8698,13 +11144,10 @@ fn test_query_bounded_range_uses_index_and_broad_sources_fallback() {
     let all_ids = engine.batch_upsert_nodes(inputs).unwrap();
     engine.flush().unwrap();
     let score = engine
-        .ensure_node_property_index("Person",
-            "score",
-            SecondaryIndexKind::Range,
-        )
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     let status = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, score.index_id, SecondaryIndexState::Ready);
     wait_for_property_index_state(&engine, status.index_id, SecondaryIndexState::Ready);
@@ -8879,7 +11322,7 @@ fn test_query_missing_building_and_failed_indexes_fallback() {
 
     let (build_ready_rx, build_release_tx) = engine.set_secondary_index_build_pause();
     let info = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     build_ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
@@ -8947,7 +11390,7 @@ fn test_query_ready_sidecar_removed_after_open_remains_usable_until_reopen() {
     );
     engine.flush().unwrap();
     let info = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -9031,7 +11474,7 @@ fn test_query_explicit_anchor_does_not_scan_ready_property_index() {
     );
     engine.flush().unwrap();
     let info = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -9343,7 +11786,7 @@ fn test_query_broad_index_warning_priority_and_selective_source_choice() {
 
     for key in ["status", "tenant", "cohort"] {
         let info = engine
-            .ensure_node_property_index("Person", key, SecondaryIndexKind::Equality)
+            .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: (key).to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
         wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
     }
@@ -9423,7 +11866,7 @@ fn test_query_large_explicit_ids_become_membership_check_for_cheaper_index() {
     let all_ids = engine.batch_upsert_nodes(inputs).unwrap();
     engine.flush().unwrap();
     let info = engine
-        .ensure_node_property_index("Person", "tenant", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("tenant").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -9483,7 +11926,7 @@ fn test_query_large_keys_become_membership_check_for_cheaper_index() {
     let all_ids = engine.batch_upsert_nodes(inputs).unwrap();
     engine.flush().unwrap();
     let info = engine
-        .ensure_node_property_index("Person", "tenant", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("tenant").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -9579,7 +12022,7 @@ fn test_query_node_page_planned_preserves_planning_followups_for_core_outcomes()
     );
     engine.flush().unwrap();
     let info = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
     let person_id = engine.get_node_label_id("Person").unwrap().unwrap();
@@ -9600,6 +12043,7 @@ fn test_query_node_page_planned_preserves_planning_followups_for_core_outcomes()
     let empty_plan = PlannedNodeQuery {
         driver: NodePhysicalPlan::Empty,
         cap_context,
+        legal_universe_fallback: None,
         warnings: Vec::new(),
         followups: vec![test_equality_read_followup(info.index_id)],
     };
@@ -9616,6 +12060,7 @@ fn test_query_node_page_planned_preserves_planning_followups_for_core_outcomes()
             PlannerEstimate::upper_bound(2),
         )),
         cap_context,
+        legal_universe_fallback: None,
         warnings: Vec::new(),
         followups: vec![test_equality_read_followup(info.index_id)],
     };
@@ -9635,6 +12080,7 @@ fn test_query_node_page_planned_preserves_planning_followups_for_core_outcomes()
             PlannerEstimate::upper_bound(1),
         )),
         cap_context,
+        legal_universe_fallback: None,
         warnings: Vec::new(),
         followups: vec![test_equality_read_followup(info.index_id)],
     };
@@ -9680,7 +12126,7 @@ fn test_query_unknown_selected_index_source_falls_back_when_execution_cap_exceed
     );
     engine.flush().unwrap();
     let info = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -9713,6 +12159,7 @@ fn test_query_unknown_selected_index_source_falls_back_when_execution_cap_exceed
                     PlannerEstimate::unknown(),
             )),
             cap_context,
+            legal_universe_fallback: None,
             warnings: Vec::new(),
             followups: vec![test_equality_read_followup(info.index_id)],
         };
@@ -9766,6 +12213,7 @@ fn test_query_unknown_selected_index_source_falls_back_when_execution_cap_exceed
                 )),
             ]),
             cap_context,
+            legal_universe_fallback: None,
             warnings: Vec::new(),
             followups: Vec::new(),
         };
@@ -9804,7 +12252,7 @@ fn test_query_limited_equality_read_skips_shadowed_ids_before_cap() {
     engine.flush().unwrap();
 
     let info = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -9866,7 +12314,7 @@ fn test_query_limited_equality_read_skips_newer_segment_shadowed_ids_before_cap(
     engine.flush().unwrap();
 
     let info = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -9913,7 +12361,7 @@ fn test_query_limited_equality_read_enforces_raw_posting_cap_for_stale_segments(
     let db_path = dir.path().join("testdb");
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let info = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
@@ -9986,7 +12434,7 @@ fn test_query_stats_backed_equality_materialization_uses_raw_ids_only() {
     let db_path = dir.path().join("testdb");
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
     let info = engine
-        .ensure_node_property_index("Person", "status", SecondaryIndexKind::Equality)
+        .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 

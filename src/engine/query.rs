@@ -5,7 +5,7 @@ use crate::gql::eval::{
 use crate::gql::ast::{
     BinaryOp, Expr, ExprKind, GqlGraphTypeAlterMode, GqlGraphTypeCheckMode, GqlIndexStatement,
     GqlMutationStatement, GqlQuery, GqlSchemaStatement, GqlShowPropertyIndexScope,
-    GqlShowSchemaKind, GqlStatementBody, Literal, OrderDirection, UnaryOp,
+    GqlShowSchemaKind, GqlStatementBody, Ident, Literal, OrderDirection, UnaryOp,
 };
 use crate::gql::index::{
     bind_index_statement, gql_index_target_kind_name, index_statement_is_mutating,
@@ -18,6 +18,7 @@ use crate::gql::lower::{
     GqlMergePatternPlan, GqlMergePlan, GqlMutationExprRef, GqlNativeTarget, GqlNativeTargetKind,
     GqlRemoveItemPlan, GqlSetItemPlan,
 };
+use crate::gql::metadata::{GqlEndpointFunction, GqlMetadataFunction};
 use crate::gql::parser::{parse_statement, GqlParseOptions};
 use crate::gql::params::{
     validate_referenced_gql_params, validate_referenced_gql_schema_ast_params,
@@ -29,8 +30,8 @@ use crate::gql::schema::{
     GqlBoundAlterGraphTypeStatement, GqlBoundCheckGraphTypeStatement, GqlSchemaSemanticPlan,
 };
 use crate::gql::semantic::{
-    bind_query, gql_semantic_error, GqlAliasKind, GqlAliasOrigin, GqlReturnPlan,
-    GqlSemanticPlan,
+    bind_query, edge_endpoint_id_call, gql_semantic_error, variable_name, GqlAliasKind,
+    GqlAliasOrigin, GqlReturnPlan, GqlSemanticPlan,
 };
 use crate::graph_row::{
     eval_graph_binary_values, eval_graph_expr, eval_graph_scalar_function_values,
@@ -677,20 +678,36 @@ impl DatabaseEngine {
     ) -> Result<GqlExecutionResult, EngineError> {
         let row = match create.target_kind {
             GqlPropertyIndexTargetKind::Node => {
-                let info = self.ensure_node_property_index(
-                    &create.label,
-                    &create.prop_key,
-                    create.kind.clone(),
-                )?;
-                create_node_property_index_row(&info)
+                let spec = SecondaryIndexSpec {
+                    fields: create.fields.clone(),
+                    kind: create.kind.clone(),
+                };
+                let info = self.ensure_node_property_index(&create.label, spec)?;
+                create_property_index_row(
+                    GqlPropertyIndexTargetKind::Node,
+                    &info.label,
+                    &info.fields,
+                    &info.kind,
+                    info.state,
+                    info.index_id,
+                    info.last_error.as_ref(),
+                )
             }
             GqlPropertyIndexTargetKind::Edge => {
-                let info = self.ensure_edge_property_index(
-                    &create.label,
-                    &create.prop_key,
-                    create.kind.clone(),
-                )?;
-                create_edge_property_index_row(&info)
+                let spec = SecondaryIndexSpec {
+                    fields: create.fields.clone(),
+                    kind: create.kind.clone(),
+                };
+                let info = self.ensure_edge_property_index(&create.label, spec)?;
+                create_property_index_row(
+                    GqlPropertyIndexTargetKind::Edge,
+                    &info.label,
+                    &info.fields,
+                    &info.kind,
+                    info.state,
+                    info.index_id,
+                    info.last_error.as_ref(),
+                )
             }
         };
         Ok(gql_index_execution_result(
@@ -716,12 +733,20 @@ impl DatabaseEngine {
         plan: Option<GqlExecutionExplain>,
     ) -> Result<GqlExecutionResult, EngineError> {
         let dropped = match drop.target_kind {
-            GqlPropertyIndexTargetKind::Node => {
-                self.drop_node_property_index(&drop.label, &drop.prop_key, drop.kind.clone())?
-            }
-            GqlPropertyIndexTargetKind::Edge => {
-                self.drop_edge_property_index(&drop.label, &drop.prop_key, drop.kind.clone())?
-            }
+            GqlPropertyIndexTargetKind::Node => self.drop_node_property_index(
+                &drop.label,
+                SecondaryIndexSpec {
+                    fields: drop.fields.clone(),
+                    kind: drop.kind.clone(),
+                },
+            )?,
+            GqlPropertyIndexTargetKind::Edge => self.drop_edge_property_index(
+                &drop.label,
+                SecondaryIndexSpec {
+                    fields: drop.fields.clone(),
+                    kind: drop.kind.clone(),
+                },
+            )?,
         };
         let row = drop_property_index_row(&drop, dropped);
         Ok(gql_index_execution_result(
@@ -798,7 +823,7 @@ impl DatabaseEngine {
             gql_index_target_kind_rank(left.target_kind)
                 .cmp(&gql_index_target_kind_rank(right.target_kind))
                 .then_with(|| left.label.cmp(&right.label))
-                .then_with(|| left.prop_key.cmp(&right.prop_key))
+                .then_with(|| gql_index_field_sort_key(&left.fields).cmp(&gql_index_field_sort_key(&right.fields)))
                 .then_with(|| gql_index_kind_rank(&left.kind).cmp(&gql_index_kind_rank(&right.kind)))
                 .then_with(|| left.index_id.cmp(&right.index_id))
         });
@@ -810,7 +835,7 @@ impl DatabaseEngine {
 struct GqlPropertyIndexCatalogRow {
     target_kind: GqlPropertyIndexTargetKind,
     label: String,
-    prop_key: String,
+    fields: Vec<SecondaryIndexField>,
     kind: SecondaryIndexKind,
     state: SecondaryIndexState,
     index_id: u64,
@@ -828,8 +853,10 @@ fn gql_property_index_catalog_row(
     entry: &SecondaryIndexManifestEntry,
     catalog: &ReadLabelCatalogSnapshot,
 ) -> Result<Option<GqlPropertyIndexCatalogRow>, EngineError> {
-    let (target_kind, label, prop_key) = match &entry.target {
-        SecondaryIndexTarget::NodeProperty { label_id, prop_key } => (
+    let fields = entry.target.public_fields();
+    let (target_kind, label) = match &entry.target {
+        SecondaryIndexTarget::NodeProperty { label_id, .. }
+        | SecondaryIndexTarget::NodeFieldIndex { label_id, .. } => (
             GqlPropertyIndexTargetKind::Node,
             catalog
                 .node_label(*label_id)
@@ -840,9 +867,9 @@ fn gql_property_index_catalog_row(
                         entry.index_id, label_id
                     ))
                 })?,
-            prop_key.clone(),
         ),
-        SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => (
+        SecondaryIndexTarget::EdgeProperty { label_id, .. }
+        | SecondaryIndexTarget::EdgeFieldIndex { label_id, .. } => (
             GqlPropertyIndexTargetKind::Edge,
             catalog
                 .edge_label(*label_id)
@@ -853,13 +880,12 @@ fn gql_property_index_catalog_row(
                         entry.index_id, label_id
                     ))
                 })?,
-            prop_key.clone(),
         ),
     };
     Ok(Some(GqlPropertyIndexCatalogRow {
         target_kind,
         label,
-        prop_key,
+        fields,
         kind: entry.kind.clone(),
         state: entry.state,
         index_id: entry.index_id,
@@ -884,12 +910,14 @@ fn create_property_index_columns() -> Vec<String> {
         "operation",
         "target_kind",
         "label",
-        "prop_key",
+        "fields",
         "kind",
         "action",
         "state",
         "index_id",
         "last_error",
+        "compound",
+        "field_count",
     ])
 }
 
@@ -898,21 +926,25 @@ fn drop_property_index_columns() -> Vec<String> {
         "operation",
         "target_kind",
         "label",
-        "prop_key",
+        "fields",
         "kind",
         "action",
+        "compound",
+        "field_count",
     ])
 }
 
 fn show_property_index_columns() -> Vec<String> {
     gql_index_columns([
+        "index_id",
         "target_kind",
         "label",
-        "prop_key",
+        "fields",
         "kind",
         "state",
-        "index_id",
         "last_error",
+        "compound",
+        "field_count",
     ])
 }
 
@@ -920,34 +952,10 @@ fn gql_index_columns<const N: usize>(columns: [&str; N]) -> Vec<String> {
     columns.into_iter().map(str::to_string).collect()
 }
 
-fn create_node_property_index_row(info: &NodePropertyIndexInfo) -> GqlRow {
-    create_property_index_row(
-        GqlPropertyIndexTargetKind::Node,
-        &info.label,
-        &info.prop_key,
-        &info.kind,
-        info.state,
-        info.index_id,
-        info.last_error.as_ref(),
-    )
-}
-
-fn create_edge_property_index_row(info: &EdgePropertyIndexInfo) -> GqlRow {
-    create_property_index_row(
-        GqlPropertyIndexTargetKind::Edge,
-        &info.label,
-        &info.prop_key,
-        &info.kind,
-        info.state,
-        info.index_id,
-        info.last_error.as_ref(),
-    )
-}
-
 fn create_property_index_row(
     target_kind: GqlPropertyIndexTargetKind,
     label: &str,
-    prop_key: &str,
+    fields: &[SecondaryIndexField],
     kind: &SecondaryIndexKind,
     state: SecondaryIndexState,
     index_id: u64,
@@ -958,12 +966,14 @@ fn create_property_index_row(
             GqlValue::String(create_property_index_operation_name().to_string()),
             GqlValue::String(gql_index_target_kind_name(target_kind).to_string()),
             GqlValue::String(label.to_string()),
-            GqlValue::String(prop_key.to_string()),
+            gql_index_fields_value(fields),
             GqlValue::String(gql_index_kind_name(kind).to_string()),
             GqlValue::String("ensured".to_string()),
             GqlValue::String(gql_index_state_name(state).to_string()),
             GqlValue::UInt(index_id),
             gql_index_last_error_value(last_error),
+            GqlValue::Bool(gql_index_fields_compound(fields)),
+            GqlValue::UInt(fields.len() as u64),
         ],
     }
 }
@@ -974,9 +984,11 @@ fn drop_property_index_row(bound: &GqlBoundPropertyIndexStatement, dropped: bool
             GqlValue::String(drop_property_index_operation_name().to_string()),
             GqlValue::String(gql_index_target_kind_name(bound.target_kind).to_string()),
             GqlValue::String(bound.label.clone()),
-            GqlValue::String(bound.prop_key.clone()),
+            gql_index_fields_value(&bound.fields),
             GqlValue::String(gql_index_kind_name(&bound.kind).to_string()),
             GqlValue::String(if dropped { "dropped" } else { "not_found" }.to_string()),
+            GqlValue::Bool(gql_index_fields_compound(&bound.fields)),
+            GqlValue::UInt(bound.fields.len() as u64),
         ],
     }
 }
@@ -984,15 +996,90 @@ fn drop_property_index_row(bound: &GqlBoundPropertyIndexStatement, dropped: bool
 fn show_property_index_row(row: &GqlPropertyIndexCatalogRow) -> GqlRow {
     GqlRow {
         values: vec![
+            GqlValue::UInt(row.index_id),
             GqlValue::String(gql_index_target_kind_name(row.target_kind).to_string()),
             GqlValue::String(row.label.clone()),
-            GqlValue::String(row.prop_key.clone()),
+            gql_index_fields_value(&row.fields),
             GqlValue::String(gql_index_kind_name(&row.kind).to_string()),
             GqlValue::String(gql_index_state_name(row.state).to_string()),
-            GqlValue::UInt(row.index_id),
             gql_index_last_error_value(row.last_error.as_ref()),
+            GqlValue::Bool(gql_index_fields_compound(&row.fields)),
+            GqlValue::UInt(row.fields.len() as u64),
         ],
     }
+}
+
+fn gql_index_fields_value(fields: &[SecondaryIndexField]) -> GqlValue {
+    GqlValue::List(fields.iter().map(gql_index_field_value).collect())
+}
+
+fn gql_index_field_value(field: &SecondaryIndexField) -> GqlValue {
+    let mut map = BTreeMap::new();
+    match field {
+        SecondaryIndexField::Property { key } => {
+            map.insert("source".to_string(), GqlValue::String("property".to_string()));
+            map.insert("key".to_string(), GqlValue::String(key.clone()));
+        }
+        SecondaryIndexField::NodeMetadata(field) => {
+            map.insert("source".to_string(), GqlValue::String("metadata".to_string()));
+            map.insert(
+                "field".to_string(),
+                GqlValue::String(gql_node_metadata_index_field_display(*field).to_string()),
+            );
+        }
+        SecondaryIndexField::EdgeMetadata(field) => {
+            map.insert("source".to_string(), GqlValue::String("metadata".to_string()));
+            map.insert(
+                "field".to_string(),
+                GqlValue::String(gql_edge_metadata_index_field_display(*field).to_string()),
+            );
+        }
+    }
+    GqlValue::Map(map)
+}
+
+/// GQL-facing display names for metadata index fields, matching the metadata function
+/// spellings in index DDL (internal manifest naming stays snake_case).
+fn gql_node_metadata_index_field_display(field: NodeMetadataIndexField) -> &'static str {
+    match field {
+        NodeMetadataIndexField::Id => "id",
+        NodeMetadataIndexField::Key => "elementKey",
+        NodeMetadataIndexField::Weight => "weight",
+        NodeMetadataIndexField::CreatedAt => "createdAt",
+        NodeMetadataIndexField::UpdatedAt => "updatedAt",
+    }
+}
+
+fn gql_edge_metadata_index_field_display(field: EdgeMetadataIndexField) -> &'static str {
+    match field {
+        EdgeMetadataIndexField::Id => "id",
+        EdgeMetadataIndexField::From => "startNode",
+        EdgeMetadataIndexField::To => "endNode",
+        EdgeMetadataIndexField::Weight => "weight",
+        EdgeMetadataIndexField::CreatedAt => "createdAt",
+        EdgeMetadataIndexField::UpdatedAt => "updatedAt",
+        EdgeMetadataIndexField::ValidFrom => "validFrom",
+        EdgeMetadataIndexField::ValidTo => "validTo",
+    }
+}
+
+fn gql_index_fields_compound(fields: &[SecondaryIndexField]) -> bool {
+    fields.len() > 1
+}
+
+fn gql_index_field_sort_key(fields: &[SecondaryIndexField]) -> Vec<(u8, String)> {
+    fields
+        .iter()
+        .map(|field| match field {
+            SecondaryIndexField::Property { key } => (0, key.clone()),
+            SecondaryIndexField::NodeMetadata(field) => {
+                (1, gql_node_metadata_index_field_display(*field).to_string())
+            }
+            SecondaryIndexField::EdgeMetadata(field) => {
+                (1, gql_edge_metadata_index_field_display(*field).to_string())
+            }
+        })
+        .collect()
 }
 
 fn gql_index_last_error_value(last_error: Option<&String>) -> GqlValue {
@@ -1126,9 +1213,10 @@ fn gql_index_explain_property_target(
     GqlIndexExplainTarget {
         target_kind: gql_index_target_kind_name(bound.target_kind).to_string(),
         label: Some(bound.label.clone()),
-        prop_key: Some(bound.prop_key.clone()),
+        fields: gql_index_explain_fields(&bound.fields),
         kind: Some(gql_index_kind_name(&bound.kind).to_string()),
         action: Some(action.to_string()),
+        compound: gql_index_fields_compound(&bound.fields),
     }
 }
 
@@ -1141,10 +1229,34 @@ fn gql_index_explain_show_target(scope: GqlShowPropertyIndexScope) -> GqlIndexEx
         }
         .to_string(),
         label: None,
-        prop_key: None,
+        fields: Vec::new(),
         kind: None,
         action: Some("show".to_string()),
+        compound: false,
     }
+}
+
+fn gql_index_explain_fields(fields: &[SecondaryIndexField]) -> Vec<GqlIndexExplainField> {
+    fields
+        .iter()
+        .map(|field| match field {
+            SecondaryIndexField::Property { key } => GqlIndexExplainField {
+                source: "property".to_string(),
+                key: Some(key.clone()),
+                field: None,
+            },
+            SecondaryIndexField::NodeMetadata(field) => GqlIndexExplainField {
+                source: "metadata".to_string(),
+                key: None,
+                field: Some(gql_node_metadata_index_field_display(*field).to_string()),
+            },
+            SecondaryIndexField::EdgeMetadata(field) => GqlIndexExplainField {
+                source: "metadata".to_string(),
+                key: None,
+                field: Some(gql_edge_metadata_index_field_display(*field).to_string()),
+            },
+        })
+        .collect()
 }
 
 fn create_property_index_operation_name() -> &'static str {
@@ -3979,6 +4091,7 @@ fn collect_gql_existing_update_targets(
                     for item in items {
                         match item {
                             GqlSetItemPlan::Property { alias, kind, .. }
+                            | GqlSetItemPlan::Metadata { alias, kind, .. }
                             | GqlSetItemPlan::MapMerge { alias, kind, .. } => {
                                 collect_gql_existing_update_target(
                                     plan, row, alias, *kind, &mut nodes, &mut edges,
@@ -4579,6 +4692,49 @@ fn apply_gql_set_items(
                     row.produced_write = true;
                 }
             }
+            GqlSetItemPlan::Metadata {
+                alias,
+                kind,
+                field,
+                value,
+            } => {
+                let value = gql_mutation_set_expr_value(
+                    plan,
+                    params,
+                    row,
+                    value,
+                    nodes,
+                    edges,
+                    existing_nodes,
+                    existing_edges,
+                )?;
+                let Some(target) = gql_mutation_target_for_alias(
+                    row,
+                    alias,
+                    *kind,
+                    target_applications,
+                    skipped_null_targets,
+                    first_existing_node_update_order,
+                    first_existing_edge_update_order,
+                    seen_existing_node_updates,
+                    seen_existing_edge_updates,
+                )?
+                else {
+                    continue;
+                };
+                if apply_gql_set_metadata(
+                    target.clone(),
+                    *field,
+                    &value,
+                    nodes,
+                    edges,
+                    existing_nodes,
+                    existing_edges,
+                )? {
+                    mark_gql_touched_created_target(row, &target);
+                    row.produced_write = true;
+                }
+            }
             GqlSetItemPlan::MapMerge { alias, kind, value } => {
                 let value = gql_mutation_set_expr_value(
                     plan,
@@ -4854,80 +5010,113 @@ fn apply_gql_set_property(
     match target {
         GqlMutationTargetKey::CreatedNode(index) => {
             let node = nodes.get_mut(index).ok_or_else(gql_missing_created_target)?;
-            apply_gql_set_node_property(&mut node.props, &mut node.weight, property, value)
+            gql_set_stored_property(&mut node.props, property, value)
         }
         GqlMutationTargetKey::ExistingNode(id) => {
             let node = existing_nodes.get_mut(&id).ok_or_else(gql_missing_existing_target)?;
-            apply_gql_set_node_property(&mut node.props, &mut node.weight, property, value)
+            gql_set_stored_property(&mut node.props, property, value)
         }
         GqlMutationTargetKey::CreatedEdge(index) => {
             let edge = edges.get_mut(index).ok_or_else(gql_missing_created_target)?;
-            apply_gql_set_edge_property(
-                &mut edge.props,
+            gql_set_stored_property(&mut edge.props, property, value)
+        }
+        GqlMutationTargetKey::ExistingEdge(id) => {
+            let edge = existing_edges.get_mut(&id).ok_or_else(gql_missing_existing_target)?;
+            gql_set_stored_property(&mut edge.props, property, value)
+        }
+    }
+}
+
+fn apply_gql_set_metadata(
+    target: GqlMutationTargetKey,
+    field: GqlMetadataFunction,
+    value: &GraphValue,
+    nodes: &mut [GqlCreatedNodeExecution],
+    edges: &mut [GqlCreatedEdgeExecution],
+    existing_nodes: &mut BTreeMap<u64, GqlExistingNodeExecution>,
+    existing_edges: &mut BTreeMap<u64, GqlExistingEdgeExecution>,
+) -> Result<bool, EngineError> {
+    match target {
+        GqlMutationTargetKey::CreatedNode(index) => {
+            let node = nodes.get_mut(index).ok_or_else(gql_missing_created_target)?;
+            apply_gql_set_node_metadata(&mut node.weight, field, value)
+        }
+        GqlMutationTargetKey::ExistingNode(id) => {
+            let node = existing_nodes.get_mut(&id).ok_or_else(gql_missing_existing_target)?;
+            apply_gql_set_node_metadata(&mut node.weight, field, value)
+        }
+        GqlMutationTargetKey::CreatedEdge(index) => {
+            let edge = edges.get_mut(index).ok_or_else(gql_missing_created_target)?;
+            apply_gql_set_edge_metadata(
                 &mut edge.weight,
                 edge.valid_from.get_or_insert(0),
                 edge.valid_to.get_or_insert(i64::MAX),
-                property,
+                field,
                 value,
             )
         }
         GqlMutationTargetKey::ExistingEdge(id) => {
             let edge = existing_edges.get_mut(&id).ok_or_else(gql_missing_existing_target)?;
-            apply_gql_set_edge_property(
-                &mut edge.props,
+            apply_gql_set_edge_metadata(
                 &mut edge.weight,
                 &mut edge.valid_from,
                 &mut edge.valid_to,
-                property,
+                field,
                 value,
             )
         }
     }
 }
 
-fn apply_gql_set_node_property(
-    props: &mut BTreeMap<String, PropValue>,
+fn apply_gql_set_node_metadata(
     weight: &mut f32,
-    property: &str,
+    field: GqlMetadataFunction,
     value: &GraphValue,
 ) -> Result<bool, EngineError> {
-    if property == "weight" {
-        let next = gql_mutation_weight(value, "node weight")?;
-        let changed = *weight != next;
-        *weight = next;
-        return Ok(changed);
+    match field {
+        GqlMetadataFunction::Weight => {
+            let next = gql_mutation_weight(value, "node weight")?;
+            let changed = *weight != next;
+            *weight = next;
+            Ok(changed)
+        }
+        _ => Err(EngineError::InvalidOperation(format!(
+            "GQL SET metadata {}() is not writable for nodes",
+            field.canonical_name()
+        ))),
     }
-    gql_set_stored_property(props, property, value)
 }
 
-fn apply_gql_set_edge_property(
-    props: &mut BTreeMap<String, PropValue>,
+fn apply_gql_set_edge_metadata(
     weight: &mut f32,
     valid_from: &mut i64,
     valid_to: &mut i64,
-    property: &str,
+    field: GqlMetadataFunction,
     value: &GraphValue,
 ) -> Result<bool, EngineError> {
-    match property {
-        "weight" => {
+    match field {
+        GqlMetadataFunction::Weight => {
             let next = gql_mutation_weight(value, "edge weight")?;
             let changed = *weight != next;
             *weight = next;
             Ok(changed)
         }
-        "valid_from" => {
-            let next = gql_mutation_i64(value, "valid_from")?;
+        GqlMetadataFunction::ValidFrom => {
+            let next = gql_mutation_i64(value, "validFrom")?;
             let changed = *valid_from != next;
             *valid_from = next;
             Ok(changed)
         }
-        "valid_to" => {
-            let next = gql_mutation_i64(value, "valid_to")?;
+        GqlMetadataFunction::ValidTo => {
+            let next = gql_mutation_i64(value, "validTo")?;
             let changed = *valid_to != next;
             *valid_to = next;
             Ok(changed)
         }
-        _ => gql_set_stored_property(props, property, value),
+        _ => Err(EngineError::InvalidOperation(format!(
+            "GQL SET metadata {}() is not writable for edges",
+            field.canonical_name()
+        ))),
     }
 }
 
@@ -4959,56 +5148,21 @@ fn apply_gql_map_merge(
     match target {
         GqlMutationTargetKey::CreatedNode(index) => {
             let node = nodes.get_mut(index).ok_or_else(gql_missing_created_target)?;
-            reject_reserved_gql_map_merge_keys(GqlAliasKind::Node, values)?;
             gql_merge_stored_properties(&mut node.props, values)
         }
         GqlMutationTargetKey::ExistingNode(id) => {
             let node = existing_nodes.get_mut(&id).ok_or_else(gql_missing_existing_target)?;
-            reject_reserved_gql_map_merge_keys(GqlAliasKind::Node, values)?;
             gql_merge_stored_properties(&mut node.props, values)
         }
         GqlMutationTargetKey::CreatedEdge(index) => {
             let edge = edges.get_mut(index).ok_or_else(gql_missing_created_target)?;
-            reject_reserved_gql_map_merge_keys(GqlAliasKind::Edge, values)?;
             gql_merge_stored_properties(&mut edge.props, values)
         }
         GqlMutationTargetKey::ExistingEdge(id) => {
             let edge = existing_edges.get_mut(&id).ok_or_else(gql_missing_existing_target)?;
-            reject_reserved_gql_map_merge_keys(GqlAliasKind::Edge, values)?;
             gql_merge_stored_properties(&mut edge.props, values)
         }
     }
-}
-
-fn reject_reserved_gql_map_merge_keys(
-    kind: GqlAliasKind,
-    values: &BTreeMap<String, GraphValue>,
-) -> Result<(), EngineError> {
-    for key in values.keys() {
-        let reserved = match kind {
-            GqlAliasKind::Node => matches!(
-                key.as_str(),
-                "id"
-                    | "labels"
-                    | "key"
-                    | "created_at"
-                    | "updated_at"
-                    | "dense_vector"
-                    | "sparse_vector"
-            ),
-            GqlAliasKind::Edge => matches!(
-                key.as_str(),
-                "id" | "from" | "to" | "label" | "type" | "created_at" | "updated_at"
-            ),
-            GqlAliasKind::Path | GqlAliasKind::Scalar => true,
-        };
-        if reserved {
-            return Err(EngineError::InvalidOperation(format!(
-                "SET += map key '{key}' is reserved metadata"
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn gql_merge_stored_properties(
@@ -5468,19 +5622,16 @@ fn materialize_gql_create_node(
     local: TxnLocalRef,
 ) -> Result<GqlCreatedNodeExecution, EngineError> {
     let key = node
-        .property_values
-        .get("key")
-        .ok_or_else(|| gql_create_invalid_value("CREATE node requires key metadata"))?;
+        .element_key
+        .as_ref()
+        .ok_or_else(|| gql_create_invalid_value("CREATE node requires elementKey metadata"))?;
     let key = gql_create_string_key(gql_create_expr_value(row, key.id)?)?;
     let mut weight = 1.0f32;
-    if let Some(weight_ref) = node.property_values.get("weight") {
+    if let Some(weight_ref) = node.weight.as_ref() {
         weight = gql_create_weight(gql_create_expr_value(row, weight_ref.id)?, "node weight")?;
     }
     let mut props = BTreeMap::new();
     for (property, expr_ref) in &node.property_values {
-        if property == "key" || property == "weight" {
-            continue;
-        }
         props.insert(
             property.clone(),
             gql_graph_value_to_prop(gql_create_expr_value(row, expr_ref.id)?)?,
@@ -5504,31 +5655,28 @@ fn materialize_gql_create_edge(
     default_valid_from: i64,
 ) -> Result<GqlCreatedEdgeExecution, EngineError> {
     let mut weight = 1.0f32;
-    if let Some(weight_ref) = edge.property_values.get("weight") {
+    if let Some(weight_ref) = edge.weight.as_ref() {
         weight = gql_create_weight(gql_create_expr_value(row, weight_ref.id)?, "edge weight")?;
     }
     let valid_from = edge
-        .property_values
-        .get("valid_from")
-        .map(|expr_ref| gql_create_i64(gql_create_expr_value(row, expr_ref.id)?, "valid_from"))
+        .valid_from
+        .as_ref()
+        .map(|expr_ref| gql_create_i64(gql_create_expr_value(row, expr_ref.id)?, "validFrom"))
         .transpose()?
         .unwrap_or(default_valid_from);
     let valid_to = edge
-        .property_values
-        .get("valid_to")
-        .map(|expr_ref| gql_create_i64(gql_create_expr_value(row, expr_ref.id)?, "valid_to"))
+        .valid_to
+        .as_ref()
+        .map(|expr_ref| gql_create_i64(gql_create_expr_value(row, expr_ref.id)?, "validTo"))
         .transpose()?
         .unwrap_or(i64::MAX);
     if valid_from >= valid_to {
         return Err(gql_create_invalid_value(
-            "GQL CREATE edge validity window requires valid_from < valid_to",
+            "GQL CREATE edge validity window requires validFrom < validTo",
         ));
     }
     let mut props = BTreeMap::new();
     for (property, expr_ref) in &edge.property_values {
-        if matches!(property.as_str(), "weight" | "valid_from" | "valid_to") {
-            continue;
-        }
         props.insert(
             property.clone(),
             gql_graph_value_to_prop(gql_create_expr_value(row, expr_ref.id)?)?,
@@ -6252,10 +6400,10 @@ fn gql_mutation_graph_function_distinct_key(
         )));
     };
     let key = match lower.as_str() {
-        "start_node" => path.node_ids.first().copied().map(|id| {
+        "startnode" => path.node_ids.first().copied().map(|id| {
             GqlMutationReturnDistinctKey::Node(GqlMutationReturnEntityDistinctKey::Existing(id))
         }),
-        "end_node" => path.node_ids.last().copied().map(|id| {
+        "endnode" => path.node_ids.last().copied().map(|id| {
             GqlMutationReturnDistinctKey::Node(GqlMutationReturnEntityDistinctKey::Existing(id))
         }),
         "nodes" => Some(GqlMutationReturnDistinctKey::List(
@@ -6719,7 +6867,7 @@ fn validate_gql_mutation_return_expr_static(
             }
         }
         ExprKind::FunctionCall { name, args } => {
-            validate_gql_mutation_return_function_static(plan, &name.name, args, &expr.span)?
+            validate_gql_mutation_return_function_static(plan, name, args, &expr.span)?
         }
         ExprKind::AggregateCall { name_span, .. } => {
             return Err(gql_semantic_error(
@@ -6781,10 +6929,11 @@ fn validate_gql_mutation_return_property_access_static(
 
 fn validate_gql_mutation_return_function_static(
     plan: &GqlMutationPlan,
-    function: &str,
+    name: &Ident,
     args: &[Expr],
     span: &SourceSpan,
 ) -> Result<(), EngineError> {
+    let function = name.name.as_str();
     let lower = function.to_ascii_lowercase();
     if gql_scalar_function_name(&lower).is_some() {
         validate_gql_scalar_function_arity(&lower, function, args.len(), span)?;
@@ -6800,6 +6949,23 @@ fn validate_gql_mutation_return_function_static(
             span.clone(),
         ));
     };
+    if let Some((_, endpoint_arg)) = edge_endpoint_id_call(name, args) {
+        let alias = variable_name(endpoint_arg).expect("endpoint call shape checked");
+        let Some(binding) = plan.semantic.aliases.get(alias) else {
+            return Err(gql_create_return_unsupported(
+                "GQL mutation RETURN references an unknown alias",
+                &endpoint_arg.span,
+            ));
+        };
+        if binding.kind == GqlAliasKind::Edge {
+            return Ok(());
+        }
+        return Err(gql_semantic_error(
+            GqlSemanticErrorCode::InvalidReturnExpression,
+            "startNode()/endNode() inside id() expects an edge alias".to_string(),
+            endpoint_arg.span.clone(),
+        ));
+    }
     let ExprKind::Variable(alias) = &arg.kind else {
         return Err(gql_semantic_error(
             GqlSemanticErrorCode::InvalidReturnExpression,
@@ -6813,18 +6979,25 @@ fn validate_gql_mutation_return_function_static(
             &arg.span,
         ));
     };
-    let valid = match lower.as_str() {
-        "id" => matches!(binding.kind, GqlAliasKind::Node | GqlAliasKind::Edge),
-        "labels" => binding.kind == GqlAliasKind::Node,
-        "type" => binding.kind == GqlAliasKind::Edge,
-        "length" | "node_ids" | "edge_ids" | "start_node" | "end_node" | "nodes"
-        | "relationships" => binding.kind == GqlAliasKind::Path,
-        _ => {
-            return Err(gql_semantic_error(
-                GqlSemanticErrorCode::InvalidReturnExpression,
-                "unsupported GQL scalar function".to_string(),
-                span.clone(),
-            ))
+    let valid = if let Some(metadata) = GqlMetadataFunction::from_lower(&lower) {
+        match binding.kind {
+            GqlAliasKind::Node => metadata.valid_for_node(),
+            GqlAliasKind::Edge => metadata.valid_for_edge(),
+            GqlAliasKind::Path | GqlAliasKind::Scalar => false,
+        }
+    } else {
+        match lower.as_str() {
+            "labels" => binding.kind == GqlAliasKind::Node,
+            "type" => binding.kind == GqlAliasKind::Edge,
+            "length" | "nodeids" | "edgeids" | "startnode" | "endnode" | "nodes"
+            | "relationships" => binding.kind == GqlAliasKind::Path,
+            _ => {
+                return Err(gql_semantic_error(
+                    GqlSemanticErrorCode::InvalidReturnExpression,
+                    "unsupported GQL scalar function".to_string(),
+                    span.clone(),
+                ))
+            }
         }
     };
     if valid {
@@ -6933,31 +7106,25 @@ fn gql_mutation_return_expr_is_commit_dependent_created_metadata(
     expr: &Expr,
 ) -> bool {
     match &expr.kind {
-        ExprKind::FunctionCall { name, args } if name.name.eq_ignore_ascii_case("id") => {
-            matches!(
-                args.as_slice(),
-                [Expr {
-                    kind: ExprKind::Variable(alias),
-                    ..
-                }] if gql_mutation_created_alias_kind(plan, alias)
-                    .is_some_and(|kind| matches!(kind, GqlAliasKind::Node | GqlAliasKind::Edge))
-            )
-        }
-        ExprKind::PropertyAccess { object, property } => {
-            let ExprKind::Variable(alias) = &object.kind else {
+        ExprKind::FunctionCall { name, args } => {
+            if !matches!(
+                GqlMetadataFunction::from_lower(&name.name.to_ascii_lowercase()),
+                Some(
+                    GqlMetadataFunction::Id
+                        | GqlMetadataFunction::CreatedAt
+                        | GqlMetadataFunction::UpdatedAt
+                )
+            ) {
                 return false;
-            };
-            match gql_mutation_created_alias_kind(plan, alias) {
-                Some(GqlAliasKind::Node) => matches!(
-                    property.name.as_str(),
-                    "id" | "created_at" | "updated_at"
-                ),
-                Some(GqlAliasKind::Edge) => matches!(
-                    property.name.as_str(),
-                    "id" | "from" | "to" | "created_at" | "updated_at"
-                ),
-                Some(GqlAliasKind::Path | GqlAliasKind::Scalar) | None => false,
             }
+            let target = edge_endpoint_id_call(name, args)
+                .map(|(_, endpoint_arg)| endpoint_arg)
+                .or_else(|| args.first())
+                .and_then(variable_name);
+            target.is_some_and(|alias| {
+                gql_mutation_created_alias_kind(plan, alias)
+                    .is_some_and(|kind| matches!(kind, GqlAliasKind::Node | GqlAliasKind::Edge))
+            })
         }
         _ => false,
     }
@@ -6980,8 +7147,8 @@ fn validate_gql_scalar_function_arity(
     let valid = match lower {
         "coalesce" => arg_count >= 1,
         "substring" => matches!(arg_count, 2 | 3),
-        "to_string" | "to_integer" | "to_float" | "abs" | "floor" | "ceil" | "round"
-        | "lower" | "upper" | "trim" | "size" | "head" | "last" => arg_count == 1,
+        "tostring" | "tointeger" | "tofloat" | "abs" | "floor" | "ceil" | "round" | "lower"
+        | "upper" | "trim" | "size" | "head" | "last" => arg_count == 1,
         _ => false,
     };
     if valid {
@@ -7002,9 +7169,9 @@ fn validate_gql_scalar_function_arity(
 fn gql_scalar_function_name(lower: &str) -> Option<GraphFunction> {
     match lower {
         "coalesce" => Some(GraphFunction::Coalesce),
-        "to_string" => Some(GraphFunction::ToString),
-        "to_integer" => Some(GraphFunction::ToInteger),
-        "to_float" => Some(GraphFunction::ToFloat),
+        "tostring" => Some(GraphFunction::ToString),
+        "tointeger" => Some(GraphFunction::ToInteger),
+        "tofloat" => Some(GraphFunction::ToFloat),
         "abs" => Some(GraphFunction::Abs),
         "floor" => Some(GraphFunction::Floor),
         "ceil" => Some(GraphFunction::Ceil),
@@ -7054,16 +7221,21 @@ fn validate_gql_mutation_order_expr_static(
             None => Ok(()),
         },
         ExprKind::FunctionCall { name, args } => {
+            if edge_endpoint_id_call(name, args).is_some() {
+                // id(startNode(r)) / id(endNode(r)) is a scalar order key; validate the
+                // whole call (the inner endpoint function is not standalone-valid).
+                return validate_gql_mutation_return_expr_static(plan, expr);
+            }
             let function = name.name.to_ascii_lowercase();
             if matches!(
                 function.as_str(),
                 "labels"
-                    | "start_node"
-                    | "end_node"
+                    | "startnode"
+                    | "endnode"
                     | "nodes"
                     | "relationships"
-                    | "node_ids"
-                    | "edge_ids"
+                    | "nodeids"
+                    | "edgeids"
             ) {
                 return Err(gql_order_key_error(span));
             }
@@ -7074,10 +7246,7 @@ fn validate_gql_mutation_order_expr_static(
         }
         ExprKind::AggregateCall { name_span, .. } => Err(gql_order_key_error(name_span)),
         ExprKind::ExistsSubquery(_) => Err(gql_order_key_error(span)),
-        ExprKind::PropertyAccess { object, property } => {
-            if matches!(property.name.as_str(), "labels" | "node_ids" | "edge_ids") {
-                return Err(gql_order_key_error(span));
-            }
+        ExprKind::PropertyAccess { object, .. } => {
             if matches!(object.kind, ExprKind::Variable(_)) {
                 Ok(())
             } else {
@@ -7150,16 +7319,8 @@ fn validate_gql_mutation_return_distinct_expr_materialized(
     expr: &Expr,
 ) -> Result<(), EngineError> {
     match &expr.kind {
-        ExprKind::PropertyAccess { object, property } => {
-            if let ExprKind::Variable(alias) = &object.kind {
-                validate_gql_mutation_return_distinct_alias_property_materialized(
-                    plan,
-                    materialized,
-                    alias,
-                    &property.name,
-                    &expr.span,
-                )?;
-            } else {
+        ExprKind::PropertyAccess { object, .. } => {
+            if !matches!(&object.kind, ExprKind::Variable(_)) {
                 validate_gql_mutation_return_distinct_expr_materialized(
                     plan,
                     materialized,
@@ -7168,7 +7329,38 @@ fn validate_gql_mutation_return_distinct_expr_materialized(
             }
             Ok(())
         }
-        ExprKind::FunctionCall { args, .. } | ExprKind::List(args) => {
+        ExprKind::FunctionCall { name, args } => {
+            if GqlMetadataFunction::from_lower(&name.name.to_ascii_lowercase())
+                == Some(GqlMetadataFunction::UpdatedAt)
+            {
+                if let Some(alias) = args.first().and_then(variable_name) {
+                    if let Some(binding) = plan.semantic.aliases.get(alias) {
+                        if matches!(
+                            binding.origin,
+                            GqlAliasOrigin::ReadPrefix | GqlAliasOrigin::Merged
+                        ) && gql_mutation_order_alias_has_changed_target(
+                            materialized,
+                            alias,
+                            binding.kind,
+                        ) {
+                            return Err(gql_distinct_key_error(
+                                "GQL mutation RETURN DISTINCT cannot use same-mutation updatedAt() metadata",
+                                &expr.span,
+                            ));
+                        }
+                    }
+                }
+            }
+            for arg in args {
+                validate_gql_mutation_return_distinct_expr_materialized(
+                    plan,
+                    materialized,
+                    arg,
+                )?;
+            }
+            Ok(())
+        }
+        ExprKind::List(args) => {
             for arg in args {
                 validate_gql_mutation_return_distinct_expr_materialized(
                     plan,
@@ -7242,27 +7434,6 @@ fn validate_gql_mutation_return_distinct_expr_materialized(
     }
 }
 
-fn validate_gql_mutation_return_distinct_alias_property_materialized(
-    plan: &GqlMutationPlan,
-    materialized: &GqlCreateMaterialization,
-    alias: &str,
-    property: &str,
-    span: &SourceSpan,
-) -> Result<(), EngineError> {
-    let Some(binding) = plan.semantic.aliases.get(alias) else {
-        return Ok(());
-    };
-    if property == "updated_at"
-        && matches!(binding.origin, GqlAliasOrigin::ReadPrefix | GqlAliasOrigin::Merged)
-        && gql_mutation_order_alias_has_changed_target(materialized, alias, binding.kind)
-    {
-        return Err(gql_distinct_key_error(
-            "GQL mutation RETURN DISTINCT cannot use same-mutation updated_at metadata",
-            span,
-        ));
-    }
-    Ok(())
-}
 
 fn validate_gql_mutation_order_expr_materialized(
     plan: &GqlMutationPlan,
@@ -7271,32 +7442,48 @@ fn validate_gql_mutation_order_expr_materialized(
     span: &SourceSpan,
 ) -> Result<(), EngineError> {
     match &expr.kind {
-        ExprKind::PropertyAccess { object, property } => {
-            if let ExprKind::Variable(alias) = &object.kind {
-                validate_gql_mutation_order_alias_property_materialized(
-                    plan,
-                    materialized,
-                    alias,
-                    &property.name,
-                    span,
-                )?;
-            } else {
+        ExprKind::PropertyAccess { object, .. } => {
+            if !matches!(&object.kind, ExprKind::Variable(_)) {
                 validate_gql_mutation_order_expr_materialized(plan, materialized, object, span)?;
             }
             Ok(())
         }
         ExprKind::FunctionCall { name, args } => {
-            if name.name.eq_ignore_ascii_case("id") {
-                if let Some(Expr {
-                    kind: ExprKind::Variable(alias),
-                    ..
-                }) = args.first()
-                {
-                    if plan.semantic.aliases.get(alias).is_some_and(|binding| {
-                        matches!(binding.origin, GqlAliasOrigin::Created | GqlAliasOrigin::Merged)
-                            && matches!(binding.kind, GqlAliasKind::Node | GqlAliasKind::Edge)
-                    }) {
-                        return Err(gql_order_key_error(span));
+            let metadata = GqlMetadataFunction::from_lower(&name.name.to_ascii_lowercase());
+            if matches!(
+                metadata,
+                Some(
+                    GqlMetadataFunction::Id
+                        | GqlMetadataFunction::CreatedAt
+                        | GqlMetadataFunction::UpdatedAt
+                )
+            ) {
+                let target = edge_endpoint_id_call(name, args)
+                    .map(|(_, endpoint_arg)| endpoint_arg)
+                    .or_else(|| args.first())
+                    .and_then(variable_name);
+                if let Some(alias) = target {
+                    if let Some(binding) = plan.semantic.aliases.get(alias) {
+                        if matches!(
+                            binding.origin,
+                            GqlAliasOrigin::Created | GqlAliasOrigin::Merged
+                        ) && matches!(binding.kind, GqlAliasKind::Node | GqlAliasKind::Edge)
+                        {
+                            return Err(gql_order_key_error(span));
+                        }
+                        if metadata == Some(GqlMetadataFunction::UpdatedAt)
+                            && matches!(
+                                binding.origin,
+                                GqlAliasOrigin::ReadPrefix | GqlAliasOrigin::Merged
+                            )
+                            && gql_mutation_order_alias_has_changed_target(
+                                materialized,
+                                alias,
+                                binding.kind,
+                            )
+                        {
+                            return Err(gql_order_key_error(span));
+                        }
                     }
                 }
             }
@@ -7365,38 +7552,6 @@ fn validate_gql_mutation_order_expr_materialized(
         }
         ExprKind::Literal(_) | ExprKind::Parameter(_) | ExprKind::Variable(_) => Ok(()),
     }
-}
-
-fn validate_gql_mutation_order_alias_property_materialized(
-    plan: &GqlMutationPlan,
-    materialized: &GqlCreateMaterialization,
-    alias: &str,
-    property: &str,
-    span: &SourceSpan,
-) -> Result<(), EngineError> {
-    let Some(binding) = plan.semantic.aliases.get(alias) else {
-        return Ok(());
-    };
-    if matches!(binding.origin, GqlAliasOrigin::Created | GqlAliasOrigin::Merged) {
-        let volatile = match binding.kind {
-            GqlAliasKind::Node => matches!(property, "id" | "created_at" | "updated_at"),
-            GqlAliasKind::Edge => {
-                matches!(property, "id" | "from" | "to" | "created_at" | "updated_at")
-            }
-            GqlAliasKind::Path => false,
-            GqlAliasKind::Scalar => false,
-        };
-        if volatile {
-            return Err(gql_order_key_error(span));
-        }
-    }
-    if property == "updated_at"
-        && matches!(binding.origin, GqlAliasOrigin::ReadPrefix | GqlAliasOrigin::Merged)
-        && gql_mutation_order_alias_has_changed_target(materialized, alias, binding.kind)
-    {
-        return Err(gql_order_key_error(span));
-    }
-    Ok(())
 }
 
 fn gql_mutation_order_alias_has_changed_target(
@@ -7650,14 +7805,13 @@ fn collect_gql_mutation_return_expr_ids(
                 read_set,
             )
         }
-        ExprKind::PropertyAccess { object, property } => {
+        ExprKind::PropertyAccess { object, .. } => {
             if let ExprKind::Variable(alias) = &object.kind {
                 if plan
                     .semantic
                     .aliases
                     .get(alias)
                     .is_some_and(|binding| binding.kind == GqlAliasKind::Path)
-                    && matches!(property.name.as_str(), "node_ids" | "edge_ids" | "length")
                 {
                     return;
                 }
@@ -7678,6 +7832,20 @@ fn collect_gql_mutation_return_expr_ids(
             }
         }
         ExprKind::FunctionCall { name, args } => {
+            if let Some((_, endpoint_arg)) = edge_endpoint_id_call(name, args) {
+                let alias = variable_name(endpoint_arg).expect("endpoint call shape checked");
+                collect_gql_mutation_alias_ids(
+                    plan,
+                    materialized,
+                    alias,
+                    row_indices,
+                    use_,
+                    commit,
+                    ids,
+                    read_set,
+                );
+                return;
+            }
             if let Some(Expr {
                 kind: ExprKind::Variable(alias),
                 ..
@@ -7697,7 +7865,7 @@ fn collect_gql_mutation_return_expr_ids(
                             read_set,
                         );
                     }
-                    "start_node" | "end_node" | "nodes" | "relationships"
+                    "startnode" | "endnode" | "nodes" | "relationships"
                         if use_ == GqlMutationReturnUse::Output =>
                     {
                         collect_gql_mutation_path_helper_ids(
@@ -7710,7 +7878,23 @@ fn collect_gql_mutation_return_expr_ids(
                             read_set,
                         );
                     }
-                    _ => {}
+                    // id() resolves from row identity without hydration; other metadata
+                    // functions need the record loaded, same as property access.
+                    "id" => {}
+                    _ => {
+                        if GqlMetadataFunction::from_lower(function.as_str()).is_some() {
+                            collect_gql_mutation_alias_ids(
+                                plan,
+                                materialized,
+                                alias,
+                                row_indices,
+                                use_,
+                                commit,
+                                ids,
+                                read_set,
+                            );
+                        }
+                    }
                 }
                 return;
             }
@@ -7829,13 +8013,13 @@ fn collect_gql_mutation_path_helper_ids(
             continue;
         };
         match function {
-            "start_node" => {
+            "startnode" => {
                 if let Some(&id) = path.node_ids.first() {
                     ids.node_ids.insert(id);
                     read_set.node_ids.insert(id);
                 }
             }
-            "end_node" => {
+            "endnode" => {
                 if let Some(&id) = path.node_ids.last() {
                     ids.node_ids.insert(id);
                     read_set.node_ids.insert(id);
@@ -8015,6 +8199,10 @@ fn gql_mutation_return_expr_value(
                     context,
                     &expr.span,
                 );
+            }
+            if let Some((endpoint, endpoint_arg)) = edge_endpoint_id_call(name, args) {
+                let alias = variable_name(endpoint_arg).expect("endpoint call shape checked");
+                return gql_mutation_alias_endpoint_id_value(alias, endpoint, context);
             }
             let Some(Expr {
                 kind: ExprKind::Variable(alias),
@@ -8565,17 +8753,81 @@ fn gql_mutation_alias_property_value(
                     .map(|value| value.unwrap_or(GqlValue::Null))
             }
         }
-        GqlAliasKind::Path => Ok(context
-            .path(alias)
-            .map(|path| match property {
-                "node_ids" => gql_id_list_value(&path.node_ids),
-                "edge_ids" => gql_id_list_value(&path.edge_ids),
-                "length" => GqlValue::UInt(path.edge_ids.len() as u64),
-                _ => GqlValue::Null,
-            })
-            .unwrap_or(GqlValue::Null)),
+        // Paths have no properties; semantic analysis rejects path dot access before runtime.
+        GqlAliasKind::Path => Ok(GqlValue::Null),
         GqlAliasKind::Scalar => Ok(GqlValue::Null),
     }
+}
+
+fn gql_mutation_alias_metadata_value(
+    alias: &str,
+    field: GqlMetadataFunction,
+    context: &GqlMutationReturnEvalContext<'_>,
+) -> Result<GqlValue, EngineError> {
+    let Some(binding) = context.plan.semantic.aliases.get(alias) else {
+        return Ok(GqlValue::Null);
+    };
+    match binding.kind {
+        GqlAliasKind::Node => {
+            if context.commit.is_none() {
+                if let Some(&index) = context.row.created_nodes.get(alias) {
+                    let node = gql_node_from_created_execution(
+                        &context.nodes[index],
+                        context.commit,
+                        context.include_vectors,
+                    );
+                    return Ok(gql_node_metadata_from_value(node, field));
+                }
+            }
+            context
+                .node_id(alias)
+                .map(|id| context.node_metadata_value(id, field))
+                .transpose()
+                .map(|value| value.unwrap_or(GqlValue::Null))
+        }
+        GqlAliasKind::Edge => {
+            if context.commit.is_none() {
+                if let Some(&index) = context.row.created_edges.get(alias) {
+                    let edge =
+                        gql_edge_from_created_execution(&context.edges[index], context.commit);
+                    return Ok(gql_edge_metadata_from_value(edge, field));
+                }
+            }
+            context
+                .edge_id(alias)
+                .map(|id| context.edge_metadata_value(id, field))
+                .transpose()
+                .map(|value| value.unwrap_or(GqlValue::Null))
+        }
+        GqlAliasKind::Path | GqlAliasKind::Scalar => Ok(GqlValue::Null),
+    }
+}
+
+fn gql_mutation_alias_endpoint_id_value(
+    alias: &str,
+    endpoint: GqlEndpointFunction,
+    context: &GqlMutationReturnEvalContext<'_>,
+) -> Result<GqlValue, EngineError> {
+    let Some(binding) = context.plan.semantic.aliases.get(alias) else {
+        return Ok(GqlValue::Null);
+    };
+    if binding.kind != GqlAliasKind::Edge {
+        return Ok(GqlValue::Null);
+    }
+    if context.commit.is_none() {
+        if let Some(&index) = context.row.created_edges.get(alias) {
+            let edge = gql_edge_from_created_execution(&context.edges[index], context.commit);
+            return Ok(gql_edge_endpoint_id_from_value(&edge, endpoint));
+        }
+    }
+    context
+        .edge_id(alias)
+        .map(|id| {
+            let edge = context.gql_edge(id)?;
+            Ok(gql_edge_endpoint_id_from_value(&edge, endpoint))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(GqlValue::Null))
 }
 
 fn row_scalar_value(
@@ -8598,16 +8850,20 @@ fn gql_mutation_function_value(
     context: &GqlMutationReturnEvalContext<'_>,
     span: &SourceSpan,
 ) -> Result<GqlValue, EngineError> {
-    match function.to_ascii_lowercase().as_str() {
-        "id" => {
+    let lower = function.to_ascii_lowercase();
+    if let Some(metadata) = GqlMetadataFunction::from_lower(&lower) {
+        if metadata == GqlMetadataFunction::Id {
             if let Some(id) = context.node_id(alias) {
                 return Ok(GqlValue::UInt(id));
             }
             if let Some(id) = context.edge_id(alias) {
                 return Ok(GqlValue::UInt(id));
             }
-            Ok(GqlValue::Null)
+            return Ok(GqlValue::Null);
         }
+        return gql_mutation_alias_metadata_value(alias, metadata, context);
+    }
+    match lower.as_str() {
         "labels" => context
             .row
             .created_nodes
@@ -8647,15 +8903,15 @@ fn gql_mutation_function_value(
             .path(alias)
             .map(|path| GqlValue::UInt(path.edge_ids.len() as u64))
             .unwrap_or(GqlValue::Null)),
-        "node_ids" => Ok(context
+        "nodeids" => Ok(context
             .path(alias)
             .map(|path| gql_id_list_value(&path.node_ids))
             .unwrap_or(GqlValue::Null)),
-        "edge_ids" => Ok(context
+        "edgeids" => Ok(context
             .path(alias)
             .map(|path| gql_id_list_value(&path.edge_ids))
             .unwrap_or(GqlValue::Null)),
-        "start_node" => Ok(context
+        "startnode" => Ok(context
             .path(alias)
             .and_then(|path| path.node_ids.first().copied())
             .map(|id| {
@@ -8667,7 +8923,7 @@ fn gql_mutation_function_value(
             })
             .transpose()?
             .unwrap_or(GqlValue::Null)),
-        "end_node" => Ok(context
+        "endnode" => Ok(context
             .path(alias)
             .and_then(|path| path.node_ids.last().copied())
             .map(|id| {
@@ -8761,6 +9017,24 @@ impl<'a> GqlMutationReturnEvalContext<'a> {
         Ok(gql_edge_property_from_value(edge, property))
     }
 
+    fn node_metadata_value(
+        &self,
+        id: u64,
+        field: GqlMetadataFunction,
+    ) -> Result<GqlValue, EngineError> {
+        let node = self.gql_node(id)?;
+        Ok(gql_node_metadata_from_value(node, field))
+    }
+
+    fn edge_metadata_value(
+        &self,
+        id: u64,
+        field: GqlMetadataFunction,
+    ) -> Result<GqlValue, EngineError> {
+        let edge = self.gql_edge(id)?;
+        Ok(gql_edge_metadata_from_value(edge, field))
+    }
+
     fn node_labels_value(&self, id: u64) -> Result<GqlValue, EngineError> {
         Ok(GqlValue::List(
             self.gql_node(id)?
@@ -8840,44 +9114,64 @@ impl<'a> GqlMutationReturnEvalContext<'a> {
 }
 
 fn gql_node_property_from_value(node: GqlNode, property: &str) -> GqlValue {
-    match property {
-        "id" => node.id.map(GqlValue::UInt).unwrap_or(GqlValue::Null),
-        "labels" => node
-            .labels
-            .map(|labels| GqlValue::List(labels.into_iter().map(GqlValue::String).collect()))
-            .unwrap_or(GqlValue::Null),
-        "key" => node.key.map(GqlValue::String).unwrap_or(GqlValue::Null),
-        "weight" => node
-            .weight
-            .map(|value| GqlValue::Float(value as f64))
-            .unwrap_or(GqlValue::Null),
-        "created_at" => node.created_at.map(GqlValue::Int).unwrap_or(GqlValue::Null),
-        "updated_at" => node.updated_at.map(GqlValue::Int).unwrap_or(GqlValue::Null),
-        other => node
-            .props
-            .and_then(|props| props.get(other).cloned())
-            .unwrap_or(GqlValue::Null),
-    }
+    node.props
+        .and_then(|props| props.get(property).cloned())
+        .unwrap_or(GqlValue::Null)
 }
 
 fn gql_edge_property_from_value(edge: GqlEdge, property: &str) -> GqlValue {
-    match property {
-        "id" => edge.id.map(GqlValue::UInt).unwrap_or(GqlValue::Null),
-        "from" => edge.from.map(GqlValue::UInt).unwrap_or(GqlValue::Null),
-        "to" => edge.to.map(GqlValue::UInt).unwrap_or(GqlValue::Null),
-        "label" | "type" => edge.label.map(GqlValue::String).unwrap_or(GqlValue::Null),
-        "weight" => edge
+    edge.props
+        .and_then(|props| props.get(property).cloned())
+        .unwrap_or(GqlValue::Null)
+}
+
+fn gql_node_metadata_from_value(node: GqlNode, field: GqlMetadataFunction) -> GqlValue {
+    match field {
+        GqlMetadataFunction::Id => node.id.map(GqlValue::UInt).unwrap_or(GqlValue::Null),
+        GqlMetadataFunction::ElementKey => {
+            node.key.map(GqlValue::String).unwrap_or(GqlValue::Null)
+        }
+        GqlMetadataFunction::Weight => node
             .weight
             .map(|value| GqlValue::Float(value as f64))
             .unwrap_or(GqlValue::Null),
-        "created_at" => edge.created_at.map(GqlValue::Int).unwrap_or(GqlValue::Null),
-        "updated_at" => edge.updated_at.map(GqlValue::Int).unwrap_or(GqlValue::Null),
-        "valid_from" => edge.valid_from.map(GqlValue::Int).unwrap_or(GqlValue::Null),
-        "valid_to" => edge.valid_to.map(GqlValue::Int).unwrap_or(GqlValue::Null),
-        other => edge
-            .props
-            .and_then(|props| props.get(other).cloned())
+        GqlMetadataFunction::CreatedAt => {
+            node.created_at.map(GqlValue::Int).unwrap_or(GqlValue::Null)
+        }
+        GqlMetadataFunction::UpdatedAt => {
+            node.updated_at.map(GqlValue::Int).unwrap_or(GqlValue::Null)
+        }
+        GqlMetadataFunction::ValidFrom | GqlMetadataFunction::ValidTo => GqlValue::Null,
+    }
+}
+
+fn gql_edge_metadata_from_value(edge: GqlEdge, field: GqlMetadataFunction) -> GqlValue {
+    match field {
+        GqlMetadataFunction::Id => edge.id.map(GqlValue::UInt).unwrap_or(GqlValue::Null),
+        GqlMetadataFunction::Weight => edge
+            .weight
+            .map(|value| GqlValue::Float(value as f64))
             .unwrap_or(GqlValue::Null),
+        GqlMetadataFunction::CreatedAt => {
+            edge.created_at.map(GqlValue::Int).unwrap_or(GqlValue::Null)
+        }
+        GqlMetadataFunction::UpdatedAt => {
+            edge.updated_at.map(GqlValue::Int).unwrap_or(GqlValue::Null)
+        }
+        GqlMetadataFunction::ValidFrom => {
+            edge.valid_from.map(GqlValue::Int).unwrap_or(GqlValue::Null)
+        }
+        GqlMetadataFunction::ValidTo => {
+            edge.valid_to.map(GqlValue::Int).unwrap_or(GqlValue::Null)
+        }
+        GqlMetadataFunction::ElementKey => GqlValue::Null,
+    }
+}
+
+fn gql_edge_endpoint_id_from_value(edge: &GqlEdge, endpoint: GqlEndpointFunction) -> GqlValue {
+    match endpoint {
+        GqlEndpointFunction::StartNode => edge.from.map(GqlValue::UInt).unwrap_or(GqlValue::Null),
+        GqlEndpointFunction::EndNode => edge.to.map(GqlValue::UInt).unwrap_or(GqlValue::Null),
     }
 }
 
@@ -9850,6 +10144,21 @@ fn set_operation_explain(item: &GqlSetItemPlan) -> GqlMutationOperationExplain {
                 value.id
             ),
         },
+        GqlSetItemPlan::Metadata {
+            alias,
+            kind,
+            field,
+            value,
+        } => GqlMutationOperationExplain {
+            op: "SET METADATA".to_string(),
+            target_alias: Some(alias.clone()),
+            row_multiplicity: "per mutation input row".to_string(),
+            detail: format!(
+                "{kind:?} {}() = expr #{}; by-ID replacement adapter required",
+                field.canonical_name(),
+                value.id
+            ),
+        },
         GqlSetItemPlan::MapMerge { alias, kind, value } => GqlMutationOperationExplain {
             op: "SET MAP MERGE".to_string(),
             target_alias: Some(alias.clone()),
@@ -10017,7 +10326,7 @@ impl ReadView {
         trace: &mut GraphRowExplainTrace,
     ) -> Result<(), EngineError> {
         let runtime = self.normalize_graph_row_explain_runtime_plan(query, trace)?;
-        let physical_plan = self.plan_graph_row_physical(query, &runtime)?;
+        let physical_plan = self.plan_graph_row_physical(query, &runtime, true)?;
         self.populate_graph_row_explain_trace_from_runtime(
             query,
             cursor_state,
@@ -10223,7 +10532,7 @@ impl ReadView {
     ) -> Result<GraphRowRuntimePlan, EngineError> {
         let runtime = self.normalize_graph_row_runtime_plan(query)?;
         for warning in &runtime.warnings {
-            trace.record_warning(format!("{warning:?}"));
+            trace.record_warning(gql_query_plan_warning_message(*warning).to_string());
         }
         self.record_graph_row_static_step_explain(query, &runtime, trace)?;
         Ok(runtime)
@@ -10263,7 +10572,8 @@ impl ReadView {
                             group.where_present
                         ),
                     );
-                    let group_physical_plan = self.plan_graph_row_physical(query, &group.runtime)?;
+                    let group_physical_plan =
+                        self.plan_graph_row_physical(query, &group.runtime, true)?;
                     trace.record_physical_plan(&group.runtime, &group_physical_plan);
                     self.record_graph_row_static_step_explain(query, &group.runtime, trace)?;
                 }
@@ -10694,12 +11004,12 @@ impl GraphRowExplainTrace {
             format!(
                 "alias={alias}; context={context}; source={root:?}; estimated_candidates={:?}; warnings={:?}; secondary_index_followups={}",
                 planned.estimated_candidate_count(),
-                planned.warnings,
+                gql_query_plan_warning_messages(&planned.warnings),
                 planned.followups.len()
             ),
         );
         for warning in &planned.warnings {
-            self.record_warning(format!("{warning:?}"));
+            self.record_warning(gql_query_plan_warning_message(*warning).to_string());
         }
         if !planned.followups.is_empty() {
             self.record_note(format!(
@@ -10728,12 +11038,12 @@ impl GraphRowExplainTrace {
             format!(
                 "edge={edge_name}; context={context}; label_id={label_id:?}; source={root:?}; estimated_candidates={:?}; warnings={:?}; secondary_index_followups={}",
                 planned.estimated_candidate_count(),
-                planned.warnings,
+                gql_query_plan_warning_messages(&planned.warnings),
                 planned.followups.len()
             ),
         );
         for warning in &planned.warnings {
-            self.record_warning(format!("{warning:?}"));
+            self.record_warning(gql_query_plan_warning_message(*warning).to_string());
         }
         if !planned.followups.is_empty() {
             self.record_note(format!(
@@ -11047,7 +11357,9 @@ fn collect_graph_row_edge_filter_detail(filter: &NormalizedEdgeFilter, details: 
     match filter {
         NormalizedEdgeFilter::AlwaysTrue => {}
         NormalizedEdgeFilter::AlwaysFalse => details.push("always_false"),
-        NormalizedEdgeFilter::WeightRange { .. }
+        NormalizedEdgeFilter::IdRange { .. }
+        | NormalizedEdgeFilter::CreatedAtRange { .. }
+        | NormalizedEdgeFilter::WeightRange { .. }
         | NormalizedEdgeFilter::UpdatedAtRange { .. }
         | NormalizedEdgeFilter::ValidAt { .. }
         | NormalizedEdgeFilter::ValidFromRange { .. }
@@ -11471,7 +11783,7 @@ fn resolve_order_by_return_aliases(
 
 fn validate_gql_order_expr_static(
     expr: &Expr,
-    plan: &GqlSemanticPlan,
+    _plan: &GqlSemanticPlan,
     span: &SourceSpan,
 ) -> Result<(), EngineError> {
     match &expr.kind {
@@ -11481,34 +11793,8 @@ fn validate_gql_order_expr_static(
         ExprKind::FunctionCall { name, .. }
             if matches!(
                 name.name.to_ascii_lowercase().as_str(),
-                "nodes" | "relationships" | "node_ids" | "edge_ids"
+                "nodes" | "relationships" | "nodeids" | "edgeids"
             ) =>
-        {
-            Err(gql_order_key_error(span))
-        }
-        ExprKind::PropertyAccess { object, property }
-            if property.name == "labels"
-                && matches!(
-                    &object.kind,
-                    ExprKind::Variable(name)
-                        if plan
-                            .aliases
-                            .get(name)
-                            .is_some_and(|binding| binding.kind == GqlAliasKind::Node)
-                ) =>
-        {
-            Err(gql_order_key_error(span))
-        }
-        ExprKind::PropertyAccess { object, property }
-            if matches!(property.name.as_str(), "node_ids" | "edge_ids")
-                && matches!(
-                    &object.kind,
-                    ExprKind::Variable(name)
-                        if plan
-                            .aliases
-                            .get(name)
-                            .is_some_and(|binding| binding.kind == GqlAliasKind::Path)
-                ) =>
         {
             Err(gql_order_key_error(span))
         }
@@ -12216,6 +12502,13 @@ fn gql_row_ops(lowered: &GqlLoweredPlan) -> Vec<GqlRowOperation> {
     }
     ops.push(GqlRowOperation::Projection);
     ops
+}
+
+fn gql_query_plan_warning_messages(warnings: &[QueryPlanWarning]) -> Vec<&'static str> {
+    warnings
+        .iter()
+        .map(|warning| gql_query_plan_warning_message(*warning))
+        .collect()
 }
 
 fn gql_projection_summaries(

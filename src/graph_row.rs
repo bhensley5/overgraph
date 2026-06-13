@@ -2077,11 +2077,11 @@ fn eval_bound_path_derived_function(
         PathEndpoint::Start => path
             .nodes
             .first()
-            .ok_or_else(|| invalid_path_shape("start_node"))?,
+            .ok_or_else(|| invalid_path_shape("startNode"))?,
         PathEndpoint::End => path
             .nodes
             .last()
-            .ok_or_else(|| invalid_path_shape("end_node"))?,
+            .ok_or_else(|| invalid_path_shape("endNode"))?,
     };
     graph_node_field_value(
         "path-derived function argument",
@@ -2154,7 +2154,7 @@ fn eval_bound_graph_slot_function(
                 .first()
                 .cloned()
                 .map(GraphEvalValue::Node)
-                .ok_or_else(|| invalid_path_shape("start_node"))
+                .ok_or_else(|| invalid_path_shape("startNode"))
         }
         (GraphFunction::EndNode, GraphBindingSlotKind::Path) => {
             let Some(path) = context.row.path_for_slot(slot)? else {
@@ -2164,7 +2164,7 @@ fn eval_bound_graph_slot_function(
                 .last()
                 .cloned()
                 .map(GraphEvalValue::Node)
-                .ok_or_else(|| invalid_path_shape("end_node"))
+                .ok_or_else(|| invalid_path_shape("endNode"))
         }
         (GraphFunction::Nodes, GraphBindingSlotKind::Path) => {
             let Some(path) = context.row.path_for_slot(slot)? else {
@@ -2246,13 +2246,13 @@ fn eval_graph_function_value(
             .into_iter()
             .next()
             .map(GraphEvalValue::Node)
-            .ok_or_else(|| invalid_path_shape("start_node")),
+            .ok_or_else(|| invalid_path_shape("startNode")),
         (GraphFunction::EndNode, GraphEvalValue::Path(path)) => path
             .nodes
             .into_iter()
             .last()
             .map(GraphEvalValue::Node)
-            .ok_or_else(|| invalid_path_shape("end_node")),
+            .ok_or_else(|| invalid_path_shape("endNode")),
         (GraphFunction::Nodes, GraphEvalValue::Path(path)) => Ok(GraphEvalValue::List(
             path.nodes.into_iter().map(GraphEvalValue::Node).collect(),
         )),
@@ -2667,11 +2667,11 @@ fn eval_graph_path_derived_function(
         PathEndpoint::Start => path
             .nodes
             .first()
-            .ok_or_else(|| invalid_path_shape("start_node"))?,
+            .ok_or_else(|| invalid_path_shape("startNode"))?,
         PathEndpoint::End => path
             .nodes
             .last()
-            .ok_or_else(|| invalid_path_shape("end_node"))?,
+            .ok_or_else(|| invalid_path_shape("endNode"))?,
     };
     graph_node_field_value(
         "path-derived function argument",
@@ -3748,13 +3748,13 @@ fn bound_path_function_to_output_value(
             .first()
             .map(|node| graph_bound_node_to_output_value(node, projection, output))
             .transpose()?
-            .ok_or_else(|| invalid_path_shape("start_node")),
+            .ok_or_else(|| invalid_path_shape("startNode")),
         GraphFunction::EndNode => path
             .nodes
             .last()
             .map(|node| graph_bound_node_to_output_value(node, projection, output))
             .transpose()?
-            .ok_or_else(|| invalid_path_shape("end_node")),
+            .ok_or_else(|| invalid_path_shape("endNode")),
         GraphFunction::Nodes => Ok(GraphValue::List(
             path.nodes
                 .iter()
@@ -4455,6 +4455,14 @@ fn collect_node_filter_needs(
     needs: &mut EntityProjectionNeeds,
 ) -> Result<(), EngineError> {
     match filter {
+        NodeFilterExpr::KeyEquals(_) | NodeFilterExpr::KeyIn(_) => needs.merge_node_needs(
+            alias,
+            NodeSelectedFieldNeeds {
+                key: true,
+                ..NodeSelectedFieldNeeds::default()
+            },
+            ProjectionNeedClass::Verifier,
+        )?,
         NodeFilterExpr::PropertyEquals { key, .. }
         | NodeFilterExpr::PropertyIn { key, .. }
         | NodeFilterExpr::PropertyRange { key, .. }
@@ -4472,6 +4480,20 @@ fn collect_node_filter_needs(
             NodeSelectedFieldNeeds::default(),
             ProjectionNeedClass::Verifier,
         )?,
+        NodeFilterExpr::CreatedAtRange { .. } => needs.merge_node_needs(
+            alias,
+            NodeSelectedFieldNeeds {
+                created_at: true,
+                ..NodeSelectedFieldNeeds::default()
+            },
+            ProjectionNeedClass::Verifier,
+        )?,
+        NodeFilterExpr::IdRange { .. } | NodeFilterExpr::WeightRange { .. } => needs
+            .merge_node_needs(
+                alias,
+                NodeSelectedFieldNeeds::default(),
+                ProjectionNeedClass::Verifier,
+            )?,
         NodeFilterExpr::And(filters) | NodeFilterExpr::Or(filters) => {
             for filter in filters {
                 collect_node_filter_needs(alias, filter, needs)?;
@@ -4558,6 +4580,14 @@ fn collect_edge_filter_needs(
     needs: &mut EntityProjectionNeeds,
 ) -> Result<(), EngineError> {
     match filter {
+        EdgeFilterExpr::CreatedAtRange { .. } => needs.merge_edge_needs(
+            alias,
+            EdgeSelectedFieldNeeds {
+                created_at: true,
+                ..EdgeSelectedFieldNeeds::default()
+            },
+            ProjectionNeedClass::Verifier,
+        )?,
         EdgeFilterExpr::PropertyEquals { key, .. }
         | EdgeFilterExpr::PropertyIn { key, .. }
         | EdgeFilterExpr::PropertyRange { key, .. }
@@ -4570,7 +4600,8 @@ fn collect_edge_filter_needs(
             },
             ProjectionNeedClass::Verifier,
         )?,
-        EdgeFilterExpr::WeightRange { .. }
+        EdgeFilterExpr::IdRange { .. }
+        | EdgeFilterExpr::WeightRange { .. }
         | EdgeFilterExpr::UpdatedAtRange { .. }
         | EdgeFilterExpr::ValidAt { .. }
         | EdgeFilterExpr::ValidFromRange { .. }
@@ -5741,14 +5772,14 @@ fn graph_function_name(name: GraphFunction) -> &'static str {
         GraphFunction::Labels => "labels",
         GraphFunction::Type => "type",
         GraphFunction::Length => "length",
-        GraphFunction::StartNode => "start_node",
-        GraphFunction::EndNode => "end_node",
+        GraphFunction::StartNode => "startNode",
+        GraphFunction::EndNode => "endNode",
         GraphFunction::Nodes => "nodes",
         GraphFunction::Relationships => "relationships",
         GraphFunction::Coalesce => "coalesce",
-        GraphFunction::ToString => "to_string",
-        GraphFunction::ToInteger => "to_integer",
-        GraphFunction::ToFloat => "to_float",
+        GraphFunction::ToString => "toString",
+        GraphFunction::ToInteger => "toInteger",
+        GraphFunction::ToFloat => "toFloat",
         GraphFunction::Abs => "abs",
         GraphFunction::Floor => "floor",
         GraphFunction::Ceil => "ceil",

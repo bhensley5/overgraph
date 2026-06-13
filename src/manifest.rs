@@ -2,7 +2,8 @@ use crate::error::EngineError;
 use crate::schema::{normalize_schema_manifest, validate_schema_manifest};
 use crate::segment_writer::SEGMENT_FORMAT_VERSION;
 use crate::types::{
-    validate_label_token_name, ManifestState, LABEL_TOKEN_SCHEMA_VERSION, SCHEMA_CATALOG_VERSION,
+    secondary_index_logical_identity, validate_label_token_name, validate_secondary_index_target,
+    ManifestState, SecondaryIndexTarget, LABEL_TOKEN_SCHEMA_VERSION, SCHEMA_CATALOG_VERSION,
 };
 use std::fs;
 use std::io::Write;
@@ -114,6 +115,7 @@ fn try_load_manifest_file_for_write(
 fn validate_manifest_identity(state: &ManifestState) -> Result<(), EngineError> {
     validate_label_token_manifest(state)?;
     validate_schema_manifest(state)?;
+    validate_secondary_index_manifest(state)?;
     for segment in &state.segments {
         if segment.segment_format_version != SEGMENT_FORMAT_VERSION
             || segment.segment_data_id == [0; 32]
@@ -121,6 +123,47 @@ fn validate_manifest_identity(state: &ManifestState) -> Result<(), EngineError> 
             return Err(EngineError::ManifestError(format!(
                 "unsupported segment manifest entry for segment {}; rebuild the database",
                 segment.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_secondary_index_manifest(state: &ManifestState) -> Result<(), EngineError> {
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut seen_identities = std::collections::HashSet::new();
+    for entry in &state.secondary_indexes {
+        if !seen_ids.insert(entry.index_id) {
+            return Err(EngineError::ManifestError(format!(
+                "duplicate secondary index id {} in manifest",
+                entry.index_id
+            )));
+        }
+        validate_secondary_index_target(&entry.target)?;
+        match &entry.target {
+            SecondaryIndexTarget::NodeProperty { label_id, .. }
+            | SecondaryIndexTarget::NodeFieldIndex { label_id, .. } => {
+                if !state.node_label_tokens.values().any(|id| id == label_id) {
+                    return Err(EngineError::ManifestError(format!(
+                        "secondary index {} references missing node label label_id {}",
+                        entry.index_id, label_id
+                    )));
+                }
+            }
+            SecondaryIndexTarget::EdgeProperty { label_id, .. }
+            | SecondaryIndexTarget::EdgeFieldIndex { label_id, .. } => {
+                if !state.edge_label_tokens.values().any(|id| id == label_id) {
+                    return Err(EngineError::ManifestError(format!(
+                        "secondary index {} references missing edge-label label_id {}",
+                        entry.index_id, label_id
+                    )));
+                }
+            }
+        }
+        if !seen_identities.insert(secondary_index_logical_identity(entry)?) {
+            return Err(EngineError::ManifestError(format!(
+                "duplicate secondary index declaration for {:?}",
+                entry.target
             )));
         }
     }
@@ -1041,7 +1084,14 @@ mod tests {
     fn test_manifest_round_trip_node_and_edge_secondary_indexes() {
         let dir = TempDir::new().unwrap();
         let state = ManifestState {
-            next_secondary_index_id: 4,
+            node_label_tokens: BTreeMap::from([("Person".to_string(), 1)]),
+            next_node_label_id: 2,
+            edge_label_tokens: BTreeMap::from([
+                ("KNOWS".to_string(), 1),
+                ("WORKS_AT".to_string(), 2),
+            ]),
+            next_edge_label_id: 3,
+            next_secondary_index_id: 5,
             secondary_indexes: vec![
                 crate::types::SecondaryIndexManifestEntry {
                     index_id: 0,
@@ -1073,18 +1123,38 @@ mod tests {
                     state: crate::types::SecondaryIndexState::Ready,
                     last_error: None,
                 },
+                crate::types::SecondaryIndexManifestEntry {
+                    index_id: 3,
+                    target: crate::types::SecondaryIndexTarget::NodeFieldIndex {
+                        label_id: 1,
+                        fields: vec![
+                            crate::types::SecondaryIndexFieldManifest::Property {
+                                key: "status".to_string(),
+                            },
+                            crate::types::SecondaryIndexFieldManifest::NodeMetadata {
+                                field: crate::types::NodeMetadataIndexFieldManifest::UpdatedAt,
+                            },
+                        ],
+                    },
+                    kind: crate::types::SecondaryIndexKind::Equality,
+                    state: crate::types::SecondaryIndexState::Building,
+                    last_error: None,
+                },
             ],
             ..default_manifest()
         };
         write_manifest(dir.path(), &state).unwrap();
 
         let raw_manifest = fs::read_to_string(dir.path().join(MANIFEST_CURRENT)).unwrap();
+        assert!(raw_manifest.contains("\"NodeProperty\""));
+        assert!(raw_manifest.contains("\"EdgeProperty\""));
+        assert!(raw_manifest.contains("\"NodeFieldIndex\""));
         assert!(raw_manifest.contains("\"label_id\""));
         assert!(!raw_manifest.contains(concat!("\"", "type", "_id\"")));
 
         let loaded = load_manifest(dir.path()).unwrap().unwrap();
-        assert_eq!(loaded.secondary_indexes.len(), 3);
-        assert_eq!(loaded.next_secondary_index_id, 4);
+        assert_eq!(loaded.secondary_indexes.len(), 4);
+        assert_eq!(loaded.next_secondary_index_id, 5);
         assert!(matches!(
             &loaded.secondary_indexes[0].target,
             crate::types::SecondaryIndexTarget::NodeProperty { label_id: 1, .. }
@@ -1106,12 +1176,66 @@ mod tests {
             loaded.secondary_indexes[2].state,
             crate::types::SecondaryIndexState::Ready
         );
+        assert!(matches!(
+            &loaded.secondary_indexes[3].target,
+            crate::types::SecondaryIndexTarget::NodeFieldIndex { label_id: 1, fields }
+                if fields.len() == 2
+        ));
+    }
+
+    #[test]
+    fn test_load_manifest_rejects_duplicate_secondary_index_logical_identity() {
+        let dir = TempDir::new().unwrap();
+        let state = ManifestState {
+            node_label_tokens: BTreeMap::from([("Person".to_string(), 1)]),
+            next_node_label_id: 2,
+            next_secondary_index_id: 3,
+            secondary_indexes: vec![
+                crate::types::SecondaryIndexManifestEntry {
+                    index_id: 1,
+                    target: crate::types::SecondaryIndexTarget::NodeProperty {
+                        label_id: 1,
+                        prop_key: "status".to_string(),
+                    },
+                    kind: crate::types::SecondaryIndexKind::Equality,
+                    state: crate::types::SecondaryIndexState::Building,
+                    last_error: None,
+                },
+                crate::types::SecondaryIndexManifestEntry {
+                    index_id: 2,
+                    target: crate::types::SecondaryIndexTarget::NodeFieldIndex {
+                        label_id: 1,
+                        fields: vec![crate::types::SecondaryIndexFieldManifest::Property {
+                            key: "status".to_string(),
+                        }],
+                    },
+                    kind: crate::types::SecondaryIndexKind::Equality,
+                    state: crate::types::SecondaryIndexState::Building,
+                    last_error: None,
+                },
+            ],
+            ..default_manifest()
+        };
+        fs::write(
+            dir.path().join(MANIFEST_CURRENT),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let err = load_manifest(dir.path()).expect_err("duplicate logical identity must fail");
+        assert!(
+            err.to_string()
+                .contains("duplicate secondary index declaration"),
+            "{err}"
+        );
     }
 
     #[test]
     fn test_load_manifest_rejects_legacy_domainful_range_index_kind() {
         let dir = TempDir::new().unwrap();
         let state = ManifestState {
+            node_label_tokens: BTreeMap::from([("Person".to_string(), 1)]),
+            next_node_label_id: 2,
             next_secondary_index_id: 2,
             secondary_indexes: vec![crate::types::SecondaryIndexManifestEntry {
                 index_id: 1,

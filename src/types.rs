@@ -322,9 +322,17 @@ pub struct GqlIndexExplain {
 pub struct GqlIndexExplainTarget {
     pub target_kind: String,
     pub label: Option<String>,
-    pub prop_key: Option<String>,
+    pub fields: Vec<GqlIndexExplainField>,
     pub kind: Option<String>,
     pub action: Option<String>,
+    pub compound: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GqlIndexExplainField {
+    pub source: String,
+    pub key: Option<String>,
+    pub field: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1443,6 +1451,14 @@ impl Default for NodeQuery {
 /// Recursive boolean filter supported by planner-backed node queries.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NodeFilterExpr {
+    IdRange {
+        lower: Option<u64>,
+        upper: Option<u64>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    },
+    KeyEquals(String),
+    KeyIn(Vec<String>),
     PropertyEquals {
         key: String,
         value: PropValue,
@@ -1465,6 +1481,18 @@ pub enum NodeFilterExpr {
     UpdatedAtRange {
         lower_ms: Option<i64>,
         upper_ms: Option<i64>,
+    },
+    WeightRange {
+        lower: Option<f32>,
+        upper: Option<f32>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    },
+    CreatedAtRange {
+        lower: Option<i64>,
+        upper: Option<i64>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
     },
     And(Vec<NodeFilterExpr>),
     Or(Vec<NodeFilterExpr>),
@@ -1524,6 +1552,12 @@ impl Default for EdgeQuery {
 /// Recursive boolean filter supported by planner-backed edge queries.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EdgeFilterExpr {
+    IdRange {
+        lower: Option<u64>,
+        upper: Option<u64>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
+    },
     PropertyEquals {
         key: String,
         value: PropValue,
@@ -1550,6 +1584,12 @@ pub enum EdgeFilterExpr {
     UpdatedAtRange {
         lower_ms: Option<i64>,
         upper_ms: Option<i64>,
+    },
+    CreatedAtRange {
+        lower: Option<i64>,
+        upper: Option<i64>,
+        lower_inclusive: bool,
+        upper_inclusive: bool,
     },
     ValidAt {
         epoch_ms: i64,
@@ -2438,6 +2478,8 @@ pub enum QueryPlanNode {
     KeyLookup,
     NodeLabelIndex,
     NodeLabelAnyIndex,
+    CompoundEqualityIndex { details: CompoundIndexPlanDetails },
+    CompoundRangeIndex { details: CompoundIndexPlanDetails },
     PropertyEqualityIndex,
     PropertyRangeIndex,
     TimestampIndex,
@@ -2464,6 +2506,30 @@ pub enum QueryPlanNode {
     EmptyResult,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryPlanCompoundTargetKind {
+    Node,
+    Edge,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompoundIndexPlanDetails {
+    pub index_id: u64,
+    pub target_kind: QueryPlanCompoundTargetKind,
+    pub label: Option<String>,
+    pub kind: SecondaryIndexKind,
+    pub fields: Vec<SecondaryIndexField>,
+    pub compound: bool,
+    pub matched_prefix_len: usize,
+    pub range_field: Option<SecondaryIndexField>,
+    pub in_expansions: usize,
+    pub estimated_candidates: Option<u64>,
+    pub coverage: String,
+    pub residual_predicates: usize,
+    pub final_verification: bool,
+    pub fallback_reason: Option<String>,
+}
+
 /// Warning emitted by planner explain output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryPlanWarning {
@@ -2479,8 +2545,31 @@ pub enum QueryPlanWarning {
     VerifyOnlyFilter,
     BooleanBranchFallback,
     PlanningProbeBudgetExceeded,
+    CompoundIndexPrefixNotSatisfied,
     UnknownNodeLabel,
     UnknownEdgeLabel,
+}
+
+pub(crate) fn gql_query_plan_warning_message(warning: QueryPlanWarning) -> &'static str {
+    match warning {
+        QueryPlanWarning::CompoundIndexPrefixNotSatisfied => {
+            "compound secondary index skipped because query predicates do not constrain a left prefix of the declaration"
+        }
+        QueryPlanWarning::MissingReadyIndex => "MissingReadyIndex",
+        QueryPlanWarning::UsingFallbackScan => "UsingFallbackScan",
+        QueryPlanWarning::FullScanRequiresOptIn => "FullScanRequiresOptIn",
+        QueryPlanWarning::FullScanExplicitlyAllowed => "FullScanExplicitlyAllowed",
+        QueryPlanWarning::EdgePropertyPostFilter => "EdgePropertyPostFilter",
+        QueryPlanWarning::IndexSkippedAsBroad => "IndexSkippedAsBroad",
+        QueryPlanWarning::CandidateCapExceeded => "CandidateCapExceeded",
+        QueryPlanWarning::RangeCandidateCapExceeded => "RangeCandidateCapExceeded",
+        QueryPlanWarning::TimestampCandidateCapExceeded => "TimestampCandidateCapExceeded",
+        QueryPlanWarning::VerifyOnlyFilter => "VerifyOnlyFilter",
+        QueryPlanWarning::BooleanBranchFallback => "BooleanBranchFallback",
+        QueryPlanWarning::PlanningProbeBudgetExceeded => "PlanningProbeBudgetExceeded",
+        QueryPlanWarning::UnknownNodeLabel => "UnknownNodeLabel",
+        QueryPlanWarning::UnknownEdgeLabel => "UnknownEdgeLabel",
+    }
 }
 
 /// Kind of optional secondary index declaration.
@@ -2490,6 +2579,238 @@ pub enum SecondaryIndexKind {
     Range,
 }
 
+pub const MAX_SECONDARY_INDEX_FIELDS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum NodeMetadataIndexField {
+    Id,
+    Key,
+    Weight,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum EdgeMetadataIndexField {
+    Id,
+    From,
+    To,
+    Weight,
+    CreatedAt,
+    UpdatedAt,
+    ValidFrom,
+    ValidTo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SecondaryIndexField {
+    Property { key: String },
+    NodeMetadata(NodeMetadataIndexField),
+    EdgeMetadata(EdgeMetadataIndexField),
+}
+
+impl SecondaryIndexField {
+    pub fn property(key: impl Into<String>) -> Self {
+        Self::Property { key: key.into() }
+    }
+
+    pub fn node_meta(field: NodeMetadataIndexField) -> Self {
+        Self::NodeMetadata(field)
+    }
+
+    pub fn edge_meta(field: EdgeMetadataIndexField) -> Self {
+        Self::EdgeMetadata(field)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SecondaryIndexSpec {
+    pub fields: Vec<SecondaryIndexField>,
+    pub kind: SecondaryIndexKind,
+}
+
+impl SecondaryIndexSpec {
+    pub fn equality(fields: impl Into<Vec<SecondaryIndexField>>) -> Self {
+        Self {
+            fields: fields.into(),
+            kind: SecondaryIndexKind::Equality,
+        }
+    }
+
+    pub fn range(fields: impl Into<Vec<SecondaryIndexField>>) -> Self {
+        Self {
+            fields: fields.into(),
+            kind: SecondaryIndexKind::Range,
+        }
+    }
+
+    pub(crate) fn validate_for_node(&self) -> Result<(), EngineError> {
+        validate_secondary_index_fields(&self.fields, SecondaryIndexTargetKind::Node)
+    }
+
+    pub(crate) fn validate_for_edge(&self) -> Result<(), EngineError> {
+        validate_secondary_index_fields(&self.fields, SecondaryIndexTargetKind::Edge)
+    }
+
+    pub(crate) fn node_target(&self, label_id: u32) -> Result<SecondaryIndexTarget, EngineError> {
+        self.validate_for_node()?;
+        Ok(match self.fields.as_slice() {
+            [SecondaryIndexField::Property { key }] => SecondaryIndexTarget::NodeProperty {
+                label_id,
+                prop_key: key.clone(),
+            },
+            fields => SecondaryIndexTarget::NodeFieldIndex {
+                label_id,
+                fields: fields
+                    .iter()
+                    .map(SecondaryIndexFieldManifest::from_public)
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+        })
+    }
+
+    pub(crate) fn edge_target(&self, label_id: u32) -> Result<SecondaryIndexTarget, EngineError> {
+        self.validate_for_edge()?;
+        Ok(match self.fields.as_slice() {
+            [SecondaryIndexField::Property { key }] => SecondaryIndexTarget::EdgeProperty {
+                label_id,
+                prop_key: key.clone(),
+            },
+            fields => SecondaryIndexTarget::EdgeFieldIndex {
+                label_id,
+                fields: fields
+                    .iter()
+                    .map(SecondaryIndexFieldManifest::from_public)
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum NodeMetadataIndexFieldManifest {
+    Id,
+    Key,
+    Weight,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum EdgeMetadataIndexFieldManifest {
+    Id,
+    From,
+    To,
+    Weight,
+    CreatedAt,
+    UpdatedAt,
+    ValidFrom,
+    ValidTo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SecondaryIndexFieldManifest {
+    Property {
+        key: String,
+    },
+    NodeMetadata {
+        field: NodeMetadataIndexFieldManifest,
+    },
+    EdgeMetadata {
+        field: EdgeMetadataIndexFieldManifest,
+    },
+}
+
+impl From<NodeMetadataIndexField> for NodeMetadataIndexFieldManifest {
+    fn from(field: NodeMetadataIndexField) -> Self {
+        match field {
+            NodeMetadataIndexField::Id => Self::Id,
+            NodeMetadataIndexField::Key => Self::Key,
+            NodeMetadataIndexField::Weight => Self::Weight,
+            NodeMetadataIndexField::CreatedAt => Self::CreatedAt,
+            NodeMetadataIndexField::UpdatedAt => Self::UpdatedAt,
+        }
+    }
+}
+
+impl From<NodeMetadataIndexFieldManifest> for NodeMetadataIndexField {
+    fn from(field: NodeMetadataIndexFieldManifest) -> Self {
+        match field {
+            NodeMetadataIndexFieldManifest::Id => Self::Id,
+            NodeMetadataIndexFieldManifest::Key => Self::Key,
+            NodeMetadataIndexFieldManifest::Weight => Self::Weight,
+            NodeMetadataIndexFieldManifest::CreatedAt => Self::CreatedAt,
+            NodeMetadataIndexFieldManifest::UpdatedAt => Self::UpdatedAt,
+        }
+    }
+}
+
+impl From<EdgeMetadataIndexField> for EdgeMetadataIndexFieldManifest {
+    fn from(field: EdgeMetadataIndexField) -> Self {
+        match field {
+            EdgeMetadataIndexField::Id => Self::Id,
+            EdgeMetadataIndexField::From => Self::From,
+            EdgeMetadataIndexField::To => Self::To,
+            EdgeMetadataIndexField::Weight => Self::Weight,
+            EdgeMetadataIndexField::CreatedAt => Self::CreatedAt,
+            EdgeMetadataIndexField::UpdatedAt => Self::UpdatedAt,
+            EdgeMetadataIndexField::ValidFrom => Self::ValidFrom,
+            EdgeMetadataIndexField::ValidTo => Self::ValidTo,
+        }
+    }
+}
+
+impl From<EdgeMetadataIndexFieldManifest> for EdgeMetadataIndexField {
+    fn from(field: EdgeMetadataIndexFieldManifest) -> Self {
+        match field {
+            EdgeMetadataIndexFieldManifest::Id => Self::Id,
+            EdgeMetadataIndexFieldManifest::From => Self::From,
+            EdgeMetadataIndexFieldManifest::To => Self::To,
+            EdgeMetadataIndexFieldManifest::Weight => Self::Weight,
+            EdgeMetadataIndexFieldManifest::CreatedAt => Self::CreatedAt,
+            EdgeMetadataIndexFieldManifest::UpdatedAt => Self::UpdatedAt,
+            EdgeMetadataIndexFieldManifest::ValidFrom => Self::ValidFrom,
+            EdgeMetadataIndexFieldManifest::ValidTo => Self::ValidTo,
+        }
+    }
+}
+
+impl SecondaryIndexFieldManifest {
+    pub(crate) fn from_public(field: &SecondaryIndexField) -> Result<Self, EngineError> {
+        Ok(match field {
+            SecondaryIndexField::Property { key } => Self::Property { key: key.clone() },
+            SecondaryIndexField::NodeMetadata(field) => Self::NodeMetadata {
+                field: (*field).into(),
+            },
+            SecondaryIndexField::EdgeMetadata(field) => Self::EdgeMetadata {
+                field: (*field).into(),
+            },
+        })
+    }
+
+    pub(crate) fn to_public(&self) -> SecondaryIndexField {
+        match self {
+            Self::Property { key } => SecondaryIndexField::Property { key: key.clone() },
+            Self::NodeMetadata { field } => SecondaryIndexField::NodeMetadata((*field).into()),
+            Self::EdgeMetadata { field } => SecondaryIndexField::EdgeMetadata((*field).into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SecondaryIndexTargetKind {
+    Node,
+    Edge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SecondaryIndexLogicalIdentity {
+    pub target_kind: SecondaryIndexTargetKind,
+    pub label_id: u32,
+    pub fields: Vec<SecondaryIndexField>,
+    pub kind: SecondaryIndexKind,
+}
+
 /// Diagnostic/internal target for an optional secondary index declaration.
 ///
 /// This is exposed only because raw manifest inspection is a diagnostic surface.
@@ -2497,8 +2818,177 @@ pub enum SecondaryIndexKind {
 /// `EdgePropertyIndexInfo`, which expose labels and edge labels instead.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SecondaryIndexTarget {
-    NodeProperty { label_id: u32, prop_key: String },
-    EdgeProperty { label_id: u32, prop_key: String },
+    NodeProperty {
+        label_id: u32,
+        prop_key: String,
+    },
+    EdgeProperty {
+        label_id: u32,
+        prop_key: String,
+    },
+    NodeFieldIndex {
+        label_id: u32,
+        fields: Vec<SecondaryIndexFieldManifest>,
+    },
+    EdgeFieldIndex {
+        label_id: u32,
+        fields: Vec<SecondaryIndexFieldManifest>,
+    },
+}
+
+impl SecondaryIndexTarget {
+    pub(crate) fn target_kind(&self) -> SecondaryIndexTargetKind {
+        match self {
+            Self::NodeProperty { .. } | Self::NodeFieldIndex { .. } => {
+                SecondaryIndexTargetKind::Node
+            }
+            Self::EdgeProperty { .. } | Self::EdgeFieldIndex { .. } => {
+                SecondaryIndexTargetKind::Edge
+            }
+        }
+    }
+
+    pub(crate) fn label_id(&self) -> u32 {
+        match self {
+            Self::NodeProperty { label_id, .. }
+            | Self::EdgeProperty { label_id, .. }
+            | Self::NodeFieldIndex { label_id, .. }
+            | Self::EdgeFieldIndex { label_id, .. } => *label_id,
+        }
+    }
+
+    pub(crate) fn single_property_key(&self) -> Option<&str> {
+        match self {
+            Self::NodeProperty { prop_key, .. } | Self::EdgeProperty { prop_key, .. } => {
+                Some(prop_key)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn public_fields(&self) -> Vec<SecondaryIndexField> {
+        match self {
+            Self::NodeProperty { prop_key, .. } | Self::EdgeProperty { prop_key, .. } => {
+                vec![SecondaryIndexField::property(prop_key.clone())]
+            }
+            Self::NodeFieldIndex { fields, .. } | Self::EdgeFieldIndex { fields, .. } => fields
+                .iter()
+                .map(SecondaryIndexFieldManifest::to_public)
+                .collect(),
+        }
+    }
+
+    pub(crate) fn is_compound(&self) -> bool {
+        self.public_fields().len() >= 2
+    }
+}
+
+pub(crate) fn secondary_index_logical_identity(
+    entry: &SecondaryIndexManifestEntry,
+) -> Result<SecondaryIndexLogicalIdentity, EngineError> {
+    validate_secondary_index_target(&entry.target)?;
+    Ok(SecondaryIndexLogicalIdentity {
+        target_kind: entry.target.target_kind(),
+        label_id: entry.target.label_id(),
+        fields: entry.target.public_fields(),
+        kind: entry.kind.clone(),
+    })
+}
+
+pub(crate) fn validate_secondary_index_target(
+    target: &SecondaryIndexTarget,
+) -> Result<(), EngineError> {
+    let target_kind = target.target_kind();
+    validate_secondary_index_fields(&target.public_fields(), target_kind)
+}
+
+pub(crate) fn validate_secondary_index_fields(
+    fields: &[SecondaryIndexField],
+    target_kind: SecondaryIndexTargetKind,
+) -> Result<(), EngineError> {
+    match fields.len() {
+        0 => {
+            return Err(invalid_secondary_index(
+                "field list must contain 1 to 8 fields",
+            ));
+        }
+        1..=MAX_SECONDARY_INDEX_FIELDS => {}
+        _ => {
+            return Err(invalid_secondary_index(
+                "compound secondary indexes support at most 8 fields",
+            ));
+        }
+    }
+
+    let mut seen = HashSet::with_capacity(fields.len());
+    for field in fields {
+        match (target_kind, field) {
+            (_, SecondaryIndexField::Property { key }) => {
+                if key.is_empty() {
+                    return Err(invalid_secondary_index("property key must not be empty"));
+                }
+            }
+            (SecondaryIndexTargetKind::Node, SecondaryIndexField::NodeMetadata(_)) => {}
+            (SecondaryIndexTargetKind::Edge, SecondaryIndexField::EdgeMetadata(_)) => {}
+            (SecondaryIndexTargetKind::Node, SecondaryIndexField::EdgeMetadata(_)) => {
+                return Err(invalid_secondary_index(
+                    "node indexes cannot include edge metadata fields",
+                ));
+            }
+            (SecondaryIndexTargetKind::Edge, SecondaryIndexField::NodeMetadata(_)) => {
+                return Err(invalid_secondary_index(
+                    "edge indexes cannot include node metadata fields",
+                ));
+            }
+        }
+        if !seen.insert(field.clone()) {
+            return Err(invalid_secondary_index(format!(
+                "duplicate field {}",
+                secondary_index_field_display(field)
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn invalid_secondary_index(message: impl Into<String>) -> EngineError {
+    EngineError::InvalidOperation(format!("invalid secondary index: {}", message.into()))
+}
+
+fn secondary_index_field_display(field: &SecondaryIndexField) -> String {
+    match field {
+        SecondaryIndexField::Property { key } => format!("property `{key}`"),
+        SecondaryIndexField::NodeMetadata(field) => {
+            format!("node metadata `{}`", node_metadata_index_field_name(*field))
+        }
+        SecondaryIndexField::EdgeMetadata(field) => {
+            format!("edge metadata `{}`", edge_metadata_index_field_name(*field))
+        }
+    }
+}
+
+pub(crate) fn node_metadata_index_field_name(field: NodeMetadataIndexField) -> &'static str {
+    match field {
+        NodeMetadataIndexField::Id => "id",
+        NodeMetadataIndexField::Key => "key",
+        NodeMetadataIndexField::Weight => "weight",
+        NodeMetadataIndexField::CreatedAt => "created_at",
+        NodeMetadataIndexField::UpdatedAt => "updated_at",
+    }
+}
+
+pub(crate) fn edge_metadata_index_field_name(field: EdgeMetadataIndexField) -> &'static str {
+    match field {
+        EdgeMetadataIndexField::Id => "id",
+        EdgeMetadataIndexField::From => "from",
+        EdgeMetadataIndexField::To => "to",
+        EdgeMetadataIndexField::Weight => "weight",
+        EdgeMetadataIndexField::CreatedAt => "created_at",
+        EdgeMetadataIndexField::UpdatedAt => "updated_at",
+        EdgeMetadataIndexField::ValidFrom => "valid_from",
+        EdgeMetadataIndexField::ValidTo => "valid_to",
+    }
 }
 
 /// Lifecycle state for an optional secondary index declaration.
@@ -2527,16 +3017,11 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SchemaAdditionalPropertiesManifest {
+    #[default]
     Allow,
     Reject,
-}
-
-impl Default for SchemaAdditionalPropertiesManifest {
-    fn default() -> Self {
-        Self::Allow
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2552,17 +3037,12 @@ pub enum SchemaValueTypeManifest {
     Map,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SchemaVectorPresenceManifest {
+    #[default]
     Optional,
     Required,
     Forbidden,
-}
-
-impl Default for SchemaVectorPresenceManifest {
-    fn default() -> Self {
-        Self::Optional
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2731,10 +3211,11 @@ pub struct EdgeSchemaManifestEntry {
 pub struct NodePropertyIndexInfo {
     pub index_id: u64,
     pub label: String,
-    pub prop_key: String,
+    pub fields: Vec<SecondaryIndexField>,
     pub kind: SecondaryIndexKind,
     pub state: SecondaryIndexState,
     pub last_error: Option<String>,
+    pub compound: bool,
 }
 
 /// User-facing diagnostic information about a node-label token.
@@ -2756,10 +3237,11 @@ pub struct EdgeLabelInfo {
 pub struct EdgePropertyIndexInfo {
     pub index_id: u64,
     pub label: String,
-    pub prop_key: String,
+    pub fields: Vec<SecondaryIndexField>,
     pub kind: SecondaryIndexKind,
     pub state: SecondaryIndexState,
     pub last_error: Option<String>,
+    pub compound: bool,
 }
 
 /// Bound for a property range query.
@@ -3889,6 +4371,191 @@ impl Default for DbOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_invalid_secondary_index(result: Result<(), EngineError>, expected: &str) {
+        let err = result.expect_err("secondary index spec should be invalid");
+        let message = err.to_string();
+        assert!(
+            message.contains("invalid secondary index:"),
+            "missing invalid secondary index prefix in `{message}`"
+        );
+        assert!(
+            message.contains(expected),
+            "expected `{expected}` in `{message}`"
+        );
+    }
+
+    #[test]
+    fn secondary_index_spec_validates_field_counts() {
+        assert_invalid_secondary_index(
+            SecondaryIndexSpec::equality(Vec::new()).validate_for_node(),
+            "field list must contain 1 to 8 fields",
+        );
+
+        SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("a")])
+            .validate_for_node()
+            .unwrap();
+
+        let eight_fields = (0..MAX_SECONDARY_INDEX_FIELDS)
+            .map(|idx| SecondaryIndexField::property(format!("p{idx}")))
+            .collect::<Vec<_>>();
+        SecondaryIndexSpec::equality(eight_fields)
+            .validate_for_node()
+            .unwrap();
+
+        let nine_fields = (0..=MAX_SECONDARY_INDEX_FIELDS)
+            .map(|idx| SecondaryIndexField::property(format!("p{idx}")))
+            .collect::<Vec<_>>();
+        assert_invalid_secondary_index(
+            SecondaryIndexSpec::equality(nine_fields).validate_for_node(),
+            "compound secondary indexes support at most 8 fields",
+        );
+    }
+
+    #[test]
+    fn secondary_index_spec_rejects_duplicate_and_invalid_fields() {
+        assert_invalid_secondary_index(
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("status"),
+                SecondaryIndexField::property("status"),
+            ])
+            .validate_for_node(),
+            "duplicate field property `status`",
+        );
+        assert_invalid_secondary_index(
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::node_meta(NodeMetadataIndexField::UpdatedAt),
+                SecondaryIndexField::node_meta(NodeMetadataIndexField::UpdatedAt),
+            ])
+            .validate_for_node(),
+            "duplicate field node metadata `updated_at`",
+        );
+        assert_invalid_secondary_index(
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("")])
+                .validate_for_node(),
+            "property key must not be empty",
+        );
+        assert_invalid_secondary_index(
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::edge_meta(
+                EdgeMetadataIndexField::From,
+            )])
+            .validate_for_node(),
+            "node indexes cannot include edge metadata fields",
+        );
+        assert_invalid_secondary_index(
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::node_meta(
+                NodeMetadataIndexField::Key,
+            )])
+            .validate_for_edge(),
+            "edge indexes cannot include node metadata fields",
+        );
+
+        SecondaryIndexSpec::equality(vec![
+            SecondaryIndexField::property("updated_at"),
+            SecondaryIndexField::node_meta(NodeMetadataIndexField::UpdatedAt),
+        ])
+        .validate_for_node()
+        .unwrap();
+    }
+
+    #[test]
+    fn secondary_index_spec_routes_to_physical_manifest_targets() {
+        assert_eq!(
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")])
+                .node_target(7)
+                .unwrap(),
+            SecondaryIndexTarget::NodeProperty {
+                label_id: 7,
+                prop_key: "status".to_string(),
+            }
+        );
+        assert_eq!(
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")])
+                .edge_target(9)
+                .unwrap(),
+            SecondaryIndexTarget::EdgeProperty {
+                label_id: 9,
+                prop_key: "score".to_string(),
+            }
+        );
+        assert_eq!(
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::node_meta(
+                NodeMetadataIndexField::UpdatedAt,
+            )])
+            .node_target(7)
+            .unwrap(),
+            SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 7,
+                fields: vec![SecondaryIndexFieldManifest::NodeMetadata {
+                    field: NodeMetadataIndexFieldManifest::UpdatedAt,
+                }],
+            }
+        );
+        assert_eq!(
+            SecondaryIndexSpec::equality(vec![
+                SecondaryIndexField::property("status"),
+                SecondaryIndexField::property("tier"),
+            ])
+            .node_target(7)
+            .unwrap(),
+            SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 7,
+                fields: vec![
+                    SecondaryIndexFieldManifest::Property {
+                        key: "status".to_string(),
+                    },
+                    SecondaryIndexFieldManifest::Property {
+                        key: "tier".to_string(),
+                    },
+                ],
+            }
+        );
+        assert_eq!(
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::edge_meta(
+                EdgeMetadataIndexField::UpdatedAt,
+            )])
+            .edge_target(9)
+            .unwrap(),
+            SecondaryIndexTarget::EdgeFieldIndex {
+                label_id: 9,
+                fields: vec![SecondaryIndexFieldManifest::EdgeMetadata {
+                    field: EdgeMetadataIndexFieldManifest::UpdatedAt,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn secondary_index_logical_identity_collapses_legacy_and_field_property_targets() {
+        let legacy = SecondaryIndexManifestEntry {
+            index_id: 1,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 4,
+                prop_key: "status".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        };
+        let field_target = SecondaryIndexManifestEntry {
+            index_id: 2,
+            target: SecondaryIndexTarget::NodeFieldIndex {
+                label_id: 4,
+                fields: vec![SecondaryIndexFieldManifest::Property {
+                    key: "status".to_string(),
+                }],
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Building,
+            last_error: None,
+        };
+
+        assert_eq!(
+            secondary_index_logical_identity(&legacy).unwrap(),
+            secondary_index_logical_identity(&field_target).unwrap()
+        );
+    }
+
     #[test]
     fn test_default_db_options() {
         let opts = DbOptions::default();

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .overgraph import (
     OverGraph,
@@ -46,6 +46,9 @@ from .overgraph import (
     VectorHit,
     WriteTxn,
 )
+
+if TYPE_CHECKING:
+    from . import EdgeQueryRequest, NodeQueryRequest, QueryPlan, SecondaryIndexSpecLike
 
 
 class AsyncWriteTxn:
@@ -523,16 +526,28 @@ class AsyncOverGraph:
     async def find_nodes(self, label: str, prop_key: str, prop_value: Any) -> IdArray:
         return await asyncio.to_thread(self._db.find_nodes, label, prop_key, prop_value)
 
-    async def query_node_ids(self, request: Any) -> IdPageResult:
+    async def query_node_ids(
+        self,
+        request: dict[str, Any] | NodeQueryRequest,
+    ) -> IdPageResult:
         return await asyncio.to_thread(self._db.query_node_ids, request)
 
-    async def query_nodes(self, request: Any) -> NodePageResult:
+    async def query_nodes(
+        self,
+        request: dict[str, Any] | NodeQueryRequest,
+    ) -> NodePageResult:
         return await asyncio.to_thread(self._db.query_nodes, request)
 
-    async def query_edge_ids(self, request: Any) -> IdPageResult:
+    async def query_edge_ids(
+        self,
+        request: dict[str, Any] | EdgeQueryRequest,
+    ) -> IdPageResult:
         return await asyncio.to_thread(self._db.query_edge_ids, request)
 
-    async def query_edges(self, request: Any) -> EdgePageResult:
+    async def query_edges(
+        self,
+        request: dict[str, Any] | EdgeQueryRequest,
+    ) -> EdgePageResult:
         return await asyncio.to_thread(self._db.query_edges, request)
 
     async def query_pattern(self, request: Any) -> dict[str, Any]:
@@ -544,10 +559,16 @@ class AsyncOverGraph:
     async def query_graph_pipeline(self, request: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self._db.query_graph_pipeline, request)
 
-    async def explain_node_query(self, request: Any) -> dict[str, Any]:
+    async def explain_node_query(
+        self,
+        request: dict[str, Any] | NodeQueryRequest,
+    ) -> QueryPlan:
         return await asyncio.to_thread(self._db.explain_node_query, request)
 
-    async def explain_edge_query(self, request: Any) -> dict[str, Any]:
+    async def explain_edge_query(
+        self,
+        request: dict[str, Any] | EdgeQueryRequest,
+    ) -> QueryPlan:
         return await asyncio.to_thread(self._db.explain_edge_query, request)
 
     async def explain_pattern_query(self, request: Any) -> dict[str, Any]:
@@ -578,27 +599,23 @@ class AsyncOverGraph:
     async def ensure_node_property_index(
         self,
         label: str,
-        prop_key: str,
-        kind: str,
+        spec: SecondaryIndexSpecLike,
     ) -> NodePropertyIndexInfo:
         return await asyncio.to_thread(
             self._db.ensure_node_property_index,
             label,
-            prop_key,
-            kind,
+            spec,
         )
 
     async def drop_node_property_index(
         self,
         label: str,
-        prop_key: str,
-        kind: str,
+        spec: SecondaryIndexSpecLike,
     ) -> bool:
         return await asyncio.to_thread(
             self._db.drop_node_property_index,
             label,
-            prop_key,
-            kind,
+            spec,
         )
 
     async def list_node_property_indexes(self) -> list[NodePropertyIndexInfo]:
@@ -607,27 +624,23 @@ class AsyncOverGraph:
     async def ensure_edge_property_index(
         self,
         label: str,
-        prop_key: str,
-        kind: str,
+        spec: SecondaryIndexSpecLike,
     ) -> EdgePropertyIndexInfo:
         return await asyncio.to_thread(
             self._db.ensure_edge_property_index,
             label,
-            prop_key,
-            kind,
+            spec,
         )
 
     async def drop_edge_property_index(
         self,
         label: str,
-        prop_key: str,
-        kind: str,
+        spec: SecondaryIndexSpecLike,
     ) -> bool:
         return await asyncio.to_thread(
             self._db.drop_edge_property_index,
             label,
-            prop_key,
-            kind,
+            spec,
         )
 
     async def list_edge_property_indexes(self) -> list[EdgePropertyIndexInfo]:

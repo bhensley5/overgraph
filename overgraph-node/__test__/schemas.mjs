@@ -498,7 +498,7 @@ describe('schema management APIs', () => {
     assert.equal(db.getNodeByKey('StrictNode', 'bad-txn'), null);
 
     assertSchemaViolation(() =>
-      db.executeGql("CREATE (n:StrictNode {key: 'bad-gql', name: 1}) RETURN n")
+      db.executeGql("CREATE (n:StrictNode {elementKey: 'bad-gql', name: 1}) RETURN n")
     );
     assert.equal(db.getNodeByKey('StrictNode', 'bad-gql'), null);
 
@@ -533,7 +533,7 @@ describe('schema management APIs', () => {
 
     assertSchemaViolation(() =>
       db.executeGql(
-        "MATCH (a:Endpoint) WHERE a.key = 'from' MATCH (b:Endpoint) WHERE b.key = 'to' CREATE (a)-[:StrictEdge {since: 'now'}]->(b)"
+        "MATCH (a:Endpoint) WHERE elementKey(a) = 'from' MATCH (b:Endpoint) WHERE elementKey(b) = 'to' CREATE (a)-[:StrictEdge {since: 'now'}]->(b)"
       )
     );
     assert.equal(db.getEdgeByTriple(from, to, 'StrictEdge'), null);

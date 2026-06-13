@@ -3,6 +3,7 @@ pub(crate) mod eval;
 pub(crate) mod index;
 mod lexer;
 pub(crate) mod lower;
+pub(crate) mod metadata;
 pub(crate) mod params;
 pub(crate) mod parser;
 pub(crate) mod result;

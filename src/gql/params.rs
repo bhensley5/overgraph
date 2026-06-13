@@ -266,7 +266,9 @@ fn collect_set_parameter_spans(
 ) {
     for item in &set.items {
         match item {
-            SetItem::Property { value, .. } | SetItem::MapMerge { value, .. } => {
+            SetItem::Property { value, .. }
+            | SetItem::Metadata { value, .. }
+            | SetItem::MapMerge { value, .. } => {
                 collect_expr_parameter_spans(value, spans);
             }
             SetItem::NodeLabel { .. } => {}
@@ -556,7 +558,7 @@ mod tests {
     #[test]
     fn gql_schema_params_preserve_query_and_mutation_behavior() {
         assert_eq!(
-            referenced("MATCH (n:Person {key: $key}) RETURN n.name"),
+            referenced("MATCH (n:Person {elementKey: $key}) RETURN n.name"),
             vec!["key"]
         );
         assert_eq!(

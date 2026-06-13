@@ -1,6 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 
-use eg::types::{GqlPath, GraphAggregateFunction};
+use eg::types::{
+    CompoundIndexPlanDetails, GqlPath, GraphAggregateFunction, QueryPlanCompoundTargetKind,
+};
 use eg::{
     gql_referenced_param_names, AdjacencyExport as CoreAdjacencyExport, AllShortestPathsOptions,
     CompactionPhase, CompactionProgress as CoreCompactionProgress,
@@ -8,8 +10,9 @@ use eg::{
     ComponentScrubFinding as CoreComponentScrubFinding, DatabaseEngine, DbOptions,
     DbStats as CoreDbStats, DegreeOptions, DenseMetric, DenseVectorConfig,
     DenseVectorSchema as CoreDenseVectorSchema, Direction, EdgeFilterExpr, EdgeInput,
-    EdgeLabelInfo as CoreEdgeLabelInfo, EdgePropertyIndexInfo as CoreEdgePropertyIndexInfo,
-    EdgeQuery, EdgeQueryOrder, EdgeSchema as CoreEdgeSchema, EdgeSchemaInfo as CoreEdgeSchemaInfo,
+    EdgeLabelInfo as CoreEdgeLabelInfo, EdgeMetadataIndexField as CoreEdgeMetadataIndexField,
+    EdgePropertyIndexInfo as CoreEdgePropertyIndexInfo, EdgeQuery, EdgeQueryOrder,
+    EdgeSchema as CoreEdgeSchema, EdgeSchemaInfo as CoreEdgeSchemaInfo,
     EdgeValiditySchema as CoreEdgeValiditySchema, EdgeView as CoreEdgeView,
     EndpointLabelSchema as CoreEndpointLabelSchema, EngineError, ExportOptions, FusionMode,
     GqlCapSummary, GqlEdge, GqlExecutionCapSummary, GqlExecutionExplain, GqlExecutionMode,
@@ -40,20 +43,21 @@ use eg::{
     GraphVectorSelection, HnswConfig, IsConnectedOptions, LabelMatchMode,
     NeighborEntry as CoreNeighborEntry, NeighborOptions, NodeFilterExpr, NodeIdMap, NodeInput,
     NodeKeyQuery, NodeLabelConstraintSchema as CoreNodeLabelConstraintSchema, NodeLabelFilter,
-    NodeLabelInfo as CoreNodeLabelInfo, NodePropertyIndexInfo as CoreNodePropertyIndexInfo,
-    NodeQuery, NodeQueryOrder, NodeSchema as CoreNodeSchema, NodeSchemaInfo as CoreNodeSchemaInfo,
-    NodeView as CoreNodeView, NumericFieldSchema as CoreNumericFieldSchema, PageRequest,
-    PprAlgorithm, PprOptions, PprResult as CorePprResult, PropValue,
-    PropertyRangeBound as CorePropertyRangeBound, PropertyRangeCursor as CorePropertyRangeCursor,
-    PropertyRangePageRequest, PropertyRangePageResult as CorePropertyRangePageResult,
-    PropertySchema as CorePropertySchema, PrunePolicy, PrunePolicyInfo,
-    PruneResult as CorePruneResult, QueryPlan, QueryPlanKind, QueryPlanNode, QueryPlanNote,
-    QueryPlanPublicInputs, QueryPlanPublicName, QueryPlanWarning, SchemaAdditionalProperties,
-    SchemaCheckOptions, SchemaNumericBound as CoreSchemaNumericBound, SchemaSetOptions,
-    SchemaTargetKind as CoreSchemaTargetKind, SchemaValidationReport as CoreSchemaValidationReport,
-    SchemaValueType, SchemaVectorPresence, SchemaViolation as CoreSchemaViolation,
-    SchemaViolationTarget as CoreSchemaViolationTarget, ScoringMode,
-    ScrubReport as CoreScrubReport, SecondaryIndexKind, SecondaryIndexState,
+    NodeLabelInfo as CoreNodeLabelInfo, NodeMetadataIndexField as CoreNodeMetadataIndexField,
+    NodePropertyIndexInfo as CoreNodePropertyIndexInfo, NodeQuery, NodeQueryOrder,
+    NodeSchema as CoreNodeSchema, NodeSchemaInfo as CoreNodeSchemaInfo, NodeView as CoreNodeView,
+    NumericFieldSchema as CoreNumericFieldSchema, PageRequest, PprAlgorithm, PprOptions,
+    PprResult as CorePprResult, PropValue, PropertyRangeBound as CorePropertyRangeBound,
+    PropertyRangeCursor as CorePropertyRangeCursor, PropertyRangePageRequest,
+    PropertyRangePageResult as CorePropertyRangePageResult, PropertySchema as CorePropertySchema,
+    PrunePolicy, PrunePolicyInfo, PruneResult as CorePruneResult, QueryPlan, QueryPlanKind,
+    QueryPlanNode, QueryPlanNote, QueryPlanPublicInputs, QueryPlanPublicName, QueryPlanWarning,
+    SchemaAdditionalProperties, SchemaCheckOptions, SchemaNumericBound as CoreSchemaNumericBound,
+    SchemaSetOptions, SchemaTargetKind as CoreSchemaTargetKind,
+    SchemaValidationReport as CoreSchemaValidationReport, SchemaValueType, SchemaVectorPresence,
+    SchemaViolation as CoreSchemaViolation, SchemaViolationTarget as CoreSchemaViolationTarget,
+    ScoringMode, ScrubReport as CoreScrubReport, SecondaryIndexField as CoreSecondaryIndexField,
+    SecondaryIndexKind, SecondaryIndexSpec as CoreSecondaryIndexSpec, SecondaryIndexState,
     SegmentScrubResult as CoreSegmentScrubResult, ShortestPath as CoreShortestPath,
     ShortestPathOptions, SparseVectorSchema as CoreSparseVectorSchema,
     StringFieldSchema as CoreStringFieldSchema, Subgraph as CoreSubgraph, SubgraphOptions,
@@ -914,33 +918,31 @@ impl OverGraph {
         gql_explain_to_py(py, explain)
     }
 
-    #[pyo3(signature = (label, prop_key, kind))]
+    #[pyo3(signature = (label, spec))]
     fn ensure_node_property_index(
         &self,
         py: Python<'_>,
         label: String,
-        prop_key: String,
-        kind: &str,
+        spec: &Bound<'_, PyAny>,
     ) -> PyResult<NodePropertyIndexInfo> {
-        let kind = parse_secondary_index_kind(kind)?;
+        let spec = parse_py_secondary_index_spec(spec, PySecondaryIndexTargetKind::Node)?;
         with_engine(self, py, move |eng| {
             Ok(NodePropertyIndexInfo::from(
-                eng.ensure_node_property_index(&label, &prop_key, kind.clone())?,
+                eng.ensure_node_property_index(&label, spec.clone())?,
             ))
         })
     }
 
-    #[pyo3(signature = (label, prop_key, kind))]
+    #[pyo3(signature = (label, spec))]
     fn drop_node_property_index(
         &self,
         py: Python<'_>,
         label: String,
-        prop_key: String,
-        kind: &str,
+        spec: &Bound<'_, PyAny>,
     ) -> PyResult<bool> {
-        let kind = parse_secondary_index_kind(kind)?;
+        let spec = parse_py_secondary_index_spec(spec, PySecondaryIndexTargetKind::Node)?;
         with_engine(self, py, move |eng| {
-            eng.drop_node_property_index(&label, &prop_key, kind.clone())
+            eng.drop_node_property_index(&label, spec.clone())
         })
     }
 
@@ -954,33 +956,31 @@ impl OverGraph {
         })
     }
 
-    #[pyo3(signature = (label, prop_key, kind))]
+    #[pyo3(signature = (label, spec))]
     fn ensure_edge_property_index(
         &self,
         py: Python<'_>,
         label: String,
-        prop_key: String,
-        kind: &str,
+        spec: &Bound<'_, PyAny>,
     ) -> PyResult<EdgePropertyIndexInfo> {
-        let kind = parse_secondary_index_kind(kind)?;
+        let spec = parse_py_secondary_index_spec(spec, PySecondaryIndexTargetKind::Edge)?;
         with_engine(self, py, move |eng| {
             Ok(EdgePropertyIndexInfo::from(
-                eng.ensure_edge_property_index(&label, &prop_key, kind.clone())?,
+                eng.ensure_edge_property_index(&label, spec.clone())?,
             ))
         })
     }
 
-    #[pyo3(signature = (label, prop_key, kind))]
+    #[pyo3(signature = (label, spec))]
     fn drop_edge_property_index(
         &self,
         py: Python<'_>,
         label: String,
-        prop_key: String,
-        kind: &str,
+        spec: &Bound<'_, PyAny>,
     ) -> PyResult<bool> {
-        let kind = parse_secondary_index_kind(kind)?;
+        let spec = parse_py_secondary_index_spec(spec, PySecondaryIndexTargetKind::Edge)?;
         with_engine(self, py, move |eng| {
-            eng.drop_edge_property_index(&label, &prop_key, kind.clone())
+            eng.drop_edge_property_index(&label, spec.clone())
         })
     }
 
@@ -2603,13 +2603,15 @@ pub struct NodePropertyIndexInfo {
     #[pyo3(get)]
     pub label: String,
     #[pyo3(get)]
-    pub prop_key: String,
+    pub fields: Vec<BTreeMap<String, String>>,
     #[pyo3(get)]
     pub kind: String,
     #[pyo3(get)]
     pub state: String,
     #[pyo3(get)]
     pub last_error: Option<String>,
+    #[pyo3(get)]
+    pub compound: bool,
 }
 
 impl From<CoreNodePropertyIndexInfo> for NodePropertyIndexInfo {
@@ -2618,10 +2620,15 @@ impl From<CoreNodePropertyIndexInfo> for NodePropertyIndexInfo {
         NodePropertyIndexInfo {
             index_id: info.index_id,
             label: info.label,
-            prop_key: info.prop_key,
+            fields: info
+                .fields
+                .into_iter()
+                .map(secondary_index_field_to_py)
+                .collect(),
             kind: kind.to_string(),
             state: secondary_index_state_to_py(info.state).to_string(),
             last_error: info.last_error,
+            compound: info.compound,
         }
     }
 }
@@ -2630,8 +2637,8 @@ impl From<CoreNodePropertyIndexInfo> for NodePropertyIndexInfo {
 impl NodePropertyIndexInfo {
     fn __repr__(&self) -> String {
         format!(
-            "NodePropertyIndexInfo(index_id={}, label='{}', prop_key='{}', kind='{}', state='{}')",
-            self.index_id, self.label, self.prop_key, self.kind, self.state
+            "NodePropertyIndexInfo(index_id={}, label='{}', fields={:?}, kind='{}', state='{}', compound={})",
+            self.index_id, self.label, self.fields, self.kind, self.state, self.compound
         )
     }
 }
@@ -2700,13 +2707,15 @@ pub struct EdgePropertyIndexInfo {
     #[pyo3(get)]
     pub label: String,
     #[pyo3(get)]
-    pub prop_key: String,
+    pub fields: Vec<BTreeMap<String, String>>,
     #[pyo3(get)]
     pub kind: String,
     #[pyo3(get)]
     pub state: String,
     #[pyo3(get)]
     pub last_error: Option<String>,
+    #[pyo3(get)]
+    pub compound: bool,
 }
 
 impl From<CoreEdgePropertyIndexInfo> for EdgePropertyIndexInfo {
@@ -2715,10 +2724,15 @@ impl From<CoreEdgePropertyIndexInfo> for EdgePropertyIndexInfo {
         EdgePropertyIndexInfo {
             index_id: info.index_id,
             label: info.label,
-            prop_key: info.prop_key,
+            fields: info
+                .fields
+                .into_iter()
+                .map(secondary_index_field_to_py)
+                .collect(),
             kind: kind.to_string(),
             state: secondary_index_state_to_py(info.state).to_string(),
             last_error: info.last_error,
+            compound: info.compound,
         }
     }
 }
@@ -2727,8 +2741,8 @@ impl From<CoreEdgePropertyIndexInfo> for EdgePropertyIndexInfo {
 impl EdgePropertyIndexInfo {
     fn __repr__(&self) -> String {
         format!(
-            "EdgePropertyIndexInfo(index_id={}, label='{}', prop_key='{}', kind='{}', state='{}')",
-            self.index_id, self.label, self.prop_key, self.kind, self.state
+            "EdgePropertyIndexInfo(index_id={}, label='{}', fields={:?}, kind='{}', state='{}', compound={})",
+            self.index_id, self.label, self.fields, self.kind, self.state, self.compound
         )
     }
 }
@@ -6031,11 +6045,23 @@ fn gql_index_explain_to_py(py: Python<'_>, explain: eg::GqlIndexExplain) -> PyRe
         .into_iter()
         .map(|target| {
             let item = PyDict::new(py);
+            let fields = target
+                .fields
+                .into_iter()
+                .map(|field| {
+                    let field_item = PyDict::new(py);
+                    field_item.set_item("source", field.source)?;
+                    field_item.set_item("key", field.key)?;
+                    field_item.set_item("field", field.field)?;
+                    Ok(field_item.into_any().unbind())
+                })
+                .collect::<PyResult<Vec<PyObject>>>()?;
             item.set_item("target_kind", target.target_kind)?;
             item.set_item("label", target.label)?;
-            item.set_item("prop_key", target.prop_key)?;
+            item.set_item("fields", fields)?;
             item.set_item("kind", target.kind)?;
             item.set_item("action", target.action)?;
+            item.set_item("compound", target.compound)?;
             Ok(item.into_any().unbind())
         })
         .collect::<PyResult<Vec<PyObject>>>()?;
@@ -6351,6 +6377,14 @@ fn query_plan_node_to_py(py: Python<'_>, node: QueryPlanNode) -> PyResult<PyObje
         QueryPlanNode::KeyLookup => dict.set_item("kind", "key_lookup")?,
         QueryPlanNode::NodeLabelIndex => dict.set_item("kind", "node_label_index")?,
         QueryPlanNode::NodeLabelAnyIndex => dict.set_item("kind", "node_label_any_index")?,
+        QueryPlanNode::CompoundEqualityIndex { details } => {
+            dict.set_item("kind", "compound_equality_index")?;
+            dict.set_item("details", compound_index_plan_details_to_py(py, details)?)?;
+        }
+        QueryPlanNode::CompoundRangeIndex { details } => {
+            dict.set_item("kind", "compound_range_index")?;
+            dict.set_item("details", compound_index_plan_details_to_py(py, details)?)?;
+        }
         QueryPlanNode::PropertyEqualityIndex => dict.set_item("kind", "property_equality_index")?,
         QueryPlanNode::PropertyRangeIndex => dict.set_item("kind", "property_range_index")?,
         QueryPlanNode::TimestampIndex => dict.set_item("kind", "timestamp_index")?,
@@ -6472,8 +6506,51 @@ fn query_plan_warning_to_py(warning: &QueryPlanWarning) -> &'static str {
         QueryPlanWarning::VerifyOnlyFilter => "verify_only_filter",
         QueryPlanWarning::BooleanBranchFallback => "boolean_branch_fallback",
         QueryPlanWarning::PlanningProbeBudgetExceeded => "planning_probe_budget_exceeded",
+        QueryPlanWarning::CompoundIndexPrefixNotSatisfied => "compound_index_prefix_not_satisfied",
         QueryPlanWarning::UnknownNodeLabel => "unknown_node_label",
         QueryPlanWarning::UnknownEdgeLabel => "unknown_edge_label",
+    }
+}
+
+fn compound_index_plan_details_to_py(
+    py: Python<'_>,
+    details: CompoundIndexPlanDetails,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("index_id", details.index_id)?;
+    dict.set_item(
+        "target_kind",
+        query_plan_compound_target_kind_to_py(details.target_kind),
+    )?;
+    dict.set_item("label", details.label)?;
+    dict.set_item("kind", secondary_index_kind_to_py(&details.kind))?;
+    dict.set_item(
+        "fields",
+        details
+            .fields
+            .into_iter()
+            .map(secondary_index_field_to_py)
+            .collect::<Vec<_>>(),
+    )?;
+    dict.set_item("compound", details.compound)?;
+    dict.set_item("matched_prefix_len", details.matched_prefix_len)?;
+    dict.set_item(
+        "range_field",
+        details.range_field.map(secondary_index_field_to_py),
+    )?;
+    dict.set_item("in_expansions", details.in_expansions)?;
+    dict.set_item("estimated_candidates", details.estimated_candidates)?;
+    dict.set_item("coverage", details.coverage)?;
+    dict.set_item("residual_predicates", details.residual_predicates)?;
+    dict.set_item("final_verification", details.final_verification)?;
+    dict.set_item("fallback_reason", details.fallback_reason)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn query_plan_compound_target_kind_to_py(kind: QueryPlanCompoundTargetKind) -> &'static str {
+    match kind {
+        QueryPlanCompoundTargetKind::Node => "node",
+        QueryPlanCompoundTargetKind::Edge => "edge",
     }
 }
 
@@ -9197,6 +9274,26 @@ fn ensure_only_py_fields(
     Ok(())
 }
 
+fn ensure_only_py_secondary_index_fields(
+    dict: &Bound<'_, PyDict>,
+    allowed: &[&str],
+    context: &str,
+) -> PyResult<()> {
+    for (key, _) in dict.iter() {
+        let key: String = key.extract().map_err(|_| {
+            PyValueError::new_err(format!(
+                "invalid secondary index: {context} field names must be strings"
+            ))
+        })?;
+        if !allowed.iter().any(|allowed| *allowed == key) {
+            return Err(PyValueError::new_err(format!(
+                "invalid secondary index: {context} does not accept field '{key}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn require_py_true_field(dict: &Bound<'_, PyDict>, field: &str, context: &str) -> PyResult<()> {
     let value = dict
         .get_item(field)?
@@ -9273,13 +9370,176 @@ fn secondary_index_kind_to_py(kind: &SecondaryIndexKind) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PySecondaryIndexTargetKind {
+    Node,
+    Edge,
+}
+
+fn secondary_index_field_to_py(field: CoreSecondaryIndexField) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    match field {
+        CoreSecondaryIndexField::Property { key } => {
+            map.insert("source".to_string(), "property".to_string());
+            map.insert("key".to_string(), key);
+        }
+        CoreSecondaryIndexField::NodeMetadata(field) => {
+            map.insert("source".to_string(), "metadata".to_string());
+            map.insert(
+                "field".to_string(),
+                node_metadata_index_field_to_py(field).to_string(),
+            );
+        }
+        CoreSecondaryIndexField::EdgeMetadata(field) => {
+            map.insert("source".to_string(), "metadata".to_string());
+            map.insert(
+                "field".to_string(),
+                edge_metadata_index_field_to_py(field).to_string(),
+            );
+        }
+    }
+    map
+}
+
+fn parse_py_secondary_index_spec(
+    value: &Bound<'_, PyAny>,
+    target_kind: PySecondaryIndexTargetKind,
+) -> PyResult<CoreSecondaryIndexSpec> {
+    let dict = value
+        .downcast::<PyDict>()
+        .map_err(|_| PyTypeError::new_err("invalid secondary index: spec must be a mapping"))?;
+    ensure_only_py_secondary_index_fields(dict, &["fields", "kind"], "secondary index spec")?;
+    let kind = py_required_string(dict, "kind", "kind")?;
+    let kind = parse_secondary_index_kind(&kind)?;
+    let fields_value = py_non_none_item(dict, "fields")?
+        .ok_or_else(|| PyValueError::new_err("invalid secondary index: fields are required"))?;
+    let fields_list = fields_value
+        .downcast::<PyList>()
+        .map_err(|_| PyTypeError::new_err("invalid secondary index: fields must be a list"))?;
+    let mut fields = Vec::with_capacity(fields_list.len());
+    for field in fields_list.iter() {
+        fields.push(parse_py_secondary_index_field(&field, target_kind)?);
+    }
+    Ok(CoreSecondaryIndexSpec { fields, kind })
+}
+
+fn parse_py_secondary_index_field(
+    value: &Bound<'_, PyAny>,
+    target_kind: PySecondaryIndexTargetKind,
+) -> PyResult<CoreSecondaryIndexField> {
+    let dict = value
+        .downcast::<PyDict>()
+        .map_err(|_| PyTypeError::new_err("invalid secondary index: field must be a mapping"))?;
+    ensure_only_py_secondary_index_fields(
+        dict,
+        &["source", "key", "field"],
+        "secondary index field",
+    )?;
+    let source_value = py_non_none_item(dict, "source")?.ok_or_else(|| {
+        PyValueError::new_err("invalid secondary index: field source is required")
+    })?;
+    let source = py_extract_secondary_index_string(&source_value, "field source")?;
+    match source.as_str() {
+        "property" => {
+            let key_value = py_non_none_item(dict, "key")?.ok_or_else(|| {
+                PyValueError::new_err("invalid secondary index: property fields require key")
+            })?;
+            let key = py_extract_secondary_index_string(&key_value, "property key")?;
+            Ok(CoreSecondaryIndexField::property(key))
+        }
+        "metadata" => {
+            let field_value = py_non_none_item(dict, "field")?.ok_or_else(|| {
+                PyValueError::new_err("invalid secondary index: metadata fields require field")
+            })?;
+            let field = py_extract_secondary_index_string(&field_value, "metadata field")?;
+            match target_kind {
+                PySecondaryIndexTargetKind::Node => Ok(CoreSecondaryIndexField::node_meta(
+                    parse_py_node_metadata_index_field(&field)?,
+                )),
+                PySecondaryIndexTargetKind::Edge => Ok(CoreSecondaryIndexField::edge_meta(
+                    parse_py_edge_metadata_index_field(&field)?,
+                )),
+            }
+        }
+        other => Err(PyValueError::new_err(format!(
+            "invalid secondary index: field source must be 'property' or 'metadata', got '{other}'"
+        ))),
+    }
+}
+
+fn py_required_string(dict: &Bound<'_, PyDict>, key: &str, display: &str) -> PyResult<String> {
+    let value = py_non_none_item(dict, key)?.ok_or_else(|| {
+        PyValueError::new_err(format!("invalid secondary index: {display} is required"))
+    })?;
+    py_extract_secondary_index_string(&value, display)
+}
+
+fn py_extract_secondary_index_string(value: &Bound<'_, PyAny>, display: &str) -> PyResult<String> {
+    value.extract::<String>().map_err(|_| {
+        PyValueError::new_err(format!(
+            "invalid secondary index: {display} must be a string"
+        ))
+    })
+}
+
+fn node_metadata_index_field_to_py(field: CoreNodeMetadataIndexField) -> &'static str {
+    match field {
+        CoreNodeMetadataIndexField::Id => "id",
+        CoreNodeMetadataIndexField::Key => "key",
+        CoreNodeMetadataIndexField::Weight => "weight",
+        CoreNodeMetadataIndexField::CreatedAt => "created_at",
+        CoreNodeMetadataIndexField::UpdatedAt => "updated_at",
+    }
+}
+
+fn edge_metadata_index_field_to_py(field: CoreEdgeMetadataIndexField) -> &'static str {
+    match field {
+        CoreEdgeMetadataIndexField::Id => "id",
+        CoreEdgeMetadataIndexField::From => "from",
+        CoreEdgeMetadataIndexField::To => "to",
+        CoreEdgeMetadataIndexField::Weight => "weight",
+        CoreEdgeMetadataIndexField::CreatedAt => "created_at",
+        CoreEdgeMetadataIndexField::UpdatedAt => "updated_at",
+        CoreEdgeMetadataIndexField::ValidFrom => "valid_from",
+        CoreEdgeMetadataIndexField::ValidTo => "valid_to",
+    }
+}
+
+fn parse_py_node_metadata_index_field(field: &str) -> PyResult<CoreNodeMetadataIndexField> {
+    match field {
+        "id" => Ok(CoreNodeMetadataIndexField::Id),
+        "key" => Ok(CoreNodeMetadataIndexField::Key),
+        "weight" => Ok(CoreNodeMetadataIndexField::Weight),
+        "created_at" => Ok(CoreNodeMetadataIndexField::CreatedAt),
+        "updated_at" => Ok(CoreNodeMetadataIndexField::UpdatedAt),
+        other => Err(PyValueError::new_err(format!(
+            "invalid secondary index: unsupported node metadata field '{other}'"
+        ))),
+    }
+}
+
+fn parse_py_edge_metadata_index_field(field: &str) -> PyResult<CoreEdgeMetadataIndexField> {
+    match field {
+        "id" => Ok(CoreEdgeMetadataIndexField::Id),
+        "from" => Ok(CoreEdgeMetadataIndexField::From),
+        "to" => Ok(CoreEdgeMetadataIndexField::To),
+        "weight" => Ok(CoreEdgeMetadataIndexField::Weight),
+        "created_at" => Ok(CoreEdgeMetadataIndexField::CreatedAt),
+        "updated_at" => Ok(CoreEdgeMetadataIndexField::UpdatedAt),
+        "valid_from" => Ok(CoreEdgeMetadataIndexField::ValidFrom),
+        "valid_to" => Ok(CoreEdgeMetadataIndexField::ValidTo),
+        other => Err(PyValueError::new_err(format!(
+            "invalid secondary index: unsupported edge metadata field '{other}'"
+        ))),
+    }
+}
+
 fn parse_secondary_index_kind(kind: &str) -> PyResult<SecondaryIndexKind> {
     match kind {
         "equality" => Ok(SecondaryIndexKind::Equality),
         "range" => Ok(SecondaryIndexKind::Range),
         other => Err(PyValueError::new_err(format!(
-            "Invalid index kind '{}'. Must be 'equality' or 'range'.",
-            other
+            "invalid secondary index: kind must be 'equality' or 'range', got '{other}'"
         ))),
     }
 }
