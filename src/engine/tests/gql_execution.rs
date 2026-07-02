@@ -28,6 +28,57 @@ fn execute_gql_with_options(
         .unwrap()
 }
 
+#[test]
+fn gql_query_profile_stage_timing_note_in_explain_plan() {
+    let (_dir, engine) = query_test_engine();
+    insert_query_node(&engine, "Person", "ada", &[], 1.0);
+
+    let profiled = engine
+        .execute_gql(
+            "MATCH (n:Person) WHERE elementKey(n) = 'ada' RETURN id(n)",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                profile: true,
+                include_plan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    let plan = profiled
+        .plan
+        .as_ref()
+        .expect("include_plan should populate the explain plan");
+    assert!(
+        plan.notes.iter().any(|note| {
+            note.contains("stage timing")
+                && note.contains("bind=")
+                && note.contains("graph_row_plan_and_execute=")
+        }),
+        "profile=true should attach a stage-timing note, got: {:?}",
+        plan.notes
+    );
+
+    let plain = engine
+        .execute_gql(
+            "MATCH (n:Person) WHERE elementKey(n) = 'ada' RETURN id(n)",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                include_plan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    let plain_plan = plain.plan.as_ref().unwrap();
+    assert!(
+        !plain_plan
+            .notes
+            .iter()
+            .any(|note| note.contains("stage timing")),
+        "profile=false must not attach the stage-timing note, got: {:?}",
+        plain_plan.notes
+    );
+}
+
 fn execute_gql_with_params(
     engine: &DatabaseEngine,
     source: &str,
