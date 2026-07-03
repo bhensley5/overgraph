@@ -40,6 +40,46 @@ use crate::graph_row::{
 };
 use std::time::Instant;
 
+struct GqlQueryInstrumentation {
+    enabled: bool,
+    bind_ns: u64,
+    lower_ns: u64,
+    snapshot_ns: u64,
+    graph_row_ns: u64,
+    projection_ns: u64,
+}
+
+impl GqlQueryInstrumentation {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            bind_ns: 0,
+            lower_ns: 0,
+            snapshot_ns: 0,
+            graph_row_ns: 0,
+            projection_ns: 0,
+        }
+    }
+
+    #[inline]
+    fn mark(&self) -> Option<Instant> {
+        self.enabled.then(Instant::now)
+    }
+
+    fn note(&self) -> String {
+        format!(
+            "stage timing (nanoseconds): bind={b} lower={l} snapshot={s} \
+             graph_row_plan_and_execute={g} projection={p}; graph_row covers normalize, \
+             cost-based planning, index probe, and execution inside the shared read view",
+            b = self.bind_ns,
+            l = self.lower_ns,
+            s = self.snapshot_ns,
+            g = self.graph_row_ns,
+            p = self.projection_ns,
+        )
+    }
+}
+
 impl DatabaseEngine {
     pub fn execute_gql(
         &self,
@@ -97,9 +137,20 @@ impl DatabaseEngine {
         options: &GqlExecutionOptions,
         started_at: Instant,
     ) -> Result<GqlExecutionResult, EngineError> {
+        let mut instr = GqlQueryInstrumentation::new(options.profile);
+
+        let bind_start = instr.mark();
         let semantic = bind_query(ast, params)?;
+        if let Some(t) = bind_start {
+            instr.bind_ns = t.elapsed().as_nanos() as u64;
+        }
         validate_referenced_gql_params(&semantic, params, options)?;
+
+        let lower_start = instr.mark();
         let mut lowered = lower_semantic_plan(semantic, params, options)?;
+        if let Some(t) = lower_start {
+            instr.lower_ns = t.elapsed().as_nanos() as u64;
+        }
         let return_exprs = return_exprs(&lowered.semantic);
         if matches!(&lowered.native_target, GqlNativeTarget::GraphPipeline { .. }) {
             return self.execute_gql_pipeline_target(lowered, started_at, options);
@@ -150,8 +201,12 @@ impl DatabaseEngine {
             });
         }
 
+        let snapshot_start = instr.mark();
         let (_guard, published) = self.runtime.published_snapshot()?;
-        let plan = if options.include_plan {
+        if let Some(t) = snapshot_start {
+            instr.snapshot_ns = t.elapsed().as_nanos() as u64;
+        }
+        let mut plan = if options.include_plan {
             Some(wrap_read_gql_explain(build_gql_explain(
                 &published.view,
                 &lowered,
@@ -164,7 +219,11 @@ impl DatabaseEngine {
         };
         let mut warnings = warnings;
 
+        let graph_row_start = instr.mark();
         let graph_rows = execute_gql_graph_row_target(&published.view, &lowered)?;
+        if let Some(t) = graph_row_start {
+            instr.graph_row_ns = t.elapsed().as_nanos() as u64;
+        }
         for followup in graph_rows.followups {
             self.runtime.enqueue_secondary_index_read_followup(followup);
         }
@@ -191,6 +250,7 @@ impl DatabaseEngine {
             }
         }
 
+        let projection_start = instr.mark();
         let projected = graph_result
             .rows
             .into_iter()
@@ -204,6 +264,9 @@ impl DatabaseEngine {
                 })
             })
             .collect::<Result<Vec<_>, EngineError>>()?;
+        if let Some(t) = projection_start {
+            instr.projection_ns = t.elapsed().as_nanos() as u64;
+        }
 
         let rows_returned = projected.len();
         let elapsed_us = if options.profile {
@@ -220,6 +283,11 @@ impl DatabaseEngine {
         }
         if truncated_by_row_cap && row_counts.limit.is_none() {
             rows_matched = rows_returned;
+        }
+        if instr.enabled {
+            if let Some(plan) = plan.as_mut() {
+                plan.notes.push(instr.note());
+            }
         }
         Ok(GqlExecutionResult {
             kind: GqlStatementKind::Query,
