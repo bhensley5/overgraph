@@ -79,6 +79,78 @@ fn gql_query_profile_stage_timing_note_in_explain_plan() {
     );
 }
 
+#[test]
+fn gql_query_profile_planning_counters_in_explain_note() {
+    let (_dir, engine) = query_test_engine();
+    insert_query_node(&engine, "Person", "ada", &[], 1.0);
+
+    let profiled = engine
+        .execute_gql(
+            "MATCH (n:Person) WHERE elementKey(n) = 'ada' RETURN id(n)",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                profile: true,
+                include_plan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    let note = profiled
+        .plan
+        .as_ref()
+        .and_then(|p| {
+            p.notes
+                .iter()
+                .find(|n| n.contains("planning counters"))
+                .cloned()
+        })
+        .expect("profile+include_plan should attach a planning-counters note");
+
+    assert!(
+        note.contains("prepare="),
+        "note should carry the prepare stage timer"
+    );
+    for key in [
+        "node_legal_universe_sources=",
+        "edge_source_consults=",
+        "edge_source_misses=",
+        "secondary_index_followups=",
+    ] {
+        assert!(note.contains(key), "note should carry counter {key:?}");
+    }
+
+    let universe = note
+        .split("node_legal_universe_sources=")
+        .nth(1)
+        .and_then(|rest| rest.trim_start().split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("node_legal_universe_sources should be a number");
+    assert!(
+        universe >= 1,
+        "a single-node graph-row query must enumerate >=1 universe source, got {universe}"
+    );
+
+    let plain = engine
+        .execute_gql(
+            "MATCH (n:Person) WHERE elementKey(n) = 'ada' RETURN id(n)",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                include_plan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    let plain_plan = plain.plan.as_ref().unwrap();
+    assert!(
+        !plain_plan
+            .notes
+            .iter()
+            .any(|n| n.contains("planning counters")),
+        "profile=false must not attach planning counters, got: {:?}",
+        plain_plan.notes
+    );
+}
+
 fn execute_gql_with_params(
     engine: &DatabaseEngine,
     source: &str,

@@ -44,9 +44,14 @@ struct GqlQueryInstrumentation {
     enabled: bool,
     bind_ns: u64,
     lower_ns: u64,
+    prepare_ns: u64,
     snapshot_ns: u64,
     graph_row_ns: u64,
     projection_ns: u64,
+    edge_source_consults: u64,
+    edge_source_misses: u64,
+    node_legal_universe_sources: u64,
+    secondary_index_followups: u64,
 }
 
 impl GqlQueryInstrumentation {
@@ -55,9 +60,14 @@ impl GqlQueryInstrumentation {
             enabled,
             bind_ns: 0,
             lower_ns: 0,
+            prepare_ns: 0,
             snapshot_ns: 0,
             graph_row_ns: 0,
             projection_ns: 0,
+            edge_source_consults: 0,
+            edge_source_misses: 0,
+            node_legal_universe_sources: 0,
+            secondary_index_followups: 0,
         }
     }
 
@@ -68,14 +78,21 @@ impl GqlQueryInstrumentation {
 
     fn note(&self) -> String {
         format!(
-            "stage timing (nanoseconds): bind={b} lower={l} snapshot={s} \
-             graph_row_plan_and_execute={g} projection={p}; graph_row covers normalize, \
-             cost-based planning, index probe, and execution inside the shared read view",
+            "stage timing (nanoseconds): bind={b} lower={l} prepare={pr} snapshot={s} \
+             graph_row_plan_and_execute={g} projection={p}; planning counters: \
+             node_legal_universe_sources={n} edge_source_consults={ec} edge_source_misses={em} \
+             secondary_index_followups={sf}; graph_row covers normalize, cost-based planning, \
+             index probe, and execution inside the shared read view",
             b = self.bind_ns,
             l = self.lower_ns,
+            pr = self.prepare_ns,
             s = self.snapshot_ns,
             g = self.graph_row_ns,
             p = self.projection_ns,
+            n = self.node_legal_universe_sources,
+            ec = self.edge_source_consults,
+            em = self.edge_source_misses,
+            sf = self.secondary_index_followups,
         )
     }
 }
@@ -155,10 +172,14 @@ impl DatabaseEngine {
         if matches!(&lowered.native_target, GqlNativeTarget::GraphPipeline { .. }) {
             return self.execute_gql_pipeline_target(lowered, started_at, options);
         }
+        let prepare_start = instr.mark();
         let resolved_order_by = resolve_order_by_return_aliases(&lowered)?;
         validate_gql_row_independent_order_keys(&resolved_order_by, &lowered, params)?;
         let row_counts = evaluate_gql_row_counts(&lowered, params, options)?;
         configure_gql_graph_row_target(&mut lowered, &resolved_order_by, &row_counts, options)?;
+        if let Some(t) = prepare_start {
+            instr.prepare_ns = t.elapsed().as_nanos() as u64;
+        }
         let warnings = lowered.warnings.clone();
 
         if row_counts.limit == Some(0) {
@@ -220,9 +241,20 @@ impl DatabaseEngine {
         let mut warnings = warnings;
 
         let graph_row_start = instr.mark();
+        if instr.enabled {
+            reset_graph_row_planning_probe();
+        }
         let graph_rows = execute_gql_graph_row_target(&published.view, &lowered)?;
+        let secondary_index_followups = graph_rows.followups.len();
         if let Some(t) = graph_row_start {
             instr.graph_row_ns = t.elapsed().as_nanos() as u64;
+        }
+        if instr.enabled {
+            let probe = snapshot_graph_row_planning_probe();
+            instr.edge_source_consults = probe.edge_source_consults;
+            instr.edge_source_misses = probe.edge_source_misses;
+            instr.node_legal_universe_sources = probe.node_legal_universe_sources;
+            instr.secondary_index_followups = secondary_index_followups as u64;
         }
         for followup in graph_rows.followups {
             self.runtime.enqueue_secondary_index_read_followup(followup);
