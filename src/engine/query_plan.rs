@@ -169,6 +169,26 @@ impl GraphRowEdgeSourceCostMemo {
 
 const GRAPH_ROW_EDGE_INTERSECTION_TINY_SET: u64 = 64;
 
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct GraphRowPlanningProbeCounters {
+    pub(crate) edge_source_consults: u64,
+    pub(crate) edge_source_misses: u64,
+    pub(crate) node_legal_universe_sources: u64,
+}
+
+thread_local! {
+    static GRAPH_ROW_PLANNING_PROBE: std::cell::RefCell<GraphRowPlanningProbeCounters> =
+        std::cell::RefCell::new(GraphRowPlanningProbeCounters::default());
+}
+
+pub(crate) fn reset_graph_row_planning_probe() {
+    GRAPH_ROW_PLANNING_PROBE.with(|c| *c.borrow_mut() = GraphRowPlanningProbeCounters::default());
+}
+
+pub(crate) fn snapshot_graph_row_planning_probe() -> GraphRowPlanningProbeCounters {
+    GRAPH_ROW_PLANNING_PROBE.with(|c| *c.borrow())
+}
+
 #[derive(Clone, Debug)]
 struct GraphRowPhysicalSegment {
     segment_index: usize,
@@ -6011,13 +6031,24 @@ impl ReadView {
         build_explain: bool,
         memo: &'memo mut GraphRowEdgeSourceCostMemo,
     ) -> Result<&'memo GraphRowEdgeSourcePlanCost, EngineError> {
-        let Some(state_index) = GraphRowEdgeSourceCostMemo::bound_state_index(from_bound, to_bound)
-        else {
-            return Err(EngineError::InvalidOperation(
-                "graph row bound edge-source cost requested without a bound endpoint".into(),
-            ));
+        let state_index = match GraphRowEdgeSourceCostMemo::bound_state_index(from_bound, to_bound)
+        {
+            Some(idx) => idx,
+            None => {
+                return Err(EngineError::InvalidOperation(
+                    "graph row bound edge-source cost requested without a bound endpoint".into(),
+                ));
+            }
         };
-        if memo.bound_costs[edge_index][state_index].is_none() {
+        let is_miss = memo.bound_costs[edge_index][state_index].is_none();
+        GRAPH_ROW_PLANNING_PROBE.with(|c| {
+            let mut c = c.borrow_mut();
+            c.edge_source_consults += 1;
+            if is_miss {
+                c.edge_source_misses += 1;
+            }
+        });
+        if is_miss {
             let cost = self.graph_row_edge_source_plan_cost_with_endpoints(
                 query,
                 edge,
@@ -8884,6 +8915,10 @@ impl ReadView {
         }
 
         let legal_universe_sources = self.legal_universe_sources(query)?;
+        GRAPH_ROW_PLANNING_PROBE.with(|c| {
+            c.borrow_mut().node_legal_universe_sources +=
+                legal_universe_sources.len() as u64;
+        });
         let legal_universe_fallback =
             Self::cheapest_node_legal_universe_source(&legal_universe_sources);
         let cap_context = QueryCapContext {
