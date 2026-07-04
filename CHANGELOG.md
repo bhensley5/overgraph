@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-04
+
+### Added
+
+#### True Offline Scrub
+- **Path-level database scrub.** Added `scrub_path` / `scrub_path_with_options` in Rust, `scrubPath` / `scrubPathAsync` in Node.js, and `scrub_path` / `async_scrub_path` in Python so users can inspect a database directory without opening the engine first.
+- **Database-level scrub reports.** Added manifest selection diagnostics, database-level severity, manifest-published segment results, WAL validation summaries, orphan artifact findings, component totals, and manifest stability checks.
+- **`overgraph-scrub` CLI.** Added a maintenance CLI behind the existing `cli` feature with text and JSON output, documented exit codes, WAL validation controls, manifest-stability controls, and opt-in orphan segment component scrub.
+
+#### Profile Diagnostics
+- **Graph-row timing split.** Added profile-gated `planning_ns` and `execution_ns` stats to graph-row results, with Rust, Node.js, and Python surfaces exposing the split when profiling is enabled.
+- **GQL read-stage timing notes.** GQL `include_plan` plus `profile` now reports bind, lower, prepare, published-snapshot, graph-row, and projection timings so callers can see which read-path stage dominated a query.
+- **Planner-effort counters.** Profile notes now include planner counters for node legal-universe sources, edge source consults, edge source misses, and secondary-index followups.
+
+### Changed
+
+#### Scrub Semantics
+- **Offline scrub is strictly read-only.** Path-level scrub never creates manifests, opens the engine, replays or truncates WAL files, promotes fallback manifests, deletes orphan artifacts, schedules index rebuilds, or mutates database state.
+- **Online scrub remains unchanged.** Existing `db.scrub()` / `OverGraph.scrub()` APIs still verify the published segment view of an already opened engine and keep their existing report shapes across Rust, Node.js, and Python.
+- **Public docs distinguish online and offline integrity checks.** API reference, README, architecture overview, getting-started docs, and connector docs now separate explicit online segment scrub from true offline path scrub.
+
+### Fixed
+
+- **Offline corruption diagnostics.** Path-level scrub can now report corrupt `segment.core` payloads, corrupt external sidecars, invalid manifest fallbacks, malformed or missing WAL generations, trailing WAL bytes, orphan segment directories, orphan WAL files, and manifest changes during scrub without first running recovery.
+- **Connector scrub parity.** Node.js and Python now expose the database-level scrub report, options, severity strings, WAL result details, orphan segment results, async path scrub APIs, and type/stub coverage matching the Rust surface.
+
 ## [0.13.0] - 2026-06-13
 
 ### Breaking Changes
@@ -468,6 +494,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.14.0]: https://github.com/bhensley5/overgraph/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/bhensley5/overgraph/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/bhensley5/overgraph/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/bhensley5/overgraph/compare/v0.10.0...v0.11.0

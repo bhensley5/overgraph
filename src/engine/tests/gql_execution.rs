@@ -53,6 +53,8 @@ fn gql_query_profile_stage_timing_note_in_explain_plan() {
             note.contains("stage timing")
                 && note.contains("bind=")
                 && note.contains("graph_row_plan_and_execute=")
+                && note.contains("graph_row_planning=")
+                && note.contains("graph_row_execution=")
         }),
         "profile=true should attach a stage-timing note, got: {:?}",
         plan.notes
@@ -115,6 +117,8 @@ fn gql_query_profile_planning_counters_in_explain_note() {
         "edge_source_consults=",
         "edge_source_misses=",
         "secondary_index_followups=",
+        "graph_row_planning=",
+        "graph_row_execution=",
     ] {
         assert!(note.contains(key), "note should carry counter {key:?}");
     }

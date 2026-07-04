@@ -47,6 +47,8 @@ struct GqlQueryInstrumentation {
     prepare_ns: u64,
     snapshot_ns: u64,
     graph_row_ns: u64,
+    graph_row_planning_ns: u64,
+    graph_row_execution_ns: u64,
     projection_ns: u64,
     edge_source_consults: u64,
     edge_source_misses: u64,
@@ -63,6 +65,8 @@ impl GqlQueryInstrumentation {
             prepare_ns: 0,
             snapshot_ns: 0,
             graph_row_ns: 0,
+            graph_row_planning_ns: 0,
+            graph_row_execution_ns: 0,
             projection_ns: 0,
             edge_source_consults: 0,
             edge_source_misses: 0,
@@ -79,15 +83,21 @@ impl GqlQueryInstrumentation {
     fn note(&self) -> String {
         format!(
             "stage timing (nanoseconds): bind={b} lower={l} prepare={pr} snapshot={s} \
-             graph_row_plan_and_execute={g} projection={p}; planning counters: \
+             graph_row_plan_and_execute={g} graph_row_planning={gp} \
+             graph_row_execution={ge} projection={p}; planning counters: \
              node_legal_universe_sources={n} edge_source_consults={ec} edge_source_misses={em} \
-             secondary_index_followups={sf}; graph_row covers normalize, cost-based planning, \
-             index probe, and execution inside the shared read view",
+             secondary_index_followups={sf}; graph_row_planning covers runtime-plan normalization \
+             and cost-based physical planning inside the shared read view; graph_row_execution \
+             covers index probe, traversal, hydration, filtering, ordering, pagination, and \
+             projection; graph_row_plan_and_execute also includes GQL target normalization and \
+             cursor preparation",
             b = self.bind_ns,
             l = self.lower_ns,
             pr = self.prepare_ns,
             s = self.snapshot_ns,
             g = self.graph_row_ns,
+            gp = self.graph_row_planning_ns,
+            ge = self.graph_row_execution_ns,
             p = self.projection_ns,
             n = self.node_legal_universe_sources,
             ec = self.edge_source_consults,
@@ -260,6 +270,10 @@ impl DatabaseEngine {
             self.runtime.enqueue_secondary_index_read_followup(followup);
         }
         let graph_result = graph_rows.value;
+        if instr.enabled {
+            instr.graph_row_planning_ns = graph_result.stats.planning_ns.unwrap_or(0);
+            instr.graph_row_execution_ns = graph_result.stats.execution_ns.unwrap_or(0);
+        }
         warnings.extend(graph_result.stats.warnings.iter().cloned());
 
         let effective_row_cap = options.max_rows.min(options.max_intermediate_bindings).max(1);

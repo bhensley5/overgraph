@@ -59,6 +59,14 @@ class TestDenseSearch:
         assert len(hits) == 5
         assert hits[0].node_id == ids[1]  # highest sparse dot product
 
+    def test_errors_when_dense_search_is_not_configured(self, tmp_path):
+        db = OverGraph.open(str(tmp_path / "no-dense-config"))
+        try:
+            with pytest.raises(Exception, match="dense vector search is not configured"):
+                db.vector_search("dense", 1, dense_query=[1, 0, 0, 0])
+        finally:
+            db.close()
+
 
 class TestHybridSearch:
     def test_weighted_rank_fusion_promotes_balanced(self, hybrid_db):

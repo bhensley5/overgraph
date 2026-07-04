@@ -88,6 +88,25 @@ def test_query_graph_rows_fixed_basic(db):
     assert result["rows"] == [{"person": ids["ada"], "rel": ids["works"], "company": ids["acme"]}]
     assert result["next_cursor"] is None
     assert result["stats"]["rows_returned"] == 1
+    assert result["stats"]["planning_ns"] is None
+    assert result["stats"]["execution_ns"] is None
+
+    profiled = db.query_graph_rows(
+        {**fixed_request(ids), "options": {"profile": True}}
+    )
+    assert isinstance(profiled["stats"]["planning_ns"], int)
+    assert isinstance(profiled["stats"]["execution_ns"], int)
+
+    fast_profiled = db.query_graph_rows(
+        {
+            "nodes": [{"alias": "n", "ids": [ids["ada"]]}],
+            "return": [{"expr": {"binding": "n"}, "as": "n"}],
+            "limit": 1,
+            "options": {"profile": True},
+        }
+    )
+    assert isinstance(fast_profiled["stats"]["planning_ns"], int)
+    assert isinstance(fast_profiled["stats"]["execution_ns"], int)
 
 
 def test_query_graph_rows_optional_hit_and_miss(db):

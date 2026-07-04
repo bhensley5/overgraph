@@ -58,6 +58,20 @@ describe('vectorSearch dense (sync)', () => {
     assert.equal(hits.length, 5);
     assert.equal(hits[0].nodeId, ids[1]); // highest sparse dot product
   });
+
+  it('errors when dense search is not configured', () => {
+    const noVectorDir = mkdtempSync(join(tmpdir(), 'og-vs-no-config-'));
+    const noVectorDb = OverGraph.open(join(noVectorDir, 'db'));
+    try {
+      assert.throws(
+        () => noVectorDb.vectorSearch('dense', { k: 1, denseQuery: [1, 0, 0, 0] }),
+        /dense vector search is not configured/,
+      );
+    } finally {
+      noVectorDb.close();
+      rmSync(noVectorDir, { recursive: true });
+    }
+  });
 });
 
 describe('vectorSearch hybrid (sync)', () => {

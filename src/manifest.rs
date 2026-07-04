@@ -9,9 +9,9 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-const MANIFEST_CURRENT: &str = "manifest.current";
-const MANIFEST_TMP: &str = "manifest.tmp";
-const MANIFEST_PREV: &str = "manifest.prev";
+pub(crate) const MANIFEST_CURRENT: &str = "manifest.current";
+pub(crate) const MANIFEST_TMP: &str = "manifest.tmp";
+pub(crate) const MANIFEST_PREV: &str = "manifest.prev";
 
 /// Persist a ManifestState atomically:
 /// 1. Write to manifest.tmp + fsync file
@@ -112,7 +112,7 @@ fn try_load_manifest_file_for_write(
     }
 }
 
-fn validate_manifest_identity(state: &ManifestState) -> Result<(), EngineError> {
+pub(crate) fn validate_manifest_identity(state: &ManifestState) -> Result<(), EngineError> {
     validate_label_token_manifest(state)?;
     validate_schema_manifest(state)?;
     validate_secondary_index_manifest(state)?;

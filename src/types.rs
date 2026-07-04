@@ -2265,6 +2265,12 @@ pub struct GraphRowStats {
     pub paths_enumerated: usize,
     pub db_hits: usize,
     pub elapsed_us: Option<u64>,
+    /// Nanoseconds spent normalizing the runtime plan and selecting the physical graph-row plan.
+    /// Populated only when `GraphQueryOptions.profile` is set.
+    pub planning_ns: Option<u64>,
+    /// Nanoseconds spent executing the physical graph-row plan and preparing returned rows.
+    /// Populated only when `GraphQueryOptions.profile` is set.
+    pub execution_ns: Option<u64>,
     pub effective_at_epoch: i64,
     pub warnings: Vec<String>,
 }
@@ -4076,6 +4082,126 @@ pub enum ScrubFindingType {
     RangeOverlap,
     FileMissing,
     IoError,
+}
+
+/// Options for true offline, path-level database scrub.
+#[derive(Debug, Clone)]
+pub struct ScrubPathOptions {
+    pub validate_wal: bool,
+    pub include_orphan_segments: bool,
+    pub check_manifest_stability: bool,
+}
+
+impl Default for ScrubPathOptions {
+    fn default() -> Self {
+        Self {
+            validate_wal: true,
+            include_orphan_segments: false,
+            check_manifest_stability: true,
+        }
+    }
+}
+
+/// Database-level report returned by path-level offline scrub.
+#[derive(Debug, Clone)]
+pub struct DatabaseScrubReport {
+    pub manifest: Option<ManifestScrubSummary>,
+    pub findings: Vec<DatabaseScrubFinding>,
+    pub segments: Vec<SegmentScrubResult>,
+    pub wal_generations: Vec<WalScrubResult>,
+    pub orphan_segments: Vec<OrphanSegmentScrubResult>,
+    pub total_components_checked: u64,
+    pub total_components_ok: u64,
+    pub total_components_failed: u64,
+    pub total_bytes_digested: u64,
+    pub total_wal_records_checked: u64,
+    pub total_wal_bytes_checked: u64,
+    pub duration_ms: u64,
+}
+
+/// Summary of the manifest selected by path-level scrub.
+#[derive(Debug, Clone)]
+pub struct ManifestScrubSummary {
+    pub source: ManifestScrubSource,
+    pub segment_count: usize,
+    pub pending_flush_count: usize,
+    pub active_wal_generation_id: u64,
+    pub next_wal_generation_id: u64,
+}
+
+/// Manifest file selected by path-level scrub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestScrubSource {
+    Current,
+    Tmp,
+    Prev,
+}
+
+/// Database-level path scrub finding with severity.
+#[derive(Debug, Clone)]
+pub struct DatabaseScrubFinding {
+    pub component_kind: String,
+    pub finding_type: DatabaseScrubFindingType,
+    pub severity: DatabaseScrubSeverity,
+    pub detail: String,
+}
+
+/// Severity for database-level path scrub findings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseScrubSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+/// Classification of database-level path scrub findings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseScrubFindingType {
+    ManifestMissing,
+    ManifestFileInvalid,
+    ManifestFallbackUsed,
+    ManifestChangedDuringScrub,
+    WalMissing,
+    WalCorrupt,
+    WalTrailingBytes,
+    OrphanSegment,
+    OrphanWal,
+    OrphanSegmentUnpinned,
+    OrphanSegmentScrubSkipped,
+}
+
+/// Read-only WAL generation scrub result.
+#[derive(Debug, Clone)]
+pub struct WalScrubResult {
+    pub generation_id: u64,
+    pub role: WalScrubRole,
+    pub epoch_id: Option<u64>,
+    pub segment_id: Option<u64>,
+    pub file_len: u64,
+    pub durable_len: u64,
+    pub trailing_bytes: u64,
+    pub records_checked: u64,
+    pub bytes_checked: u64,
+    pub findings: Vec<DatabaseScrubFinding>,
+}
+
+/// Manifest role for a read-only WAL generation scrub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalScrubRole {
+    Active,
+    FrozenPendingFlush,
+    PublishedPendingRetire,
+}
+
+/// Optional orphan segment scrub result.
+#[derive(Debug, Clone)]
+pub struct OrphanSegmentScrubResult {
+    pub segment_id: Option<u64>,
+    pub path: String,
+    pub findings: Vec<ComponentScrubFinding>,
+    pub components_ok: u64,
+    pub bytes_digested: u64,
+    pub semantic_checks_skipped: bool,
 }
 
 /// Direction for neighbor queries.

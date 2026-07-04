@@ -1,4 +1,8 @@
 import type {
+  DatabaseScrubFinding,
+  DatabaseScrubFindingType,
+  DatabaseScrubReport,
+  DatabaseScrubSeverity,
   EdgeInput,
   EdgeLabelInfo,
   EdgeSchema,
@@ -19,15 +23,22 @@ import type {
   NodePropertyIndexInfo,
   NodeSchema,
   NodeSchemaInfo,
+  ManifestScrubSource,
+  ManifestScrubSummary,
+  OrphanSegmentScrubResult,
   OverGraph,
   SchemaCheckOptions,
   SecondaryIndexField,
   SecondaryIndexSpec,
   EdgePropertyIndexInfo,
+  ScrubPathOptions,
   SchemaLiteral,
   SchemaSetOptions,
   SchemaValidationReport,
+  WalScrubResult,
+  WalScrubRole,
 } from '../../index.js'
+import { scrubPath, scrubPathAsync } from '../../index.js'
 import type {
   GraphPathValue,
   GraphPipelineRequest,
@@ -54,6 +65,49 @@ import type {
 import type * as QueryTypes from '../../query-types.js'
 
 declare const db: OverGraph
+declare const dbPath: string
+
+const scrubPathOptions: ScrubPathOptions = {
+  validateWal: true,
+  includeOrphanSegments: false,
+  checkManifestStability: true,
+}
+const databaseScrubReport: DatabaseScrubReport = scrubPath(dbPath, scrubPathOptions)
+const databaseScrubReportWithNullOptions: DatabaseScrubReport = scrubPath(dbPath, null)
+const asyncDatabaseScrubReport: Promise<DatabaseScrubReport> = scrubPathAsync(dbPath, {
+  validateWal: false,
+})
+const manifestSummary: ManifestScrubSummary | null = databaseScrubReport.manifest
+const manifestSource: ManifestScrubSource = manifestSummary?.source ?? 'Current'
+const databaseFinding: DatabaseScrubFinding | undefined = databaseScrubReport.findings[0]
+const databaseFindingType: DatabaseScrubFindingType = databaseFinding?.findingType ?? 'ManifestMissing'
+const databaseFindingSeverity: DatabaseScrubSeverity = databaseFinding?.severity ?? 'warning'
+const walScrub: WalScrubResult | undefined = databaseScrubReport.walGenerations[0]
+const walRole: WalScrubRole = walScrub?.role ?? 'Active'
+const walEpoch: number | null = walScrub?.epochId ?? null
+const orphanScrub: OrphanSegmentScrubResult | undefined = databaseScrubReport.orphanSegments[0]
+const orphanSegmentId: number | null = orphanScrub?.segmentId ?? null
+const orphanSkipped: boolean = orphanScrub?.semanticChecksSkipped ?? false
+const allFindingTypes: Array<DatabaseScrubFindingType> = [
+  'ManifestMissing',
+  'ManifestFileInvalid',
+  'ManifestFallbackUsed',
+  'ManifestChangedDuringScrub',
+  'WalMissing',
+  'WalCorrupt',
+  'WalTrailingBytes',
+  'OrphanSegment',
+  'OrphanWal',
+  'OrphanSegmentUnpinned',
+  'OrphanSegmentScrubSkipped',
+]
+const severities: Array<DatabaseScrubSeverity> = ['info', 'warning', 'error']
+const manifestSources: Array<ManifestScrubSource> = ['Current', 'Tmp', 'Prev']
+const walRoles: Array<WalScrubRole> = [
+  'Active',
+  'FrozenPendingFlush',
+  'PublishedPendingRetire',
+]
 
 const nodeIndexSpec: SecondaryIndexSpec = {
   kind: 'range',

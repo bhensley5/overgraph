@@ -1,8 +1,10 @@
 use crate::error::EngineError;
+use crate::manifest::{validate_manifest_identity, MANIFEST_CURRENT, MANIFEST_PREV, MANIFEST_TMP};
 use crate::parallel::engine_cpu_install;
 use crate::property_value_semantics::{
     hash_prop_equality_key, numeric_range_sort_key_for_value, NumericRangeSortKey,
 };
+use crate::schema::normalize_schema_manifest;
 use crate::segment_components::{
     component_id, decode_identity_header, decode_manifest_envelope, dependency_digest,
     ComponentHandleV1, ComponentIdentityHeaderV1, SegmentComponentKind, SegmentComponentManifestV1,
@@ -12,20 +14,881 @@ use crate::segment_components::{
 use crate::segment_reader::{validate_segment_manifest_identity, SegmentReader};
 use crate::segment_writer::segment_dir;
 use crate::types::{
-    ComponentScrubFinding, ManifestState, ScrubFindingType, ScrubReport, SecondaryIndexKind,
-    SecondaryIndexManifestEntry, SecondaryIndexState, SecondaryIndexTarget, SegmentInfo,
-    SegmentScrubResult,
+    ComponentScrubFinding, DatabaseScrubFinding, DatabaseScrubFindingType, DatabaseScrubReport,
+    DatabaseScrubSeverity, FlushEpochState, ManifestScrubSource, ManifestScrubSummary,
+    ManifestState, OrphanSegmentScrubResult, ScrubFindingType, ScrubPathOptions, ScrubReport,
+    SecondaryIndexKind, SecondaryIndexManifestEntry, SecondaryIndexState, SecondaryIndexTarget,
+    SegmentInfo, SegmentScrubResult, WalScrubResult, WalScrubRole,
 };
+use crate::wal::{scrub_generation_readonly, wal_generation_path, WalScrubTerminal};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Instant;
 
 const SCRUB_READ_BUFFER_SIZE: usize = 64 * 1024;
+
+struct ScrubManifestLoad {
+    manifest: Option<ManifestState>,
+    source: Option<ManifestScrubSource>,
+    source_digest: Option<[u8; 32]>,
+    source_len: Option<u64>,
+    findings: Vec<DatabaseScrubFinding>,
+}
+
+#[derive(Clone)]
+struct WalRoleRef {
+    generation_id: u64,
+    role: WalScrubRole,
+    epoch_id: Option<u64>,
+    segment_id: Option<u64>,
+}
+
+struct OrphanSegmentCandidate {
+    segment_id: Option<u64>,
+    path: PathBuf,
+}
+
+struct OrphanScanOutcome {
+    findings: Vec<DatabaseScrubFinding>,
+    orphan_segments: Vec<OrphanSegmentScrubResult>,
+    total_components_checked: u64,
+    total_components_ok: u64,
+    total_components_failed: u64,
+    total_bytes_digested: u64,
+}
+
+struct OrphanSegmentDeepScrub {
+    result: OrphanSegmentScrubResult,
+    component_checks_ran: bool,
+}
+
+#[cfg(test)]
+struct ManifestStabilityTestHook {
+    db_dir: PathBuf,
+    callback: Box<dyn FnOnce() + Send>,
+}
+
+#[cfg(test)]
+static MANIFEST_STABILITY_TEST_HOOK: Mutex<Option<ManifestStabilityTestHook>> = Mutex::new(None);
+
+pub fn scrub_path(path: &Path) -> Result<DatabaseScrubReport, EngineError> {
+    scrub_path_with_options(path, &ScrubPathOptions::default())
+}
+
+pub fn scrub_path_with_options(
+    path: &Path,
+    options: &ScrubPathOptions,
+) -> Result<DatabaseScrubReport, EngineError> {
+    let start = Instant::now();
+    validate_scrub_root(path)?;
+
+    let manifest_load = load_manifest_for_scrub(path);
+    let selected_manifest_metadata = (
+        manifest_load.source,
+        manifest_load.source_len,
+        manifest_load.source_digest,
+    );
+    let mut findings = manifest_load.findings;
+    let mut manifest_summary = None;
+    let mut segments = Vec::new();
+    let mut wal_generations = Vec::new();
+    let mut total_components_checked = 0;
+    let mut total_components_ok = 0;
+    let mut total_components_failed = 0;
+    let mut total_bytes_digested = 0;
+    let mut total_wal_records_checked = 0;
+    let mut total_wal_bytes_checked = 0;
+    let mut referenced_wal_generations = HashSet::new();
+
+    if let (Some(manifest), Some(source)) = (&manifest_load.manifest, manifest_load.source) {
+        manifest_summary = Some(build_manifest_summary(source, manifest));
+        let segment_report = scrub_database(path, manifest)?;
+        segments = segment_report.segments;
+        total_components_checked = segment_report.total_components_checked;
+        total_components_ok = segment_report.total_components_ok;
+        total_components_failed = segment_report.total_components_failed;
+        total_bytes_digested = segment_report.total_bytes_digested;
+
+        let wal_roles = wal_roles_for_manifest(manifest);
+        referenced_wal_generations.extend(wal_roles.iter().map(|role| role.generation_id));
+        if options.validate_wal {
+            wal_generations = scrub_manifest_wal_generations(path, manifest, &segments, &wal_roles);
+            for wal in &wal_generations {
+                total_wal_records_checked += wal.records_checked;
+                total_wal_bytes_checked += wal.bytes_checked;
+                findings.extend(wal.findings.iter().cloned());
+            }
+        }
+    }
+
+    let orphan_scan = scan_orphan_artifacts(
+        path,
+        manifest_load.manifest.as_ref(),
+        &referenced_wal_generations,
+        options.include_orphan_segments,
+    );
+    findings.extend(orphan_scan.findings);
+    let orphan_segments = orphan_scan.orphan_segments;
+    total_components_checked += orphan_scan.total_components_checked;
+    total_components_ok += orphan_scan.total_components_ok;
+    total_components_failed += orphan_scan.total_components_failed;
+    total_bytes_digested += orphan_scan.total_bytes_digested;
+
+    if options.check_manifest_stability {
+        run_manifest_stability_test_hook(path);
+        if let Some(finding) = recheck_selected_manifest_stability(
+            path,
+            selected_manifest_metadata.0,
+            selected_manifest_metadata.1,
+            selected_manifest_metadata.2,
+        ) {
+            findings.push(finding);
+        }
+    }
+
+    Ok(DatabaseScrubReport {
+        manifest: manifest_summary,
+        findings,
+        segments,
+        wal_generations,
+        orphan_segments,
+        total_components_checked,
+        total_components_ok,
+        total_components_failed,
+        total_bytes_digested,
+        total_wal_records_checked,
+        total_wal_bytes_checked,
+        duration_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
+fn validate_scrub_root(path: &Path) -> Result<(), EngineError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Err(EngineError::DatabaseNotFound(format!(
+                "database path does not exist: {}",
+                path.display()
+            )));
+        }
+        Err(error) => return Err(EngineError::IoError(error)),
+    };
+    if !metadata.is_dir() {
+        return Err(EngineError::InvalidOperation(format!(
+            "database path is not a directory: {}",
+            path.display()
+        )));
+    }
+    fs::read_dir(path)?;
+    Ok(())
+}
+
+fn load_manifest_for_scrub(db_dir: &Path) -> ScrubManifestLoad {
+    let mut findings = Vec::new();
+    for (index, (source, name)) in manifest_candidates().iter().copied().enumerate() {
+        let path = db_dir.join(name);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                findings.push(manifest_file_invalid_finding(
+                    name,
+                    format!("cannot read {name}: {error}"),
+                ));
+                continue;
+            }
+        };
+        let source_len = bytes.len() as u64;
+        let source_digest: [u8; 32] = Sha256::digest(&bytes).into();
+        match parse_manifest_for_scrub(&bytes) {
+            Ok(manifest) => {
+                if index > 0 {
+                    findings.push(DatabaseScrubFinding {
+                        component_kind: "manifest".to_string(),
+                        finding_type: DatabaseScrubFindingType::ManifestFallbackUsed,
+                        severity: DatabaseScrubSeverity::Warning,
+                        detail: format!(
+                            "selected {name} after an earlier manifest candidate was absent or invalid"
+                        ),
+                    });
+                }
+                return ScrubManifestLoad {
+                    manifest: Some(manifest),
+                    source: Some(source),
+                    source_digest: Some(source_digest),
+                    source_len: Some(source_len),
+                    findings,
+                };
+            }
+            Err(error) => {
+                findings.push(manifest_file_invalid_finding(
+                    name,
+                    format!("{name} is invalid: {error}"),
+                ));
+            }
+        }
+    }
+
+    findings.push(DatabaseScrubFinding {
+        component_kind: "manifest".to_string(),
+        finding_type: DatabaseScrubFindingType::ManifestMissing,
+        severity: DatabaseScrubSeverity::Error,
+        detail: "no valid manifest could be selected from manifest.current, manifest.tmp, or manifest.prev"
+            .to_string(),
+    });
+
+    ScrubManifestLoad {
+        manifest: None,
+        source: None,
+        source_digest: None,
+        source_len: None,
+        findings,
+    }
+}
+
+fn manifest_candidates() -> [(ManifestScrubSource, &'static str); 3] {
+    [
+        (ManifestScrubSource::Current, MANIFEST_CURRENT),
+        (ManifestScrubSource::Tmp, MANIFEST_TMP),
+        (ManifestScrubSource::Prev, MANIFEST_PREV),
+    ]
+}
+
+fn parse_manifest_for_scrub(bytes: &[u8]) -> Result<ManifestState, EngineError> {
+    let mut manifest: ManifestState = serde_json::from_slice(bytes)
+        .map_err(|error| EngineError::ManifestError(format!("parse: {error}")))?;
+    normalize_schema_manifest(&mut manifest)?;
+    validate_manifest_identity(&manifest)?;
+    Ok(manifest)
+}
+
+fn build_manifest_summary(
+    source: ManifestScrubSource,
+    manifest: &ManifestState,
+) -> ManifestScrubSummary {
+    ManifestScrubSummary {
+        source,
+        segment_count: manifest.segments.len(),
+        pending_flush_count: manifest.pending_flush_epochs.len(),
+        active_wal_generation_id: manifest.active_wal_generation_id,
+        next_wal_generation_id: manifest.next_wal_generation_id,
+    }
+}
+
+fn manifest_file_invalid_finding(name: &str, detail: String) -> DatabaseScrubFinding {
+    DatabaseScrubFinding {
+        component_kind: name.to_string(),
+        finding_type: DatabaseScrubFindingType::ManifestFileInvalid,
+        severity: DatabaseScrubSeverity::Error,
+        detail,
+    }
+}
+
+fn wal_roles_for_manifest(manifest: &ManifestState) -> Vec<WalRoleRef> {
+    let mut roles = Vec::with_capacity(1 + manifest.pending_flush_epochs.len());
+    roles.push(WalRoleRef {
+        generation_id: manifest.active_wal_generation_id,
+        role: WalScrubRole::Active,
+        epoch_id: None,
+        segment_id: None,
+    });
+    for epoch in &manifest.pending_flush_epochs {
+        let role = match epoch.state {
+            FlushEpochState::FrozenPendingFlush => WalScrubRole::FrozenPendingFlush,
+            FlushEpochState::PublishedPendingRetire => WalScrubRole::PublishedPendingRetire,
+        };
+        roles.push(WalRoleRef {
+            generation_id: epoch.wal_generation_id,
+            role,
+            epoch_id: Some(epoch.epoch_id),
+            segment_id: epoch.segment_id,
+        });
+    }
+    roles
+}
+
+fn scrub_manifest_wal_generations(
+    db_dir: &Path,
+    manifest: &ManifestState,
+    segments: &[SegmentScrubResult],
+    roles: &[WalRoleRef],
+) -> Vec<WalScrubResult> {
+    let duplicate_details = duplicate_wal_role_details(roles);
+    roles
+        .iter()
+        .map(|role_ref| {
+            let mut result = scrub_wal_role(db_dir, manifest, segments, role_ref);
+            if let Some(detail) = duplicate_details.get(&role_ref.generation_id) {
+                result.findings.push(DatabaseScrubFinding {
+                    component_kind: wal_component_kind(role_ref.generation_id),
+                    finding_type: DatabaseScrubFindingType::WalCorrupt,
+                    severity: DatabaseScrubSeverity::Error,
+                    detail: detail.clone(),
+                });
+            }
+            result
+        })
+        .collect()
+}
+
+fn duplicate_wal_role_details(roles: &[WalRoleRef]) -> BTreeMap<u64, String> {
+    let mut by_generation: BTreeMap<u64, Vec<WalScrubRole>> = BTreeMap::new();
+    for role_ref in roles {
+        let roles = by_generation.entry(role_ref.generation_id).or_default();
+        if !roles.contains(&role_ref.role) {
+            roles.push(role_ref.role);
+        }
+    }
+    by_generation
+        .into_iter()
+        .filter_map(|(generation_id, roles)| {
+            if roles.len() <= 1 {
+                return None;
+            }
+            let names = roles
+                .iter()
+                .map(|role| wal_role_name(*role))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some((
+                generation_id,
+                format!(
+                    "WAL generation {generation_id} is referenced by multiple manifest roles: {names}"
+                ),
+            ))
+        })
+        .collect()
+}
+
+fn scrub_wal_role(
+    db_dir: &Path,
+    manifest: &ManifestState,
+    segments: &[SegmentScrubResult],
+    role_ref: &WalRoleRef,
+) -> WalScrubResult {
+    let mut result = WalScrubResult {
+        generation_id: role_ref.generation_id,
+        role: role_ref.role,
+        epoch_id: role_ref.epoch_id,
+        segment_id: role_ref.segment_id,
+        file_len: 0,
+        durable_len: 0,
+        trailing_bytes: 0,
+        records_checked: 0,
+        bytes_checked: 0,
+        findings: Vec::new(),
+    };
+
+    let wal_path = wal_generation_path(db_dir, role_ref.generation_id);
+    match fs::metadata(&wal_path) {
+        Ok(metadata) => {
+            result.file_len = metadata.len();
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            result.findings.push(DatabaseScrubFinding {
+                component_kind: wal_component_kind(role_ref.generation_id),
+                finding_type: DatabaseScrubFindingType::WalMissing,
+                severity: wal_missing_severity(role_ref, manifest, segments),
+                detail: format!(
+                    "manifest references missing WAL generation {} at {}",
+                    role_ref.generation_id,
+                    wal_path.display()
+                ),
+            });
+            return result;
+        }
+        Err(error) => {
+            result.findings.push(DatabaseScrubFinding {
+                component_kind: wal_component_kind(role_ref.generation_id),
+                finding_type: DatabaseScrubFindingType::WalCorrupt,
+                severity: wal_corrupt_severity(role_ref, manifest, segments),
+                detail: format!(
+                    "cannot stat WAL generation {} at {}: {error}",
+                    role_ref.generation_id,
+                    wal_path.display()
+                ),
+            });
+            return result;
+        }
+    }
+
+    match scrub_generation_readonly(db_dir, role_ref.generation_id) {
+        Ok(scan) => {
+            result.file_len = scan.file_len;
+            result.durable_len = scan.durable_len;
+            result.trailing_bytes = scan.file_len.saturating_sub(scan.durable_len);
+            result.records_checked = scan.records_checked;
+            result.bytes_checked = scan.bytes_checked;
+            if scan.file_len == 0 {
+                result.findings.push(DatabaseScrubFinding {
+                    component_kind: wal_component_kind(role_ref.generation_id),
+                    finding_type: DatabaseScrubFindingType::WalMissing,
+                    severity: wal_missing_severity(role_ref, manifest, segments),
+                    detail: format!(
+                        "WAL generation {} exists but is zero bytes",
+                        role_ref.generation_id
+                    ),
+                });
+            }
+            if let Some(terminal) = scan.terminal {
+                match terminal {
+                    WalScrubTerminal::RecoverableTrailing { reason } => {
+                        result.findings.push(DatabaseScrubFinding {
+                            component_kind: wal_component_kind(role_ref.generation_id),
+                            finding_type: DatabaseScrubFindingType::WalTrailingBytes,
+                            severity: DatabaseScrubSeverity::Warning,
+                            detail: format!(
+                                "WAL generation {} has recoverable trailing bytes after durable offset {}: {reason}",
+                                role_ref.generation_id, result.durable_len
+                            ),
+                        });
+                    }
+                    WalScrubTerminal::Corrupt { reason } => {
+                        result.findings.push(DatabaseScrubFinding {
+                            component_kind: wal_component_kind(role_ref.generation_id),
+                            finding_type: DatabaseScrubFindingType::WalCorrupt,
+                            severity: wal_corrupt_severity(role_ref, manifest, segments),
+                            detail: format!(
+                                "WAL generation {} is corrupt: {reason}",
+                                role_ref.generation_id
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            result.findings.push(DatabaseScrubFinding {
+                component_kind: wal_component_kind(role_ref.generation_id),
+                finding_type: DatabaseScrubFindingType::WalCorrupt,
+                severity: wal_corrupt_severity(role_ref, manifest, segments),
+                detail: format!(
+                    "cannot read WAL generation {} at {}: {error}",
+                    role_ref.generation_id,
+                    wal_path.display()
+                ),
+            });
+        }
+    }
+
+    result
+}
+
+fn wal_missing_severity(
+    role_ref: &WalRoleRef,
+    manifest: &ManifestState,
+    segments: &[SegmentScrubResult],
+) -> DatabaseScrubSeverity {
+    match role_ref.role {
+        WalScrubRole::Active => {
+            if manifest
+                .pending_flush_epochs
+                .iter()
+                .any(|epoch| epoch.state == FlushEpochState::FrozenPendingFlush)
+            {
+                DatabaseScrubSeverity::Error
+            } else {
+                DatabaseScrubSeverity::Warning
+            }
+        }
+        WalScrubRole::FrozenPendingFlush => DatabaseScrubSeverity::Error,
+        WalScrubRole::PublishedPendingRetire => {
+            if published_pending_retire_segment_healthy(role_ref, manifest, segments) {
+                DatabaseScrubSeverity::Warning
+            } else {
+                DatabaseScrubSeverity::Error
+            }
+        }
+    }
+}
+
+fn wal_corrupt_severity(
+    role_ref: &WalRoleRef,
+    manifest: &ManifestState,
+    segments: &[SegmentScrubResult],
+) -> DatabaseScrubSeverity {
+    match role_ref.role {
+        WalScrubRole::Active | WalScrubRole::FrozenPendingFlush => DatabaseScrubSeverity::Error,
+        WalScrubRole::PublishedPendingRetire => {
+            if published_pending_retire_segment_healthy(role_ref, manifest, segments) {
+                DatabaseScrubSeverity::Warning
+            } else {
+                DatabaseScrubSeverity::Error
+            }
+        }
+    }
+}
+
+fn published_pending_retire_segment_healthy(
+    role_ref: &WalRoleRef,
+    manifest: &ManifestState,
+    segments: &[SegmentScrubResult],
+) -> bool {
+    let Some(segment_id) = role_ref.segment_id else {
+        return false;
+    };
+    if !manifest
+        .segments
+        .iter()
+        .any(|segment| segment.id == segment_id)
+    {
+        return false;
+    }
+    segments
+        .iter()
+        .find(|segment| segment.segment_id == segment_id)
+        .is_some_and(|segment| segment.findings.is_empty())
+}
+
+fn wal_component_kind(generation_id: u64) -> String {
+    format!("wal_{generation_id}.wal")
+}
+
+fn wal_role_name(role: WalScrubRole) -> &'static str {
+    match role {
+        WalScrubRole::Active => "Active",
+        WalScrubRole::FrozenPendingFlush => "FrozenPendingFlush",
+        WalScrubRole::PublishedPendingRetire => "PublishedPendingRetire",
+    }
+}
+
+fn scan_orphan_artifacts(
+    db_dir: &Path,
+    manifest: Option<&ManifestState>,
+    referenced_wal_generations: &HashSet<u64>,
+    include_orphan_segments: bool,
+) -> OrphanScanOutcome {
+    let manifest_segment_ids: HashSet<u64> = manifest
+        .map(|manifest| manifest.segments.iter().map(|segment| segment.id).collect())
+        .unwrap_or_default();
+    let orphan_segment_candidates = scan_orphan_segment_candidates(db_dir, &manifest_segment_ids);
+    let mut outcome = OrphanScanOutcome {
+        findings: Vec::new(),
+        orphan_segments: Vec::new(),
+        total_components_checked: 0,
+        total_components_ok: 0,
+        total_components_failed: 0,
+        total_bytes_digested: 0,
+    };
+
+    for candidate in orphan_segment_candidates {
+        outcome.findings.push(DatabaseScrubFinding {
+            component_kind: "segment".to_string(),
+            finding_type: DatabaseScrubFindingType::OrphanSegment,
+            severity: DatabaseScrubSeverity::Warning,
+            detail: format!(
+                "segment artifact is not referenced by the selected manifest: {}",
+                candidate.path.display()
+            ),
+        });
+
+        if include_orphan_segments {
+            let deep = scrub_orphan_segment_unpinned(&candidate);
+            if deep.component_checks_ran {
+                outcome.findings.push(DatabaseScrubFinding {
+                    component_kind: "segment".to_string(),
+                    finding_type: DatabaseScrubFindingType::OrphanSegmentUnpinned,
+                    severity: DatabaseScrubSeverity::Warning,
+                    detail: format!(
+                        "orphan segment was component-scrubbed without root manifest semantic checks: {}",
+                        candidate.path.display()
+                    ),
+                });
+                let failed = failed_component_count(&deep.result.findings);
+                outcome.total_components_checked += deep.result.components_ok + failed;
+                outcome.total_components_ok += deep.result.components_ok;
+                outcome.total_components_failed += failed;
+                outcome.total_bytes_digested += deep.result.bytes_digested;
+            } else {
+                outcome.findings.push(DatabaseScrubFinding {
+                    component_kind: "segment".to_string(),
+                    finding_type: DatabaseScrubFindingType::OrphanSegmentScrubSkipped,
+                    severity: DatabaseScrubSeverity::Warning,
+                    detail: format!(
+                        "orphan segment could not be component-scrubbed: {}",
+                        candidate.path.display()
+                    ),
+                });
+            }
+            outcome.orphan_segments.push(deep.result);
+        }
+    }
+
+    for path in scan_orphan_wal_files(db_dir, referenced_wal_generations) {
+        outcome.findings.push(DatabaseScrubFinding {
+            component_kind: "wal".to_string(),
+            finding_type: DatabaseScrubFindingType::OrphanWal,
+            severity: DatabaseScrubSeverity::Warning,
+            detail: format!(
+                "WAL artifact is not referenced by the selected manifest: {}",
+                path.display()
+            ),
+        });
+    }
+
+    outcome
+}
+
+fn scan_orphan_segment_candidates(
+    db_dir: &Path,
+    manifest_segment_ids: &HashSet<u64>,
+) -> Vec<OrphanSegmentCandidate> {
+    let seg_parent = db_dir.join("segments");
+    let entries = match fs::read_dir(&seg_parent) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some((segment_id, is_tmp)) = parse_segment_artifact_name(&name) else {
+            continue;
+        };
+        let is_orphan = is_tmp
+            || segment_id
+                .map(|id| !manifest_segment_ids.contains(&id))
+                .unwrap_or(true);
+        if is_orphan {
+            candidates.push(OrphanSegmentCandidate {
+                segment_id,
+                path: entry.path(),
+            });
+        }
+    }
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    candidates
+}
+
+fn parse_segment_artifact_name(name: &str) -> Option<(Option<u64>, bool)> {
+    let rest = name.strip_prefix("seg_")?;
+    let (id_str, is_tmp) = if let Some(id_str) = rest.strip_suffix(".tmp") {
+        (id_str, true)
+    } else {
+        (rest, false)
+    };
+    let segment_id = id_str.parse::<u64>().ok();
+    Some((segment_id, is_tmp))
+}
+
+fn scan_orphan_wal_files(db_dir: &Path, referenced_wal_generations: &HashSet<u64>) -> Vec<PathBuf> {
+    let entries = match fs::read_dir(db_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut paths = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(generation_id) = parse_wal_artifact_name(&name) else {
+            continue;
+        };
+        if generation_id
+            .map(|id| !referenced_wal_generations.contains(&id))
+            .unwrap_or(true)
+        {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    paths
+}
+
+fn parse_wal_artifact_name(name: &str) -> Option<Option<u64>> {
+    let rest = name.strip_prefix("wal_")?;
+    let id_str = rest.strip_suffix(".wal")?;
+    Some(id_str.parse::<u64>().ok())
+}
+
+fn scrub_orphan_segment_unpinned(candidate: &OrphanSegmentCandidate) -> OrphanSegmentDeepScrub {
+    let manifest_path = candidate.path.join(SEGMENT_COMPONENT_MANIFEST_FILENAME);
+    let manifest_data = match fs::read(&manifest_path) {
+        Ok(data) => data,
+        Err(error) => {
+            return OrphanSegmentDeepScrub {
+                result: OrphanSegmentScrubResult {
+                    segment_id: candidate.segment_id,
+                    path: candidate.path.display().to_string(),
+                    findings: vec![ComponentScrubFinding {
+                        component_kind: "segment_manifest".into(),
+                        finding_type: ScrubFindingType::FileMissing,
+                        detail: format!("cannot read segment manifest: {error}"),
+                    }],
+                    components_ok: 0,
+                    bytes_digested: 0,
+                    semantic_checks_skipped: true,
+                },
+                component_checks_ran: false,
+            };
+        }
+    };
+    let manifest = match decode_manifest_envelope(&manifest_data) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return OrphanSegmentDeepScrub {
+                result: OrphanSegmentScrubResult {
+                    segment_id: candidate.segment_id,
+                    path: candidate.path.display().to_string(),
+                    findings: vec![ComponentScrubFinding {
+                        component_kind: "segment_manifest".into(),
+                        finding_type: ScrubFindingType::IoError,
+                        detail: format!("cannot decode segment manifest: {error}"),
+                    }],
+                    components_ok: 0,
+                    bytes_digested: 0,
+                    semantic_checks_skipped: true,
+                },
+                component_checks_ran: false,
+            };
+        }
+    };
+
+    let mut findings = Vec::new();
+    let mut components_ok = 0;
+    let mut bytes_digested = 0;
+
+    let packed_outcome = scrub_packed_core(&candidate.path, &manifest, &mut bytes_digested);
+    components_ok += packed_outcome.components_ok;
+    findings.extend(packed_outcome.findings);
+
+    for record in &manifest.components {
+        if record.kind == SegmentComponentKind::PackedSegmentContainer
+            || matches!(record.handle, ComponentHandleV1::PackedRange { .. })
+        {
+            continue;
+        }
+
+        let component_findings = match &record.handle {
+            ComponentHandleV1::ExternalFile { .. } => {
+                scrub_external_component(&candidate.path, record, &manifest, &mut bytes_digested)
+            }
+            ComponentHandleV1::PackedRange { .. } => unreachable!("packed ranges handled above"),
+        };
+
+        if component_findings.is_empty() {
+            components_ok += 1;
+        } else {
+            findings.extend(component_findings);
+        }
+    }
+
+    OrphanSegmentDeepScrub {
+        result: OrphanSegmentScrubResult {
+            segment_id: Some(manifest.segment_id),
+            path: candidate.path.display().to_string(),
+            findings,
+            components_ok,
+            bytes_digested,
+            semantic_checks_skipped: true,
+        },
+        component_checks_ran: true,
+    }
+}
+
+fn failed_component_count(findings: &[ComponentScrubFinding]) -> u64 {
+    findings
+        .iter()
+        .map(|finding| finding.component_kind.as_str())
+        .collect::<HashSet<_>>()
+        .len() as u64
+}
+
+fn recheck_selected_manifest_stability(
+    db_dir: &Path,
+    source: Option<ManifestScrubSource>,
+    expected_len: Option<u64>,
+    expected_digest: Option<[u8; 32]>,
+) -> Option<DatabaseScrubFinding> {
+    let (Some(source), Some(expected_len), Some(expected_digest)) =
+        (source, expected_len, expected_digest)
+    else {
+        return None;
+    };
+    let name = manifest_source_name(source);
+    let path = db_dir.join(name);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Some(DatabaseScrubFinding {
+                component_kind: "manifest".to_string(),
+                finding_type: DatabaseScrubFindingType::ManifestChangedDuringScrub,
+                severity: DatabaseScrubSeverity::Warning,
+                detail: format!(
+                    "selected manifest {name} could not be reread at end of scrub: {error}"
+                ),
+            });
+        }
+    };
+    let actual_len = bytes.len() as u64;
+    let actual_digest: [u8; 32] = Sha256::digest(&bytes).into();
+    if actual_len != expected_len || actual_digest != expected_digest {
+        return Some(DatabaseScrubFinding {
+            component_kind: "manifest".to_string(),
+            finding_type: DatabaseScrubFindingType::ManifestChangedDuringScrub,
+            severity: DatabaseScrubSeverity::Warning,
+            detail: format!(
+                "selected manifest {name} changed during scrub: length {expected_len}->{actual_len}"
+            ),
+        });
+    }
+    None
+}
+
+fn manifest_source_name(source: ManifestScrubSource) -> &'static str {
+    match source {
+        ManifestScrubSource::Current => MANIFEST_CURRENT,
+        ManifestScrubSource::Tmp => MANIFEST_TMP,
+        ManifestScrubSource::Prev => MANIFEST_PREV,
+    }
+}
+
+#[cfg(test)]
+fn set_manifest_stability_test_hook(db_dir: PathBuf, callback: impl FnOnce() + Send + 'static) {
+    *MANIFEST_STABILITY_TEST_HOOK.lock().unwrap() = Some(ManifestStabilityTestHook {
+        db_dir,
+        callback: Box::new(callback),
+    });
+}
+
+#[cfg(test)]
+fn run_manifest_stability_test_hook(db_dir: &Path) {
+    let hook = {
+        let mut guard = MANIFEST_STABILITY_TEST_HOOK.lock().unwrap();
+        if guard
+            .as_ref()
+            .is_some_and(|hook| hook.db_dir.as_path() == db_dir)
+        {
+            guard.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        (hook.callback)();
+    }
+}
+
+#[cfg(not(test))]
+fn run_manifest_stability_test_hook(_db_dir: &Path) {}
 
 pub(crate) fn scrub_database(
     db_dir: &Path,
@@ -1314,6 +2177,7 @@ mod tests {
     use crate::segment_components::{
         encode_manifest_envelope, SegmentComponentManifestV1, SegmentComponentRecordV1,
     };
+    use crate::types::{NodeSchemaManifestEntry, SchemaAdditionalPropertiesManifest};
     use crate::{
         DatabaseEngine, DbOptions, NodeInput, PropValue, ScrubFindingType, SecondaryIndexField,
         SecondaryIndexKind, SecondaryIndexSpec, UpsertEdgeOptions, UpsertNodeOptions,
@@ -1365,6 +2229,42 @@ mod tests {
         let db = open_test_db(&db_path);
         populate_and_flush(&db);
         (dir, db_path, db)
+    }
+
+    fn valid_manifest_with_next(next_node_id: u64) -> ManifestState {
+        ManifestState {
+            next_node_id,
+            next_edge_id: next_node_id,
+            ..crate::manifest::default_manifest()
+        }
+    }
+
+    fn write_manifest_candidate(dir: &Path, name: &str, manifest: &ManifestState) -> Vec<u8> {
+        let bytes = serde_json::to_vec_pretty(manifest).unwrap();
+        std::fs::write(dir.join(name), &bytes).unwrap();
+        bytes
+    }
+
+    fn count_manifest_finding(
+        load: &ScrubManifestLoad,
+        component_kind: &str,
+        finding_type: DatabaseScrubFindingType,
+    ) -> usize {
+        load.findings
+            .iter()
+            .filter(|finding| {
+                finding.component_kind == component_kind && finding.finding_type == finding_type
+            })
+            .count()
+    }
+
+    fn has_manifest_finding(
+        load: &ScrubManifestLoad,
+        finding_type: DatabaseScrubFindingType,
+    ) -> bool {
+        load.findings
+            .iter()
+            .any(|finding| finding.finding_type == finding_type)
     }
 
     fn first_seg_dir(db_path: &Path) -> PathBuf {
@@ -1559,6 +2459,350 @@ mod tests {
         })
         .unwrap();
         (dir, db_path, db, eq.index_id, range.index_id)
+    }
+
+    #[test]
+    fn scrub_manifest_scan_selects_valid_current() {
+        let dir = TempDir::new().unwrap();
+        write_manifest_candidate(dir.path(), MANIFEST_CURRENT, &valid_manifest_with_next(10));
+
+        let load = load_manifest_for_scrub(dir.path());
+
+        assert_eq!(load.source, Some(ManifestScrubSource::Current));
+        assert_eq!(load.manifest.unwrap().next_node_id, 10);
+        assert!(load.findings.is_empty());
+        assert_eq!(
+            load.source_len.unwrap(),
+            std::fs::metadata(dir.path().join(MANIFEST_CURRENT))
+                .unwrap()
+                .len()
+        );
+        assert!(load.source_digest.is_some());
+    }
+
+    #[test]
+    fn scrub_manifest_scan_selects_tmp_without_promoting_it() {
+        let dir = TempDir::new().unwrap();
+        write_manifest_candidate(dir.path(), MANIFEST_TMP, &valid_manifest_with_next(20));
+
+        let load = load_manifest_for_scrub(dir.path());
+
+        assert_eq!(load.source, Some(ManifestScrubSource::Tmp));
+        assert_eq!(load.manifest.unwrap().next_node_id, 20);
+        assert!(dir.path().join(MANIFEST_TMP).exists());
+        assert!(!dir.path().join(MANIFEST_CURRENT).exists());
+    }
+
+    #[test]
+    fn scrub_manifest_scan_selects_prev_without_rewriting_it() {
+        let dir = TempDir::new().unwrap();
+        let prev_bytes =
+            write_manifest_candidate(dir.path(), MANIFEST_PREV, &valid_manifest_with_next(30));
+
+        let load = load_manifest_for_scrub(dir.path());
+
+        assert_eq!(load.source, Some(ManifestScrubSource::Prev));
+        assert_eq!(load.manifest.unwrap().next_node_id, 30);
+        assert_eq!(
+            std::fs::read(dir.path().join(MANIFEST_PREV)).unwrap(),
+            prev_bytes
+        );
+        assert!(!dir.path().join(MANIFEST_CURRENT).exists());
+        assert!(!dir.path().join(MANIFEST_TMP).exists());
+    }
+
+    #[test]
+    fn scrub_manifest_scan_records_invalid_current_and_fallback() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(MANIFEST_CURRENT), b"NOT VALID JSON {{{").unwrap();
+        write_manifest_candidate(dir.path(), MANIFEST_PREV, &valid_manifest_with_next(40));
+
+        let load = load_manifest_for_scrub(dir.path());
+
+        assert_eq!(load.source, Some(ManifestScrubSource::Prev));
+        assert_eq!(
+            count_manifest_finding(
+                &load,
+                MANIFEST_CURRENT,
+                DatabaseScrubFindingType::ManifestFileInvalid
+            ),
+            1
+        );
+        assert!(has_manifest_finding(
+            &load,
+            DatabaseScrubFindingType::ManifestFallbackUsed
+        ));
+    }
+
+    #[test]
+    fn scrub_manifest_scan_records_validation_invalid_current() {
+        let dir = TempDir::new().unwrap();
+        let mut invalid = valid_manifest_with_next(50);
+        invalid.label_token_schema_version = 0;
+        write_manifest_candidate(dir.path(), MANIFEST_CURRENT, &invalid);
+        write_manifest_candidate(dir.path(), MANIFEST_PREV, &valid_manifest_with_next(51));
+
+        let load = load_manifest_for_scrub(dir.path());
+
+        assert_eq!(load.source, Some(ManifestScrubSource::Prev));
+        let current_finding = load
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.component_kind == MANIFEST_CURRENT
+                    && finding.finding_type == DatabaseScrubFindingType::ManifestFileInvalid
+            })
+            .expect("validation-invalid current must be recorded");
+        assert_eq!(current_finding.severity, DatabaseScrubSeverity::Error);
+        assert!(current_finding
+            .detail
+            .contains("missing label token schema"));
+    }
+
+    #[test]
+    fn scrub_manifest_scan_records_read_error_current() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(MANIFEST_CURRENT)).unwrap();
+        write_manifest_candidate(dir.path(), MANIFEST_PREV, &valid_manifest_with_next(55));
+
+        let load = load_manifest_for_scrub(dir.path());
+
+        assert_eq!(load.source, Some(ManifestScrubSource::Prev));
+        let current_finding = load
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.component_kind == MANIFEST_CURRENT
+                    && finding.finding_type == DatabaseScrubFindingType::ManifestFileInvalid
+            })
+            .expect("read-error current must be recorded");
+        assert_eq!(current_finding.severity, DatabaseScrubSeverity::Error);
+        assert!(current_finding.detail.contains("cannot read"));
+        assert!(has_manifest_finding(
+            &load,
+            DatabaseScrubFindingType::ManifestFallbackUsed
+        ));
+    }
+
+    #[test]
+    fn scrub_manifest_scan_records_normalization_invalid_current() {
+        let dir = TempDir::new().unwrap();
+        let mut invalid = valid_manifest_with_next(56);
+        invalid.node_label_tokens.insert("Person".to_string(), 1);
+        invalid.next_node_label_id = 2;
+        invalid.schema_catalog_version = 0;
+        invalid.node_schemas.push(NodeSchemaManifestEntry {
+            schema_id: 1,
+            revision: 1,
+            label_id: 1,
+            created_at_ms: 100,
+            updated_at_ms: 100,
+            additional_properties: SchemaAdditionalPropertiesManifest::Allow,
+            properties: BTreeMap::new(),
+            key: None,
+            label_constraints: None,
+            weight: None,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+        write_manifest_candidate(dir.path(), MANIFEST_CURRENT, &invalid);
+        write_manifest_candidate(dir.path(), MANIFEST_PREV, &valid_manifest_with_next(57));
+
+        let load = load_manifest_for_scrub(dir.path());
+
+        assert_eq!(load.source, Some(ManifestScrubSource::Prev));
+        let current_finding = load
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.component_kind == MANIFEST_CURRENT
+                    && finding.finding_type == DatabaseScrubFindingType::ManifestFileInvalid
+            })
+            .expect("normalization-invalid current must be recorded");
+        assert_eq!(current_finding.severity, DatabaseScrubSeverity::Error);
+        assert!(current_finding
+            .detail
+            .contains("schema_catalog_version 0 cannot contain schema entries"));
+        assert!(has_manifest_finding(
+            &load,
+            DatabaseScrubFindingType::ManifestFallbackUsed
+        ));
+    }
+
+    #[test]
+    fn scrub_manifest_scan_records_invalid_current_and_tmp_before_prev() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(MANIFEST_CURRENT), b"NOT VALID JSON {{{").unwrap();
+        let mut invalid_tmp = valid_manifest_with_next(60);
+        invalid_tmp.next_node_label_id = 0;
+        write_manifest_candidate(dir.path(), MANIFEST_TMP, &invalid_tmp);
+        write_manifest_candidate(dir.path(), MANIFEST_PREV, &valid_manifest_with_next(61));
+
+        let load = load_manifest_for_scrub(dir.path());
+
+        assert_eq!(load.source, Some(ManifestScrubSource::Prev));
+        assert_eq!(
+            count_manifest_finding(
+                &load,
+                MANIFEST_CURRENT,
+                DatabaseScrubFindingType::ManifestFileInvalid
+            ),
+            1
+        );
+        assert_eq!(
+            count_manifest_finding(
+                &load,
+                MANIFEST_TMP,
+                DatabaseScrubFindingType::ManifestFileInvalid
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn scrub_manifest_scan_reports_missing_when_all_absent() {
+        let dir = TempDir::new().unwrap();
+
+        let load = load_manifest_for_scrub(dir.path());
+
+        assert!(load.manifest.is_none());
+        assert!(load.source.is_none());
+        assert_eq!(load.findings.len(), 1);
+        assert!(has_manifest_finding(
+            &load,
+            DatabaseScrubFindingType::ManifestMissing
+        ));
+    }
+
+    #[test]
+    fn scrub_manifest_scan_reports_all_invalid_candidates_and_missing() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(MANIFEST_CURRENT), b"NOT VALID JSON {{{").unwrap();
+        std::fs::write(dir.path().join(MANIFEST_TMP), b"NOT VALID JSON {{{").unwrap();
+        let mut invalid_prev = valid_manifest_with_next(70);
+        invalid_prev.label_token_schema_version = 0;
+        write_manifest_candidate(dir.path(), MANIFEST_PREV, &invalid_prev);
+
+        let load = load_manifest_for_scrub(dir.path());
+
+        assert!(load.manifest.is_none());
+        assert_eq!(
+            load.findings
+                .iter()
+                .filter(|finding| {
+                    finding.finding_type == DatabaseScrubFindingType::ManifestFileInvalid
+                })
+                .count(),
+            3
+        );
+        assert!(has_manifest_finding(
+            &load,
+            DatabaseScrubFindingType::ManifestMissing
+        ));
+    }
+
+    #[test]
+    fn scrub_manifest_scan_does_not_write_normalized_defaults() {
+        let dir = TempDir::new().unwrap();
+        let legacy_json = r#"{
+  "version": 1,
+  "label_token_schema_version": 1,
+  "node_label_tokens": {},
+  "edge_label_tokens": {},
+  "next_node_label_id": 1,
+  "next_edge_label_id": 1,
+  "segments": [],
+  "next_node_id": 10,
+  "next_edge_id": 20,
+  "prune_policies": {},
+  "next_engine_seq": 0,
+  "next_wal_generation_id": 0,
+  "active_wal_generation_id": 0,
+  "pending_flush_epochs": []
+}"#;
+        let path = dir.path().join(MANIFEST_CURRENT);
+        std::fs::write(&path, legacy_json).unwrap();
+
+        let load = load_manifest_for_scrub(dir.path());
+
+        let manifest = load.manifest.unwrap();
+        assert_eq!(load.source, Some(ManifestScrubSource::Current));
+        assert_eq!(
+            manifest.schema_catalog_version,
+            crate::types::SCHEMA_CATALOG_VERSION
+        );
+        assert!(manifest.secondary_indexes.is_empty());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), legacy_json);
+    }
+
+    #[test]
+    fn path_scrub_implementation_does_not_call_open_or_mutating_helpers() {
+        let source = include_str!("scrub.rs").replace("\r\n", "\n");
+        let implementation = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        let wal_source = include_str!("wal.rs").replace("\r\n", "\n");
+        let wal_scanner = wal_source
+            .split("pub(crate) fn scrub_generation_readonly")
+            .nth(1)
+            .unwrap()
+            .split("impl WalReader")
+            .next()
+            .unwrap();
+        for forbidden in [
+            concat!("DatabaseEngine", "::open("),
+            concat!("EngineCore", "::open("),
+            concat!("WalWriter", "::open_generation("),
+            concat!("WalReader", "::"),
+            concat!("read_generation_recoverable", "("),
+            concat!("replay_wal_generation_to_memtable", "("),
+            concat!("write_manifest", "("),
+            concat!("load_manifest", "("),
+            concat!("load_manifest_readonly", "("),
+            concat!("try_load_manifest_file", "("),
+            concat!("remove_wal_generation", "("),
+            concat!("truncate_wal_generation_to", "("),
+            concat!("cleanup_orphan_segments", "("),
+            concat!("cleanup_orphan_wal_files", "("),
+            concat!("cleanup_orphan_optional_component_files", "("),
+            concat!("remove_file", "("),
+            concat!("remove_dir_all", "("),
+            concat!("rename", "("),
+        ] {
+            for (name, code) in [
+                ("path-level scrub implementation", implementation),
+                ("read-only WAL scrub scanner", wal_scanner),
+            ] {
+                assert!(
+                    !code.contains(forbidden),
+                    "{name} must not contain {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scrub_path_reports_selected_manifest_changed_during_scrub() {
+        let dir = TempDir::new().unwrap();
+        write_manifest_candidate(dir.path(), MANIFEST_CURRENT, &valid_manifest_with_next(80));
+        let db_dir = dir.path().to_path_buf();
+        let hook_dir = db_dir.clone();
+        set_manifest_stability_test_hook(db_dir.clone(), move || {
+            write_manifest_candidate(&hook_dir, MANIFEST_CURRENT, &valid_manifest_with_next(81));
+        });
+
+        let report = scrub_path_with_options(
+            &db_dir,
+            &ScrubPathOptions {
+                validate_wal: false,
+                include_orphan_segments: false,
+                check_manifest_stability: true,
+            },
+        )
+        .unwrap();
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.finding_type == DatabaseScrubFindingType::ManifestChangedDuringScrub
+                && finding.severity == DatabaseScrubSeverity::Warning
+        }));
     }
 
     #[test]

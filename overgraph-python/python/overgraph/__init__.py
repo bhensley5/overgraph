@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from .overgraph import *  # noqa: F401,F403
-from .async_api import AsyncOverGraph, AsyncWriteTxn  # noqa: F401
+from .async_api import AsyncOverGraph, AsyncWriteTxn, async_scrub_path  # noqa: F401
 
 
 def _set_if_not_none(target: dict[str, Any], key: str, value: Any) -> None:

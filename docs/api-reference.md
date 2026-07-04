@@ -163,6 +163,7 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
   - [ingest_mode](#ingest_mode)
   - [end_ingest](#end_ingest)
   - [scrub](#scrub)
+  - [scrub_path](#scrub_path)
 - [Introspection](#introspection)
   - [node_count](#node_count)
   - [edge_count](#edge_count)
@@ -3269,8 +3270,25 @@ Result fields:
 | columns | `columns` | `columns` | `columns` | Output column names in row order. |
 | rows | `rows: Vec<GraphRow>` | `rows: object[]` or `rows: any[][]` | `rows: list[dict]` or `list[list]` | Rust rows are positional `values`. Connectors return objects by default and arrays when compact rows are enabled. |
 | next cursor | `next_cursor` | `nextCursor` | `next_cursor` | Final logical row cursor for the next page, or null/None on the last page. |
-| stats | `stats` | `stats` | `stats` | Row counts, peak intermediate/frontier counts, path count, db-hit counter, effective epoch, elapsed time, and warnings. |
+| stats | `stats` | `stats` | `stats` | Row counts, peak intermediate/frontier counts, path count, db-hit counter, effective epoch, profile timings, and warnings. |
 | plan | `plan` | `plan` | `plan` | `GraphRowExplain` when `options.include_plan` / `includePlan` / `include_plan` is true; otherwise null/None. |
+
+Graph-row stats fields:
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| Rows returned | `rows_returned` | `rowsReturned` | `rows_returned` | Final result rows returned in this page. |
+| Rows after filter | `rows_after_filter` | `rowsAfterFilter` | `rows_after_filter` | Rows remaining after row-level filtering before final row operations. |
+| Rows seen for page | `rows_seen_for_page` | `rowsSeenForPage` | `rows_seen_for_page` | Rows considered by final pagination/cursor handling. |
+| Intermediate binding peak | `intermediate_bindings_peak` | `intermediateBindingsPeak` | `intermediate_bindings_peak` | Peak row bindings held during graph-row execution. |
+| Frontier peak | `frontier_peak` | `frontierPeak` | `frontier_peak` | Peak traversal frontier size. |
+| Paths enumerated | `paths_enumerated` | `pathsEnumerated` | `paths_enumerated` | Bounded path values enumerated while executing the graph-row request. |
+| Work counter | `db_hits` | `dbHits` | `db_hits` | Best-effort profile work units, not a storage IO contract. |
+| Elapsed time | `elapsed_us` | `elapsedUs` | `elapsed_us` | Total graph-row read-view time in microseconds. Populated only when `profile` is true. |
+| Planning time | `planning_ns` | `planningNs` | `planning_ns` | Runtime-plan normalization plus physical graph-row planning time in nanoseconds. Populated only when `profile` is true. |
+| Execution time | `execution_ns` | `executionNs` | `execution_ns` | Physical graph-row execution and returned-row preparation time in nanoseconds. Populated only when `profile` is true. |
+| Effective epoch | `effective_at_epoch` | `effectiveAtEpoch` | `effective_at_epoch` | Temporal epoch used for the graph-row read. |
+| Warnings | `warnings` | `warnings` | `warnings` | Cap, ordering, full-scan, cursor, and planning warnings. |
 
 Optional misses produce null values. In Rust that is `GraphValue::Null`; Node.js serializes it as
 `null`; Python serializes it as `None`.
@@ -4629,6 +4647,12 @@ Nested read explain fields:
 For `graph_pipeline_query`, `projection` summarizes the read stages, including match, projection,
 `DISTINCT`, aggregation, union, shortest path, subquery, row operations, cursors, and caps. Execution
 stats are reported on `stats`; `elapsedUs` / `elapsed_us` is populated only when `profile` is true.
+For profiled GQL reads, notes may include a diagnostic stage-timing line with bind, lower, prepare,
+snapshot, graph-row, and projection timings plus planner counters. Reads that lower to native
+graph-row execution keep the existing `graph_row_plan_and_execute` total and add
+`graph_row_planning` and `graph_row_execution` split buckets. The structured split is also exposed
+directly on native graph-row stats as `planning_ns` / `planningNs` and `execution_ns` /
+`executionNs`.
 
 Nested mutation explain fields:
 
@@ -6715,10 +6739,15 @@ hits = db.vector_search("hybrid", k=10,
 |-----------|------|---------|--------|----------|---------|-------------|
 | mode | `VectorSearchMode` | `string` | `str` | Yes | — | `"dense"`, `"sparse"`, or `"hybrid"`. Determines which query vector(s) and index to use. |
 | k | `usize` | `number` | `int` | Yes | — | Number of top results to return. |
-| dense_query | `Option<Vec<f32>>` | `number[]` | `list[float]` | Required for `dense`/`hybrid` | `None` | Query vector for dense search. Must have the same dimension as configured at `open()`. |
-| sparse_query | `Option<Vec<(u32, f32)>>` | `SparseEntry[]` | `list[tuple[int, float]]` | Required for `sparse`/`hybrid` | `None` | Query vector for sparse search. List of `(dimension_index, value)` pairs. |
+| dense_query | `Option<Vec<f32>>` | `number[]` | `list[float]` | Required for `dense`; optional for `hybrid` | `None` | Query vector for dense search. Must have the same dimension as configured at `open()`. In `hybrid` mode, provide `dense_query`, `sparse_query`, or both. |
+| sparse_query | `Option<Vec<(u32, f32)>>` | `SparseEntry[]` | `list[tuple[int, float]]` | Required for `sparse`; optional for `hybrid` | `None` | Query vector for sparse search. List of `(dimension_index, value)` pairs. In `hybrid` mode, provide `dense_query`, `sparse_query`, or both. |
 | label_filter | `Option<NodeLabelFilter>` | `labelFilter: { labels: string[], mode: "any" \| "all" }` | `label_filter: dict` | No | `None` | Node-label filter. |
 | ef_search | `Option<usize>` | `number` | `int` | No | `128` | HNSW search expansion factor. The effective dense fetch limit is at least `k` and at least `8`. Higher values improve recall at the cost of latency. Only applies to dense/hybrid modes. |
+
+Dense vector search requires a database-level dense vector dimension. If a dense query is
+provided against a database without dense-vector configuration, OverGraph returns a setup
+error instead of an empty result. Sparse-only search does not require dense-vector
+configuration.
 
 **Hybrid fusion parameters** (only used when `mode = "hybrid"`):
 
@@ -7110,7 +7139,9 @@ stats = db.end_ingest()  # CompactionStats | None
 
 ### scrub
 
-Runs an offline integrity check across all segments. Recomputes SHA-256 payload digests for every component and compares them to the digests recorded at write time. Reports mismatches without modifying any data.
+Runs an explicit online integrity check through an already opened database handle. The engine takes a live manifest snapshot, recomputes SHA-256 payload digests for every published segment component, and compares them to the digests recorded at write time. Reports mismatches without modifying any data.
+
+Use this when the database can already open successfully and you want to verify the published segment payloads visible to that engine instance. This is not the true path-level offline scrub: opening the database can perform normal recovery before `db.scrub()` runs.
 
 **Rust**
 ```rust
@@ -7138,7 +7169,7 @@ report = db.scrub()
 print(f"checked: {report.total_components_checked}, failed: {report.total_components_failed}")
 
 # async
-report = await db.scrub()
+report = await adb.scrub()
 ```
 
 #### Parameters
@@ -7170,16 +7201,111 @@ None.
 | Field | Rust | Node.js | Python | Description |
 |-------|------|---------|--------|-------------|
 | component_kind | `String` | `string` | `str` | Which component type had the problem (e.g. `"NodeRecords"`, `"PlannerStats"`). |
-| finding_type | `ScrubFindingType` | `string` | `str` | Classification: `PayloadDigestMismatch`, `ComponentIdMismatch`, `DependencyDigestMismatch`, `IdentityHeaderMismatch`, `ContainerIdMismatch`, `SegmentIdentityMismatch`, `RangeOverflow`, `RangeOverlap`, `FileMissing`, or `IoError`. |
+| finding_type | `ScrubFindingType` | `string` | `str` | Classification: `PayloadDigestMismatch`, `ComponentIdMismatch`, `DependencyDigestMismatch`, `IdentityHeaderMismatch`, `ContainerIdMismatch`, `SegmentIdentityMismatch`, `SemanticMismatch`, `RangeOverflow`, `RangeOverlap`, `FileMissing`, or `IoError`. |
 | detail | `String` | `string` | `str` | Human-readable description of the finding. |
 
 #### Behavior
 
-- Scrub is **read-only** — it never modifies data on disk.
-- Scrub is **offline** — it is never called automatically during open, query, flush, or compaction. You must call it explicitly.
+- Scrub is **read-only** - it never modifies data on disk.
+- Scrub is **explicit** - it is never called automatically during open, query, flush, or compaction. You must call it explicitly.
+- Scrub is **online** in the sense that it runs through an opened engine and uses that engine's live manifest snapshot.
 - Segments are checked in parallel using a shared thread pool. The work is I/O-bound (streaming 64KB-buffered reads + SHA-256), not CPU-bound.
 - A healthy database returns `total_components_failed == 0` and an empty `findings` array for every segment.
 - If a segment directory is missing (e.g. deleted concurrently), the scrub reports a `FileMissing` finding rather than panicking.
+
+---
+
+### scrub_path
+
+Runs a true offline, path-level database scrub without opening the engine. It reads the database directory directly, selects the first valid manifest from `manifest.current`, `manifest.tmp`, and `manifest.prev`, verifies manifest-published segments, structurally validates manifest-referenced WAL generations, reports orphan segment/WAL artifacts, and optionally component-scrubs orphan segments.
+
+This API is authoritative for closed or otherwise quiescent database directories. It is safe to run against a live directory because it is read-only, but live-directory results are best-effort; enable the default manifest stability check to detect obvious manifest changes during the scan.
+
+Path-level scrub never repairs, truncates, adopts, deletes, replays WAL, promotes manifests, or rewrites normalized manifest defaults.
+
+**Rust**
+```rust
+use std::path::Path;
+
+let report = overgraph::scrub_path(Path::new("./my-db"))?;
+
+let options = overgraph::ScrubPathOptions {
+    validate_wal: true,
+    include_orphan_segments: true,
+    check_manifest_stability: true,
+};
+let report = overgraph::scrub_path_with_options(Path::new("./my-db"), &options)?;
+```
+
+**Node.js**
+```javascript
+import { scrubPath, scrubPathAsync } from "overgraph";
+
+const report = scrubPath("./my-db", { includeOrphanSegments: true });
+const asyncReport = await scrubPathAsync("./my-db", { validateWal: false });
+```
+
+**Python**
+```python
+from overgraph import scrub_path
+from overgraph.async_api import async_scrub_path
+
+report = scrub_path("./my-db", include_orphan_segments=True)
+async_report = await async_scrub_path("./my-db", validate_wal=False)
+```
+
+#### Parameters
+
+| Option | Rust | Node.js | Python | Default | Description |
+|--------|------|---------|--------|---------|-------------|
+| validate WAL | `validate_wal` | `validateWal` | `validate_wal` | `true` | Validate manifest-referenced current-layout `wal_*.wal` generations without replaying or truncating them. |
+| include orphan segments | `include_orphan_segments` | `includeOrphanSegments` | `include_orphan_segments` | `false` | Component-scrub orphan segment directories. Semantic checks that require the root manifest are skipped. |
+| check manifest stability | `check_manifest_stability` | `checkManifestStability` | `check_manifest_stability` | `true` | Re-read the selected manifest at the end and report a warning if it changed. |
+
+#### Returns: DatabaseScrubReport
+
+| Field | Rust | Node.js | Python | Description |
+|-------|------|---------|--------|-------------|
+| manifest | `Option<ManifestScrubSummary>` | `ManifestScrubSummary \| null` | `ManifestScrubSummary \| None` | Selected manifest summary, or none when no valid manifest exists. |
+| findings | `Vec<DatabaseScrubFinding>` | `Array<DatabaseScrubFinding>` | `list[DatabaseScrubFinding]` | Database-level findings with `info`, `warning`, or `error` severity. |
+| segments | `Vec<SegmentScrubResult>` | `Array<SegmentScrubResult>` | `list[SegmentScrubResult]` | Manifest-published segment scrub results. |
+| wal_generations | `Vec<WalScrubResult>` | `Array<WalScrubResult>` | `list[WalScrubResult]` | Manifest-referenced WAL generation results. Empty when WAL validation is disabled or no valid manifest exists. |
+| orphan_segments | `Vec<OrphanSegmentScrubResult>` | `Array<OrphanSegmentScrubResult>` | `list[OrphanSegmentScrubResult]` | Opt-in component results for orphan segment directories. |
+| total_components_checked | `u64` | `number` | `int` | Segment/orphan component checks that actually ran. |
+| total_components_ok | `u64` | `number` | `int` | Components that passed. |
+| total_components_failed | `u64` | `number` | `int` | Components with one or more component findings. |
+| total_bytes_digested | `u64` | `number` | `int` | Segment/orphan component bytes hashed. |
+| total_wal_records_checked | `u64` | `number` | `int` | WAL records structurally checked. |
+| total_wal_bytes_checked | `u64` | `number` | `int` | WAL bytes structurally checked. |
+| duration_ms | `u64` | `number` | `int` | Wall-clock time in milliseconds. |
+
+#### Nested DTOs
+
+`ManifestScrubSummary` includes `source` (`Current`, `Tmp`, or `Prev`), `segment_count`, `pending_flush_count`, `active_wal_generation_id`, and `next_wal_generation_id`.
+
+`DatabaseScrubFinding` includes `component_kind`, `finding_type`, `severity`, and `detail`. Finding types are `ManifestMissing`, `ManifestFileInvalid`, `ManifestFallbackUsed`, `ManifestChangedDuringScrub`, `WalMissing`, `WalCorrupt`, `WalTrailingBytes`, `OrphanSegment`, `OrphanWal`, `OrphanSegmentUnpinned`, and `OrphanSegmentScrubSkipped`.
+
+`WalScrubResult` includes `generation_id`, `role` (`Active`, `FrozenPendingFlush`, or `PublishedPendingRetire`), optional `epoch_id`, optional `segment_id`, `file_len`, `durable_len`, `trailing_bytes`, `records_checked`, `bytes_checked`, and per-WAL findings.
+
+`OrphanSegmentScrubResult` includes optional `segment_id`, `path`, component `findings`, `components_ok`, `bytes_digested`, and `semantic_checks_skipped`.
+
+#### CLI
+
+The `cli` feature builds `overgraph-scrub`:
+
+```bash
+overgraph-scrub [--json] [--include-orphan-segments] [--no-wal] [--no-stability-check] <db-path>
+```
+
+Text output is a concise human-readable summary. `--json` emits the full connector-style `DatabaseScrubReport` shape with camelCase fields.
+
+Exit codes:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Scrub completed with no error-severity database findings and no failed component checks. Warning-only findings, such as orphan discovery without deep scrub, still exit `0`. |
+| `1` | Scrub completed and found error-severity database findings or failed segment/orphan component checks. |
+| `2` | Invocation error, root directory error, scrub `EngineError`, or JSON serialization error prevented report output. |
 
 ---
 
@@ -7581,7 +7707,9 @@ asyncio.run(main())
 | | `compact_with_progress` | Merge with progress |
 | | `ingest_mode` | Enter bulk mode |
 | | `end_ingest` | Exit bulk mode + compact |
-| | `scrub` | Validate database integrity |
+| | `scrub` | Explicit online segment integrity check |
+| | `scrub_path` | True offline path-level integrity check |
+| | `overgraph-scrub` | CLI for true offline path-level integrity check |
 | **Introspection** | `path` | Database directory path |
 | | `manifest` | Rust raw manifest diagnostics |
 | | `next_node_id` | Rust next node ID diagnostic |

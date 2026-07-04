@@ -3,7 +3,7 @@ members = [".", "overgraph-node", "overgraph-python"]
 
 [package]
 name = "overgraph"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 description = "An absurdly fast embedded graph database. Pure Rust, sub-microsecond reads."
 license = "MIT OR Apache-2.0"
@@ -36,12 +36,21 @@ path = "src/bin/inspect.rs"
 required-features = ["cli"]
 
 [[bin]]
+name = "overgraph-scrub"
+path = "src/bin/scrub.rs"
+required-features = ["cli"]
+
+[[bin]]
 name = "benchmark-harness"
 path = "src/bin/benchmark_harness.rs"
 required-features = ["cli"]
 
 [[test]]
 name = "inspect_integration"
+required-features = ["cli"]
+
+[[test]]
+name = "scrub_cli_integration"
 required-features = ["cli"]
 
 [[example]]

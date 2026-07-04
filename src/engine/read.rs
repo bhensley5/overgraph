@@ -2678,7 +2678,9 @@ impl ReadView {
         }
 
         let Some(config) = self.manifest.dense_vector.as_ref() else {
-            return Ok(Vec::new());
+            return Err(EngineError::InvalidOperation(
+                "dense vector search is not configured; open the database with a dense vector dimension before using dense queries".into(),
+            ));
         };
         validate_dense_vector(query, config)?;
 

@@ -23,7 +23,8 @@ cargo add overgraph
 
 ## Open a database
 
-A database is a directory on disk. Pass a vector dimension if you want to use dense vector search.
+A database is a directory on disk. Pass a vector dimension when creating a database if you
+want to write dense vectors or run dense vector search.
 
 **Python**
 ```python
@@ -56,6 +57,10 @@ let opts = DbOptions {
 };
 let mut db = DatabaseEngine::open(Path::new("./my-graph"), &opts)?;
 ```
+
+Dense vector search is disabled unless the database has a dense vector dimension. Dense
+queries on a database without dense-vector configuration return a setup error; sparse-only
+search does not require this option.
 
 ## Choose labels and edge labels
 
@@ -270,6 +275,10 @@ for n in &neighbors {
 ```
 
 ## Vector search
+
+Hybrid search accepts a dense query, a sparse query, or both. When both are present,
+OverGraph fuses the two rankings; when only one is present, hybrid mode uses that
+single modality.
 
 **Python**
 ```python
