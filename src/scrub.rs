@@ -108,7 +108,7 @@ pub fn scrub_path_with_options(
     let mut referenced_wal_generations = HashSet::new();
 
     if let (Some(manifest), Some(source)) = (&manifest_load.manifest, manifest_load.source) {
-        manifest_summary = Some(build_manifest_summary(source, &manifest));
+        manifest_summary = Some(build_manifest_summary(source, manifest));
         let segment_report = scrub_database(path, manifest)?;
         segments = segment_report.segments;
         total_components_checked = segment_report.total_components_checked;
@@ -2737,9 +2737,9 @@ mod tests {
 
     #[test]
     fn path_scrub_implementation_does_not_call_open_or_mutating_helpers() {
-        let source = include_str!("scrub.rs");
+        let source = include_str!("scrub.rs").replace("\r\n", "\n");
         let implementation = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
-        let wal_source = include_str!("wal.rs");
+        let wal_source = include_str!("wal.rs").replace("\r\n", "\n");
         let wal_scanner = wal_source
             .split("pub(crate) fn scrub_generation_readonly")
             .nth(1)

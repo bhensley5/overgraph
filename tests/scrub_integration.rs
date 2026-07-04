@@ -508,7 +508,7 @@ fn test_scrub_path_zero_byte_active_wal_uses_missing_severity() {
     let db = open_test_db(&db_path);
     db.close().unwrap();
     let manifest = read_manifest_state(&db_path);
-    std::fs::write(wal_path(&db_path, manifest.active_wal_generation_id), &[]).unwrap();
+    std::fs::write(wal_path(&db_path, manifest.active_wal_generation_id), []).unwrap();
 
     let report = scrub_path(&db_path).unwrap();
 
