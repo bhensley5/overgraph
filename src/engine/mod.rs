@@ -3150,7 +3150,7 @@ fn normalize_node_vectors_for_write(
         Some(values) => {
             let config = dense_config.ok_or_else(|| {
                 EngineError::InvalidOperation(
-                    "dense vector writes require DbOptions::dense_vector to be configured".into(),
+                    "dense vector writes are not configured; open the database with a dense vector dimension before writing dense vectors".into(),
                 )
             })?;
             validate_dense_vector(values, config)?;

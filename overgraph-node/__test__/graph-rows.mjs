@@ -80,10 +80,29 @@ describe('graph row connector API', () => {
       limit: 10,
     };
 
-    assert.deepEqual(db.queryGraphRows(request).rows, [
+    const plain = db.queryGraphRows(request);
+    assert.equal(plain.stats.planningNs, null);
+    assert.equal(plain.stats.executionNs, null);
+    assert.deepEqual(plain.rows, [
       { a: ids.ada, r: ids.ab, b: ids.ben },
       { a: ids.ada, r: ids.ad, b: ids.dee },
     ]);
+
+    const profiled = db.queryGraphRows({
+      ...request,
+      options: { profile: true },
+    });
+    assert.equal(typeof profiled.stats.planningNs, 'number');
+    assert.equal(typeof profiled.stats.executionNs, 'number');
+
+    const fastProfiled = db.queryGraphRows({
+      nodes: [{ alias: 'n', ids: [ids.ada] }],
+      return: [{ expr: { binding: 'n' }, as: 'n' }],
+      limit: 1,
+      options: { profile: true },
+    });
+    assert.equal(typeof fastProfiled.stats.planningNs, 'number');
+    assert.equal(typeof fastProfiled.stats.executionNs, 'number');
 
     const compact = db.queryGraphRows({
       ...request,

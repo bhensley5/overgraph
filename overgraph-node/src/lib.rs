@@ -11,10 +11,13 @@ use overgraph::{
     gql_referenced_param_names, AdjacencyExport as CoreAdjacencyExport,
     AllShortestPathsOptions as CoreAllShortestPathsOptions, CompactionPhase,
     CompactionStats as CoreCompactionStats, ComponentOptions, DatabaseEngine,
-    DbOptions as CoreDbOptions, DbStats as CoreDbStats, DegreeOptions as CoreDegreeOptions,
-    DenseMetric, DenseVectorConfig as CoreDenseVectorConfig,
-    DenseVectorSchema as CoreDenseVectorSchema, Direction, EdgeFilterExpr,
-    EdgeInput as CoreEdgeInput, EdgeLabelInfo as CoreEdgeLabelInfo,
+    DatabaseScrubFinding as CoreDatabaseScrubFinding,
+    DatabaseScrubFindingType as CoreDatabaseScrubFindingType,
+    DatabaseScrubReport as CoreDatabaseScrubReport,
+    DatabaseScrubSeverity as CoreDatabaseScrubSeverity, DbOptions as CoreDbOptions,
+    DbStats as CoreDbStats, DegreeOptions as CoreDegreeOptions, DenseMetric,
+    DenseVectorConfig as CoreDenseVectorConfig, DenseVectorSchema as CoreDenseVectorSchema,
+    Direction, EdgeFilterExpr, EdgeInput as CoreEdgeInput, EdgeLabelInfo as CoreEdgeLabelInfo,
     EdgeMetadataIndexField as CoreEdgeMetadataIndexField,
     EdgePropertyIndexInfo as CoreEdgePropertyIndexInfo, EdgeQuery, EdgeQueryOrder,
     EdgeSchema as CoreEdgeSchema, EdgeSchemaInfo as CoreEdgeSchemaInfo,
@@ -49,15 +52,17 @@ use overgraph::{
     GraphShortestPathStage, GraphSubqueryStage, GraphUnaryOp, GraphUnionStage, GraphValue,
     GraphVariableLengthPattern, GraphVectorSelection, HnswConfig,
     IsConnectedOptions as CoreIsConnectedOptions, LabelMatchMode as CoreLabelMatchMode,
-    NeighborEntry as CoreNeighborEntry, NeighborOptions, NodeFilterExpr, NodeIdMap,
-    NodeInput as CoreNodeInput, NodeKeyQuery,
+    ManifestScrubSource as CoreManifestScrubSource,
+    ManifestScrubSummary as CoreManifestScrubSummary, NeighborEntry as CoreNeighborEntry,
+    NeighborOptions, NodeFilterExpr, NodeIdMap, NodeInput as CoreNodeInput, NodeKeyQuery,
     NodeLabelConstraintSchema as CoreNodeLabelConstraintSchema,
     NodeLabelFilter as CoreNodeLabelFilter, NodeLabelInfo as CoreNodeLabelInfo,
     NodeMetadataIndexField as CoreNodeMetadataIndexField,
     NodePropertyIndexInfo as CoreNodePropertyIndexInfo, NodeQuery, NodeQueryOrder,
     NodeSchema as CoreNodeSchema, NodeSchemaInfo as CoreNodeSchemaInfo, NodeView as CoreNodeView,
-    NumericFieldSchema as CoreNumericFieldSchema, PageRequest, PageResult, PprAlgorithm,
-    PprOptions, PprResult as CorePprResult, PropValue,
+    NumericFieldSchema as CoreNumericFieldSchema,
+    OrphanSegmentScrubResult as CoreOrphanSegmentScrubResult, PageRequest, PageResult,
+    PprAlgorithm, PprOptions, PprResult as CorePprResult, PropValue,
     PropertyRangeBound as CorePropertyRangeBound, PropertyRangeCursor as CorePropertyRangeCursor,
     PropertyRangePageRequest, PropertyRangePageResult as CorePropertyRangePageResult,
     PropertySchema as CorePropertySchema, PrunePolicy as CorePrunePolicy, PrunePolicyInfo,
@@ -69,19 +74,20 @@ use overgraph::{
     SchemaValidationReport as CoreSchemaValidationReport, SchemaValueType as CoreSchemaValueType,
     SchemaVectorPresence as CoreSchemaVectorPresence, SchemaViolation as CoreSchemaViolation,
     SchemaViolationTarget as CoreSchemaViolationTarget, ScoringMode,
-    ScrubReport as CoreScrubReport, SecondaryIndexField as CoreSecondaryIndexField,
-    SecondaryIndexKind as CoreSecondaryIndexKind, SecondaryIndexSpec as CoreSecondaryIndexSpec,
-    SecondaryIndexState, ShortestPath as CoreShortestPath,
-    ShortestPathOptions as CoreShortestPathOptions, SparseVectorSchema as CoreSparseVectorSchema,
-    StringFieldSchema as CoreStringFieldSchema, Subgraph, SubgraphOptions, TopKOptions,
-    TraversalCursor as CoreTraversalCursor, TraversalHit as CoreTraversalHit,
-    TraversalPageResult as CoreTraversalPageResult, TraverseOptions as CoreTraverseOptions,
-    TxnCommitResult as CoreTxnCommitResult, TxnEdgeRef as CoreTxnEdgeRef,
-    TxnEdgeView as CoreTxnEdgeView, TxnIntent, TxnLocalRef, TxnNodeRef as CoreTxnNodeRef,
-    TxnNodeView as CoreTxnNodeView, UpsertEdgeOptions as CoreUpsertEdgeOptions,
-    UpsertNodeOptions as CoreUpsertNodeOptions, VectorHit as CoreVectorHit, VectorSearchMode,
-    VectorSearchRequest, VectorSearchScope as CoreVectorSearchScope, WalSyncMode,
-    WriteTxn as CoreWriteTxn,
+    ScrubPathOptions as CoreScrubPathOptions, ScrubReport as CoreScrubReport,
+    SecondaryIndexField as CoreSecondaryIndexField, SecondaryIndexKind as CoreSecondaryIndexKind,
+    SecondaryIndexSpec as CoreSecondaryIndexSpec, SecondaryIndexState,
+    ShortestPath as CoreShortestPath, ShortestPathOptions as CoreShortestPathOptions,
+    SparseVectorSchema as CoreSparseVectorSchema, StringFieldSchema as CoreStringFieldSchema,
+    Subgraph, SubgraphOptions, TopKOptions, TraversalCursor as CoreTraversalCursor,
+    TraversalHit as CoreTraversalHit, TraversalPageResult as CoreTraversalPageResult,
+    TraverseOptions as CoreTraverseOptions, TxnCommitResult as CoreTxnCommitResult,
+    TxnEdgeRef as CoreTxnEdgeRef, TxnEdgeView as CoreTxnEdgeView, TxnIntent, TxnLocalRef,
+    TxnNodeRef as CoreTxnNodeRef, TxnNodeView as CoreTxnNodeView,
+    UpsertEdgeOptions as CoreUpsertEdgeOptions, UpsertNodeOptions as CoreUpsertNodeOptions,
+    VectorHit as CoreVectorHit, VectorSearchMode, VectorSearchRequest,
+    VectorSearchScope as CoreVectorSearchScope, WalScrubResult as CoreWalScrubResult,
+    WalScrubRole as CoreWalScrubRole, WalSyncMode, WriteTxn as CoreWriteTxn,
 };
 
 /// ThreadsafeFunction with `CalleeHandled = false` so the JS callback
@@ -369,7 +375,7 @@ impl ToNapiValue for GraphJsValue {
     }
 }
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 // ============================================================
@@ -378,6 +384,22 @@ use std::sync::{Arc, Condvar, Mutex};
 
 struct InnerDb {
     engine: DatabaseEngine,
+}
+
+#[napi]
+pub fn scrub_path(path: String, options: Option<ScrubPathOptions>) -> Result<DatabaseScrubReport> {
+    let options = js_scrub_path_options_to_rust(options);
+    overgraph::scrub_path_with_options(Path::new(&path), &options)
+        .map(DatabaseScrubReport::from)
+        .map_err(|e| napi::Error::from_reason(e.to_string()))
+}
+
+#[napi(ts_return_type = "Promise<DatabaseScrubReport>")]
+pub fn scrub_path_async(path: String, options: Option<ScrubPathOptions>) -> AsyncTask<ScrubPathOp> {
+    AsyncTask::new(ScrubPathOp {
+        path: PathBuf::from(path),
+        options: js_scrub_path_options_to_rust(options),
+    })
 }
 
 #[napi]
@@ -4999,6 +5021,241 @@ impl From<overgraph::ComponentScrubFinding> for ComponentScrubFinding {
 }
 
 #[napi(object)]
+pub struct ScrubPathOptions {
+    pub validate_wal: Option<bool>,
+    pub include_orphan_segments: Option<bool>,
+    pub check_manifest_stability: Option<bool>,
+}
+
+fn js_scrub_path_options_to_rust(options: Option<ScrubPathOptions>) -> CoreScrubPathOptions {
+    let mut core = CoreScrubPathOptions::default();
+    if let Some(options) = options {
+        if let Some(validate_wal) = options.validate_wal {
+            core.validate_wal = validate_wal;
+        }
+        if let Some(include_orphan_segments) = options.include_orphan_segments {
+            core.include_orphan_segments = include_orphan_segments;
+        }
+        if let Some(check_manifest_stability) = options.check_manifest_stability {
+            core.check_manifest_stability = check_manifest_stability;
+        }
+    }
+    core
+}
+
+#[napi(object)]
+pub struct DatabaseScrubReport {
+    pub manifest: serde_json::Value,
+    pub findings: Vec<DatabaseScrubFinding>,
+    pub segments: Vec<SegmentScrubResult>,
+    pub wal_generations: Vec<WalScrubResult>,
+    pub orphan_segments: Vec<OrphanSegmentScrubResult>,
+    pub total_components_checked: f64,
+    pub total_components_ok: f64,
+    pub total_components_failed: f64,
+    pub total_bytes_digested: f64,
+    pub total_wal_records_checked: f64,
+    pub total_wal_bytes_checked: f64,
+    pub duration_ms: f64,
+}
+
+#[napi(object)]
+pub struct ManifestScrubSummary {
+    pub source: String,
+    pub segment_count: f64,
+    pub pending_flush_count: f64,
+    pub active_wal_generation_id: f64,
+    pub next_wal_generation_id: f64,
+}
+
+#[napi(object)]
+pub struct DatabaseScrubFinding {
+    pub component_kind: String,
+    pub finding_type: String,
+    pub severity: String,
+    pub detail: String,
+}
+
+#[napi(object)]
+pub struct WalScrubResult {
+    pub generation_id: f64,
+    pub role: String,
+    pub epoch_id: serde_json::Value,
+    pub segment_id: serde_json::Value,
+    pub file_len: f64,
+    pub durable_len: f64,
+    pub trailing_bytes: f64,
+    pub records_checked: f64,
+    pub bytes_checked: f64,
+    pub findings: Vec<DatabaseScrubFinding>,
+}
+
+#[napi(object)]
+pub struct OrphanSegmentScrubResult {
+    pub segment_id: serde_json::Value,
+    pub path: String,
+    pub findings: Vec<ComponentScrubFinding>,
+    pub components_ok: f64,
+    pub bytes_digested: f64,
+    pub semantic_checks_skipped: bool,
+}
+
+impl From<CoreDatabaseScrubReport> for DatabaseScrubReport {
+    fn from(r: CoreDatabaseScrubReport) -> Self {
+        DatabaseScrubReport {
+            manifest: r
+                .manifest
+                .map(manifest_scrub_summary_to_json)
+                .unwrap_or(serde_json::Value::Null),
+            findings: r
+                .findings
+                .into_iter()
+                .map(DatabaseScrubFinding::from)
+                .collect(),
+            segments: r
+                .segments
+                .into_iter()
+                .map(SegmentScrubResult::from)
+                .collect(),
+            wal_generations: r
+                .wal_generations
+                .into_iter()
+                .map(WalScrubResult::from)
+                .collect(),
+            orphan_segments: r
+                .orphan_segments
+                .into_iter()
+                .map(OrphanSegmentScrubResult::from)
+                .collect(),
+            total_components_checked: r.total_components_checked as f64,
+            total_components_ok: r.total_components_ok as f64,
+            total_components_failed: r.total_components_failed as f64,
+            total_bytes_digested: r.total_bytes_digested as f64,
+            total_wal_records_checked: r.total_wal_records_checked as f64,
+            total_wal_bytes_checked: r.total_wal_bytes_checked as f64,
+            duration_ms: r.duration_ms as f64,
+        }
+    }
+}
+
+impl From<CoreManifestScrubSummary> for ManifestScrubSummary {
+    fn from(summary: CoreManifestScrubSummary) -> Self {
+        ManifestScrubSummary {
+            source: manifest_scrub_source_to_js(summary.source).to_string(),
+            segment_count: summary.segment_count as f64,
+            pending_flush_count: summary.pending_flush_count as f64,
+            active_wal_generation_id: summary.active_wal_generation_id as f64,
+            next_wal_generation_id: summary.next_wal_generation_id as f64,
+        }
+    }
+}
+
+impl From<CoreDatabaseScrubFinding> for DatabaseScrubFinding {
+    fn from(finding: CoreDatabaseScrubFinding) -> Self {
+        DatabaseScrubFinding {
+            component_kind: finding.component_kind,
+            finding_type: database_scrub_finding_type_to_js(finding.finding_type).to_string(),
+            severity: database_scrub_severity_to_js(finding.severity).to_string(),
+            detail: finding.detail,
+        }
+    }
+}
+
+impl From<CoreWalScrubResult> for WalScrubResult {
+    fn from(wal: CoreWalScrubResult) -> Self {
+        WalScrubResult {
+            generation_id: wal.generation_id as f64,
+            role: wal_scrub_role_to_js(wal.role).to_string(),
+            epoch_id: optional_u64_to_json_number(wal.epoch_id),
+            segment_id: optional_u64_to_json_number(wal.segment_id),
+            file_len: wal.file_len as f64,
+            durable_len: wal.durable_len as f64,
+            trailing_bytes: wal.trailing_bytes as f64,
+            records_checked: wal.records_checked as f64,
+            bytes_checked: wal.bytes_checked as f64,
+            findings: wal
+                .findings
+                .into_iter()
+                .map(DatabaseScrubFinding::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<CoreOrphanSegmentScrubResult> for OrphanSegmentScrubResult {
+    fn from(orphan: CoreOrphanSegmentScrubResult) -> Self {
+        OrphanSegmentScrubResult {
+            segment_id: optional_u64_to_json_number(orphan.segment_id),
+            path: orphan.path,
+            findings: orphan
+                .findings
+                .into_iter()
+                .map(ComponentScrubFinding::from)
+                .collect(),
+            components_ok: orphan.components_ok as f64,
+            bytes_digested: orphan.bytes_digested as f64,
+            semantic_checks_skipped: orphan.semantic_checks_skipped,
+        }
+    }
+}
+
+fn manifest_scrub_source_to_js(source: CoreManifestScrubSource) -> &'static str {
+    match source {
+        CoreManifestScrubSource::Current => "Current",
+        CoreManifestScrubSource::Tmp => "Tmp",
+        CoreManifestScrubSource::Prev => "Prev",
+    }
+}
+
+fn manifest_scrub_summary_to_json(summary: CoreManifestScrubSummary) -> serde_json::Value {
+    serde_json::json!({
+        "source": manifest_scrub_source_to_js(summary.source),
+        "segmentCount": summary.segment_count as f64,
+        "pendingFlushCount": summary.pending_flush_count as f64,
+        "activeWalGenerationId": summary.active_wal_generation_id as f64,
+        "nextWalGenerationId": summary.next_wal_generation_id as f64,
+    })
+}
+
+fn optional_u64_to_json_number(value: Option<u64>) -> serde_json::Value {
+    value
+        .map(|id| serde_json::json!(id as f64))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn database_scrub_finding_type_to_js(finding_type: CoreDatabaseScrubFindingType) -> &'static str {
+    match finding_type {
+        CoreDatabaseScrubFindingType::ManifestMissing => "ManifestMissing",
+        CoreDatabaseScrubFindingType::ManifestFileInvalid => "ManifestFileInvalid",
+        CoreDatabaseScrubFindingType::ManifestFallbackUsed => "ManifestFallbackUsed",
+        CoreDatabaseScrubFindingType::ManifestChangedDuringScrub => "ManifestChangedDuringScrub",
+        CoreDatabaseScrubFindingType::WalMissing => "WalMissing",
+        CoreDatabaseScrubFindingType::WalCorrupt => "WalCorrupt",
+        CoreDatabaseScrubFindingType::WalTrailingBytes => "WalTrailingBytes",
+        CoreDatabaseScrubFindingType::OrphanSegment => "OrphanSegment",
+        CoreDatabaseScrubFindingType::OrphanWal => "OrphanWal",
+        CoreDatabaseScrubFindingType::OrphanSegmentUnpinned => "OrphanSegmentUnpinned",
+        CoreDatabaseScrubFindingType::OrphanSegmentScrubSkipped => "OrphanSegmentScrubSkipped",
+    }
+}
+
+fn database_scrub_severity_to_js(severity: CoreDatabaseScrubSeverity) -> &'static str {
+    match severity {
+        CoreDatabaseScrubSeverity::Info => "info",
+        CoreDatabaseScrubSeverity::Warning => "warning",
+        CoreDatabaseScrubSeverity::Error => "error",
+    }
+}
+
+fn wal_scrub_role_to_js(role: CoreWalScrubRole) -> &'static str {
+    match role {
+        CoreWalScrubRole::Active => "Active",
+        CoreWalScrubRole::FrozenPendingFlush => "FrozenPendingFlush",
+        CoreWalScrubRole::PublishedPendingRetire => "PublishedPendingRetire",
+    }
+}
+
+#[napi(object)]
 pub struct DenseVectorConfig {
     pub dimension: u32,
     pub metric: Option<String>,
@@ -6864,6 +7121,20 @@ fn graph_stats_to_value(stats: GraphRowStats) -> GraphValue {
             "elapsedUs".to_string(),
             stats
                 .elapsed_us
+                .map(GraphValue::UInt)
+                .unwrap_or(GraphValue::Null),
+        ),
+        (
+            "planningNs".to_string(),
+            stats
+                .planning_ns
+                .map(GraphValue::UInt)
+                .unwrap_or(GraphValue::Null),
+        ),
+        (
+            "executionNs".to_string(),
+            stats
+                .execution_ns
                 .map(GraphValue::UInt)
                 .unwrap_or(GraphValue::Null),
         ),
@@ -11304,6 +11575,27 @@ fn js_patch_to_rust(patch: GraphPatch) -> napi::Result<CoreGraphPatch> {
 // ============================================================
 // Async task types
 // ============================================================
+
+/// Path-level offline scrub task: runs on the libuv thread pool without any
+/// engine instance, preserving the no-open read-only API contract.
+pub struct ScrubPathOp {
+    path: PathBuf,
+    options: CoreScrubPathOptions,
+}
+
+impl Task for ScrubPathOp {
+    type Output = CoreDatabaseScrubReport;
+    type JsValue = DatabaseScrubReport;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        overgraph::scrub_path_with_options(&self.path, &self.options)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        Ok(output.into())
+    }
+}
 
 /// Generic async task for write operations: runs on the libuv thread pool
 /// using a cloned shared engine handle, without holding the wrapper lock.

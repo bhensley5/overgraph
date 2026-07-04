@@ -464,6 +464,43 @@ export interface ConnectedComponentsOptions {
   atEpoch?: number
 }
 
+export interface DatabaseScrubFinding {
+  componentKind: string
+  findingType: DatabaseScrubFindingType
+  severity: DatabaseScrubSeverity
+  detail: string
+}
+
+export type DatabaseScrubFindingType =
+  | 'ManifestMissing'
+  | 'ManifestFileInvalid'
+  | 'ManifestFallbackUsed'
+  | 'ManifestChangedDuringScrub'
+  | 'WalMissing'
+  | 'WalCorrupt'
+  | 'WalTrailingBytes'
+  | 'OrphanSegment'
+  | 'OrphanWal'
+  | 'OrphanSegmentUnpinned'
+  | 'OrphanSegmentScrubSkipped'
+
+export type DatabaseScrubSeverity = 'info' | 'warning' | 'error'
+
+export interface DatabaseScrubReport {
+  manifest: ManifestScrubSummary | null
+  findings: Array<DatabaseScrubFinding>
+  segments: Array<SegmentScrubResult>
+  walGenerations: Array<WalScrubResult>
+  orphanSegments: Array<OrphanSegmentScrubResult>
+  totalComponentsChecked: number
+  totalComponentsOk: number
+  totalComponentsFailed: number
+  totalBytesDigested: number
+  totalWalRecordsChecked: number
+  totalWalBytesChecked: number
+  durationMs: number
+}
+
 export interface DbOptions {
   createIfMissing?: boolean
   edgeUniqueness?: boolean
@@ -647,6 +684,16 @@ export interface KeyQuery {
   key: string
 }
 
+export interface ManifestScrubSummary {
+  source: ManifestScrubSource
+  segmentCount: number
+  pendingFlushCount: number
+  activeWalGenerationId: number
+  nextWalGenerationId: number
+}
+
+export type ManifestScrubSource = 'Current' | 'Tmp' | 'Prev'
+
 export interface NamedPrunePolicy {
   name: string
   policy: PrunePolicy
@@ -718,6 +765,15 @@ export interface NodePropertyIndexInfo {
   state: 'building' | 'ready' | 'failed'
   lastError: string | null
   compound: boolean
+}
+
+export interface OrphanSegmentScrubResult {
+  segmentId: number | null
+  path: string
+  findings: Array<ComponentScrubFinding>
+  componentsOk: number
+  bytesDigested: number
+  semanticChecksSkipped: boolean
 }
 
 export interface PatchResult {
@@ -793,6 +849,16 @@ export interface SchemaSetOptions {
   maxViolations?: number
   chunkSize?: number
   scanLimit?: number | null
+}
+
+export declare function scrubPath(path: string, options?: ScrubPathOptions | undefined | null): DatabaseScrubReport
+
+export declare function scrubPathAsync(path: string, options?: ScrubPathOptions | undefined | null): Promise<DatabaseScrubReport>
+
+export interface ScrubPathOptions {
+  validateWal?: boolean
+  includeOrphanSegments?: boolean
+  checkManifestStability?: boolean
 }
 
 export interface ScrubReport {
@@ -998,3 +1064,18 @@ export interface VectorSearchScope {
   edgeLabelFilter?: Array<string>
   atEpoch?: number
 }
+
+export interface WalScrubResult {
+  generationId: number
+  role: WalScrubRole
+  epochId: number | null
+  segmentId: number | null
+  fileLen: number
+  durableLen: number
+  trailingBytes: number
+  recordsChecked: number
+  bytesChecked: number
+  findings: Array<DatabaseScrubFinding>
+}
+
+export type WalScrubRole = 'Active' | 'FrozenPendingFlush' | 'PublishedPendingRetire'

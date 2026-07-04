@@ -254,6 +254,355 @@ pub(crate) struct WalReadResult {
     pub(crate) durable_len: u64,
 }
 
+#[derive(Debug)]
+pub(crate) struct WalScrubScan {
+    pub(crate) records_checked: u64,
+    pub(crate) bytes_checked: u64,
+    pub(crate) durable_len: u64,
+    pub(crate) file_len: u64,
+    pub(crate) terminal: Option<WalScrubTerminal>,
+}
+
+#[derive(Debug)]
+pub(crate) enum WalScrubTerminal {
+    RecoverableTrailing { reason: String },
+    Corrupt { reason: String },
+}
+
+struct CountedReadError {
+    bytes_read: usize,
+    error: std::io::Error,
+}
+
+pub(crate) fn scrub_generation_readonly(
+    db_dir: &Path,
+    gen_id: u64,
+) -> Result<WalScrubScan, EngineError> {
+    let path = wal_generation_path(db_dir, gen_id);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WalScrubScan {
+                records_checked: 0,
+                bytes_checked: 0,
+                durable_len: 0,
+                file_len: 0,
+                terminal: None,
+            });
+        }
+        Err(error) => {
+            return Ok(WalScrubScan {
+                records_checked: 0,
+                bytes_checked: 0,
+                durable_len: 0,
+                file_len: 0,
+                terminal: Some(WalScrubTerminal::Corrupt {
+                    reason: format!("cannot stat WAL file: {error}"),
+                }),
+            });
+        }
+    };
+    let file_len = metadata.len();
+    if file_len == 0 {
+        return Ok(WalScrubScan {
+            records_checked: 0,
+            bytes_checked: 0,
+            durable_len: 0,
+            file_len,
+            terminal: None,
+        });
+    }
+    if file_len < WAL_HEADER_SIZE as u64 {
+        return Ok(WalScrubScan {
+            records_checked: 0,
+            bytes_checked: file_len,
+            durable_len: 0,
+            file_len,
+            terminal: Some(WalScrubTerminal::Corrupt {
+                reason: "WAL file too small for header".to_string(),
+            }),
+        });
+    }
+
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            return Ok(WalScrubScan {
+                records_checked: 0,
+                bytes_checked: 0,
+                durable_len: 0,
+                file_len,
+                terminal: Some(WalScrubTerminal::Corrupt {
+                    reason: format!("cannot open WAL file: {error}"),
+                }),
+            });
+        }
+    };
+    let mut reader = BufReader::new(file);
+    let mut bytes_checked = 0u64;
+
+    let mut header = [0u8; WAL_HEADER_SIZE];
+    let header_read = match read_exact_counted(&mut reader, &mut header) {
+        Ok(bytes_read) => bytes_read,
+        Err(error) => {
+            bytes_checked += error.bytes_read as u64;
+            return Ok(WalScrubScan {
+                records_checked: 0,
+                bytes_checked,
+                durable_len: 0,
+                file_len,
+                terminal: Some(WalScrubTerminal::Corrupt {
+                    reason: format!("I/O error reading WAL header: {}", error.error),
+                }),
+            });
+        }
+    };
+    bytes_checked += header_read as u64;
+    if header_read < WAL_HEADER_SIZE {
+        return Ok(WalScrubScan {
+            records_checked: 0,
+            bytes_checked,
+            durable_len: 0,
+            file_len,
+            terminal: Some(WalScrubTerminal::Corrupt {
+                reason: "WAL file too small for header".to_string(),
+            }),
+        });
+    }
+    if let Err(error) = validate_wal_header(&header) {
+        return Ok(WalScrubScan {
+            records_checked: 0,
+            bytes_checked,
+            durable_len: 0,
+            file_len,
+            terminal: Some(WalScrubTerminal::Corrupt {
+                reason: error.to_string(),
+            }),
+        });
+    }
+
+    let mut open_batch: Option<WalReadAtomicBatch> = None;
+    let mut pos = WAL_HEADER_SIZE as u64;
+    let mut durable_len = pos;
+    let mut records_checked = 0u64;
+    let mut terminal = None;
+
+    loop {
+        let frame_start = pos;
+        let mut len_buf = [0u8; 4];
+        let len_read = match read_exact_counted(&mut reader, &mut len_buf) {
+            Ok(bytes_read) => bytes_read,
+            Err(error) => {
+                bytes_checked += error.bytes_read as u64;
+                terminal = Some(WalScrubTerminal::Corrupt {
+                    reason: format!("I/O error reading WAL frame length: {}", error.error),
+                });
+                break;
+            }
+        };
+        bytes_checked += len_read as u64;
+        if len_read == 0 {
+            break;
+        }
+        if len_read < len_buf.len() {
+            terminal = Some(WalScrubTerminal::RecoverableTrailing {
+                reason: "partial WAL frame length at end of file".to_string(),
+            });
+            break;
+        }
+
+        let payload_len = u32::from_le_bytes(len_buf) as usize;
+        if payload_len == 0 {
+            terminal = Some(WalScrubTerminal::RecoverableTrailing {
+                reason: "zero-length WAL frame".to_string(),
+            });
+            break;
+        }
+        if payload_len > MAX_WAL_RECORD_SIZE {
+            terminal = Some(WalScrubTerminal::RecoverableTrailing {
+                reason: format!(
+                    "WAL frame payload length {payload_len} exceeds maximum {MAX_WAL_RECORD_SIZE}"
+                ),
+            });
+            break;
+        }
+        let frame_end = frame_start + 8 + payload_len as u64;
+
+        let mut crc_buf = [0u8; 4];
+        let crc_read = match read_exact_counted(&mut reader, &mut crc_buf) {
+            Ok(bytes_read) => bytes_read,
+            Err(error) => {
+                bytes_checked += error.bytes_read as u64;
+                terminal = Some(WalScrubTerminal::Corrupt {
+                    reason: format!("I/O error reading WAL frame CRC: {}", error.error),
+                });
+                break;
+            }
+        };
+        bytes_checked += crc_read as u64;
+        if crc_read < crc_buf.len() {
+            terminal = Some(WalScrubTerminal::RecoverableTrailing {
+                reason: "partial WAL frame CRC at end of file".to_string(),
+            });
+            break;
+        }
+        let stored_crc = u32::from_le_bytes(crc_buf);
+
+        let mut payload = vec![0u8; payload_len];
+        let payload_read = match read_exact_counted(&mut reader, &mut payload) {
+            Ok(bytes_read) => bytes_read,
+            Err(error) => {
+                bytes_checked += error.bytes_read as u64;
+                terminal = Some(WalScrubTerminal::Corrupt {
+                    reason: format!("I/O error reading WAL frame payload: {}", error.error),
+                });
+                break;
+            }
+        };
+        bytes_checked += payload_read as u64;
+        if payload_read < payload_len {
+            terminal = Some(WalScrubTerminal::RecoverableTrailing {
+                reason: "partial WAL frame payload at end of file".to_string(),
+            });
+            break;
+        }
+
+        if crc32fast::hash(&payload) != stored_crc {
+            terminal = Some(WalScrubTerminal::RecoverableTrailing {
+                reason: "WAL frame CRC mismatch".to_string(),
+            });
+            break;
+        }
+
+        if payload.len() < 8 {
+            terminal = Some(WalScrubTerminal::RecoverableTrailing {
+                reason: "WAL frame is missing engine sequence prefix".to_string(),
+            });
+            break;
+        }
+        let engine_seq = u64::from_le_bytes(payload[..8].try_into().expect("8 bytes for seq"));
+        let walop_bytes = &payload[8..];
+        let recognized_tag = walop_bytes.first().and_then(|tag| OpTag::from_u8(*tag));
+
+        match decode_wal_op(walop_bytes) {
+            Ok(op) => match &op {
+                WalOp::BeginAtomicBatch {
+                    first_seq,
+                    op_count,
+                } => {
+                    if open_batch.is_some() {
+                        terminal = Some(WalScrubTerminal::RecoverableTrailing {
+                            reason: "nested WAL atomic batch begin".to_string(),
+                        });
+                        break;
+                    }
+                    let Some(batch) = WalReadAtomicBatch::new(*first_seq, *op_count) else {
+                        terminal = Some(WalScrubTerminal::RecoverableTrailing {
+                            reason: "malformed WAL atomic batch begin marker".to_string(),
+                        });
+                        break;
+                    };
+                    open_batch = Some(batch);
+                    records_checked += 1;
+                    pos = frame_end;
+                }
+                WalOp::CommitAtomicBatch {
+                    first_seq,
+                    op_count,
+                } => {
+                    let Some(batch) = open_batch else {
+                        terminal = Some(WalScrubTerminal::RecoverableTrailing {
+                            reason: "WAL atomic batch commit without begin".to_string(),
+                        });
+                        break;
+                    };
+                    if !batch.matches_commit(*first_seq, *op_count) {
+                        terminal = Some(WalScrubTerminal::RecoverableTrailing {
+                            reason: "WAL atomic batch commit does not match begin".to_string(),
+                        });
+                        break;
+                    }
+                    open_batch = None;
+                    records_checked += 1;
+                    durable_len = frame_end;
+                    pos = frame_end;
+                }
+                _ => {
+                    if let Some(batch) = open_batch.as_mut() {
+                        if !batch.push_normal_op(engine_seq) {
+                            terminal = Some(WalScrubTerminal::RecoverableTrailing {
+                                reason: "WAL atomic batch sequence is not contiguous".to_string(),
+                            });
+                            break;
+                        }
+                    } else {
+                        durable_len = frame_end;
+                    }
+                    records_checked += 1;
+                    pos = frame_end;
+                }
+            },
+            Err(_)
+                if matches!(
+                    recognized_tag,
+                    Some(OpTag::BeginAtomicBatch | OpTag::CommitAtomicBatch)
+                ) =>
+            {
+                terminal = Some(WalScrubTerminal::RecoverableTrailing {
+                    reason: "malformed WAL atomic marker".to_string(),
+                });
+                break;
+            }
+            Err(error) if recognized_tag.is_some() => {
+                terminal = Some(WalScrubTerminal::Corrupt {
+                    reason: format!("failed to decode WAL record: {error}"),
+                });
+                break;
+            }
+            Err(_) => {
+                terminal = Some(WalScrubTerminal::RecoverableTrailing {
+                    reason: "unknown WAL operation tag".to_string(),
+                });
+                break;
+            }
+        }
+    }
+
+    if terminal.is_none() && open_batch.is_some() {
+        terminal = Some(WalScrubTerminal::RecoverableTrailing {
+            reason: "incomplete WAL atomic batch at end of file".to_string(),
+        });
+    }
+
+    Ok(WalScrubScan {
+        records_checked,
+        bytes_checked,
+        durable_len,
+        file_len,
+        terminal,
+    })
+}
+
+fn read_exact_counted(
+    reader: &mut BufReader<File>,
+    buf: &mut [u8],
+) -> Result<usize, CountedReadError> {
+    let mut read = 0usize;
+    while read < buf.len() {
+        match reader.read(&mut buf[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(error) => {
+                return Err(CountedReadError {
+                    bytes_read: read,
+                    error,
+                });
+            }
+        }
+    }
+    Ok(read)
+}
+
 impl WalReader {
     #[cfg(test)]
     pub(crate) fn new(db_dir: &Path) -> Self {
@@ -507,6 +856,302 @@ mod tests {
             valid_to: i64::MAX,
             last_write_seq: 0,
         })
+    }
+
+    fn append_raw_payload_frame(path: &Path, payload: &[u8]) {
+        let crc = crc32fast::hash(payload);
+        let len = payload.len() as u32;
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(&len.to_le_bytes()).unwrap();
+        file.write_all(&crc.to_le_bytes()).unwrap();
+        file.write_all(payload).unwrap();
+        file.flush().unwrap();
+    }
+
+    fn append_raw_walop_frame(path: &Path, seq: u64, walop_bytes: &[u8]) {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&seq.to_le_bytes());
+        payload.extend_from_slice(walop_bytes);
+        append_raw_payload_frame(path, &payload);
+    }
+
+    fn assert_recoverable_terminal(scan: &WalScrubScan, expected_reason: &str) {
+        match &scan.terminal {
+            Some(WalScrubTerminal::RecoverableTrailing { reason }) => {
+                assert!(
+                    reason.contains(expected_reason),
+                    "expected recoverable reason containing {expected_reason:?}, got {reason:?}"
+                );
+            }
+            other => panic!("expected recoverable terminal, got {other:?}"),
+        }
+    }
+
+    fn assert_corrupt_terminal(scan: &WalScrubScan, expected_reason: &str) {
+        match &scan.terminal {
+            Some(WalScrubTerminal::Corrupt { reason }) => {
+                assert!(
+                    reason.contains(expected_reason),
+                    "expected corrupt reason containing {expected_reason:?}, got {reason:?}"
+                );
+            }
+            other => panic!("expected corrupt terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scrub_wal_valid_empty_header() {
+        let dir = TempDir::new().unwrap();
+        let writer = WalWriter::open_generation(dir.path(), 0).unwrap();
+        drop(writer);
+
+        let scan = scrub_generation_readonly(dir.path(), 0).unwrap();
+
+        assert_eq!(scan.file_len, WAL_HEADER_SIZE as u64);
+        assert_eq!(scan.durable_len, WAL_HEADER_SIZE as u64);
+        assert_eq!(scan.bytes_checked, WAL_HEADER_SIZE as u64);
+        assert_eq!(scan.records_checked, 0);
+        assert!(scan.terminal.is_none());
+    }
+
+    #[test]
+    fn scrub_wal_zero_byte_generation_is_empty() {
+        let dir = TempDir::new().unwrap();
+        File::create(dir.path().join(WAL_FILENAME)).unwrap();
+
+        let scan = scrub_generation_readonly(dir.path(), 0).unwrap();
+
+        assert_eq!(scan.file_len, 0);
+        assert_eq!(scan.durable_len, 0);
+        assert_eq!(scan.bytes_checked, 0);
+        assert_eq!(scan.records_checked, 0);
+        assert!(scan.terminal.is_none());
+    }
+
+    #[test]
+    fn scrub_wal_valid_single_op() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
+        writer.append(&make_test_node(1, "one"), 1).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let file_len = std::fs::metadata(dir.path().join(WAL_FILENAME))
+            .unwrap()
+            .len();
+
+        let scan = scrub_generation_readonly(dir.path(), 0).unwrap();
+
+        assert_eq!(scan.file_len, file_len);
+        assert_eq!(scan.durable_len, file_len);
+        assert_eq!(scan.bytes_checked, file_len);
+        assert_eq!(scan.records_checked, 1);
+        assert!(scan.terminal.is_none());
+    }
+
+    #[test]
+    fn scrub_wal_valid_atomic_batch() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
+        writer
+            .append_batch(&[(1, make_test_node(1, "one")), (2, make_test_node(2, "two"))])
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let file_len = std::fs::metadata(dir.path().join(WAL_FILENAME))
+            .unwrap()
+            .len();
+
+        let scan = scrub_generation_readonly(dir.path(), 0).unwrap();
+
+        assert_eq!(scan.file_len, file_len);
+        assert_eq!(scan.durable_len, file_len);
+        assert_eq!(scan.bytes_checked, file_len);
+        assert_eq!(scan.records_checked, 4);
+        assert!(scan.terminal.is_none());
+    }
+
+    #[test]
+    fn scrub_wal_partial_trailing_frame_reports_durable_prefix() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
+        writer.append(&make_test_node(1, "one"), 1).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let wal_path = dir.path().join(WAL_FILENAME);
+        let durable_len = std::fs::metadata(&wal_path).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        file.write_all(&[0xAA, 0xBB, 0xCC]).unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        let scan = scrub_generation_readonly(dir.path(), 0).unwrap();
+
+        assert_eq!(scan.durable_len, durable_len);
+        assert_eq!(scan.records_checked, 1);
+        assert_eq!(scan.file_len - scan.durable_len, 3);
+        assert_recoverable_terminal(&scan, "partial WAL frame length");
+    }
+
+    #[test]
+    fn scrub_wal_bad_header_is_corrupt() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(WAL_FILENAME), b"BADWAL!!").unwrap();
+
+        let scan = scrub_generation_readonly(dir.path(), 0).unwrap();
+
+        assert_eq!(scan.file_len, WAL_HEADER_SIZE as u64);
+        assert_eq!(scan.bytes_checked, WAL_HEADER_SIZE as u64);
+        assert_eq!(scan.durable_len, 0);
+        assert_corrupt_terminal(&scan, "invalid WAL magic");
+    }
+
+    #[test]
+    fn scrub_wal_crc_mismatch_is_recoverable_suffix() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
+        writer.append(&make_test_node(1, "one"), 1).unwrap();
+        writer.append(&make_test_node(2, "two"), 2).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let wal_path = dir.path().join(WAL_FILENAME);
+        let mut data = std::fs::read(&wal_path).unwrap();
+        let first_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        let second_start = WAL_HEADER_SIZE + 8 + first_len;
+        data[second_start + 4] ^= 0xFF;
+        std::fs::write(&wal_path, data).unwrap();
+
+        let scan = scrub_generation_readonly(dir.path(), 0).unwrap();
+
+        assert_eq!(scan.records_checked, 1);
+        assert_recoverable_terminal(&scan, "CRC mismatch");
+    }
+
+    #[test]
+    fn scrub_wal_unknown_op_tag_after_durable_prefix_is_trailing() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
+        writer.append(&make_test_node(1, "one"), 1).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let wal_path = dir.path().join(WAL_FILENAME);
+        append_raw_walop_frame(&wal_path, 99, &[255u8, 0, 0, 0]);
+
+        let scan = scrub_generation_readonly(dir.path(), 0).unwrap();
+
+        assert_eq!(scan.records_checked, 1);
+        assert_recoverable_terminal(&scan, "unknown WAL operation tag");
+    }
+
+    #[test]
+    fn scrub_wal_malformed_recognized_non_marker_op_is_corrupt() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
+        writer.append(&make_test_node(1, "one"), 1).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let wal_path = dir.path().join(WAL_FILENAME);
+        let mut walop_bytes = encode_wal_op(&make_test_node(2, "two")).unwrap();
+        walop_bytes.push(0xFF);
+        append_raw_walop_frame(&wal_path, 2, &walop_bytes);
+
+        let scan = scrub_generation_readonly(dir.path(), 0).unwrap();
+
+        assert_eq!(scan.records_checked, 1);
+        assert_corrupt_terminal(&scan, "failed to decode WAL record");
+    }
+
+    #[test]
+    fn scrub_wal_malformed_recognized_non_marker_op_inside_batch_is_corrupt() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
+        writer
+            .append(
+                &WalOp::BeginAtomicBatch {
+                    first_seq: 1,
+                    op_count: 2,
+                },
+                1,
+            )
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let wal_path = dir.path().join(WAL_FILENAME);
+        let mut walop_bytes = encode_wal_op(&make_test_node(1, "bad")).unwrap();
+        walop_bytes.push(0xFF);
+        append_raw_walop_frame(&wal_path, 1, &walop_bytes);
+
+        let scan = scrub_generation_readonly(dir.path(), 0).unwrap();
+
+        assert_eq!(scan.records_checked, 1);
+        assert_eq!(scan.durable_len, WAL_HEADER_SIZE as u64);
+        assert_corrupt_terminal(&scan, "failed to decode WAL record");
+    }
+
+    #[test]
+    fn scrub_wal_malformed_atomic_begin_is_trailing() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
+        writer
+            .append(
+                &WalOp::BeginAtomicBatch {
+                    first_seq: 1,
+                    op_count: 1,
+                },
+                1,
+            )
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let scan = scrub_generation_readonly(dir.path(), 0).unwrap();
+
+        assert_eq!(scan.records_checked, 0);
+        assert_eq!(scan.durable_len, WAL_HEADER_SIZE as u64);
+        assert_recoverable_terminal(&scan, "malformed WAL atomic batch begin marker");
+    }
+
+    #[test]
+    fn scrub_wal_incomplete_atomic_batch_is_not_durable() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = WalWriter::open_generation(dir.path(), 0).unwrap();
+        writer
+            .append(
+                &WalOp::BeginAtomicBatch {
+                    first_seq: 1,
+                    op_count: 2,
+                },
+                1,
+            )
+            .unwrap();
+        writer.append(&make_test_node(1, "one"), 1).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let scan = scrub_generation_readonly(dir.path(), 0).unwrap();
+
+        assert_eq!(scan.records_checked, 2);
+        assert_eq!(scan.durable_len, WAL_HEADER_SIZE as u64);
+        assert_recoverable_terminal(&scan, "incomplete WAL atomic batch");
+    }
+
+    #[test]
+    fn scrub_wal_scanner_is_streaming_and_does_not_call_recovery_reader() {
+        let source = include_str!("wal.rs");
+        let scanner = source
+            .split("pub(crate) fn scrub_generation_readonly")
+            .nth(1)
+            .unwrap()
+            .split("fn read_exact_counted")
+            .next()
+            .unwrap();
+        assert!(
+            !scanner.contains("read_generation_recoverable"),
+            "read-only WAL scrub scanner must not call recovery reader"
+        );
+        assert!(
+            !scanner.contains("Vec<(u64, WalOp)>"),
+            "read-only WAL scrub scanner must not retain decoded WAL records"
+        );
     }
 
     #[test]

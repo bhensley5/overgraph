@@ -469,7 +469,10 @@ Only referenced params are resource-validated; extra unused params are ignored.
 - `notes`
 
 When `includePlan` / `include_plan` is true on `execute_gql`, the result includes the same explain
-payload in `plan`. When `profile` is true, `stats.elapsedUs` / `stats.elapsed_us` is populated.
+payload in `plan`. When `profile` is true, `stats.elapsedUs` / `stats.elapsed_us` is populated, and
+GQL read notes may include diagnostic stage timings and planner counters. Reads that lower to native
+graph-row execution include `graph_row_planning` and `graph_row_execution` alongside the existing
+`graph_row_plan_and_execute` total.
 
 ## Examples
 

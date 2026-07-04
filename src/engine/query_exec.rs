@@ -7,6 +7,46 @@ struct QueryExecutionOutcome<T> {
     followups: Vec<SecondaryIndexReadFollowup>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GraphRowProfileTimers {
+    overall_started_at: Option<std::time::Instant>,
+    planning_ns: Option<u64>,
+    execution_started_at: Option<std::time::Instant>,
+}
+
+impl GraphRowProfileTimers {
+    fn new(enabled: bool) -> Self {
+        Self {
+            overall_started_at: enabled.then(std::time::Instant::now),
+            planning_ns: None,
+            execution_started_at: None,
+        }
+    }
+
+    fn planning_started(&self) -> Option<std::time::Instant> {
+        self.overall_started_at
+            .map(|_| std::time::Instant::now())
+    }
+
+    fn finish_planning(&mut self, started_at: Option<std::time::Instant>) {
+        if let Some(started_at) = started_at {
+            let finished_at = std::time::Instant::now();
+            self.planning_ns = Some(finished_at.duration_since(started_at).as_nanos() as u64);
+            self.execution_started_at = Some(finished_at);
+        }
+    }
+
+    fn elapsed_us(&self) -> Option<u64> {
+        self.overall_started_at
+            .map(|started_at| started_at.elapsed().as_micros() as u64)
+    }
+
+    fn execution_ns(&self) -> Option<u64> {
+        self.execution_started_at
+            .map(|started_at| started_at.elapsed().as_nanos() as u64)
+    }
+}
+
 struct VerifiedNodePage {
     ids: Vec<u64>,
     nodes: Vec<NodeRecord>,
@@ -6686,7 +6726,7 @@ impl ReadView {
         query: &NormalizedGraphRowQuery,
         cursor_state: GraphRowCursorState,
     ) -> Result<QueryExecutionOutcome<GraphRowResult>, EngineError> {
-        let started_at = std::time::Instant::now();
+        let mut profile_timers = GraphRowProfileTimers::new(query.options.profile);
         #[cfg(test)]
         self.query_execution_counters
             .graph_row_query_calls
@@ -6705,9 +6745,11 @@ impl ReadView {
         };
         let selection_capacity = graph_row_selection_capacity(query, &cursor_state)?;
 
+        let planning_started_at = profile_timers.planning_started();
         let runtime = self.normalize_graph_row_runtime_plan(query)?;
         let physical_plan =
             self.plan_graph_row_physical(query, &runtime, query.options.include_plan)?;
+        profile_timers.finish_planning(planning_started_at);
         let policy_cutoffs = self.query_policy_cutoffs();
         let mut explain_trace = if query.options.include_plan {
             let mut trace = GraphRowExplainTrace::default();
@@ -6731,7 +6773,7 @@ impl ReadView {
                 effective_at_epoch,
                 original_skip,
                 selection_capacity,
-                started_at,
+                &profile_timers,
                 policy_cutoffs.as_ref(),
                 explain_trace.take(),
             )? {
@@ -6934,10 +6976,9 @@ impl ReadView {
                 frontier_peak,
                 paths_enumerated,
                 db_hits: 0,
-                elapsed_us: query
-                    .options
-                    .profile
-                    .then(|| started_at.elapsed().as_micros() as u64),
+                elapsed_us: profile_timers.elapsed_us(),
+                planning_ns: profile_timers.planning_ns,
+                execution_ns: profile_timers.execution_ns(),
                 effective_at_epoch,
                 warnings,
             },
@@ -6959,7 +7000,7 @@ impl ReadView {
         effective_at_epoch: i64,
         original_skip: u64,
         selection_capacity: usize,
-        started_at: std::time::Instant,
+        profile_timers: &GraphRowProfileTimers,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
         explain_trace: Option<GraphRowExplainTrace>,
     ) -> Result<Option<QueryExecutionOutcome<GraphRowResult>>, EngineError> {
@@ -7105,10 +7146,9 @@ impl ReadView {
                     frontier_peak: 0,
                     paths_enumerated: 0,
                     db_hits: 0,
-                    elapsed_us: query
-                        .options
-                        .profile
-                        .then(|| started_at.elapsed().as_micros() as u64),
+                    elapsed_us: profile_timers.elapsed_us(),
+                    planning_ns: profile_timers.planning_ns,
+                    execution_ns: profile_timers.execution_ns(),
                     effective_at_epoch,
                     warnings,
                 },

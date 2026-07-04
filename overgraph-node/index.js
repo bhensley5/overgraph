@@ -584,3 +584,5 @@ module.exports.NodeView = nativeBinding.NodeView
 module.exports.OverGraph = nativeBinding.OverGraph
 module.exports.SubgraphResult = nativeBinding.SubgraphResult
 module.exports.WriteTxn = nativeBinding.WriteTxn
+module.exports.scrubPath = nativeBinding.scrubPath
+module.exports.scrubPathAsync = nativeBinding.scrubPathAsync

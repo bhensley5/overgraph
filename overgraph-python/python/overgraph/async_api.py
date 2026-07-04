@@ -11,6 +11,7 @@ from .overgraph import (
     AdjacencyExport,
     CompactionProgress,
     CompactionStats,
+    DatabaseScrubReport,
     DbStats,
     EdgePageResult,
     EdgePropertyIndexInfo,
@@ -35,6 +36,7 @@ from .overgraph import (
     PropertyRangePageResult,
     PruneResult,
     ScrubReport,
+    scrub_path,
     SegmentInfo,
     SchemaValidationReport,
     ShortestPath,
@@ -49,6 +51,10 @@ from .overgraph import (
 
 if TYPE_CHECKING:
     from . import EdgeQueryRequest, NodeQueryRequest, QueryPlan, SecondaryIndexSpecLike
+
+
+async def async_scrub_path(path: str, **options: Any) -> "DatabaseScrubReport":
+    return await asyncio.to_thread(scrub_path, path, **options)
 
 
 class AsyncWriteTxn:

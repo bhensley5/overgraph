@@ -7,10 +7,13 @@ use eg::{
     gql_referenced_param_names, AdjacencyExport as CoreAdjacencyExport, AllShortestPathsOptions,
     CompactionPhase, CompactionProgress as CoreCompactionProgress,
     CompactionStats as CoreCompactionStats, ComponentOptions,
-    ComponentScrubFinding as CoreComponentScrubFinding, DatabaseEngine, DbOptions,
-    DbStats as CoreDbStats, DegreeOptions, DenseMetric, DenseVectorConfig,
-    DenseVectorSchema as CoreDenseVectorSchema, Direction, EdgeFilterExpr, EdgeInput,
-    EdgeLabelInfo as CoreEdgeLabelInfo, EdgeMetadataIndexField as CoreEdgeMetadataIndexField,
+    ComponentScrubFinding as CoreComponentScrubFinding, DatabaseEngine,
+    DatabaseScrubFinding as CoreDatabaseScrubFinding,
+    DatabaseScrubReport as CoreDatabaseScrubReport,
+    DatabaseScrubSeverity as CoreDatabaseScrubSeverity, DbOptions, DbStats as CoreDbStats,
+    DegreeOptions, DenseMetric, DenseVectorConfig, DenseVectorSchema as CoreDenseVectorSchema,
+    Direction, EdgeFilterExpr, EdgeInput, EdgeLabelInfo as CoreEdgeLabelInfo,
+    EdgeMetadataIndexField as CoreEdgeMetadataIndexField,
     EdgePropertyIndexInfo as CoreEdgePropertyIndexInfo, EdgeQuery, EdgeQueryOrder,
     EdgeSchema as CoreEdgeSchema, EdgeSchemaInfo as CoreEdgeSchemaInfo,
     EdgeValiditySchema as CoreEdgeValiditySchema, EdgeView as CoreEdgeView,
@@ -41,23 +44,27 @@ use eg::{
     GraphSelectedProjection, GraphShortestPathEndpoint, GraphShortestPathMode,
     GraphShortestPathStage, GraphSubqueryStage, GraphUnaryOp, GraphUnionStage, GraphValue,
     GraphVectorSelection, HnswConfig, IsConnectedOptions, LabelMatchMode,
-    NeighborEntry as CoreNeighborEntry, NeighborOptions, NodeFilterExpr, NodeIdMap, NodeInput,
-    NodeKeyQuery, NodeLabelConstraintSchema as CoreNodeLabelConstraintSchema, NodeLabelFilter,
+    ManifestScrubSummary as CoreManifestScrubSummary, NeighborEntry as CoreNeighborEntry,
+    NeighborOptions, NodeFilterExpr, NodeIdMap, NodeInput, NodeKeyQuery,
+    NodeLabelConstraintSchema as CoreNodeLabelConstraintSchema, NodeLabelFilter,
     NodeLabelInfo as CoreNodeLabelInfo, NodeMetadataIndexField as CoreNodeMetadataIndexField,
     NodePropertyIndexInfo as CoreNodePropertyIndexInfo, NodeQuery, NodeQueryOrder,
     NodeSchema as CoreNodeSchema, NodeSchemaInfo as CoreNodeSchemaInfo, NodeView as CoreNodeView,
-    NumericFieldSchema as CoreNumericFieldSchema, PageRequest, PprAlgorithm, PprOptions,
-    PprResult as CorePprResult, PropValue, PropertyRangeBound as CorePropertyRangeBound,
-    PropertyRangeCursor as CorePropertyRangeCursor, PropertyRangePageRequest,
-    PropertyRangePageResult as CorePropertyRangePageResult, PropertySchema as CorePropertySchema,
-    PrunePolicy, PrunePolicyInfo, PruneResult as CorePruneResult, QueryPlan, QueryPlanKind,
-    QueryPlanNode, QueryPlanNote, QueryPlanPublicInputs, QueryPlanPublicName, QueryPlanWarning,
-    SchemaAdditionalProperties, SchemaCheckOptions, SchemaNumericBound as CoreSchemaNumericBound,
-    SchemaSetOptions, SchemaTargetKind as CoreSchemaTargetKind,
-    SchemaValidationReport as CoreSchemaValidationReport, SchemaValueType, SchemaVectorPresence,
-    SchemaViolation as CoreSchemaViolation, SchemaViolationTarget as CoreSchemaViolationTarget,
-    ScoringMode, ScrubReport as CoreScrubReport, SecondaryIndexField as CoreSecondaryIndexField,
-    SecondaryIndexKind, SecondaryIndexSpec as CoreSecondaryIndexSpec, SecondaryIndexState,
+    NumericFieldSchema as CoreNumericFieldSchema,
+    OrphanSegmentScrubResult as CoreOrphanSegmentScrubResult, PageRequest, PprAlgorithm,
+    PprOptions, PprResult as CorePprResult, PropValue,
+    PropertyRangeBound as CorePropertyRangeBound, PropertyRangeCursor as CorePropertyRangeCursor,
+    PropertyRangePageRequest, PropertyRangePageResult as CorePropertyRangePageResult,
+    PropertySchema as CorePropertySchema, PrunePolicy, PrunePolicyInfo,
+    PruneResult as CorePruneResult, QueryPlan, QueryPlanKind, QueryPlanNode, QueryPlanNote,
+    QueryPlanPublicInputs, QueryPlanPublicName, QueryPlanWarning, SchemaAdditionalProperties,
+    SchemaCheckOptions, SchemaNumericBound as CoreSchemaNumericBound, SchemaSetOptions,
+    SchemaTargetKind as CoreSchemaTargetKind, SchemaValidationReport as CoreSchemaValidationReport,
+    SchemaValueType, SchemaVectorPresence, SchemaViolation as CoreSchemaViolation,
+    SchemaViolationTarget as CoreSchemaViolationTarget, ScoringMode,
+    ScrubPathOptions as CoreScrubPathOptions, ScrubReport as CoreScrubReport,
+    SecondaryIndexField as CoreSecondaryIndexField, SecondaryIndexKind,
+    SecondaryIndexSpec as CoreSecondaryIndexSpec, SecondaryIndexState,
     SegmentScrubResult as CoreSegmentScrubResult, ShortestPath as CoreShortestPath,
     ShortestPathOptions, SparseVectorSchema as CoreSparseVectorSchema,
     StringFieldSchema as CoreStringFieldSchema, Subgraph as CoreSubgraph, SubgraphOptions,
@@ -65,7 +72,8 @@ use eg::{
     TraversalPageResult as CoreTraversalPageResult, TraverseOptions,
     TxnCommitResult as CoreTxnCommitResult, TxnEdgeRef, TxnEdgeView, TxnIntent, TxnLocalRef,
     TxnNodeRef, TxnNodeView, UpsertEdgeOptions, UpsertNodeOptions, VectorSearchMode,
-    VectorSearchRequest, VectorSearchScope, WalSyncMode, WriteTxn as CoreWriteTxn,
+    VectorSearchRequest, VectorSearchScope, WalScrubResult as CoreWalScrubResult, WalSyncMode,
+    WriteTxn as CoreWriteTxn,
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -131,6 +139,22 @@ fn clone_engine_handle(inner: &Arc<Mutex<Option<InnerDb>>>) -> PyResult<Database
     let guard = inner.lock().map_err(lock_err)?;
     let db = guard.as_ref().ok_or_else(closed_err)?;
     Ok(db.engine.clone())
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, **kwargs))]
+fn scrub_path(
+    py: Python<'_>,
+    path: &str,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<DatabaseScrubReport> {
+    let options = parse_scrub_path_options(kwargs)?;
+    let path = path.to_string();
+    py.allow_threads(move || {
+        eg::scrub_path_with_options(Path::new(&path), &options)
+            .map(DatabaseScrubReport::from)
+            .map_err(to_py_err)
+    })
 }
 
 #[pymethods]
@@ -2315,6 +2339,298 @@ impl ComponentScrubFinding {
             "ScrubFinding(kind='{}', type='{}', detail='{}')",
             self.component_kind, self.finding_type, self.detail,
         )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct DatabaseScrubReport {
+    manifest_internal: Option<ManifestScrubSummary>,
+    findings_internal: Vec<DatabaseScrubFinding>,
+    segments_internal: Vec<SegmentScrubResult>,
+    wal_generations_internal: Vec<WalScrubResult>,
+    orphan_segments_internal: Vec<OrphanSegmentScrubResult>,
+    #[pyo3(get)]
+    pub total_components_checked: u64,
+    #[pyo3(get)]
+    pub total_components_ok: u64,
+    #[pyo3(get)]
+    pub total_components_failed: u64,
+    #[pyo3(get)]
+    pub total_bytes_digested: u64,
+    #[pyo3(get)]
+    pub total_wal_records_checked: u64,
+    #[pyo3(get)]
+    pub total_wal_bytes_checked: u64,
+    #[pyo3(get)]
+    pub duration_ms: u64,
+}
+
+impl From<CoreDatabaseScrubReport> for DatabaseScrubReport {
+    fn from(r: CoreDatabaseScrubReport) -> Self {
+        DatabaseScrubReport {
+            manifest_internal: r.manifest.map(ManifestScrubSummary::from),
+            findings_internal: r
+                .findings
+                .into_iter()
+                .map(DatabaseScrubFinding::from)
+                .collect(),
+            segments_internal: r
+                .segments
+                .into_iter()
+                .map(SegmentScrubResult::from)
+                .collect(),
+            wal_generations_internal: r
+                .wal_generations
+                .into_iter()
+                .map(WalScrubResult::from)
+                .collect(),
+            orphan_segments_internal: r
+                .orphan_segments
+                .into_iter()
+                .map(OrphanSegmentScrubResult::from)
+                .collect(),
+            total_components_checked: r.total_components_checked,
+            total_components_ok: r.total_components_ok,
+            total_components_failed: r.total_components_failed,
+            total_bytes_digested: r.total_bytes_digested,
+            total_wal_records_checked: r.total_wal_records_checked,
+            total_wal_bytes_checked: r.total_wal_bytes_checked,
+            duration_ms: r.duration_ms,
+        }
+    }
+}
+
+#[pymethods]
+impl DatabaseScrubReport {
+    #[getter]
+    fn manifest(&self) -> Option<ManifestScrubSummary> {
+        self.manifest_internal.clone()
+    }
+
+    #[getter]
+    fn findings(&self) -> Vec<DatabaseScrubFinding> {
+        self.findings_internal.clone()
+    }
+
+    #[getter]
+    fn segments(&self) -> Vec<SegmentScrubResult> {
+        self.segments_internal.clone()
+    }
+
+    #[getter]
+    fn wal_generations(&self) -> Vec<WalScrubResult> {
+        self.wal_generations_internal.clone()
+    }
+
+    #[getter]
+    fn orphan_segments(&self) -> Vec<OrphanSegmentScrubResult> {
+        self.orphan_segments_internal.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DatabaseScrubReport(manifest={}, findings={}, segments={}, wal_generations={}, orphan_segments={}, checked={}, failed={}, duration_ms={})",
+            self.manifest_internal.is_some(),
+            self.findings_internal.len(),
+            self.segments_internal.len(),
+            self.wal_generations_internal.len(),
+            self.orphan_segments_internal.len(),
+            self.total_components_checked,
+            self.total_components_failed,
+            self.duration_ms,
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct ManifestScrubSummary {
+    #[pyo3(get)]
+    pub source: String,
+    #[pyo3(get)]
+    pub segment_count: u64,
+    #[pyo3(get)]
+    pub pending_flush_count: u64,
+    #[pyo3(get)]
+    pub active_wal_generation_id: u64,
+    #[pyo3(get)]
+    pub next_wal_generation_id: u64,
+}
+
+impl From<CoreManifestScrubSummary> for ManifestScrubSummary {
+    fn from(summary: CoreManifestScrubSummary) -> Self {
+        ManifestScrubSummary {
+            source: format!("{:?}", summary.source),
+            segment_count: summary.segment_count as u64,
+            pending_flush_count: summary.pending_flush_count as u64,
+            active_wal_generation_id: summary.active_wal_generation_id,
+            next_wal_generation_id: summary.next_wal_generation_id,
+        }
+    }
+}
+
+#[pymethods]
+impl ManifestScrubSummary {
+    fn __repr__(&self) -> String {
+        format!(
+            "ManifestScrubSummary(source='{}', segments={}, pending_flushes={})",
+            self.source, self.segment_count, self.pending_flush_count,
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct DatabaseScrubFinding {
+    #[pyo3(get)]
+    pub component_kind: String,
+    #[pyo3(get)]
+    pub finding_type: String,
+    #[pyo3(get)]
+    pub severity: String,
+    #[pyo3(get)]
+    pub detail: String,
+}
+
+impl From<CoreDatabaseScrubFinding> for DatabaseScrubFinding {
+    fn from(f: CoreDatabaseScrubFinding) -> Self {
+        DatabaseScrubFinding {
+            component_kind: f.component_kind,
+            finding_type: format!("{:?}", f.finding_type),
+            severity: database_scrub_severity_to_py(f.severity).to_string(),
+            detail: f.detail,
+        }
+    }
+}
+
+#[pymethods]
+impl DatabaseScrubFinding {
+    fn __repr__(&self) -> String {
+        format!(
+            "DatabaseScrubFinding(kind='{}', type='{}', severity='{}', detail='{}')",
+            self.component_kind, self.finding_type, self.severity, self.detail,
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct WalScrubResult {
+    #[pyo3(get)]
+    pub generation_id: u64,
+    #[pyo3(get)]
+    pub role: String,
+    #[pyo3(get)]
+    pub epoch_id: Option<u64>,
+    #[pyo3(get)]
+    pub segment_id: Option<u64>,
+    #[pyo3(get)]
+    pub file_len: u64,
+    #[pyo3(get)]
+    pub durable_len: u64,
+    #[pyo3(get)]
+    pub trailing_bytes: u64,
+    #[pyo3(get)]
+    pub records_checked: u64,
+    #[pyo3(get)]
+    pub bytes_checked: u64,
+    findings_internal: Vec<DatabaseScrubFinding>,
+}
+
+impl From<CoreWalScrubResult> for WalScrubResult {
+    fn from(wal: CoreWalScrubResult) -> Self {
+        WalScrubResult {
+            generation_id: wal.generation_id,
+            role: format!("{:?}", wal.role),
+            epoch_id: wal.epoch_id,
+            segment_id: wal.segment_id,
+            file_len: wal.file_len,
+            durable_len: wal.durable_len,
+            trailing_bytes: wal.trailing_bytes,
+            records_checked: wal.records_checked,
+            bytes_checked: wal.bytes_checked,
+            findings_internal: wal
+                .findings
+                .into_iter()
+                .map(DatabaseScrubFinding::from)
+                .collect(),
+        }
+    }
+}
+
+#[pymethods]
+impl WalScrubResult {
+    #[getter]
+    fn findings(&self) -> Vec<DatabaseScrubFinding> {
+        self.findings_internal.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "WalScrubResult(generation_id={}, role='{}', findings={})",
+            self.generation_id,
+            self.role,
+            self.findings_internal.len(),
+        )
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct OrphanSegmentScrubResult {
+    #[pyo3(get)]
+    pub segment_id: Option<u64>,
+    #[pyo3(get)]
+    pub path: String,
+    findings_internal: Vec<ComponentScrubFinding>,
+    #[pyo3(get)]
+    pub components_ok: u64,
+    #[pyo3(get)]
+    pub bytes_digested: u64,
+    #[pyo3(get)]
+    pub semantic_checks_skipped: bool,
+}
+
+impl From<CoreOrphanSegmentScrubResult> for OrphanSegmentScrubResult {
+    fn from(orphan: CoreOrphanSegmentScrubResult) -> Self {
+        OrphanSegmentScrubResult {
+            segment_id: orphan.segment_id,
+            path: orphan.path,
+            findings_internal: orphan
+                .findings
+                .into_iter()
+                .map(ComponentScrubFinding::from)
+                .collect(),
+            components_ok: orphan.components_ok,
+            bytes_digested: orphan.bytes_digested,
+            semantic_checks_skipped: orphan.semantic_checks_skipped,
+        }
+    }
+}
+
+#[pymethods]
+impl OrphanSegmentScrubResult {
+    #[getter]
+    fn findings(&self) -> Vec<ComponentScrubFinding> {
+        self.findings_internal.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "OrphanSegmentScrubResult(segment_id={:?}, findings={}, semantic_checks_skipped={})",
+            self.segment_id,
+            self.findings_internal.len(),
+            self.semantic_checks_skipped,
+        )
+    }
+}
+
+fn database_scrub_severity_to_py(severity: CoreDatabaseScrubSeverity) -> &'static str {
+    match severity {
+        CoreDatabaseScrubSeverity::Info => "info",
+        CoreDatabaseScrubSeverity::Warning => "warning",
+        CoreDatabaseScrubSeverity::Error => "error",
     }
 }
 
@@ -5770,6 +6086,8 @@ fn graph_row_stats_to_py(py: Python<'_>, stats: GraphRowStats) -> PyResult<PyObj
     dict.set_item("paths_enumerated", stats.paths_enumerated)?;
     dict.set_item("db_hits", stats.db_hits)?;
     dict.set_item("elapsed_us", stats.elapsed_us)?;
+    dict.set_item("planning_ns", stats.planning_ns)?;
+    dict.set_item("execution_ns", stats.execution_ns)?;
     dict.set_item("effective_at_epoch", stats.effective_at_epoch)?;
     dict.set_item("warnings", stats.warnings)?;
     Ok(dict.into_any().unbind())
@@ -9906,6 +10224,41 @@ const KNOWN_OPTIONS: &[&str] = &[
     "dense_vector_metric",
 ];
 
+const KNOWN_SCRUB_PATH_OPTIONS: &[&str] = &[
+    "validate_wal",
+    "include_orphan_segments",
+    "check_manifest_stability",
+];
+
+fn parse_scrub_path_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<CoreScrubPathOptions> {
+    let mut options = CoreScrubPathOptions::default();
+    let Some(d) = kwargs else {
+        return Ok(options);
+    };
+
+    for key in d.keys() {
+        let k: String = key.extract()?;
+        if !KNOWN_SCRUB_PATH_OPTIONS.contains(&k.as_str()) {
+            return Err(PyValueError::new_err(format!(
+                "Unknown option '{}'. Valid options: {}",
+                k,
+                KNOWN_SCRUB_PATH_OPTIONS.join(", ")
+            )));
+        }
+    }
+
+    if let Some(value) = d.get_item("validate_wal")? {
+        options.validate_wal = value.extract()?;
+    }
+    if let Some(value) = d.get_item("include_orphan_segments")? {
+        options.include_orphan_segments = value.extract()?;
+    }
+    if let Some(value) = d.get_item("check_manifest_stability")? {
+        options.check_manifest_stability = value.extract()?;
+    }
+    Ok(options)
+}
+
 fn parse_db_options(d: &Bound<'_, PyDict>) -> PyResult<DbOptions> {
     for key in d.keys() {
         let k: String = key.extract()?;
@@ -10556,6 +10909,7 @@ fn validate_py_type_token_name(name: &str, context: &str) -> PyResult<()> {
 
 #[pymodule]
 fn overgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(scrub_path, m)?)?;
     m.add_class::<OverGraph>()?;
     m.add_class::<WriteTxn>()?;
     m.add_class::<DbStats>()?;
@@ -10603,6 +10957,11 @@ fn overgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ScrubReport>()?;
     m.add_class::<SegmentScrubResult>()?;
     m.add_class::<ComponentScrubFinding>()?;
+    m.add_class::<DatabaseScrubReport>()?;
+    m.add_class::<ManifestScrubSummary>()?;
+    m.add_class::<DatabaseScrubFinding>()?;
+    m.add_class::<WalScrubResult>()?;
+    m.add_class::<OrphanSegmentScrubResult>()?;
     m.add("OverGraphError", m.py().get_type::<OverGraphError>())?;
     Ok(())
 }

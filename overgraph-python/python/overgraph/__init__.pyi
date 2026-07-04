@@ -27,6 +27,22 @@ SchemaVectorPresenceName = Literal["optional", "required", "forbidden"]
 SchemaAdditionalPropertiesMode = Literal["allow", "reject"]
 SecondaryIndexKind = Literal["equality", "range"]
 SecondaryIndexState = Literal["building", "ready", "failed"]
+DatabaseScrubFindingTypeName = Literal[
+    "ManifestMissing",
+    "ManifestFileInvalid",
+    "ManifestFallbackUsed",
+    "ManifestChangedDuringScrub",
+    "WalMissing",
+    "WalCorrupt",
+    "WalTrailingBytes",
+    "OrphanSegment",
+    "OrphanWal",
+    "OrphanSegmentUnpinned",
+    "OrphanSegmentScrubSkipped",
+]
+DatabaseScrubSeverityName = Literal["info", "warning", "error"]
+ManifestScrubSourceName = Literal["Current", "Tmp", "Prev"]
+WalScrubRoleName = Literal["Active", "FrozenPendingFlush", "PublishedPendingRetire"]
 NodeMetadataIndexField = Literal["id", "key", "weight", "created_at", "updated_at"]
 EdgeMetadataIndexField = Literal[
     "id",
@@ -316,6 +332,65 @@ class ComponentScrubFinding:
     component_kind: str
     finding_type: str
     detail: str
+    def __repr__(self) -> str: ...
+
+class DatabaseScrubReport:
+    total_components_checked: int
+    total_components_ok: int
+    total_components_failed: int
+    total_bytes_digested: int
+    total_wal_records_checked: int
+    total_wal_bytes_checked: int
+    duration_ms: int
+    @property
+    def manifest(self) -> ManifestScrubSummary | None: ...
+    @property
+    def findings(self) -> list[DatabaseScrubFinding]: ...
+    @property
+    def segments(self) -> list[SegmentScrubResult]: ...
+    @property
+    def wal_generations(self) -> list[WalScrubResult]: ...
+    @property
+    def orphan_segments(self) -> list[OrphanSegmentScrubResult]: ...
+    def __repr__(self) -> str: ...
+
+class ManifestScrubSummary:
+    source: ManifestScrubSourceName
+    segment_count: int
+    pending_flush_count: int
+    active_wal_generation_id: int
+    next_wal_generation_id: int
+    def __repr__(self) -> str: ...
+
+class DatabaseScrubFinding:
+    component_kind: str
+    finding_type: DatabaseScrubFindingTypeName
+    severity: DatabaseScrubSeverityName
+    detail: str
+    def __repr__(self) -> str: ...
+
+class WalScrubResult:
+    generation_id: int
+    role: WalScrubRoleName
+    epoch_id: int | None
+    segment_id: int | None
+    file_len: int
+    durable_len: int
+    trailing_bytes: int
+    records_checked: int
+    bytes_checked: int
+    @property
+    def findings(self) -> list[DatabaseScrubFinding]: ...
+    def __repr__(self) -> str: ...
+
+class OrphanSegmentScrubResult:
+    segment_id: int | None
+    path: str
+    components_ok: int
+    bytes_digested: int
+    semantic_checks_skipped: bool
+    @property
+    def findings(self) -> list[ComponentScrubFinding]: ...
     def __repr__(self) -> str: ...
 
 class DbStats:
@@ -714,6 +789,8 @@ class GraphRowStats(TypedDict):
     paths_enumerated: int
     db_hits: int
     elapsed_us: int | None
+    planning_ns: int | None
+    execution_ns: int | None
     effective_at_epoch: int
     warnings: list[str]
 
@@ -1088,6 +1165,22 @@ class OverGraphError(Exception): ...
 # ============================================================
 # Sync API
 # ============================================================
+
+def scrub_path(
+    path: str,
+    *,
+    validate_wal: bool = True,
+    include_orphan_segments: bool = False,
+    check_manifest_stability: bool = True,
+) -> DatabaseScrubReport: ...
+
+async def async_scrub_path(
+    path: str,
+    *,
+    validate_wal: bool = True,
+    include_orphan_segments: bool = False,
+    check_manifest_stability: bool = True,
+) -> DatabaseScrubReport: ...
 
 class OverGraph:
     @staticmethod

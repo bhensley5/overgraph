@@ -543,6 +543,8 @@ export interface GraphRowStats {
   pathsEnumerated: number
   dbHits: number
   elapsedUs: number | null
+  planningNs: number | null
+  executionNs: number | null
   effectiveAtEpoch: number
   warnings: Array<string>
 }

@@ -357,6 +357,54 @@ fn graph_pipeline_options_default_matches_spec() {
 }
 
 #[test]
+fn graph_row_profile_timing_stats_cover_fast_and_general_paths() {
+    let (_dir, engine) = graph_row_test_engine();
+    let ada = insert_graph_row_node(&engine, "ProfilePerson", "ada", &[]);
+    let ben = insert_graph_row_node(&engine, "ProfilePerson", "ben", &[]);
+    let knows = insert_graph_row_edge(&engine, ada, ben, "PROFILE_KNOWS", &[]);
+
+    let mut fast = graph_query(&["n"], Vec::new());
+    fast.nodes[0].ids = vec![ada];
+    fast.return_items = Some(vec![graph_return_binding("n", GraphReturnProjection::IdOnly)]);
+    fast.page.limit = 1;
+
+    let plain_fast = engine.query_graph_rows(&fast).unwrap();
+    assert_eq!(plain_fast.stats.elapsed_us, None);
+    assert_eq!(plain_fast.stats.planning_ns, None);
+    assert_eq!(plain_fast.stats.execution_ns, None);
+
+    fast.options.profile = true;
+    let profiled_fast = engine.query_graph_rows(&fast).unwrap();
+    assert!(profiled_fast.stats.elapsed_us.is_some());
+    assert!(profiled_fast.stats.planning_ns.is_some());
+    assert!(profiled_fast.stats.execution_ns.is_some());
+
+    let mut general = graph_query(
+        &["a", "b"],
+        vec![graph_edge_with_label(Some("r"), "a", "b", "PROFILE_KNOWS")],
+    );
+    general.nodes[0].ids = vec![ada];
+    general.return_items = Some(vec![
+        graph_return_binding("a", GraphReturnProjection::IdOnly),
+        graph_return_binding("r", GraphReturnProjection::IdOnly),
+        graph_return_binding("b", GraphReturnProjection::IdOnly),
+    ]);
+    general.page.limit = 1;
+
+    let plain_general = engine.query_graph_rows(&general).unwrap();
+    assert_eq!(plain_general.stats.elapsed_us, None);
+    assert_eq!(plain_general.stats.planning_ns, None);
+    assert_eq!(plain_general.stats.execution_ns, None);
+    assert_eq!(plain_general.rows[0].values[1], GraphValue::EdgeId(knows));
+
+    general.options.profile = true;
+    let profiled_general = engine.query_graph_rows(&general).unwrap();
+    assert!(profiled_general.stats.elapsed_us.is_some());
+    assert!(profiled_general.stats.planning_ns.is_some());
+    assert!(profiled_general.stats.execution_ns.is_some());
+}
+
+#[test]
 fn graph_pipeline_one_stage_matches_graph_row_result_and_cursor() {
     let (_dir, engine) = graph_row_test_engine();
     insert_graph_row_node(

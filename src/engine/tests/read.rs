@@ -13388,13 +13388,15 @@ fn test_vector_search_dense_rejects_missing_query_and_wrong_dimension() {
 }
 
 #[test]
-fn test_vector_search_dense_empty_when_unconfigured_or_no_vectors() {
+fn test_vector_search_dense_errors_when_unconfigured_empty_when_no_vectors() {
     let dir = TempDir::new().unwrap();
     let engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
-    assert!(engine
+    let err = engine
         .vector_search(&dense_search_request(vec![1.0, 0.0], 5, None, None))
-        .unwrap()
-        .is_empty());
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("dense vector search is not configured"));
     engine.close().unwrap();
 
     let dir = TempDir::new().unwrap();
