@@ -147,7 +147,7 @@ fn scrub_cli_clean_json_output_matches_connector_shape() {
     assert_eq!(parsed["manifest"]["source"], "Current");
     assert_eq!(parsed["manifest"]["segmentCount"], 1);
     assert!(parsed["segments"].as_array().unwrap().len() == 1);
-    assert!(parsed["walGenerations"].as_array().unwrap().len() >= 1);
+    assert!(!parsed["walGenerations"].as_array().unwrap().is_empty());
     assert!(parsed["findings"].as_array().is_some());
     assert!(parsed["orphanSegments"].as_array().unwrap().is_empty());
     assert!(parsed["totalComponentsChecked"].as_u64().unwrap() > 0);

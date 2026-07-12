@@ -13,6 +13,16 @@ function planHasKind(node, kind) {
   return Array.isArray(node.inputs) && node.inputs.some(input => planHasKind(input, kind));
 }
 
+function planNodes(node, kind) {
+  if (!node) return [];
+  const matches = node.kind === kind ? [node] : [];
+  if (node.input) matches.push(...planNodes(node.input, kind));
+  if (Array.isArray(node.inputs)) {
+    for (const input of node.inputs) matches.push(...planNodes(input, kind));
+  }
+  return matches;
+}
+
 function nodeLabels(label) {
   return { labels: [label], mode: 'all' };
 }
@@ -51,6 +61,20 @@ async function waitForIndexState(db, predicate, expectedState = 'ready', timeout
     }
     if (Date.now() >= deadline) {
       throw new Error(`timed out waiting for secondary index state '${expectedState}'`);
+    }
+    await delay(20);
+  }
+}
+
+async function waitForEdgeIndexState(db, predicate, expectedState = 'ready', timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const info = predicate(db.listEdgePropertyIndexes());
+    if (info?.state === expectedState) {
+      return info;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for edge secondary index state '${expectedState}'`);
     }
     await delay(20);
   }
@@ -572,5 +596,264 @@ describe('query API parity', () => {
     });
     assert.equal(asyncPlan.kind, 'node_query');
     assert.ok(asyncPlan.warnings.every(warning => /^[a-z_]+$/.test(warning)));
+  });
+
+  it('serializes streamed explain shapes and preserves result parity', async () => {
+    const label = 'StreamParity';
+    for (const [key, kind] of [
+      ['status', 'equality'],
+      ['region', 'equality'],
+      ['score', 'range'],
+      ['tenant', 'equality'],
+      ['cohort', 'equality'],
+    ]) {
+      db.ensureNodePropertyIndex(label, propertyIndexSpec(key, kind));
+    }
+    for (const [key, kind] of [
+      ['status', 'equality'],
+      ['region', 'equality'],
+      ['score', 'range'],
+      ['tenant', 'equality'],
+      ['cohort', 'equality'],
+    ]) {
+      await waitForIndexState(
+        db,
+        infos => infos.find(info => info.label === label && hasPropertyField(info, key) && info.kind === kind)
+      );
+    }
+
+    const total = 10_000;
+    const ids = Array.from(db.batchUpsertNodes(Array.from({ length: total }, (_, ordinal) => ({
+      labels: [label],
+      key: `stream-parity-${ordinal}`,
+      props: {
+        status: ordinal < 5_000 ? 'hot' : 'cold',
+        region: ordinal % 2 === 0 ? 'east' : 'west',
+        score: ordinal,
+        tenant: ordinal < 100 ? 'tiny' : 'other',
+        cohort: ordinal < 300 ? 'focus' : 'other',
+      },
+    }))));
+    db.flush();
+
+    const labelFilter = nodeLabels(label);
+    const eagerIntersectQuery = {
+      labelFilter,
+      filter: { and: [{ property: 'tenant', eq: 'tiny' }, { property: 'cohort', eq: 'focus' }] },
+      limit: 25,
+    };
+    const streamedIntersectQuery = {
+      labelFilter,
+      filter: { and: [{ property: 'status', eq: 'hot' }, { property: 'region', eq: 'east' }] },
+      limit: 25,
+    };
+    const streamedUnionQuery = {
+      labelFilter,
+      filter: { property: 'status', in: ['hot', 'cold'] },
+      limit: 25,
+    };
+    const streamedSourceQuery = {
+      labelFilter,
+      filter: { property: 'status', eq: 'hot' },
+      limit: 25,
+    };
+    const bufferedRangeQuery = {
+      labelFilter,
+      filter: { and: [{ property: 'status', eq: 'hot' }, { property: 'score', gte: 0, lte: 2_999 }] },
+      limit: 25,
+    };
+    const cappedRangeQuery = {
+      labelFilter,
+      filter: { and: [{ property: 'tenant', eq: 'tiny' }, { property: 'score', gte: 0, lte: 8_999 }] },
+      limit: 25,
+    };
+
+    const eagerIntersect = planNodes(db.explainNodeQuery(eagerIntersectQuery).root, 'intersect')[0];
+    assert.equal(eagerIntersect.mode, 'eager');
+
+    const streamedIntersectPlan = db.explainNodeQuery(streamedIntersectQuery);
+    const streamedIntersect = planNodes(streamedIntersectPlan.root, 'intersect')[0];
+    assert.equal(streamedIntersect.mode, 'streamed');
+    assert.deepEqual(
+      Array.from(db.queryNodeIds(streamedIntersectQuery).items),
+      ids.filter((_, ordinal) => ordinal < 5_000 && ordinal % 2 === 0).slice(0, 25)
+    );
+
+    const streamedUnion = planNodes(db.explainNodeQuery(streamedUnionQuery).root, 'union')[0];
+    assert.equal(streamedUnion.mode, 'streamed');
+    assert.deepEqual(Array.from(db.queryNodeIds(streamedUnionQuery).items), ids.slice(0, 25));
+
+    const streamedSource = planNodes(db.explainNodeQuery(streamedSourceQuery).root, 'streamed_source')[0];
+    assert.equal(streamedSource.input.kind, 'property_equality_index');
+    assert.deepEqual(Array.from(db.queryNodeIds(streamedSourceQuery).items), ids.slice(0, 25));
+
+    const bufferedPlan = db.explainNodeQuery(bufferedRangeQuery);
+    const bufferedIntersect = planNodes(bufferedPlan.root, 'intersect')[0];
+    assert.equal(bufferedIntersect.mode, 'streamed');
+    const buffered = planNodes(bufferedPlan.root, 'buffered_id_sort')[0];
+    assert.equal(buffered.input.kind, 'property_range_index');
+    assert.deepEqual(Array.from(db.queryNodeIds(bufferedRangeQuery).items), ids.slice(0, 25));
+
+    const cappedPlan = db.explainNodeQuery(cappedRangeQuery);
+    assert.deepEqual(cappedPlan.warnings, ['index_skipped_as_broad', 'verify_only_filter']);
+    assert.equal(planNodes(cappedPlan.root, 'property_equality_index').length, 1);
+    assert.equal(planNodes(cappedPlan.root, 'property_range_index').length, 0);
+    assert.equal(planNodes(cappedPlan.root, 'buffered_id_sort').length, 0);
+    assert.deepEqual(Array.from(db.queryNodeIds(cappedRangeQuery).items), ids.slice(0, 25));
+
+    const edgeLabel = 'STREAM_PARITY_EDGE';
+    for (const [key, kind] of [
+      ['status', 'equality'],
+      ['region', 'equality'],
+      ['score', 'range'],
+      ['tenant', 'equality'],
+    ]) {
+      db.ensureEdgePropertyIndex(edgeLabel, propertyIndexSpec(key, kind));
+    }
+    for (const [key, kind] of [
+      ['status', 'equality'],
+      ['region', 'equality'],
+      ['score', 'range'],
+      ['tenant', 'equality'],
+    ]) {
+      await waitForEdgeIndexState(
+        db,
+        infos => infos.find(info => info.label === edgeLabel && hasPropertyField(info, key) && info.kind === kind)
+      );
+    }
+
+    const edgeSource = db.upsertNode('StreamParityEdgeNode', 'source');
+    const edgeTargets = Array.from(db.batchUpsertNodes(Array.from({ length: 9_000 }, (_, ordinal) => ({
+      labels: ['StreamParityEdgeNode'],
+      key: `target-${ordinal}`,
+    }))));
+    const edgeIds = Array.from(db.batchUpsertEdges(edgeTargets.map((to, ordinal) => ({
+      from: edgeSource,
+      to,
+      label: edgeLabel,
+      props: {
+        status: ordinal < 5_000 ? 'hot' : 'cold',
+        region: ordinal % 2 === 0 ? 'east' : 'west',
+        score: ordinal,
+        tenant: ordinal < 100 ? 'tiny' : 'other',
+      },
+    }))));
+    db.flush();
+
+    const edgeStreamedIntersectQuery = {
+      label: edgeLabel,
+      filter: { and: [{ property: 'status', eq: 'hot' }, { property: 'region', eq: 'east' }] },
+      limit: 25,
+    };
+    const edgeStreamedUnionQuery = {
+      label: edgeLabel,
+      filter: { property: 'status', in: ['hot', 'cold'] },
+      limit: 25,
+    };
+    const edgeStreamedSourceQuery = {
+      label: edgeLabel,
+      filter: { property: 'status', eq: 'hot' },
+      limit: 25,
+    };
+    const edgeBufferedRangeQuery = {
+      label: edgeLabel,
+      filter: { and: [{ property: 'status', eq: 'hot' }, { property: 'score', gte: 0, lte: 2_999 }] },
+      limit: 25,
+    };
+    const edgeCappedRangeQuery = {
+      label: edgeLabel,
+      filter: { and: [{ property: 'tenant', eq: 'tiny' }, { property: 'score', gte: 0, lte: 7_999 }] },
+      limit: 25,
+    };
+
+    const edgeStreamedIntersect = planNodes(db.explainEdgeQuery(edgeStreamedIntersectQuery).root, 'intersect')[0];
+    assert.equal(edgeStreamedIntersect.mode, 'streamed');
+    assert.deepEqual(
+      Array.from(db.queryEdgeIds(edgeStreamedIntersectQuery).items),
+      edgeIds.filter((_, ordinal) => ordinal < 5_000 && ordinal % 2 === 0).slice(0, 25)
+    );
+
+    const edgeStreamedUnion = planNodes(db.explainEdgeQuery(edgeStreamedUnionQuery).root, 'union')[0];
+    assert.equal(edgeStreamedUnion.mode, 'streamed');
+    assert.deepEqual(Array.from(db.queryEdgeIds(edgeStreamedUnionQuery).items), edgeIds.slice(0, 25));
+
+    const edgeStreamedSource = planNodes(db.explainEdgeQuery(edgeStreamedSourceQuery).root, 'streamed_source')[0];
+    assert.equal(edgeStreamedSource.input.kind, 'edge_property_equality_index');
+    assert.deepEqual(Array.from(db.queryEdgeIds(edgeStreamedSourceQuery).items), edgeIds.slice(0, 25));
+
+    const edgeBufferedPlan = db.explainEdgeQuery(edgeBufferedRangeQuery);
+    const edgeBufferedIntersect = planNodes(edgeBufferedPlan.root, 'intersect')[0];
+    assert.equal(edgeBufferedIntersect.mode, 'streamed');
+    const edgeBuffered = planNodes(edgeBufferedPlan.root, 'buffered_id_sort')[0];
+    assert.equal(edgeBuffered.input.kind, 'edge_property_range_index');
+    assert.deepEqual(Array.from(db.queryEdgeIds(edgeBufferedRangeQuery).items), edgeIds.slice(0, 25));
+
+    const edgeCappedPlan = db.explainEdgeQuery(edgeCappedRangeQuery);
+    assert.deepEqual(edgeCappedPlan.warnings, [
+      'index_skipped_as_broad',
+      'candidate_cap_exceeded',
+      'verify_only_filter',
+    ]);
+    assert.equal(planNodes(edgeCappedPlan.root, 'edge_property_equality_index').length, 1);
+    assert.equal(planNodes(edgeCappedPlan.root, 'edge_property_range_index').length, 0);
+    assert.equal(planNodes(edgeCappedPlan.root, 'buffered_id_sort').length, 0);
+    assert.deepEqual(Array.from(db.queryEdgeIds(edgeCappedRangeQuery).items), edgeIds.slice(0, 25));
+
+    const gqlStreamed = db.executeGql(
+      `MATCH (source)-[edge:${edgeLabel}]->(target)
+       WHERE id(source) = ${edgeSource} AND edge.status = 'hot' AND edge.region = 'east'
+       RETURN id(edge) AS edgeId, id(target) AS targetId
+       ORDER BY id(edge) LIMIT 25`,
+      null,
+      { includePlan: true }
+    );
+    const expectedGqlPairs = edgeIds
+      .map((edgeId, ordinal) => ({ edgeId, targetId: edgeTargets[ordinal], ordinal }))
+      .filter(({ ordinal }) => ordinal < 5_000 && ordinal % 2 === 0)
+      .slice(0, 25)
+      .map(({ edgeId, targetId }) => ({ edgeId, targetId }));
+    assert.deepEqual(gqlStreamed.rows, expectedGqlPairs);
+    assert.equal(gqlStreamed.rows.length, 25);
+    assert.ok(gqlStreamed.plan.read.pushedDown.some(item => item.includes('edge.status')));
+    assert.ok(gqlStreamed.plan.read.pushedDown.some(item => item.includes('edge.region')));
+    const gqlRuntimePlan = gqlStreamed.plan.read.projection.join('\n');
+    for (const fragment of [
+      'GraphRowSourceRead',
+      'DelegatedEdgeQuery',
+      'EdgeCandidateSource',
+      'EdgePropertyEqualityIndex',
+      'planned_modes=streamed',
+      'planned_warnings=[',
+    ]) {
+      assert.ok(
+        gqlRuntimePlan.includes(fragment),
+        `missing executed delegated GQL plan fragment ${JSON.stringify(fragment)}: ${gqlRuntimePlan}`
+      );
+    }
+
+    const smallEdgeLabel = 'STREAM_PARITY_EDGE_SMALL';
+    db.ensureEdgePropertyIndex(smallEdgeLabel, propertyIndexSpec('status', 'equality'));
+    await waitForEdgeIndexState(
+      db,
+      infos => infos.find(info => info.label === smallEdgeLabel && hasPropertyField(info, 'status') && info.kind === 'equality')
+    );
+    const smallTargets = Array.from(db.batchUpsertNodes(Array.from({ length: 100 }, (_, ordinal) => ({
+      labels: ['StreamParitySmallEdgeNode'],
+      key: `small-target-${ordinal}`,
+    }))));
+    db.batchUpsertEdges(smallTargets.map((to, ordinal) => ({
+      from: edgeSource,
+      to,
+      label: smallEdgeLabel,
+      props: { status: ordinal < 50 ? 'hot' : 'cold' },
+    })));
+    db.flush();
+    const smallEdgePlan = db.explainEdgeQuery({
+      label: smallEdgeLabel,
+      filter: { property: 'status', eq: 'hot' },
+      limit: 25,
+    });
+    assert.equal(planNodes(smallEdgePlan.root, 'edge_property_equality_index').length, 1);
+    assert.equal(planNodes(smallEdgePlan.root, 'streamed_source').length, 0);
   });
 });

@@ -11,13 +11,39 @@ const GRAPH_ROW_HUB_HIGH_RATIO: u64 = 8;
 const GRAPH_ROW_HUB_MEDIUM_RATIO: u64 = 4;
 const GRAPH_ROW_CONFIDENCE_DOWNGRADE_STEP: u8 = 1;
 const COMPOUND_INDEX_IN_EXPANSION_CAP: usize = 64;
+const STREAMED_INTERSECT_MAX_INPUTS: usize = 16;
+const STREAMED_MAX_TOTAL_CURSORS: usize = 4096;
+const EAGER_PREFERRED_SOURCE_MAX: u64 =
+    crate::planner_stats::PLANNER_STATS_DEFAULT_SELECTED_SOURCE_CAP as u64;
 
 struct PlannedNodeQuery {
     driver: NodePhysicalPlan,
+    execution_mode: NodeDriverExecutionMode,
     cap_context: QueryCapContext,
     legal_universe_fallback: Option<PlannedNodeCandidateSource>,
     warnings: Vec<QueryPlanWarning>,
     followups: Vec<SecondaryIndexReadFollowup>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeDriverExecutionMode {
+    Eager,
+    Streamed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeSetOpExecutionMode {
+    Eager,
+    Streamed,
+}
+
+impl NodeSetOpExecutionMode {
+    fn query_plan_mode(self) -> QueryPlanExecutionMode {
+        match self {
+            Self::Eager => QueryPlanExecutionMode::Eager,
+            Self::Streamed => QueryPlanExecutionMode::Streamed,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -25,8 +51,15 @@ struct PlannedNodeQuery {
 enum NodePhysicalPlan {
     Empty,
     Source(PlannedNodeCandidateSource),
-    Intersect(Vec<NodePhysicalPlan>),
-    Union(Vec<NodePhysicalPlan>),
+    BufferedIdSort(Box<NodePhysicalPlan>),
+    Intersect {
+        inputs: Vec<NodePhysicalPlan>,
+        mode: NodeSetOpExecutionMode,
+    },
+    Union {
+        inputs: Vec<NodePhysicalPlan>,
+        mode: NodeSetOpExecutionMode,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -35,6 +68,7 @@ enum BooleanPlanClassification {
     VerifyOnly,
     Bounded {
         plan: NodePhysicalPlan,
+        streamable_rejects: Vec<NodePhysicalPlan>,
         estimate: PlannerEstimate,
         structural_key: Vec<u8>,
         complete: bool,
@@ -44,6 +78,26 @@ enum BooleanPlanClassification {
 struct BooleanPlanResult {
     classification: BooleanPlanClassification,
     has_verify_only: bool,
+}
+
+struct BoundedAndSelection {
+    selected: Vec<NodePhysicalPlan>,
+    streamable_rejects: Vec<NodePhysicalPlan>,
+    skipped_to_verifier: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeStreamInputClass {
+    NativeStream,
+    BufferedIdSort,
+    NotStreamable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamedInputRejection {
+    NotStreamable,
+    BufferedCapExceeded,
+    CursorCountExceeded,
 }
 
 struct BooleanPlanningBudget {
@@ -77,10 +131,32 @@ enum NodeLegalUniverseSource {
 
 struct PlannedEdgeQuery {
     driver: EdgePhysicalPlan,
+    execution_mode: EdgeDriverExecutionMode,
     cap_context: EdgeQueryCapContext,
     legal_universe_fallback: Option<PlannedEdgeCandidateSource>,
     warnings: Vec<QueryPlanWarning>,
     followups: Vec<SecondaryIndexReadFollowup>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeDriverExecutionMode {
+    Eager,
+    Streamed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeSetOpExecutionMode {
+    Eager,
+    Streamed,
+}
+
+impl EdgeSetOpExecutionMode {
+    fn query_plan_mode(self) -> QueryPlanExecutionMode {
+        match self {
+            Self::Eager => QueryPlanExecutionMode::Eager,
+            Self::Streamed => QueryPlanExecutionMode::Streamed,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -231,8 +307,15 @@ struct EdgeMetadataSidecarAvailability {
 enum EdgePhysicalPlan {
     Empty,
     Source(PlannedEdgeCandidateSource),
-    Intersect(Vec<EdgePhysicalPlan>),
-    Union(Vec<EdgePhysicalPlan>),
+    BufferedIdSort(Box<EdgePhysicalPlan>),
+    Intersect {
+        inputs: Vec<EdgePhysicalPlan>,
+        mode: EdgeSetOpExecutionMode,
+    },
+    Union {
+        inputs: Vec<EdgePhysicalPlan>,
+        mode: EdgeSetOpExecutionMode,
+    },
 }
 
 #[derive(Clone)]
@@ -320,14 +403,17 @@ enum EdgeCandidateMaterialization {
     FromEndpointAdjacency {
         node_ids: Arc<Vec<u64>>,
         label_filter_ids: Option<Vec<u32>>,
+        stream_cursor_count_upper_bound: usize,
     },
     ToEndpointAdjacency {
         node_ids: Arc<Vec<u64>>,
         label_filter_ids: Option<Vec<u32>>,
+        stream_cursor_count_upper_bound: usize,
     },
     AnyEndpointAdjacency {
         node_ids: Arc<Vec<u64>>,
         label_filter_ids: Option<Vec<u32>>,
+        stream_cursor_count_upper_bound: usize,
     },
     EdgeWeightIndex {
         label_id: Option<u32>,
@@ -372,6 +458,12 @@ enum EdgeCandidateMaterialization {
     FallbackFullEdgeScan,
 }
 
+#[derive(Clone, Copy)]
+struct EdgeEndpointPlannerStats {
+    estimate: PlannerEstimate,
+    stream_cursor_count_upper_bound: usize,
+}
+
 struct CandidateProbe {
     source: Option<PlannedNodeCandidateSource>,
     warning: Option<QueryPlanWarning>,
@@ -390,6 +482,7 @@ enum EdgeBooleanPlanClassification {
     VerifyOnly,
     Bounded {
         plan: EdgePhysicalPlan,
+        streamable_rejects: Vec<EdgePhysicalPlan>,
         estimate: PlannerEstimate,
         structural_key: Vec<u8>,
         complete: bool,
@@ -399,6 +492,19 @@ enum EdgeBooleanPlanClassification {
 struct EdgeBooleanPlanResult {
     classification: EdgeBooleanPlanClassification,
     has_verify_only: bool,
+}
+
+struct BoundedEdgeAndSelection {
+    selected: Vec<EdgePhysicalPlan>,
+    streamable_rejects: Vec<EdgePhysicalPlan>,
+    skipped_to_verifier: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeStreamInputClass {
+    NativeStream,
+    BufferedIdSort,
+    NotStreamable,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -752,8 +858,9 @@ fn plan_warning_rank(warning: QueryPlanWarning) -> usize {
         QueryPlanWarning::BooleanBranchFallback => 10,
         QueryPlanWarning::PlanningProbeBudgetExceeded => 11,
         QueryPlanWarning::CompoundIndexPrefixNotSatisfied => 12,
-        QueryPlanWarning::UnknownNodeLabel => 13,
-        QueryPlanWarning::UnknownEdgeLabel => 14,
+        QueryPlanWarning::StreamedInputBufferCapExceeded => 13,
+        QueryPlanWarning::UnknownNodeLabel => 14,
+        QueryPlanWarning::UnknownEdgeLabel => 15,
     }
 }
 
@@ -820,6 +927,38 @@ fn filter_has_intrinsic_verify_only(filter: &NormalizedNodeFilter) -> bool {
         | NormalizedNodeFilter::WeightRange { .. }
         | NormalizedNodeFilter::CreatedAtRange { .. }
         | NormalizedNodeFilter::UpdatedAtRange { .. } => false,
+    }
+}
+
+fn classify_stream_input(plan: &NodePhysicalPlan) -> NodeStreamInputClass {
+    match plan {
+        NodePhysicalPlan::Source(source) => classify_stream_materialization(&source.materialization),
+        NodePhysicalPlan::BufferedIdSort(input) => classify_stream_input(input),
+        NodePhysicalPlan::Empty
+        | NodePhysicalPlan::Intersect { .. }
+        | NodePhysicalPlan::Union { .. } => NodeStreamInputClass::NotStreamable,
+    }
+}
+
+fn classify_stream_materialization(
+    materialization: &NodeCandidateMaterialization,
+) -> NodeStreamInputClass {
+    match materialization {
+        NodeCandidateMaterialization::Precomputed(_)
+        | NodeCandidateMaterialization::KeyLookup
+        | NodeCandidateMaterialization::NodeLabelIndex { .. }
+        | NodeCandidateMaterialization::NodeLabelAny { .. }
+        | NodeCandidateMaterialization::PropertyEqualityIndex { .. } => {
+            NodeStreamInputClass::NativeStream
+        }
+        NodeCandidateMaterialization::PropertyRangeIndex { .. }
+        | NodeCandidateMaterialization::TimestampIndex { .. } => {
+            NodeStreamInputClass::BufferedIdSort
+        }
+        NodeCandidateMaterialization::CompoundPrefixIndex { .. }
+        | NodeCandidateMaterialization::CompoundRangeIndex { .. }
+        | NodeCandidateMaterialization::FallbackNodeLabelScan { .. }
+        | NodeCandidateMaterialization::FallbackFullNodeScan => NodeStreamInputClass::NotStreamable,
     }
 }
 
@@ -1936,6 +2075,33 @@ fn compound_union_estimate_exceeds_materialization_cap(
     union_estimate > cap_context.union_total_cap(true, query_limit, estimate) as u64
 }
 
+fn stream_reject_admitted_by_selectivity_gate(
+    anchor_count: Option<u64>,
+    reject_count: Option<u64>,
+    label_universe_count: Option<u64>,
+) -> bool {
+    let Some(anchor_count) = anchor_count else {
+        return true;
+    };
+    let Some(reject_count) = reject_count else {
+        return anchor_count > EAGER_PREFERRED_SOURCE_MAX;
+    };
+
+    if let Some(universe_count) = label_universe_count {
+        if reject_count >= universe_count {
+            return false;
+        }
+        let left = (reject_count as u128).saturating_mul(universe_count as u128);
+        let pruning = universe_count - reject_count;
+        let right = (QUERY_BROAD_SOURCE_FACTOR as u128)
+            .saturating_mul(anchor_count as u128)
+            .saturating_mul(pruning as u128);
+        return left <= right;
+    }
+
+    reject_count <= anchor_count.saturating_mul(QUERY_BROAD_SOURCE_FACTOR)
+}
+
 fn remaining_compound_count_cap(cap: u64, total: u64, local_count: u64) -> Option<u64> {
     let used = total.saturating_add(local_count);
     if used < cap {
@@ -2436,7 +2602,7 @@ impl PlannedEdgeCandidateSource {
         kind: EdgeQueryCandidateSourceKind,
         node_ids: Arc<Vec<u64>>,
         label_filter_ids: Option<Vec<u32>>,
-        estimate: PlannerEstimate,
+        stats: EdgeEndpointPlannerStats,
     ) -> Self {
         // Fixed-size content key: Debug-dumping every endpoint ID made the
         // canonical key O(ids) to build, clone, and compare on large anchors.
@@ -2450,18 +2616,21 @@ impl PlannedEdgeCandidateSource {
                 EdgeCandidateMaterialization::FromEndpointAdjacency {
                     node_ids,
                     label_filter_ids,
+                    stream_cursor_count_upper_bound: stats.stream_cursor_count_upper_bound,
                 }
             }
             EdgeQueryCandidateSourceKind::ToEndpointAdjacency => {
                 EdgeCandidateMaterialization::ToEndpointAdjacency {
                     node_ids,
                     label_filter_ids,
+                    stream_cursor_count_upper_bound: stats.stream_cursor_count_upper_bound,
                 }
             }
             EdgeQueryCandidateSourceKind::AnyEndpointAdjacency => {
                 EdgeCandidateMaterialization::AnyEndpointAdjacency {
                     node_ids,
                     label_filter_ids,
+                    stream_cursor_count_upper_bound: stats.stream_cursor_count_upper_bound,
                 }
             }
             _ => unreachable!("endpoint source kind required"),
@@ -2469,7 +2638,7 @@ impl PlannedEdgeCandidateSource {
         Self {
             kind,
             canonical_key,
-            estimate,
+            estimate: stats.estimate,
             materialization,
         }
     }
@@ -2779,7 +2948,8 @@ impl NodePhysicalPlan {
         match self {
             NodePhysicalPlan::Empty => false,
             NodePhysicalPlan::Source(source) => node_source_kind_is_eager_index(source.kind),
-            NodePhysicalPlan::Intersect(inputs) | NodePhysicalPlan::Union(inputs) => {
+            NodePhysicalPlan::BufferedIdSort(input) => input.members_are_eager_index_sources(),
+            NodePhysicalPlan::Intersect { inputs, .. } | NodePhysicalPlan::Union { inputs, .. } => {
                 !inputs.is_empty()
                     && inputs
                         .iter()
@@ -2793,14 +2963,17 @@ impl NodePhysicalPlan {
         for input in inputs {
             match input {
                 NodePhysicalPlan::Empty => return NodePhysicalPlan::Empty,
-                NodePhysicalPlan::Intersect(children) => flattened.extend(children),
+                NodePhysicalPlan::Intersect { inputs: children, .. } => flattened.extend(children),
                 plan => flattened.push(plan),
             }
         }
         match flattened.len() {
             0 => NodePhysicalPlan::Empty,
             1 => flattened.into_iter().next().unwrap(),
-            _ => NodePhysicalPlan::Intersect(flattened),
+            _ => NodePhysicalPlan::Intersect {
+                inputs: flattened,
+                mode: NodeSetOpExecutionMode::Eager,
+            },
         }
     }
 
@@ -2809,14 +2982,38 @@ impl NodePhysicalPlan {
         for input in inputs {
             match input {
                 NodePhysicalPlan::Empty => {}
-                NodePhysicalPlan::Union(children) => flattened.extend(children),
+                NodePhysicalPlan::Union { inputs: children, .. } => flattened.extend(children),
                 plan => flattened.push(plan),
             }
         }
         match flattened.len() {
             0 => NodePhysicalPlan::Empty,
             1 => flattened.into_iter().next().unwrap(),
-            _ => NodePhysicalPlan::Union(flattened),
+            _ => NodePhysicalPlan::Union {
+                inputs: flattened,
+                mode: NodeSetOpExecutionMode::Eager,
+            },
+        }
+    }
+
+    fn streamed_union(inputs: Vec<NodePhysicalPlan>) -> Self {
+        let mut flattened = Vec::new();
+        for input in inputs {
+            match input {
+                NodePhysicalPlan::Empty => {}
+                NodePhysicalPlan::Union { inputs: children, .. } => {
+                    flattened.extend(children.into_iter().map(NodePhysicalPlan::into_streamed_mode));
+                }
+                plan => flattened.push(plan.into_streamed_mode()),
+            }
+        }
+        match flattened.len() {
+            0 => NodePhysicalPlan::Empty,
+            1 => flattened.into_iter().next().unwrap(),
+            _ => NodePhysicalPlan::Union {
+                inputs: flattened,
+                mode: NodeSetOpExecutionMode::Streamed,
+            },
         }
     }
 
@@ -2824,11 +3021,16 @@ impl NodePhysicalPlan {
         match self {
             NodePhysicalPlan::Empty => QueryPlanNode::EmptyResult,
             NodePhysicalPlan::Source(source) => source.plan_node(),
-            NodePhysicalPlan::Intersect(inputs) => QueryPlanNode::Intersect {
-                inputs: inputs.iter().map(NodePhysicalPlan::plan_node).collect(),
+            NodePhysicalPlan::BufferedIdSort(input) => QueryPlanNode::BufferedIdSort {
+                input: Box::new(input.plan_node()),
             },
-            NodePhysicalPlan::Union(inputs) => QueryPlanNode::Union {
+            NodePhysicalPlan::Intersect { inputs, mode } => QueryPlanNode::Intersect {
                 inputs: inputs.iter().map(NodePhysicalPlan::plan_node).collect(),
+                mode: mode.query_plan_mode(),
+            },
+            NodePhysicalPlan::Union { inputs, mode } => QueryPlanNode::Union {
+                inputs: inputs.iter().map(NodePhysicalPlan::plan_node).collect(),
+                mode: mode.query_plan_mode(),
             },
         }
     }
@@ -2837,14 +3039,15 @@ impl NodePhysicalPlan {
         match self {
             NodePhysicalPlan::Empty => PlannerEstimate::exact_cheap(0),
             NodePhysicalPlan::Source(source) => source.estimate,
-            NodePhysicalPlan::Intersect(inputs) => inputs
+            NodePhysicalPlan::BufferedIdSort(input) => input.estimate(),
+            NodePhysicalPlan::Intersect { inputs, .. } => inputs
                 .iter()
                 .map(NodePhysicalPlan::estimate)
                 .filter_map(PlannerEstimate::known_upper_bound)
                 .min()
                 .map(PlannerEstimate::upper_bound)
                 .unwrap_or_else(PlannerEstimate::unknown),
-            NodePhysicalPlan::Union(inputs) => {
+            NodePhysicalPlan::Union { inputs, .. } => {
                 let mut total = 0u64;
                 for input in inputs {
                     let Some(count) = input.estimate().known_upper_bound() else {
@@ -2861,12 +3064,13 @@ impl NodePhysicalPlan {
         match self {
             NodePhysicalPlan::Empty => 0,
             NodePhysicalPlan::Source(source) => source.kind.selectivity_rank(),
-            NodePhysicalPlan::Intersect(inputs) => inputs
+            NodePhysicalPlan::BufferedIdSort(input) => input.selectivity_rank(),
+            NodePhysicalPlan::Intersect { inputs, .. } => inputs
                 .iter()
                 .map(NodePhysicalPlan::selectivity_rank)
                 .min()
                 .unwrap_or(usize::MAX),
-            NodePhysicalPlan::Union(_) => 4,
+            NodePhysicalPlan::Union { .. } => 4,
         }
     }
 
@@ -2874,7 +3078,8 @@ impl NodePhysicalPlan {
         match self {
             NodePhysicalPlan::Empty => PlanMaterializationClass::Empty,
             NodePhysicalPlan::Source(source) => source.materialization.materialization_class(),
-            NodePhysicalPlan::Intersect(_) | NodePhysicalPlan::Union(_) => {
+            NodePhysicalPlan::BufferedIdSort(input) => input.materialization_class(),
+            NodePhysicalPlan::Intersect { .. } | NodePhysicalPlan::Union { .. } => {
                 PlanMaterializationClass::Compound
             }
         }
@@ -2885,7 +3090,8 @@ impl NodePhysicalPlan {
         let base_work = match self {
             NodePhysicalPlan::Empty => 0,
             NodePhysicalPlan::Source(source) => return source.plan_cost(),
-            NodePhysicalPlan::Intersect(inputs) | NodePhysicalPlan::Union(inputs) => {
+            NodePhysicalPlan::BufferedIdSort(input) => return input.plan_cost(),
+            NodePhysicalPlan::Intersect { inputs, .. } | NodePhysicalPlan::Union { inputs, .. } => {
                 inputs.iter().fold(16u64, |total, input| {
                     total.saturating_add(
                         input
@@ -2914,7 +3120,10 @@ impl NodePhysicalPlan {
         match self {
             NodePhysicalPlan::Empty => "empty".to_string(),
             NodePhysicalPlan::Source(source) => source.canonical_key.clone(),
-            NodePhysicalPlan::Intersect(inputs) => {
+            NodePhysicalPlan::BufferedIdSort(input) => {
+                format!("buffered:{}", input.canonical_key())
+            }
+            NodePhysicalPlan::Intersect { inputs, .. } => {
                 let mut key = String::from("and:");
                 for input in inputs {
                     key.push_str(&input.canonical_key());
@@ -2922,7 +3131,7 @@ impl NodePhysicalPlan {
                 }
                 key
             }
-            NodePhysicalPlan::Union(inputs) => {
+            NodePhysicalPlan::Union { inputs, .. } => {
                 let mut key = String::from("or:");
                 for input in inputs {
                     key.push_str(&input.canonical_key());
@@ -2937,7 +3146,8 @@ impl NodePhysicalPlan {
         match self {
             NodePhysicalPlan::Empty => false,
             NodePhysicalPlan::Source(source) => source.broad_skip_warnable(),
-            NodePhysicalPlan::Intersect(inputs) | NodePhysicalPlan::Union(inputs) => {
+            NodePhysicalPlan::BufferedIdSort(input) => input.broad_skip_warnable(),
+            NodePhysicalPlan::Intersect { inputs, .. } | NodePhysicalPlan::Union { inputs, .. } => {
                 inputs.iter().any(NodePhysicalPlan::broad_skip_warnable)
             }
         }
@@ -2950,7 +3160,8 @@ impl NodePhysicalPlan {
                 NodeQueryCandidateSourceKind::CompoundEqualityIndex
                     | NodeQueryCandidateSourceKind::CompoundRangeIndex
             ),
-            NodePhysicalPlan::Intersect(inputs) | NodePhysicalPlan::Union(inputs) => {
+            NodePhysicalPlan::BufferedIdSort(input) => input.contains_compound_source(),
+            NodePhysicalPlan::Intersect { inputs, .. } | NodePhysicalPlan::Union { inputs, .. } => {
                 inputs.iter().any(NodePhysicalPlan::contains_compound_source)
             }
             NodePhysicalPlan::Empty => false,
@@ -2965,7 +3176,8 @@ impl NodePhysicalPlan {
                     | NodeCandidateMaterialization::NodeLabelAny { .. }
                     | NodeCandidateMaterialization::FallbackNodeLabelScan { .. }
             ),
-            NodePhysicalPlan::Intersect(inputs) | NodePhysicalPlan::Union(inputs) => {
+            NodePhysicalPlan::BufferedIdSort(input) => input.uses_label_postings(),
+            NodePhysicalPlan::Intersect { inputs, .. } | NodePhysicalPlan::Union { inputs, .. } => {
                 inputs.iter().any(NodePhysicalPlan::uses_label_postings)
             }
             NodePhysicalPlan::Empty => false,
@@ -2978,10 +3190,67 @@ impl NodePhysicalPlan {
                 source.materialization,
                 NodeCandidateMaterialization::NodeLabelAny { .. }
             ),
-            NodePhysicalPlan::Intersect(inputs) | NodePhysicalPlan::Union(inputs) => {
+            NodePhysicalPlan::BufferedIdSort(input) => input.uses_label_any_union(),
+            NodePhysicalPlan::Intersect { inputs, .. } | NodePhysicalPlan::Union { inputs, .. } => {
                 inputs.iter().any(NodePhysicalPlan::uses_label_any_union)
             }
             NodePhysicalPlan::Empty => false,
+        }
+    }
+
+    fn contains_buffered_stream_input(&self) -> bool {
+        match self {
+            NodePhysicalPlan::BufferedIdSort(_) => true,
+            NodePhysicalPlan::Source(_) => {
+                classify_stream_input(self) == NodeStreamInputClass::BufferedIdSort
+            }
+            NodePhysicalPlan::Intersect { inputs, .. } | NodePhysicalPlan::Union { inputs, .. } => {
+                inputs.iter().any(NodePhysicalPlan::contains_buffered_stream_input)
+            }
+            NodePhysicalPlan::Empty => false,
+        }
+    }
+
+    fn as_source(&self) -> Option<&PlannedNodeCandidateSource> {
+        match self {
+            NodePhysicalPlan::Source(source) => Some(source),
+            NodePhysicalPlan::BufferedIdSort(input) => input.as_source(),
+            NodePhysicalPlan::Empty
+            | NodePhysicalPlan::Intersect { .. }
+            | NodePhysicalPlan::Union { .. } => None,
+        }
+    }
+
+    fn into_streamed_mode(self) -> Self {
+        match self {
+            NodePhysicalPlan::Intersect { inputs, .. } => NodePhysicalPlan::Intersect {
+                inputs: inputs
+                    .into_iter()
+                    .map(NodePhysicalPlan::into_streamed_mode)
+                    .collect(),
+                mode: NodeSetOpExecutionMode::Streamed,
+            },
+            NodePhysicalPlan::Union { inputs, .. } => NodePhysicalPlan::Union {
+                inputs: inputs
+                    .into_iter()
+                    .map(NodePhysicalPlan::into_streamed_mode)
+                    .collect(),
+                mode: NodeSetOpExecutionMode::Streamed,
+            },
+            NodePhysicalPlan::BufferedIdSort(input) => {
+                NodePhysicalPlan::BufferedIdSort(Box::new(input.into_streamed_mode()))
+            }
+            plan => plan,
+        }
+    }
+
+    fn collect_intersect_inputs(&self, out: &mut Vec<NodePhysicalPlan>) {
+        match self {
+            NodePhysicalPlan::Intersect { inputs, .. } => {
+                out.extend(inputs.iter().cloned());
+            }
+            NodePhysicalPlan::Empty => {}
+            plan => out.push(plan.clone()),
         }
     }
 }
@@ -2991,12 +3260,33 @@ impl EdgePhysicalPlan {
         Self::Source(source)
     }
 
+    fn push_intersect_input(input: EdgePhysicalPlan, out: &mut Vec<EdgePhysicalPlan>) -> bool {
+        match input {
+            EdgePhysicalPlan::Empty => false,
+            EdgePhysicalPlan::Intersect {
+                inputs: children, ..
+            } => {
+                for child in children {
+                    if !Self::push_intersect_input(child, out) {
+                        return false;
+                    }
+                }
+                true
+            }
+            plan => {
+                out.push(plan);
+                true
+            }
+        }
+    }
+
     // See NodePhysicalPlan::members_are_eager_index_sources.
     fn members_are_eager_index_sources(&self) -> bool {
         match self {
             EdgePhysicalPlan::Empty => false,
             EdgePhysicalPlan::Source(source) => edge_source_kind_is_eager_index(source.kind),
-            EdgePhysicalPlan::Intersect(inputs) | EdgePhysicalPlan::Union(inputs) => {
+            EdgePhysicalPlan::BufferedIdSort(input) => input.members_are_eager_index_sources(),
+            EdgePhysicalPlan::Intersect { inputs, .. } | EdgePhysicalPlan::Union { inputs, .. } => {
                 !inputs.is_empty()
                     && inputs
                         .iter()
@@ -3008,16 +3298,17 @@ impl EdgePhysicalPlan {
     fn intersect(inputs: Vec<EdgePhysicalPlan>) -> Self {
         let mut flattened = Vec::new();
         for input in inputs {
-            match input {
-                EdgePhysicalPlan::Empty => return EdgePhysicalPlan::Empty,
-                EdgePhysicalPlan::Intersect(children) => flattened.extend(children),
-                plan => flattened.push(plan),
+            if !Self::push_intersect_input(input, &mut flattened) {
+                return EdgePhysicalPlan::Empty;
             }
         }
         match flattened.len() {
             0 => EdgePhysicalPlan::Empty,
             1 => flattened.into_iter().next().unwrap(),
-            _ => EdgePhysicalPlan::Intersect(flattened),
+            _ => EdgePhysicalPlan::Intersect {
+                inputs: flattened,
+                mode: EdgeSetOpExecutionMode::Eager,
+            },
         }
     }
 
@@ -3026,14 +3317,38 @@ impl EdgePhysicalPlan {
         for input in inputs {
             match input {
                 EdgePhysicalPlan::Empty => {}
-                EdgePhysicalPlan::Union(children) => flattened.extend(children),
+                EdgePhysicalPlan::Union { inputs: children, .. } => flattened.extend(children),
                 plan => flattened.push(plan),
             }
         }
         match flattened.len() {
             0 => EdgePhysicalPlan::Empty,
             1 => flattened.into_iter().next().unwrap(),
-            _ => EdgePhysicalPlan::Union(flattened),
+            _ => EdgePhysicalPlan::Union {
+                inputs: flattened,
+                mode: EdgeSetOpExecutionMode::Eager,
+            },
+        }
+    }
+
+    fn streamed_union(inputs: Vec<EdgePhysicalPlan>) -> Self {
+        let mut flattened = Vec::new();
+        for input in inputs {
+            match input {
+                EdgePhysicalPlan::Empty => {}
+                EdgePhysicalPlan::Union { inputs: children, .. } => {
+                    flattened.extend(children.into_iter().map(EdgePhysicalPlan::into_streamed_mode));
+                }
+                plan => flattened.push(plan.into_streamed_mode()),
+            }
+        }
+        match flattened.len() {
+            0 => EdgePhysicalPlan::Empty,
+            1 => flattened.into_iter().next().unwrap(),
+            _ => EdgePhysicalPlan::Union {
+                inputs: flattened,
+                mode: EdgeSetOpExecutionMode::Streamed,
+            },
         }
     }
 
@@ -3041,11 +3356,16 @@ impl EdgePhysicalPlan {
         match self {
             EdgePhysicalPlan::Empty => QueryPlanNode::EmptyResult,
             EdgePhysicalPlan::Source(source) => source.plan_node(),
-            EdgePhysicalPlan::Intersect(inputs) => QueryPlanNode::Intersect {
-                inputs: inputs.iter().map(EdgePhysicalPlan::plan_node).collect(),
+            EdgePhysicalPlan::BufferedIdSort(input) => QueryPlanNode::BufferedIdSort {
+                input: Box::new(input.plan_node()),
             },
-            EdgePhysicalPlan::Union(inputs) => QueryPlanNode::Union {
+            EdgePhysicalPlan::Intersect { inputs, mode } => QueryPlanNode::Intersect {
                 inputs: inputs.iter().map(EdgePhysicalPlan::plan_node).collect(),
+                mode: mode.query_plan_mode(),
+            },
+            EdgePhysicalPlan::Union { inputs, mode } => QueryPlanNode::Union {
+                inputs: inputs.iter().map(EdgePhysicalPlan::plan_node).collect(),
+                mode: mode.query_plan_mode(),
             },
         }
     }
@@ -3054,14 +3374,15 @@ impl EdgePhysicalPlan {
         match self {
             EdgePhysicalPlan::Empty => PlannerEstimate::exact_cheap(0),
             EdgePhysicalPlan::Source(source) => source.estimate,
-            EdgePhysicalPlan::Intersect(inputs) => inputs
+            EdgePhysicalPlan::BufferedIdSort(input) => input.estimate(),
+            EdgePhysicalPlan::Intersect { inputs, .. } => inputs
                 .iter()
                 .map(EdgePhysicalPlan::estimate)
                 .filter_map(PlannerEstimate::known_upper_bound)
                 .min()
                 .map(PlannerEstimate::upper_bound)
                 .unwrap_or_else(PlannerEstimate::unknown),
-            EdgePhysicalPlan::Union(inputs) => {
+            EdgePhysicalPlan::Union { inputs, .. } => {
                 let mut total = 0u64;
                 for input in inputs {
                     let Some(count) = input.estimate().known_upper_bound() else {
@@ -3078,12 +3399,13 @@ impl EdgePhysicalPlan {
         match self {
             EdgePhysicalPlan::Empty => EdgeQueryCandidateSourceKind::ExplicitEdgeIds,
             EdgePhysicalPlan::Source(source) => source.kind,
-            EdgePhysicalPlan::Intersect(inputs) => inputs
+            EdgePhysicalPlan::BufferedIdSort(input) => input.cap_source_kind(),
+            EdgePhysicalPlan::Intersect { inputs, .. } => inputs
                 .iter()
                 .min_by_key(|plan| plan.plan_cost())
                 .map(EdgePhysicalPlan::cap_source_kind)
                 .unwrap_or(EdgeQueryCandidateSourceKind::EdgeMetadataScan),
-            EdgePhysicalPlan::Union(inputs) => {
+            EdgePhysicalPlan::Union { inputs, .. } => {
                 let mut kinds = inputs.iter().map(EdgePhysicalPlan::cap_source_kind);
                 let Some(first) = kinds.next() else {
                     return EdgeQueryCandidateSourceKind::EdgeMetadataScan;
@@ -3104,7 +3426,7 @@ impl EdgePhysicalPlan {
     ) -> usize {
         let estimate = self.estimate();
         match self {
-            EdgePhysicalPlan::Union(_) => cap_context.union_total_cap(
+            EdgePhysicalPlan::Union { .. } => cap_context.union_total_cap(
                 self.members_are_eager_index_sources(),
                 query_limit,
                 estimate,
@@ -3130,7 +3452,10 @@ impl EdgePhysicalPlan {
         match self {
             EdgePhysicalPlan::Empty => "edge_empty".to_string(),
             EdgePhysicalPlan::Source(source) => source.canonical_key.clone(),
-            EdgePhysicalPlan::Intersect(inputs) => {
+            EdgePhysicalPlan::BufferedIdSort(input) => {
+                format!("edge_buffered:{}", input.canonical_key())
+            }
+            EdgePhysicalPlan::Intersect { inputs, .. } => {
                 let mut key = String::from("edge_and:");
                 for input in inputs {
                     key.push_str(&input.canonical_key());
@@ -3138,7 +3463,7 @@ impl EdgePhysicalPlan {
                 }
                 key
             }
-            EdgePhysicalPlan::Union(inputs) => {
+            EdgePhysicalPlan::Union { inputs, .. } => {
                 let mut key = String::from("edge_or:");
                 for input in inputs {
                     key.push_str(&input.canonical_key());
@@ -3153,12 +3478,13 @@ impl EdgePhysicalPlan {
         match self {
             EdgePhysicalPlan::Empty => 0,
             EdgePhysicalPlan::Source(source) => source.kind.source_rank(),
-            EdgePhysicalPlan::Intersect(inputs) => inputs
+            EdgePhysicalPlan::BufferedIdSort(input) => input.source_rank(),
+            EdgePhysicalPlan::Intersect { inputs, .. } => inputs
                 .iter()
                 .map(EdgePhysicalPlan::source_rank)
                 .min()
                 .unwrap_or(usize::MAX),
-            EdgePhysicalPlan::Union(_) => 4,
+            EdgePhysicalPlan::Union { .. } => 4,
         }
     }
 
@@ -3166,7 +3492,8 @@ impl EdgePhysicalPlan {
         match self {
             EdgePhysicalPlan::Empty => PlanMaterializationClass::Empty,
             EdgePhysicalPlan::Source(source) => source.materialization.materialization_class(),
-            EdgePhysicalPlan::Intersect(_) | EdgePhysicalPlan::Union(_) => {
+            EdgePhysicalPlan::BufferedIdSort(input) => input.materialization_class(),
+            EdgePhysicalPlan::Intersect { .. } | EdgePhysicalPlan::Union { .. } => {
                 PlanMaterializationClass::Compound
             }
         }
@@ -3177,7 +3504,8 @@ impl EdgePhysicalPlan {
         let base_work = match self {
             EdgePhysicalPlan::Empty => 0,
             EdgePhysicalPlan::Source(source) => return source.plan_cost(),
-            EdgePhysicalPlan::Intersect(inputs) | EdgePhysicalPlan::Union(inputs) => {
+            EdgePhysicalPlan::BufferedIdSort(input) => return input.plan_cost(),
+            EdgePhysicalPlan::Intersect { inputs, .. } | EdgePhysicalPlan::Union { inputs, .. } => {
                 inputs.iter().fold(16u64, |total, input| {
                     total.saturating_add(
                         input
@@ -3206,7 +3534,8 @@ impl EdgePhysicalPlan {
         match self {
             EdgePhysicalPlan::Empty => false,
             EdgePhysicalPlan::Source(source) => source.broad_skip_warnable(),
-            EdgePhysicalPlan::Intersect(inputs) | EdgePhysicalPlan::Union(inputs) => {
+            EdgePhysicalPlan::BufferedIdSort(input) => input.broad_skip_warnable(),
+            EdgePhysicalPlan::Intersect { inputs, .. } | EdgePhysicalPlan::Union { inputs, .. } => {
                 inputs.iter().any(EdgePhysicalPlan::broad_skip_warnable)
             }
         }
@@ -3219,10 +3548,56 @@ impl EdgePhysicalPlan {
                 EdgeQueryCandidateSourceKind::CompoundEqualityIndex
                     | EdgeQueryCandidateSourceKind::CompoundRangeIndex
             ),
-            EdgePhysicalPlan::Intersect(inputs) | EdgePhysicalPlan::Union(inputs) => {
+            EdgePhysicalPlan::BufferedIdSort(input) => input.contains_compound_source(),
+            EdgePhysicalPlan::Intersect { inputs, .. } | EdgePhysicalPlan::Union { inputs, .. } => {
                 inputs.iter().any(EdgePhysicalPlan::contains_compound_source)
             }
             EdgePhysicalPlan::Empty => false,
+        }
+    }
+
+    fn as_source(&self) -> Option<&PlannedEdgeCandidateSource> {
+        match self {
+            EdgePhysicalPlan::Source(source) => Some(source),
+            EdgePhysicalPlan::BufferedIdSort(input) => input.as_source(),
+            EdgePhysicalPlan::Empty
+            | EdgePhysicalPlan::Intersect { .. }
+            | EdgePhysicalPlan::Union { .. } => None,
+        }
+    }
+
+    fn into_streamed_mode(self) -> Self {
+        match self {
+            EdgePhysicalPlan::Intersect { inputs, .. } => EdgePhysicalPlan::Intersect {
+                inputs: inputs
+                    .into_iter()
+                    .map(EdgePhysicalPlan::into_streamed_mode)
+                    .collect(),
+                mode: EdgeSetOpExecutionMode::Streamed,
+            },
+            EdgePhysicalPlan::Union { inputs, .. } => EdgePhysicalPlan::Union {
+                inputs: inputs
+                    .into_iter()
+                    .map(EdgePhysicalPlan::into_streamed_mode)
+                    .collect(),
+                mode: EdgeSetOpExecutionMode::Streamed,
+            },
+            EdgePhysicalPlan::BufferedIdSort(input) => {
+                EdgePhysicalPlan::BufferedIdSort(Box::new(input.into_streamed_mode()))
+            }
+            plan => plan,
+        }
+    }
+
+    fn collect_intersect_inputs(&self, out: &mut Vec<EdgePhysicalPlan>) {
+        match self {
+            EdgePhysicalPlan::Intersect { inputs, .. } => {
+                for input in inputs {
+                    input.collect_intersect_inputs(out);
+                }
+            }
+            EdgePhysicalPlan::Empty => {}
+            plan => out.push(plan.clone()),
         }
     }
 }
@@ -3386,7 +3761,8 @@ fn graph_row_edge_plan_is_filter_source(plan: &EdgePhysicalPlan) -> bool {
                 | EdgeQueryCandidateSourceKind::CompoundRangeIndex
                 | EdgeQueryCandidateSourceKind::EdgeMetadataScan
         ),
-        EdgePhysicalPlan::Intersect(inputs) | EdgePhysicalPlan::Union(inputs) => {
+        EdgePhysicalPlan::BufferedIdSort(input) => graph_row_edge_plan_is_filter_source(input),
+        EdgePhysicalPlan::Intersect { inputs, .. } | EdgePhysicalPlan::Union { inputs, .. } => {
             inputs.iter().all(graph_row_edge_plan_is_filter_source)
         }
         EdgePhysicalPlan::Empty => false,
@@ -3395,10 +3771,11 @@ fn graph_row_edge_plan_is_filter_source(plan: &EdgePhysicalPlan) -> bool {
 
 fn graph_row_edge_source_materialization_work(plan: &EdgePhysicalPlan) -> u64 {
     match plan {
-        EdgePhysicalPlan::Empty | EdgePhysicalPlan::Source(_) | EdgePhysicalPlan::Union(_) => {
-            plan.plan_cost().estimated_work
-        }
-        EdgePhysicalPlan::Intersect(inputs) => {
+        EdgePhysicalPlan::Empty
+        | EdgePhysicalPlan::Source(_)
+        | EdgePhysicalPlan::BufferedIdSort(_)
+        | EdgePhysicalPlan::Union { .. } => plan.plan_cost().estimated_work,
+        EdgePhysicalPlan::Intersect { inputs, .. } => {
             let mut work = 16u64;
             let mut smallest_ready_set: Option<u64> = None;
             let mut materialized_any = false;
@@ -3488,6 +3865,38 @@ impl EdgeCandidateMaterialization {
                 PlanMaterializationClass::StreamingLegalUniverse
             }
         }
+    }
+}
+
+fn classify_edge_stream_input(plan: &EdgePhysicalPlan) -> EdgeStreamInputClass {
+    match plan {
+        EdgePhysicalPlan::BufferedIdSort(_) => EdgeStreamInputClass::BufferedIdSort,
+        EdgePhysicalPlan::Source(source) => match &source.materialization {
+            EdgeCandidateMaterialization::Precomputed(_)
+            | EdgeCandidateMaterialization::EdgeTripleIndex { .. }
+            | EdgeCandidateMaterialization::EdgeLabelIndex { .. }
+            | EdgeCandidateMaterialization::EdgePropertyEqualityIndex { .. }
+            | EdgeCandidateMaterialization::FromEndpointAdjacency { .. }
+            | EdgeCandidateMaterialization::ToEndpointAdjacency { .. }
+            | EdgeCandidateMaterialization::AnyEndpointAdjacency { .. } => {
+                EdgeStreamInputClass::NativeStream
+            }
+            EdgeCandidateMaterialization::EdgeWeightIndex { .. }
+            | EdgeCandidateMaterialization::EdgeUpdatedAtIndex { .. }
+            | EdgeCandidateMaterialization::EdgeValidFromIndex { .. }
+            | EdgeCandidateMaterialization::EdgeValidToIndex { .. }
+            | EdgeCandidateMaterialization::EdgePropertyRangeIndex { .. } => {
+                EdgeStreamInputClass::BufferedIdSort
+            }
+            EdgeCandidateMaterialization::CompoundPrefixIndex { .. }
+            | EdgeCandidateMaterialization::CompoundRangeIndex { .. }
+            | EdgeCandidateMaterialization::FallbackFullEdgeScan => {
+                EdgeStreamInputClass::NotStreamable
+            }
+        },
+        EdgePhysicalPlan::Empty
+        | EdgePhysicalPlan::Intersect { .. }
+        | EdgePhysicalPlan::Union { .. } => EdgeStreamInputClass::NotStreamable,
     }
 }
 
@@ -3638,10 +4047,21 @@ impl PlannedNodeQuery {
     }
 
     fn explain_plan(&self, public_inputs: QueryPlanPublicInputs) -> QueryPlan {
+        let driver_node = match self.execution_mode {
+            NodeDriverExecutionMode::Eager => self.driver.plan_node(),
+            NodeDriverExecutionMode::Streamed => match &self.driver {
+                NodePhysicalPlan::Intersect { .. } | NodePhysicalPlan::Union { .. } => {
+                    self.driver.plan_node()
+                }
+                _ => QueryPlanNode::StreamedSource {
+                    input: Box::new(self.driver.plan_node()),
+                },
+            },
+        };
         QueryPlan {
             kind: QueryPlanKind::NodeQuery,
             root: QueryPlanNode::VerifyNodeFilter {
-                input: Box::new(self.driver.plan_node()),
+                input: Box::new(driver_node),
             },
             estimated_candidates: self.estimated_candidate_count(),
             warnings: self.warnings.clone(),
@@ -3657,7 +4077,17 @@ impl PlannedEdgeQuery {
     }
 
     fn explain_plan(&self, public_inputs: QueryPlanPublicInputs) -> QueryPlan {
-        let input = self.driver.plan_node();
+        let input = match self.execution_mode {
+            EdgeDriverExecutionMode::Eager => self.driver.plan_node(),
+            EdgeDriverExecutionMode::Streamed => match &self.driver {
+                EdgePhysicalPlan::Intersect { .. } | EdgePhysicalPlan::Union { .. } => {
+                    self.driver.plan_node()
+                }
+                _ => QueryPlanNode::StreamedSource {
+                    input: Box::new(self.driver.plan_node()),
+                },
+            },
+        };
         QueryPlan {
             kind: QueryPlanKind::EdgeQuery,
             root: QueryPlanNode::VerifyEdgeFilter {
@@ -3895,8 +4325,8 @@ impl ReadView {
 
     fn equality_candidate_probe(
         &self,
-        query: &NormalizedNodeQuery,
-        cap_context: QueryCapContext,
+        _query: &NormalizedNodeQuery,
+        _cap_context: QueryCapContext,
         label_id: u32,
         key: &str,
         value: &PropValue,
@@ -3927,18 +4357,6 @@ impl ReadView {
                 followup,
             });
         };
-        if cap_context.source_estimate_exceeds_cap(
-            NodeQueryCandidateSourceKind::PropertyEqualityIndex,
-            query.page.limit,
-            estimate,
-        ) {
-            return Ok(CandidateProbe {
-                source: None,
-                warning: Some(QueryPlanWarning::CandidateCapExceeded),
-                followup,
-            });
-        }
-
         Ok(CandidateProbe {
             source: Some(PlannedNodeCandidateSource::property_equality_index(
                 label_id,
@@ -5516,13 +5934,14 @@ impl ReadView {
     }
 
     fn edge_label_estimate(&self, label_id: u32) -> PlannerEstimate {
-        let mut count =
-            self.memtable.visible_edges_by_label_id_count(label_id, self.snapshot_seq) as u64;
+        let mut count = self
+            .memtable
+            .edge_label_posting_count_upper_bound(label_id) as u64;
         for epoch in &self.immutable_epochs {
             count = count.saturating_add(
                 epoch
                     .memtable
-                    .visible_edges_by_label_id_count(label_id, self.snapshot_seq)
+                    .edge_label_posting_count_upper_bound(label_id)
                     as u64,
             );
         }
@@ -5581,9 +6000,14 @@ impl ReadView {
         label_id: Option<u32>,
         bounds: crate::edge_metadata::RangeBoundFlags<i64>,
         indexed: bool,
+        _validity_probe: bool,
         memtable_value: impl Fn(EdgeMetadataCandidate) -> i64,
         segment_count: impl Fn(&SegmentReader) -> Option<usize>,
     ) -> PlannerEstimate {
+        #[cfg(test)]
+        if _validity_probe {
+            self.note_edge_validity_range_estimate();
+        }
         if !indexed {
             return self.edge_metadata_source_estimate(label_id);
         }
@@ -5613,14 +6037,17 @@ impl ReadView {
         PlannerEstimate::upper_bound(count)
     }
 
-    fn edge_endpoint_estimate(
+    fn edge_endpoint_planner_stats(
         &self,
         node_ids: &[u64],
         direction: Direction,
         label_filter_ids: Option<&[u32]>,
-    ) -> PlannerEstimate {
+    ) -> EdgeEndpointPlannerStats {
         if node_ids.is_empty() {
-            return PlannerEstimate::exact_cheap(0);
+            return EdgeEndpointPlannerStats {
+                estimate: PlannerEstimate::exact_cheap(0),
+                stream_cursor_count_upper_bound: 0,
+            };
         }
         let mut sorted_node_ids = node_ids.to_vec();
         sorted_node_ids.sort_unstable();
@@ -5628,6 +6055,15 @@ impl ReadView {
 
         let mut count = 0u64;
         let mut confidence = EstimateConfidence::Medium;
+        let direction_multiplier = match direction {
+            Direction::Both => 2usize,
+            Direction::Outgoing | Direction::Incoming => 1usize,
+        };
+        let memtable_layer_count = 1usize.saturating_add(self.immutable_epochs.len());
+        let mut stream_cursor_count_upper_bound = sorted_node_ids
+            .len()
+            .saturating_mul(memtable_layer_count)
+            .saturating_mul(direction_multiplier);
         let mut add_memtable_estimate =
             |estimate: crate::memtable::MemtableEndpointCountEstimate| {
                 count = count.saturating_add(estimate.count as u64);
@@ -5651,13 +6087,37 @@ impl ReadView {
         }
 
         for segment in &self.segments {
-            match segment.endpoint_adj_posting_count(&sorted_node_ids, direction, label_filter_ids) {
-                Ok(segment_count) => count = count.saturating_add(segment_count as u64),
-                Err(_) => return self.edge_full_scan_estimate(),
+            match segment.endpoint_adj_posting_stats(&sorted_node_ids, direction, label_filter_ids)
+            {
+                Ok(stats) => {
+                    count = count.saturating_add(stats.posting_total as u64);
+                    stream_cursor_count_upper_bound =
+                        stream_cursor_count_upper_bound.saturating_add(stats.cursor_count);
+                }
+                Err(_) => {
+                    return EdgeEndpointPlannerStats {
+                        estimate: self.edge_full_scan_estimate(),
+                        stream_cursor_count_upper_bound: STREAMED_MAX_TOTAL_CURSORS
+                            .saturating_add(1),
+                    };
+                }
             }
         }
 
-        PlannerEstimate::upper_bound_with_confidence(count, confidence)
+        EdgeEndpointPlannerStats {
+            estimate: PlannerEstimate::upper_bound_with_confidence(count, confidence),
+            stream_cursor_count_upper_bound,
+        }
+    }
+
+    fn edge_endpoint_estimate(
+        &self,
+        node_ids: &[u64],
+        direction: Direction,
+        label_filter_ids: Option<&[u32]>,
+    ) -> PlannerEstimate {
+        self.edge_endpoint_planner_stats(node_ids, direction, label_filter_ids)
+            .estimate
     }
 
     fn edge_metadata_sidecar_availability(&self) -> EdgeMetadataSidecarAvailability {
@@ -6769,6 +7229,7 @@ impl ReadView {
                         label_id,
                         bounds,
                         availability.updated_at,
+                        false,
                         |meta| meta.updated_at,
                         |segment| segment.edge_updated_at_range_count(label_id, bounds),
                     ),
@@ -6785,6 +7246,7 @@ impl ReadView {
                         label_id,
                         bounds,
                         availability.valid_from,
+                        true,
                         |meta| meta.valid_from,
                         |segment| segment.edge_valid_from_range_count(label_id, bounds),
                     ),
@@ -6801,6 +7263,7 @@ impl ReadView {
                         label_id,
                         bounds,
                         availability.valid_to,
+                        true,
                         |meta| meta.valid_to,
                         |segment| segment.edge_valid_to_range_count(label_id, bounds),
                     ),
@@ -6818,6 +7281,7 @@ impl ReadView {
                             label_id,
                             valid_from_bounds,
                             availability.valid_from,
+                            true,
                             |meta| meta.valid_from,
                             |segment| {
                                 segment.edge_valid_from_range_count(label_id, valid_from_bounds)
@@ -6840,6 +7304,7 @@ impl ReadView {
                             label_id,
                             valid_to_bounds,
                             availability.valid_to,
+                            true,
                             |meta| meta.valid_to,
                             |segment| segment.edge_valid_to_range_count(label_id, valid_to_bounds),
                         ),
@@ -7048,17 +7513,7 @@ impl ReadView {
                 followup,
             });
         };
-        if cap_context.source_estimate_exceeds_cap(
-            EdgeQueryCandidateSourceKind::EdgePropertyEqualityIndex,
-            query.page.limit,
-            estimate,
-        ) {
-            return Ok(EdgeCandidateProbe {
-                source: None,
-                warning: Some(QueryPlanWarning::CandidateCapExceeded),
-                followup,
-            });
-        }
+        let _ = (query, cap_context);
 
         Ok(EdgeCandidateProbe {
             source: Some(PlannedEdgeCandidateSource::edge_property_equality_index(
@@ -7309,6 +7764,7 @@ impl ReadView {
                     estimate: source.estimate,
                     structural_key,
                     complete: true,
+                    streamable_rejects: Vec::new(),
                     plan: EdgePhysicalPlan::source(source),
                 },
                 has_verify_only: false,
@@ -7324,19 +7780,59 @@ impl ReadView {
         plans.sort_by_cached_key(EdgePhysicalPlan::plan_cost);
     }
 
+    fn route_rejected_edge_plan(
+        &self,
+        query: &NormalizedEdgeQuery,
+        cap_context: EdgeQueryCapContext,
+        plan: EdgePhysicalPlan,
+        warnings: &mut Vec<QueryPlanWarning>,
+        streamable_rejects: &mut Vec<EdgePhysicalPlan>,
+        skipped_to_verifier: &mut bool,
+    ) {
+        let stream_rejection = match classify_edge_stream_input(&plan) {
+            EdgeStreamInputClass::NativeStream | EdgeStreamInputClass::BufferedIdSort => None,
+            EdgeStreamInputClass::NotStreamable => match &plan {
+                EdgePhysicalPlan::Union { inputs, .. } => self
+                    .streamed_edge_union_inputs_legal(inputs.iter(), cap_context, query.page.limit)
+                    .err(),
+                _ => Some(StreamedInputRejection::NotStreamable),
+            },
+        };
+        if stream_rejection.is_none() {
+            streamable_rejects.push(plan);
+            return;
+        }
+
+        if matches!(
+            stream_rejection,
+            Some(StreamedInputRejection::BufferedCapExceeded)
+        ) {
+            add_plan_warning(warnings, QueryPlanWarning::StreamedInputBufferCapExceeded);
+        }
+        *skipped_to_verifier = true;
+        if plan.estimate().known_upper_bound().is_some() && plan.broad_skip_warnable() {
+            add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
+        }
+    }
+
     fn select_bounded_edge_and_plans(
         &self,
         query: &NormalizedEdgeQuery,
         cap_context: EdgeQueryCapContext,
         mut plans: Vec<EdgePhysicalPlan>,
         warnings: &mut Vec<QueryPlanWarning>,
-    ) -> (Vec<EdgePhysicalPlan>, bool) {
+    ) -> BoundedEdgeAndSelection {
         self.sort_edge_physical_plans_by_selectivity(&mut plans);
         let Some(first) = plans.first() else {
-            return (Vec::new(), false);
+            return BoundedEdgeAndSelection {
+                selected: Vec::new(),
+                streamable_rejects: Vec::new(),
+                skipped_to_verifier: false,
+            };
         };
         let smallest_cost = first.plan_cost();
         let mut selected = Vec::new();
+        let mut streamable_rejects = Vec::new();
         let mut skipped_to_verifier = false;
 
         for plan in plans {
@@ -7348,10 +7844,14 @@ impl ReadView {
                 .first()
                 .is_some_and(EdgePhysicalPlan::contains_compound_source)
             {
-                skipped_to_verifier = true;
-                if plan.estimate().known_upper_bound().is_some() && plan.broad_skip_warnable() {
-                    add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
-                }
+                self.route_rejected_edge_plan(
+                    query,
+                    cap_context,
+                    plan,
+                    warnings,
+                    &mut streamable_rejects,
+                    &mut skipped_to_verifier,
+                );
                 continue;
             }
             // A compound source that is not the cheapest input would re-scan
@@ -7379,14 +7879,22 @@ impl ReadView {
             if include {
                 selected.push(plan);
             } else {
-                skipped_to_verifier = true;
-                if plan.estimate().known_upper_bound().is_some() && plan.broad_skip_warnable() {
-                    add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
-                }
+                self.route_rejected_edge_plan(
+                    query,
+                    cap_context,
+                    plan,
+                    warnings,
+                    &mut streamable_rejects,
+                    &mut skipped_to_verifier,
+                );
             }
         }
 
-        (selected, skipped_to_verifier)
+        BoundedEdgeAndSelection {
+            selected,
+            streamable_rejects,
+            skipped_to_verifier,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7446,6 +7954,8 @@ impl ReadView {
 
         let mut plans = Vec::new();
         let mut estimated_total = 0u64;
+        let mut total_estimate_known = true;
+        let mut eager_source_cap_blocked = false;
         for probe in &unique_values {
             let (estimate, followup) = self.edge_equality_candidate_estimate_for_hash(
                 entry.index_id,
@@ -7463,42 +7973,20 @@ impl ReadView {
                     has_verify_only: true,
                 });
             };
-            let Some(count) = estimate.known_upper_bound() else {
-                add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
-                return Ok(EdgeBooleanPlanResult {
-                    classification: EdgeBooleanPlanClassification::VerifyOnly,
-                    has_verify_only: true,
-                });
-            };
             if cap_context.source_estimate_exceeds_cap(
                 EdgeQueryCandidateSourceKind::EdgePropertyEqualityIndex,
                 query.page.limit,
                 estimate,
             ) {
-                add_plan_warning(
-                    warnings,
-                    edge_cap_warning_for_source(
-                        EdgeQueryCandidateSourceKind::EdgePropertyEqualityIndex,
-                    ),
-                );
-                return Ok(EdgeBooleanPlanResult {
-                    classification: EdgeBooleanPlanClassification::VerifyOnly,
-                    has_verify_only: true,
-                });
+                eager_source_cap_blocked = true;
             }
-            estimated_total = estimated_total.saturating_add(count);
-            let union_estimate = PlannerEstimate::upper_bound(estimated_total);
-            // IN-expansion members are all equality-index probes (eager).
-            let union_cap = cap_context.union_total_cap(true, query.page.limit, union_estimate);
-            if estimated_total > union_cap as u64 {
-                add_plan_warning(warnings, QueryPlanWarning::PlanningProbeBudgetExceeded);
-                return Ok(EdgeBooleanPlanResult {
-                    classification: EdgeBooleanPlanClassification::VerifyOnly,
-                    has_verify_only: true,
-                });
-            }
-            if count == 0 && estimate.proves_empty() {
-                continue;
+            if let Some(count) = estimate.known_upper_bound() {
+                estimated_total = estimated_total.saturating_add(count);
+                if count == 0 && estimate.proves_empty() {
+                    continue;
+                }
+            } else {
+                total_estimate_known = false;
             }
             plans.push(EdgePhysicalPlan::source(
                 PlannedEdgeCandidateSource::edge_property_equality_index_with_hash(
@@ -7519,10 +8007,68 @@ impl ReadView {
             });
         }
 
-        if cap_context
-            .cheapest_legal_count()
-            .is_some_and(|legal| legal <= estimated_total)
-        {
+        let union_estimate = if total_estimate_known {
+            PlannerEstimate::upper_bound(estimated_total)
+        } else {
+            PlannerEstimate::unknown()
+        };
+        let union_cap_exceeded = total_estimate_known && {
+            // IN-expansion members are all equality-index probes (eager).
+            let union_cap = cap_context.union_total_cap(true, query.page.limit, union_estimate);
+            estimated_total > union_cap as u64
+        };
+        let legal_universe_wins_eager = total_estimate_known
+            && cap_context
+                .cheapest_legal_count()
+                .is_some_and(|legal| legal <= estimated_total);
+        let should_consider_streamed_union = !total_estimate_known
+            || eager_source_cap_blocked
+            || union_cap_exceeded
+            || estimated_total > EAGER_PREFERRED_SOURCE_MAX;
+        let streamed_union_rejection = if should_consider_streamed_union {
+            self.streamed_edge_union_inputs_legal(plans.iter(), cap_context, query.page.limit)
+                .err()
+        } else {
+            Some(StreamedInputRejection::NotStreamable)
+        };
+        let streamed_union_legal = streamed_union_rejection.is_none();
+
+        if !streamed_union_legal {
+            if matches!(
+                streamed_union_rejection,
+                Some(StreamedInputRejection::BufferedCapExceeded)
+            ) {
+                add_plan_warning(warnings, QueryPlanWarning::StreamedInputBufferCapExceeded);
+            }
+            if eager_source_cap_blocked {
+                add_plan_warning(
+                    warnings,
+                    edge_cap_warning_for_source(
+                        EdgeQueryCandidateSourceKind::EdgePropertyEqualityIndex,
+                    ),
+                );
+                return Ok(EdgeBooleanPlanResult {
+                    classification: EdgeBooleanPlanClassification::VerifyOnly,
+                    has_verify_only: true,
+                });
+            }
+            if !total_estimate_known {
+                add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
+                return Ok(EdgeBooleanPlanResult {
+                    classification: EdgeBooleanPlanClassification::VerifyOnly,
+                    has_verify_only: true,
+                });
+            }
+            if union_cap_exceeded {
+                add_plan_warning(warnings, QueryPlanWarning::PlanningProbeBudgetExceeded);
+                return Ok(EdgeBooleanPlanResult {
+                    classification: EdgeBooleanPlanClassification::VerifyOnly,
+                    has_verify_only: true,
+                });
+            }
+        }
+
+        if legal_universe_wins_eager && !streamed_union_legal {
             add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
             return Ok(EdgeBooleanPlanResult {
                 classification: EdgeBooleanPlanClassification::VerifyOnly,
@@ -7533,9 +8079,10 @@ impl ReadView {
         Ok(EdgeBooleanPlanResult {
             classification: EdgeBooleanPlanClassification::Bounded {
                 plan: EdgePhysicalPlan::union(plans),
-                estimate: PlannerEstimate::upper_bound(estimated_total),
+                estimate: union_estimate,
                 structural_key,
                 complete: true,
+                streamable_rejects: Vec::new(),
             },
             has_verify_only: false,
         })
@@ -7583,30 +8130,44 @@ impl ReadView {
         };
         let mut plans = vec![EdgePhysicalPlan::source(compound.source)];
         let mut has_verify_only = planned.has_verify_only;
+        let mut inherited_streamable_rejects = Vec::new();
         match planned.classification {
             EdgeBooleanPlanClassification::Bounded {
-                plan, complete, ..
-            } if complete => plans.push(plan),
-            EdgeBooleanPlanClassification::Bounded { .. } => has_verify_only = true,
+                plan,
+                complete,
+                streamable_rejects,
+                ..
+            } if complete => {
+                plans.push(plan);
+                inherited_streamable_rejects.extend(streamable_rejects);
+            }
+            EdgeBooleanPlanClassification::Bounded {
+                streamable_rejects,
+                ..
+            } => {
+                inherited_streamable_rejects.extend(streamable_rejects);
+                has_verify_only = true;
+            }
             EdgeBooleanPlanClassification::VerifyOnly => {}
             EdgeBooleanPlanClassification::AlwaysFalse => unreachable!("handled above"),
         }
-        let (selected, _skipped_to_verifier) =
-            self.select_bounded_edge_and_plans(query, cap_context, plans, warnings);
+        let selection = self.select_bounded_edge_and_plans(query, cap_context, plans, warnings);
         // A skipped plan here is redundant coverage of the same single leaf,
         // not a lost predicate, so it does not mark the filter verify-only.
-        if selected.is_empty() {
+        if selection.selected.is_empty() {
             return Ok(EdgeBooleanPlanResult {
                 classification: EdgeBooleanPlanClassification::VerifyOnly,
                 has_verify_only,
             });
         }
-        let plan = EdgePhysicalPlan::intersect(selected);
+        inherited_streamable_rejects.extend(selection.streamable_rejects);
+        let plan = EdgePhysicalPlan::intersect(selection.selected);
         Ok(EdgeBooleanPlanResult {
             classification: EdgeBooleanPlanClassification::Bounded {
                 estimate: plan.estimate(),
                 structural_key: filter.structural_key(),
                 complete: true,
+                streamable_rejects: inherited_streamable_rejects,
                 plan,
             },
             has_verify_only,
@@ -7713,6 +8274,7 @@ impl ReadView {
                             estimate: plan.estimate(),
                             structural_key,
                             complete: true,
+                            streamable_rejects: Vec::new(),
                             plan,
                         },
                         has_verify_only: false,
@@ -7726,6 +8288,7 @@ impl ReadView {
             NormalizedEdgeFilter::And(children) => {
                 let mut plans = Vec::new();
                 let mut has_verify_only = false;
+                let mut streamable_rejects = Vec::new();
                 if allow_compound {
                     if let Some(compound) =
                         self.best_edge_compound_candidate(query, filter, cap_context, warnings)
@@ -7753,32 +8316,43 @@ impl ReadView {
                             });
                         }
                         EdgeBooleanPlanClassification::VerifyOnly => {}
-                        EdgeBooleanPlanClassification::Bounded { plan, complete, .. }
-                            if complete =>
+                        EdgeBooleanPlanClassification::Bounded {
+                            plan,
+                            complete,
+                            streamable_rejects: mut child_rejects,
+                            ..
+                        } if complete =>
                         {
-                            plans.push(plan)
+                            plans.push(plan);
+                            streamable_rejects.append(&mut child_rejects);
                         }
-                        EdgeBooleanPlanClassification::Bounded { .. } => {
+                        EdgeBooleanPlanClassification::Bounded {
+                            streamable_rejects: mut child_rejects,
+                            ..
+                        } => {
+                            streamable_rejects.append(&mut child_rejects);
                             has_verify_only = true;
                         }
                     }
                 }
 
-                let (selected, skipped_to_verifier) =
+                let mut selection =
                     self.select_bounded_edge_and_plans(query, cap_context, plans, warnings);
-                has_verify_only |= skipped_to_verifier;
-                if selected.is_empty() {
+                has_verify_only |= selection.skipped_to_verifier;
+                streamable_rejects.append(&mut selection.streamable_rejects);
+                if selection.selected.is_empty() {
                     return Ok(EdgeBooleanPlanResult {
                         classification: EdgeBooleanPlanClassification::VerifyOnly,
                         has_verify_only,
                     });
                 }
-                let plan = EdgePhysicalPlan::intersect(selected);
+                let plan = EdgePhysicalPlan::intersect(selection.selected);
                 Ok(EdgeBooleanPlanResult {
                     classification: EdgeBooleanPlanClassification::Bounded {
                         estimate: plan.estimate(),
                         structural_key,
                         complete: true,
+                        streamable_rejects,
                         plan,
                     },
                     has_verify_only,
@@ -7796,6 +8370,7 @@ impl ReadView {
 
                 let mut plan_entries = Vec::new();
                 let mut estimated_total = 0u64;
+                let mut total_estimate_known = true;
                 let mut has_verify_only = false;
                 let mut members_eager = true;
                 for child in children {
@@ -7824,33 +8399,24 @@ impl ReadView {
                             estimate,
                             structural_key,
                             complete,
+                            streamable_rejects,
                         } if complete => {
-                            let Some(count) = estimate.known_upper_bound() else {
-                                add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
-                                add_plan_warning(warnings, QueryPlanWarning::BooleanBranchFallback);
-                                return Ok(EdgeBooleanPlanResult {
-                                    classification: EdgeBooleanPlanClassification::VerifyOnly,
-                                    has_verify_only: true,
-                                });
-                            };
-                            members_eager &= plan.members_are_eager_index_sources();
-                            estimated_total = estimated_total.saturating_add(count);
-                            let union_estimate = PlannerEstimate::upper_bound(estimated_total);
-                            let union_cap = cap_context.union_total_cap(
-                                members_eager,
-                                query.page.limit,
-                                union_estimate,
-                            );
-                            if estimated_total > union_cap as u64 {
-                                add_plan_warning(
+                            if !streamable_rejects.is_empty() {
+                                Self::warn_edge_streamable_rejects_demoted(
                                     warnings,
-                                    QueryPlanWarning::PlanningProbeBudgetExceeded,
+                                    &streamable_rejects,
                                 );
                                 add_plan_warning(warnings, QueryPlanWarning::BooleanBranchFallback);
                                 return Ok(EdgeBooleanPlanResult {
                                     classification: EdgeBooleanPlanClassification::VerifyOnly,
                                     has_verify_only: true,
                                 });
+                            }
+                            members_eager &= plan.members_are_eager_index_sources();
+                            if let Some(count) = estimate.known_upper_bound() {
+                                estimated_total = estimated_total.saturating_add(count);
+                            } else {
+                                total_estimate_known = false;
                             }
                             plan_entries.push((structural_key, plan));
                         }
@@ -7870,9 +8436,62 @@ impl ReadView {
                         has_verify_only,
                     });
                 }
+                let union_estimate = if total_estimate_known {
+                    PlannerEstimate::upper_bound(estimated_total)
+                } else {
+                    PlannerEstimate::unknown()
+                };
+                let union_cap_exceeded = total_estimate_known && {
+                    let union_cap =
+                        cap_context.union_total_cap(members_eager, query.page.limit, union_estimate);
+                    estimated_total > union_cap as u64
+                };
+                let should_consider_streamed_union = !total_estimate_known
+                    || union_cap_exceeded
+                    || estimated_total > EAGER_PREFERRED_SOURCE_MAX;
+                let streamed_union_rejection = if should_consider_streamed_union {
+                    self.streamed_edge_union_inputs_legal(
+                        plan_entries.iter().map(|(_, plan)| plan),
+                        cap_context,
+                        query.page.limit,
+                    )
+                    .err()
+                } else {
+                    Some(StreamedInputRejection::NotStreamable)
+                };
+                let streamed_union_legal = streamed_union_rejection.is_none();
+
+                if !streamed_union_legal {
+                    if matches!(
+                        streamed_union_rejection,
+                        Some(StreamedInputRejection::BufferedCapExceeded)
+                    ) {
+                        add_plan_warning(
+                            warnings,
+                            QueryPlanWarning::StreamedInputBufferCapExceeded,
+                        );
+                    }
+                    if !total_estimate_known {
+                        add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
+                        add_plan_warning(warnings, QueryPlanWarning::BooleanBranchFallback);
+                        return Ok(EdgeBooleanPlanResult {
+                            classification: EdgeBooleanPlanClassification::VerifyOnly,
+                            has_verify_only: true,
+                        });
+                    }
+                    if union_cap_exceeded {
+                        add_plan_warning(warnings, QueryPlanWarning::PlanningProbeBudgetExceeded);
+                        add_plan_warning(warnings, QueryPlanWarning::BooleanBranchFallback);
+                        return Ok(EdgeBooleanPlanResult {
+                            classification: EdgeBooleanPlanClassification::VerifyOnly,
+                            has_verify_only: true,
+                        });
+                    }
+                }
                 if cap_context
                     .cheapest_legal_count()
-                    .is_some_and(|legal| legal <= estimated_total)
+                    .is_some_and(|legal| total_estimate_known && legal <= estimated_total)
+                    && !streamed_union_legal
                 {
                     add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
                     add_plan_warning(warnings, QueryPlanWarning::BooleanBranchFallback);
@@ -7891,9 +8510,10 @@ impl ReadView {
                 );
                 Ok(EdgeBooleanPlanResult {
                     classification: EdgeBooleanPlanClassification::Bounded {
-                        estimate: plan.estimate(),
+                        estimate: union_estimate,
                         structural_key,
                         complete: true,
+                        streamable_rejects: Vec::new(),
                         plan,
                     },
                     has_verify_only,
@@ -8143,19 +8763,60 @@ impl ReadView {
         }
     }
 
+    fn route_rejected_and_plan(
+        &self,
+        query: &NormalizedNodeQuery,
+        cap_context: QueryCapContext,
+        plan: NodePhysicalPlan,
+        warnings: &mut Vec<QueryPlanWarning>,
+        streamable_rejects: &mut Vec<NodePhysicalPlan>,
+        skipped_to_verifier: &mut bool,
+    ) {
+        let streamable = match classify_stream_input(&plan) {
+            NodeStreamInputClass::NativeStream | NodeStreamInputClass::BufferedIdSort => true,
+            NodeStreamInputClass::NotStreamable => {
+                if let NodePhysicalPlan::Union { inputs, .. } = &plan {
+                    self
+                        .streamed_union_inputs_legal(
+                            inputs.iter(),
+                            cap_context,
+                            query.page.limit,
+                        )
+                        .is_ok()
+                } else {
+                    false
+                }
+            }
+        };
+        if streamable {
+            streamable_rejects.push(plan);
+            return;
+        }
+
+        *skipped_to_verifier = true;
+        if plan.estimate().known_upper_bound().is_some() && plan.broad_skip_warnable() {
+            add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
+        }
+    }
+
     fn select_bounded_and_plans(
         &self,
         query: &NormalizedNodeQuery,
         cap_context: QueryCapContext,
         mut plans: Vec<NodePhysicalPlan>,
         warnings: &mut Vec<QueryPlanWarning>,
-    ) -> (Vec<NodePhysicalPlan>, bool) {
+    ) -> BoundedAndSelection {
         self.sort_physical_plans_by_selectivity(&mut plans);
         let Some(first) = plans.first() else {
-            return (Vec::new(), false);
+            return BoundedAndSelection {
+                selected: Vec::new(),
+                streamable_rejects: Vec::new(),
+                skipped_to_verifier: false,
+            };
         };
         let smallest_cost = first.plan_cost();
         let mut selected = Vec::new();
+        let mut streamable_rejects = Vec::new();
         let mut skipped_to_verifier = false;
 
         for plan in plans {
@@ -8167,10 +8828,14 @@ impl ReadView {
                 .first()
                 .is_some_and(NodePhysicalPlan::contains_compound_source)
             {
-                skipped_to_verifier = true;
-                if plan.estimate().known_upper_bound().is_some() && plan.broad_skip_warnable() {
-                    add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
-                }
+                self.route_rejected_and_plan(
+                    query,
+                    cap_context,
+                    plan,
+                    warnings,
+                    &mut streamable_rejects,
+                    &mut skipped_to_verifier,
+                );
                 continue;
             }
             // A compound source that is not the cheapest input would re-scan
@@ -8186,8 +8851,12 @@ impl ReadView {
             }
             let plan_cost = plan.plan_cost();
             let estimate = plan.estimate();
+            let source_kind = plan
+                .as_source()
+                .map(|source| source.kind)
+                .unwrap_or(NodeQueryCandidateSourceKind::PropertyEqualityIndex);
             let cap = cap_context.source_cap(
-                NodeQueryCandidateSourceKind::PropertyEqualityIndex,
+                source_kind,
                 query.page.limit,
                 estimate,
             );
@@ -8199,17 +8868,44 @@ impl ReadView {
                     <= smallest_cost
                         .estimated_work
                         .saturating_mul(QUERY_BROAD_SOURCE_FACTOR);
-            if include {
+            let route_broad_union_to_streaming = include
+                && matches!(plan, NodePhysicalPlan::Union { .. })
+                && plan
+                    .estimate()
+                    .known_upper_bound()
+                    .is_none_or(|count| count > EAGER_PREFERRED_SOURCE_MAX)
+                && if let NodePhysicalPlan::Union { inputs, .. } = &plan {
+                    self
+                        .streamed_union_inputs_legal(
+                            inputs.iter(),
+                            cap_context,
+                            query.page.limit,
+                        )
+                        .is_ok()
+                } else {
+                    false
+                };
+            if route_broad_union_to_streaming {
+                streamable_rejects.push(plan);
+            } else if include {
                 selected.push(plan);
             } else {
-                skipped_to_verifier = true;
-                if plan.estimate().known_upper_bound().is_some() && plan.broad_skip_warnable() {
-                    add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
-                }
+                self.route_rejected_and_plan(
+                    query,
+                    cap_context,
+                    plan,
+                    warnings,
+                    &mut streamable_rejects,
+                    &mut skipped_to_verifier,
+                );
             }
         }
 
-        (selected, skipped_to_verifier)
+        BoundedAndSelection {
+            selected,
+            streamable_rejects,
+            skipped_to_verifier,
+        }
     }
 
     fn classification_from_probe(
@@ -8235,6 +8931,7 @@ impl ReadView {
                     estimate: source.estimate,
                     structural_key,
                     complete: true,
+                    streamable_rejects: Vec::new(),
                     plan: NodePhysicalPlan::source(source),
                 },
                 has_verify_only: false,
@@ -8373,6 +9070,8 @@ impl ReadView {
 
         let mut plans = Vec::new();
         let mut estimated_total = 0u64;
+        let mut total_estimate_known = true;
+        let mut eager_source_cap_blocked = false;
         for probe in &unique_values {
             let (estimate, followup) = self.equality_candidate_estimate_for_hash(
                 entry.index_id,
@@ -8390,37 +9089,20 @@ impl ReadView {
                     has_verify_only: true,
                 });
             };
-            let Some(count) = estimate.known_upper_bound() else {
-                add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
-                return Ok(BooleanPlanResult {
-                    classification: BooleanPlanClassification::VerifyOnly,
-                    has_verify_only: true,
-                });
-            };
             if cap_context.source_estimate_exceeds_cap(
                 NodeQueryCandidateSourceKind::PropertyEqualityIndex,
                 query.page.limit,
                 estimate,
             ) {
-                add_plan_warning(warnings, cap_warning_for_source(NodeQueryCandidateSourceKind::PropertyEqualityIndex));
-                return Ok(BooleanPlanResult {
-                    classification: BooleanPlanClassification::VerifyOnly,
-                    has_verify_only: true,
-                });
+                eager_source_cap_blocked = true;
             }
-            estimated_total = estimated_total.saturating_add(count);
-            let union_estimate = PlannerEstimate::upper_bound(estimated_total);
-            // IN-expansion members are all equality-index probes (eager).
-            let union_cap = cap_context.union_total_cap(true, query.page.limit, union_estimate);
-            if estimated_total > union_cap as u64 {
-                add_plan_warning(warnings, QueryPlanWarning::PlanningProbeBudgetExceeded);
-                return Ok(BooleanPlanResult {
-                    classification: BooleanPlanClassification::VerifyOnly,
-                    has_verify_only: true,
-                });
-            }
-            if count == 0 && estimate.proves_empty() {
-                continue;
+            if let Some(count) = estimate.known_upper_bound() {
+                estimated_total = estimated_total.saturating_add(count);
+                if count == 0 && estimate.proves_empty() {
+                    continue;
+                }
+            } else {
+                total_estimate_known = false;
             }
             plans.push(NodePhysicalPlan::source(
                 PlannedNodeCandidateSource::property_equality_index_with_hash(
@@ -8441,10 +9123,56 @@ impl ReadView {
             });
         }
 
-        if cap_context
-            .cheapest_legal_count()
-            .is_some_and(|legal| legal <= estimated_total)
-        {
+        let union_estimate = if total_estimate_known {
+            PlannerEstimate::upper_bound(estimated_total)
+        } else {
+            PlannerEstimate::unknown()
+        };
+        let union_cap_exceeded = total_estimate_known && {
+            let union_cap = cap_context.union_total_cap(true, query.page.limit, union_estimate);
+            estimated_total > union_cap as u64
+        };
+        let legal_universe_wins_eager = total_estimate_known
+            && cap_context
+                .cheapest_legal_count()
+                .is_some_and(|legal| legal <= estimated_total);
+        let should_consider_streamed_union = !total_estimate_known
+            || eager_source_cap_blocked
+            || union_cap_exceeded
+            || estimated_total > EAGER_PREFERRED_SOURCE_MAX;
+        let streamed_union_legal = should_consider_streamed_union
+            && self
+                .streamed_union_inputs_legal(plans.iter(), cap_context, query.page.limit)
+                .is_ok();
+
+        if !streamed_union_legal {
+            if eager_source_cap_blocked {
+                add_plan_warning(
+                    warnings,
+                    cap_warning_for_source(NodeQueryCandidateSourceKind::PropertyEqualityIndex),
+                );
+                return Ok(BooleanPlanResult {
+                    classification: BooleanPlanClassification::VerifyOnly,
+                    has_verify_only: true,
+                });
+            }
+            if !total_estimate_known {
+                add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
+                return Ok(BooleanPlanResult {
+                    classification: BooleanPlanClassification::VerifyOnly,
+                    has_verify_only: true,
+                });
+            }
+            if union_cap_exceeded {
+                add_plan_warning(warnings, QueryPlanWarning::PlanningProbeBudgetExceeded);
+                return Ok(BooleanPlanResult {
+                    classification: BooleanPlanClassification::VerifyOnly,
+                    has_verify_only: true,
+                });
+            }
+        }
+
+        if legal_universe_wins_eager && !streamed_union_legal {
             add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
             return Ok(BooleanPlanResult {
                 classification: BooleanPlanClassification::VerifyOnly,
@@ -8455,9 +9183,10 @@ impl ReadView {
         Ok(BooleanPlanResult {
             classification: BooleanPlanClassification::Bounded {
                 plan: NodePhysicalPlan::union(plans),
-                estimate: PlannerEstimate::upper_bound(estimated_total),
+                estimate: union_estimate,
                 structural_key,
                 complete: true,
+                streamable_rejects: Vec::new(),
             },
             has_verify_only: false,
         })
@@ -8598,30 +9327,45 @@ impl ReadView {
         };
         let mut plans = vec![compound.into_plan()];
         let mut has_verify_only = planned.has_verify_only;
+        let mut inherited_streamable_rejects = Vec::new();
         match planned.classification {
             BooleanPlanClassification::Bounded {
-                plan, complete, ..
-            } if complete => plans.push(plan),
-            BooleanPlanClassification::Bounded { .. } => has_verify_only = true,
+                plan,
+                complete,
+                streamable_rejects,
+                ..
+            } if complete => {
+                plans.push(plan);
+                inherited_streamable_rejects.extend(streamable_rejects);
+            }
+            BooleanPlanClassification::Bounded {
+                streamable_rejects,
+                ..
+            } => {
+                inherited_streamable_rejects.extend(streamable_rejects);
+                has_verify_only = true;
+            }
             BooleanPlanClassification::VerifyOnly => {}
             BooleanPlanClassification::AlwaysFalse => unreachable!("handled above"),
         }
-        let (selected, _skipped_to_verifier) =
+        let selection =
             self.select_bounded_and_plans(query, cap_context, plans, warnings);
         // A skipped plan here is redundant coverage of the same single leaf,
         // not a lost predicate, so it does not mark the filter verify-only.
-        if selected.is_empty() {
+        if selection.selected.is_empty() {
             return Ok(BooleanPlanResult {
                 classification: BooleanPlanClassification::VerifyOnly,
                 has_verify_only,
             });
         }
-        let plan = NodePhysicalPlan::intersect(selected);
+        inherited_streamable_rejects.extend(selection.streamable_rejects);
+        let plan = NodePhysicalPlan::intersect(selection.selected);
         Ok(BooleanPlanResult {
             classification: BooleanPlanClassification::Bounded {
                 estimate: plan.estimate(),
                 structural_key: filter.structural_key(),
                 complete: true,
+                streamable_rejects: inherited_streamable_rejects,
                 plan,
             },
             has_verify_only,
@@ -8728,6 +9472,7 @@ impl ReadView {
             NormalizedNodeFilter::And(children) => {
                 let mut plans = Vec::new();
                 let mut has_verify_only = false;
+                let mut streamable_rejects = Vec::new();
                 if let Some(compound) =
                     self.best_node_compound_candidate(query, filter, cap_context, warnings)?
                 {
@@ -8753,29 +9498,41 @@ impl ReadView {
                         }
                         BooleanPlanClassification::VerifyOnly => {}
                         BooleanPlanClassification::Bounded {
-                            plan, complete, ..
-                        } if complete => plans.push(plan),
-                        BooleanPlanClassification::Bounded { .. } => {
+                            plan,
+                            complete,
+                            streamable_rejects: mut child_rejects,
+                            ..
+                        } if complete => {
+                            plans.push(plan);
+                            streamable_rejects.append(&mut child_rejects);
+                        }
+                        BooleanPlanClassification::Bounded {
+                            streamable_rejects: mut child_rejects,
+                            ..
+                        } => {
+                            streamable_rejects.append(&mut child_rejects);
                             has_verify_only = true;
                         }
                     }
                 }
 
-                let (selected, skipped_to_verifier) =
+                let mut selection =
                     self.select_bounded_and_plans(query, cap_context, plans, warnings);
-                has_verify_only |= skipped_to_verifier;
-                if selected.is_empty() {
+                has_verify_only |= selection.skipped_to_verifier;
+                streamable_rejects.append(&mut selection.streamable_rejects);
+                if selection.selected.is_empty() {
                     return Ok(BooleanPlanResult {
                         classification: BooleanPlanClassification::VerifyOnly,
                         has_verify_only,
                     });
                 }
-                let plan = NodePhysicalPlan::intersect(selected);
+                let plan = NodePhysicalPlan::intersect(selection.selected);
                 Ok(BooleanPlanResult {
                     classification: BooleanPlanClassification::Bounded {
                         estimate: plan.estimate(),
                         structural_key,
                         complete: true,
+                        streamable_rejects,
                         plan,
                     },
                     has_verify_only,
@@ -8793,6 +9550,7 @@ impl ReadView {
 
                 let mut plan_entries = Vec::new();
                 let mut estimated_total = 0u64;
+                let mut total_estimate_known = true;
                 let mut has_verify_only = false;
                 let mut members_eager = true;
                 for child in children {
@@ -8820,33 +9578,24 @@ impl ReadView {
                             estimate,
                             structural_key,
                             complete,
+                            streamable_rejects,
                         } if complete => {
-                            let Some(count) = estimate.known_upper_bound() else {
-                                add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
-                                add_plan_warning(warnings, QueryPlanWarning::BooleanBranchFallback);
-                                return Ok(BooleanPlanResult {
-                                    classification: BooleanPlanClassification::VerifyOnly,
-                                    has_verify_only: true,
-                                });
-                            };
-                            members_eager &= plan.members_are_eager_index_sources();
-                            estimated_total = estimated_total.saturating_add(count);
-                            let union_estimate = PlannerEstimate::upper_bound(estimated_total);
-                            let union_cap = cap_context.union_total_cap(
-                                members_eager,
-                                query.page.limit,
-                                union_estimate,
-                            );
-                            if estimated_total > union_cap as u64 {
-                                add_plan_warning(
+                            if !streamable_rejects.is_empty() {
+                                Self::warn_streamable_rejects_demoted(
                                     warnings,
-                                    QueryPlanWarning::PlanningProbeBudgetExceeded,
+                                    &streamable_rejects,
                                 );
                                 add_plan_warning(warnings, QueryPlanWarning::BooleanBranchFallback);
                                 return Ok(BooleanPlanResult {
                                     classification: BooleanPlanClassification::VerifyOnly,
                                     has_verify_only: true,
                                 });
+                            }
+                            members_eager &= plan.members_are_eager_index_sources();
+                            if let Some(count) = estimate.known_upper_bound() {
+                                estimated_total = estimated_total.saturating_add(count);
+                            } else {
+                                total_estimate_known = false;
                             }
                             plan_entries.push((structural_key, plan));
                         }
@@ -8866,9 +9615,54 @@ impl ReadView {
                         has_verify_only,
                     });
                 }
+                let union_estimate = if total_estimate_known {
+                    PlannerEstimate::upper_bound(estimated_total)
+                } else {
+                    PlannerEstimate::unknown()
+                };
+                let union_cap_exceeded = total_estimate_known && {
+                    let union_cap =
+                        cap_context.union_total_cap(members_eager, query.page.limit, union_estimate);
+                    estimated_total > union_cap as u64
+                };
+                let should_consider_streamed_union = !total_estimate_known
+                    || union_cap_exceeded
+                    || estimated_total > EAGER_PREFERRED_SOURCE_MAX;
+                let streamed_union_legal = if should_consider_streamed_union {
+                    self
+                        .streamed_union_inputs_legal(
+                            plan_entries.iter().map(|(_, plan)| plan),
+                            cap_context,
+                            query.page.limit,
+                        )
+                        .is_ok()
+                } else {
+                    false
+                };
+
+                if !streamed_union_legal {
+                    if !total_estimate_known {
+                        add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
+                        add_plan_warning(warnings, QueryPlanWarning::BooleanBranchFallback);
+                        return Ok(BooleanPlanResult {
+                            classification: BooleanPlanClassification::VerifyOnly,
+                            has_verify_only: true,
+                        });
+                    }
+                    if union_cap_exceeded {
+                        add_plan_warning(warnings, QueryPlanWarning::PlanningProbeBudgetExceeded);
+                        add_plan_warning(warnings, QueryPlanWarning::BooleanBranchFallback);
+                        return Ok(BooleanPlanResult {
+                            classification: BooleanPlanClassification::VerifyOnly,
+                            has_verify_only: true,
+                        });
+                    }
+                }
+
                 if cap_context
                     .cheapest_legal_count()
-                    .is_some_and(|legal| legal <= estimated_total)
+                    .is_some_and(|legal| total_estimate_known && legal <= estimated_total)
+                    && !streamed_union_legal
                 {
                     add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
                     add_plan_warning(warnings, QueryPlanWarning::BooleanBranchFallback);
@@ -8887,14 +9681,433 @@ impl ReadView {
                 );
                 Ok(BooleanPlanResult {
                     classification: BooleanPlanClassification::Bounded {
-                        estimate: plan.estimate(),
+                        estimate: union_estimate,
                         structural_key,
                         complete: true,
+                        streamable_rejects: Vec::new(),
                         plan,
                     },
                     has_verify_only,
                 })
             }
+        }
+    }
+
+    fn warn_streamable_rejects_demoted(
+        warnings: &mut Vec<QueryPlanWarning>,
+        streamable_rejects: &[NodePhysicalPlan],
+    ) {
+        if streamable_rejects.iter().any(|plan| {
+            plan.estimate().known_upper_bound().is_some() && plan.broad_skip_warnable()
+        }) {
+            add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
+            add_plan_warning(warnings, QueryPlanWarning::VerifyOnlyFilter);
+        }
+    }
+
+    fn node_plan_all_inputs_eager_preferred(plan: &NodePhysicalPlan) -> bool {
+        let mut inputs = Vec::new();
+        plan.collect_intersect_inputs(&mut inputs);
+        !inputs.is_empty()
+            && inputs.iter().all(|input| {
+                input
+                    .estimate()
+                    .known_upper_bound()
+                    .is_some_and(|count| count <= EAGER_PREFERRED_SOURCE_MAX)
+            })
+    }
+
+    fn node_selected_anchor_count(inputs: &[NodePhysicalPlan]) -> Option<u64> {
+        inputs
+            .iter()
+            .filter_map(|input| input.estimate().known_upper_bound())
+            .min()
+    }
+
+    fn node_stream_cursor_count_upper_bound(&self, plan: &NodePhysicalPlan) -> usize {
+        let layer_count = 1usize
+            .saturating_add(self.immutable_epochs.len())
+            .saturating_add(self.segments.len());
+        match plan {
+            NodePhysicalPlan::Empty => 0,
+            NodePhysicalPlan::BufferedIdSort(_) => 1,
+            NodePhysicalPlan::Intersect { inputs, .. } | NodePhysicalPlan::Union { inputs, .. } => {
+                inputs
+                    .iter()
+                    .map(|input| self.node_stream_cursor_count_upper_bound(input))
+                    .sum()
+            }
+            NodePhysicalPlan::Source(source) => match &source.materialization {
+                NodeCandidateMaterialization::Precomputed(_)
+                | NodeCandidateMaterialization::KeyLookup => 1,
+                NodeCandidateMaterialization::NodeLabelIndex { .. } => layer_count,
+                NodeCandidateMaterialization::NodeLabelAny { label_ids } => {
+                    layer_count.saturating_mul(label_ids.len())
+                }
+                NodeCandidateMaterialization::PropertyEqualityIndex { value, .. } => {
+                    layer_count.saturating_mul(equality_probe_value_hashes(value).len())
+                }
+                NodeCandidateMaterialization::PropertyRangeIndex { .. }
+                | NodeCandidateMaterialization::TimestampIndex { .. } => 1,
+                NodeCandidateMaterialization::CompoundPrefixIndex { .. }
+                | NodeCandidateMaterialization::CompoundRangeIndex { .. }
+                | NodeCandidateMaterialization::FallbackNodeLabelScan { .. }
+                | NodeCandidateMaterialization::FallbackFullNodeScan => STREAMED_MAX_TOTAL_CURSORS
+                    .saturating_add(1),
+            },
+        }
+    }
+
+    fn label_stream_candidate_from_legal_sources(
+        &self,
+        legal_universe_sources: &[NodeLegalUniverseSource],
+    ) -> Option<NodePhysicalPlan> {
+        legal_universe_sources
+            .iter()
+            .filter_map(|source| match source {
+                NodeLegalUniverseSource::Label { .. }
+                | NodeLegalUniverseSource::LabelAny { .. } => Some(source.source(false)),
+                NodeLegalUniverseSource::ExplicitIds(_)
+                | NodeLegalUniverseSource::KeyLookup(_)
+                | NodeLegalUniverseSource::FullScan { .. } => None,
+            })
+            .map(NodePhysicalPlan::source)
+            .min_by_key(NodePhysicalPlan::plan_cost)
+    }
+
+    fn corrected_gate_label_universe_count(
+        legal_universe_sources: &[NodeLegalUniverseSource],
+    ) -> Option<u64> {
+        let cheapest = legal_universe_sources
+            .iter()
+            .min_by_key(|source| source.source(true).plan_cost())?;
+        match cheapest {
+            NodeLegalUniverseSource::Label { estimate, .. }
+            | NodeLegalUniverseSource::LabelAny { estimate, .. } => estimate.known_upper_bound(),
+            NodeLegalUniverseSource::ExplicitIds(_)
+            | NodeLegalUniverseSource::KeyLookup(_)
+            | NodeLegalUniverseSource::FullScan { .. } => None,
+        }
+    }
+
+    fn buffered_stream_input_under_cap(
+        input: &NodePhysicalPlan,
+        cap_context: QueryCapContext,
+        query_limit: Option<usize>,
+    ) -> bool {
+        let Some(source) = input.as_source() else {
+            return false;
+        };
+        let estimate = input.estimate();
+        let cap = cap_context.source_cap(source.kind, query_limit, estimate);
+        estimate
+            .known_upper_bound()
+            .is_some_and(|count| count <= cap as u64)
+    }
+
+    fn buffered_stream_plan(input: &NodePhysicalPlan) -> NodePhysicalPlan {
+        match input {
+            NodePhysicalPlan::BufferedIdSort(_) => input.clone(),
+            _ => NodePhysicalPlan::BufferedIdSort(Box::new(input.clone())),
+        }
+    }
+
+    fn streamed_leaf_input_plan(
+        &self,
+        input: &NodePhysicalPlan,
+        cap_context: QueryCapContext,
+        query_limit: Option<usize>,
+    ) -> Result<NodePhysicalPlan, StreamedInputRejection> {
+        match classify_stream_input(input) {
+            NodeStreamInputClass::NativeStream => Ok(input.clone()),
+            NodeStreamInputClass::BufferedIdSort => {
+                if Self::buffered_stream_input_under_cap(input, cap_context, query_limit) {
+                    Ok(Self::buffered_stream_plan(input))
+                } else {
+                    Err(StreamedInputRejection::BufferedCapExceeded)
+                }
+            }
+            NodeStreamInputClass::NotStreamable => Err(StreamedInputRejection::NotStreamable),
+        }
+    }
+
+    fn streamed_union_branch_plan(
+        &self,
+        input: &NodePhysicalPlan,
+        cap_context: QueryCapContext,
+        query_limit: Option<usize>,
+    ) -> Result<NodePhysicalPlan, StreamedInputRejection> {
+        match input {
+            NodePhysicalPlan::Union { inputs, .. } => {
+                self.streamed_union_plan_from_inputs(inputs, cap_context, query_limit)
+            }
+            NodePhysicalPlan::Intersect { .. } => Err(StreamedInputRejection::NotStreamable),
+            _ => self.streamed_leaf_input_plan(input, cap_context, query_limit),
+        }
+    }
+
+    fn streamed_union_plan_from_inputs(
+        &self,
+        inputs: &[NodePhysicalPlan],
+        cap_context: QueryCapContext,
+        query_limit: Option<usize>,
+    ) -> Result<NodePhysicalPlan, StreamedInputRejection> {
+        let mut streamed_inputs = Vec::new();
+        for input in inputs {
+            let input = self.streamed_union_branch_plan(input, cap_context, query_limit)?;
+            match input {
+                NodePhysicalPlan::Empty => {}
+                NodePhysicalPlan::Union {
+                    inputs: children, ..
+                } => streamed_inputs.extend(children),
+                plan => streamed_inputs.push(plan),
+            }
+        }
+
+        let total_cursors: usize = streamed_inputs
+            .iter()
+            .map(|input| self.node_stream_cursor_count_upper_bound(input))
+            .sum();
+        if total_cursors > STREAMED_MAX_TOTAL_CURSORS {
+            return Err(StreamedInputRejection::CursorCountExceeded);
+        }
+
+        Ok(NodePhysicalPlan::streamed_union(streamed_inputs))
+    }
+
+    fn streamed_union_branch_cursor_count(
+        &self,
+        input: &NodePhysicalPlan,
+        cap_context: QueryCapContext,
+        query_limit: Option<usize>,
+    ) -> Result<usize, StreamedInputRejection> {
+        match input {
+            NodePhysicalPlan::Empty => Ok(0),
+            NodePhysicalPlan::Union { inputs, .. } => {
+                self.streamed_union_inputs_cursor_count(inputs.iter(), cap_context, query_limit)
+            }
+            NodePhysicalPlan::Intersect { .. } => Err(StreamedInputRejection::NotStreamable),
+            _ => match classify_stream_input(input) {
+                NodeStreamInputClass::NativeStream => {
+                    Ok(self.node_stream_cursor_count_upper_bound(input))
+                }
+                NodeStreamInputClass::BufferedIdSort => {
+                    if Self::buffered_stream_input_under_cap(input, cap_context, query_limit) {
+                        Ok(1)
+                    } else {
+                        Err(StreamedInputRejection::BufferedCapExceeded)
+                    }
+                }
+                NodeStreamInputClass::NotStreamable => Err(StreamedInputRejection::NotStreamable),
+            },
+        }
+    }
+
+    fn streamed_union_inputs_cursor_count<'a>(
+        &self,
+        inputs: impl IntoIterator<Item = &'a NodePhysicalPlan>,
+        cap_context: QueryCapContext,
+        query_limit: Option<usize>,
+    ) -> Result<usize, StreamedInputRejection> {
+        let mut total_cursors = 0usize;
+        for input in inputs {
+            total_cursors = total_cursors.saturating_add(
+                self.streamed_union_branch_cursor_count(input, cap_context, query_limit)?,
+            );
+            if total_cursors > STREAMED_MAX_TOTAL_CURSORS {
+                return Err(StreamedInputRejection::CursorCountExceeded);
+            }
+        }
+        Ok(total_cursors)
+    }
+
+    fn streamed_union_inputs_legal<'a>(
+        &self,
+        inputs: impl IntoIterator<Item = &'a NodePhysicalPlan>,
+        cap_context: QueryCapContext,
+        query_limit: Option<usize>,
+    ) -> Result<(), StreamedInputRejection> {
+        self.streamed_union_inputs_cursor_count(inputs, cap_context, query_limit)
+            .map(|_| ())
+    }
+
+    fn streamed_input_plan(
+        &self,
+        input: &NodePhysicalPlan,
+        cap_context: QueryCapContext,
+        query_limit: Option<usize>,
+    ) -> Result<NodePhysicalPlan, StreamedInputRejection> {
+        match input {
+            NodePhysicalPlan::Union { inputs, .. } => {
+                self.streamed_union_plan_from_inputs(inputs, cap_context, query_limit)
+            }
+            _ => self.streamed_leaf_input_plan(input, cap_context, query_limit),
+        }
+    }
+
+    fn native_single_source_stream_allowed(
+        input: &NodePhysicalPlan,
+        _cap_context: QueryCapContext,
+        _query_limit: Option<usize>,
+    ) -> bool {
+        if classify_stream_input(input) != NodeStreamInputClass::NativeStream {
+            return false;
+        }
+        input
+            .estimate()
+            .known_upper_bound()
+            .is_none_or(|count| count > EAGER_PREFERRED_SOURCE_MAX)
+    }
+
+    fn select_streamed_node_driver(
+        &self,
+        query: &NormalizedNodeQuery,
+        cap_context: QueryCapContext,
+        bounded_plan: &NodePhysicalPlan,
+        streamable_rejects: &[NodePhysicalPlan],
+        legal_universe_sources: &[NodeLegalUniverseSource],
+        warnings: &mut Vec<QueryPlanWarning>,
+    ) -> Option<NodePhysicalPlan> {
+        let mut selected_inputs = Vec::new();
+        bounded_plan.collect_intersect_inputs(&mut selected_inputs);
+        let selected_anchor_count = Self::node_selected_anchor_count(&selected_inputs);
+        let label_universe_count = Self::corrected_gate_label_universe_count(legal_universe_sources);
+        let selected_eager_preferred = Self::node_plan_all_inputs_eager_preferred(bounded_plan);
+
+        let mut admitted = Vec::new();
+        let mut admitted_extra_count = 0usize;
+        let mut sorted_selected_inputs = selected_inputs;
+        sorted_selected_inputs.sort_by_cached_key(NodePhysicalPlan::plan_cost);
+        for (index, input) in sorted_selected_inputs.into_iter().enumerate() {
+            let is_anchor = index == 0;
+            let gate_admitted = is_anchor
+                || stream_reject_admitted_by_selectivity_gate(
+                    selected_anchor_count,
+                    input.estimate().known_upper_bound(),
+                    label_universe_count,
+                );
+            match self.streamed_input_plan(&input, cap_context, query.page.limit) {
+                Ok(streamed_input) => {
+                    if gate_admitted && admitted.len() < STREAMED_INTERSECT_MAX_INPUTS {
+                        if !is_anchor {
+                            admitted_extra_count += 1;
+                        }
+                        admitted.push(streamed_input);
+                    }
+                }
+                Err(StreamedInputRejection::BufferedCapExceeded) => {
+                    add_plan_warning(warnings, QueryPlanWarning::StreamedInputBufferCapExceeded);
+                }
+                Err(StreamedInputRejection::NotStreamable | StreamedInputRejection::CursorCountExceeded) => {}
+            }
+        }
+
+        let mut admitted_reject_count = 0usize;
+        let mut native_reject_demoted = false;
+        let mut sorted_rejects = streamable_rejects.to_vec();
+        sorted_rejects.sort_by_cached_key(NodePhysicalPlan::plan_cost);
+        for input in sorted_rejects {
+            let gate_admitted = stream_reject_admitted_by_selectivity_gate(
+                selected_anchor_count,
+                input.estimate().known_upper_bound(),
+                label_universe_count,
+            );
+            match self.streamed_input_plan(&input, cap_context, query.page.limit) {
+                Ok(streamed_input) => {
+                    if gate_admitted && admitted.len() < STREAMED_INTERSECT_MAX_INPUTS {
+                        admitted.push(streamed_input);
+                        admitted_reject_count += 1;
+                        admitted_extra_count += 1;
+                    } else if input.estimate().known_upper_bound().is_some()
+                        && input.broad_skip_warnable()
+                    {
+                        native_reject_demoted = true;
+                    }
+                }
+                Err(StreamedInputRejection::BufferedCapExceeded) => {
+                    add_plan_warning(warnings, QueryPlanWarning::StreamedInputBufferCapExceeded);
+                }
+                Err(StreamedInputRejection::NotStreamable | StreamedInputRejection::CursorCountExceeded) => {}
+            }
+        }
+
+        if selected_eager_preferred && admitted_reject_count == 0 {
+            return None;
+        }
+        if admitted_extra_count == 0
+            && admitted.iter().all(|input| {
+                input
+                    .estimate()
+                    .known_upper_bound()
+                    .is_some_and(|count| count <= EAGER_PREFERRED_SOURCE_MAX)
+            })
+        {
+            return None;
+        }
+
+        if !admitted.is_empty() {
+            if let Some(label_plan) = self.label_stream_candidate_from_legal_sources(legal_universe_sources) {
+                if let Some(label_count) = label_plan.estimate().known_upper_bound() {
+                    let label_is_strictly_smallest = admitted.iter().all(|input| {
+                        input
+                            .estimate()
+                            .known_upper_bound()
+                            .is_some_and(|count| label_count < count)
+                    });
+                    if label_is_strictly_smallest {
+                        admitted.push(label_plan);
+                        admitted.sort_by_cached_key(NodePhysicalPlan::plan_cost);
+                        admitted.truncate(STREAMED_INTERSECT_MAX_INPUTS);
+                    }
+                }
+            }
+        }
+
+        if admitted.is_empty() {
+            return None;
+        }
+
+        let total_cursors: usize = admitted
+            .iter()
+            .map(|input| self.node_stream_cursor_count_upper_bound(input))
+            .sum();
+        if total_cursors > STREAMED_MAX_TOTAL_CURSORS {
+            return None;
+        }
+
+        if let Some(smallest_known_stream) = admitted
+            .iter()
+            .filter_map(|input| input.estimate().known_upper_bound())
+            .min()
+        {
+            if cap_context
+                .cheapest_legal_count()
+                .is_some_and(|legal| legal < smallest_known_stream)
+            {
+                return None;
+            }
+        }
+
+        admitted.sort_by_cached_key(NodePhysicalPlan::plan_cost);
+        if native_reject_demoted {
+            add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
+            add_plan_warning(warnings, QueryPlanWarning::VerifyOnlyFilter);
+        }
+        if admitted.len() == 1 {
+            let input = admitted.pop().expect("length checked");
+            if matches!(input, NodePhysicalPlan::Union { .. })
+                || Self::native_single_source_stream_allowed(
+                    &input,
+                    cap_context,
+                    query.page.limit,
+                )
+            {
+                Some(input.into_streamed_mode())
+            } else {
+                None
+            }
+        } else {
+            Some(NodePhysicalPlan::intersect(admitted).into_streamed_mode())
         }
     }
 
@@ -8907,6 +10120,7 @@ impl ReadView {
             finalize_plan_warnings(&mut warnings);
             return Ok(PlannedNodeQuery {
                 driver: NodePhysicalPlan::Empty,
+                execution_mode: NodeDriverExecutionMode::Eager,
                 cap_context: QueryCapContext::default(),
                 legal_universe_fallback: None,
                 warnings,
@@ -8961,6 +10175,7 @@ impl ReadView {
             finalize_plan_warnings(&mut warnings);
             return Ok(PlannedNodeQuery {
                 driver: NodePhysicalPlan::Empty,
+                execution_mode: NodeDriverExecutionMode::Eager,
                 cap_context,
                 legal_universe_fallback,
                 warnings,
@@ -8971,8 +10186,15 @@ impl ReadView {
         let mut driver_candidates =
             Self::node_legal_universe_plans_from_sources(&legal_universe_sources, has_filter);
         let mut bounded_filter_plan = None;
-        if let BooleanPlanClassification::Bounded { plan, .. } = filter_plan.classification {
+        let mut bounded_streamable_rejects = Vec::new();
+        if let BooleanPlanClassification::Bounded {
+            plan,
+            streamable_rejects,
+            ..
+        } = filter_plan.classification
+        {
             bounded_filter_plan = Some(plan.clone());
+            bounded_streamable_rejects = streamable_rejects;
             driver_candidates.push(plan);
         }
 
@@ -8982,22 +10204,46 @@ impl ReadView {
             ));
         }
 
-        self.sort_physical_plans_by_selectivity(&mut driver_candidates);
-        let driver = driver_candidates
-            .first()
-            .cloned()
-            .expect("driver candidates must be non-empty");
+        let streamed_driver = bounded_filter_plan.as_ref().and_then(|bounded_plan| {
+            self.select_streamed_node_driver(
+                query,
+                cap_context,
+                bounded_plan,
+                &bounded_streamable_rejects,
+                &legal_universe_sources,
+                &mut warnings,
+            )
+        });
 
-        if let Some(bounded_plan) = bounded_filter_plan.as_ref() {
-            if bounded_plan.canonical_key() != driver.canonical_key() {
-                if let (Some(selected), Some(bounded)) = (
-                    driver.estimate().known_upper_bound(),
-                    bounded_plan.estimate().known_upper_bound(),
-                ) {
-                    if bounded > selected.saturating_mul(QUERY_BROAD_SOURCE_FACTOR)
-                        && bounded_plan.broad_skip_warnable()
-                    {
-                        add_plan_warning(&mut warnings, QueryPlanWarning::IndexSkippedAsBroad);
+        let (driver, execution_mode) = if let Some(driver) = streamed_driver {
+            (driver, NodeDriverExecutionMode::Streamed)
+        } else {
+            Self::warn_streamable_rejects_demoted(&mut warnings, &bounded_streamable_rejects);
+            self.sort_physical_plans_by_selectivity(&mut driver_candidates);
+            (
+                driver_candidates
+                    .first()
+                    .cloned()
+                    .expect("driver candidates must be non-empty"),
+                NodeDriverExecutionMode::Eager,
+            )
+        };
+
+        if execution_mode == NodeDriverExecutionMode::Eager {
+            if let Some(bounded_plan) = bounded_filter_plan.as_ref() {
+                if bounded_plan.canonical_key() != driver.canonical_key() {
+                    if let (Some(selected), Some(bounded)) = (
+                        driver.estimate().known_upper_bound(),
+                        bounded_plan.estimate().known_upper_bound(),
+                    ) {
+                        if bounded > selected.saturating_mul(QUERY_BROAD_SOURCE_FACTOR)
+                            && bounded_plan.broad_skip_warnable()
+                        {
+                            add_plan_warning(
+                                &mut warnings,
+                                QueryPlanWarning::IndexSkippedAsBroad,
+                            );
+                        }
                     }
                 }
             }
@@ -9020,6 +10266,7 @@ impl ReadView {
         finalize_plan_warnings(&mut warnings);
         Ok(PlannedNodeQuery {
             driver,
+            execution_mode,
             cap_context,
             legal_universe_fallback,
             warnings,
@@ -9057,7 +10304,7 @@ impl ReadView {
             ));
         }
         if !query.from_ids.is_empty() {
-            let estimate = self.edge_endpoint_estimate(
+            let stats = self.edge_endpoint_planner_stats(
                 &query.from_ids,
                 Direction::Outgoing,
                 label_filter_ids.as_deref(),
@@ -9066,27 +10313,33 @@ impl ReadView {
                 EdgeQueryCandidateSourceKind::FromEndpointAdjacency,
                 Arc::new(query.from_ids.clone()),
                 label_filter_ids.clone(),
-                estimate,
+                stats,
             ));
         }
         if !query.to_ids.is_empty() {
-            let estimate =
-                self.edge_endpoint_estimate(&query.to_ids, Direction::Incoming, label_filter_ids.as_deref());
+            let stats = self.edge_endpoint_planner_stats(
+                &query.to_ids,
+                Direction::Incoming,
+                label_filter_ids.as_deref(),
+            );
             sources.push(PlannedEdgeCandidateSource::endpoint_adjacency(
                 EdgeQueryCandidateSourceKind::ToEndpointAdjacency,
                 Arc::new(query.to_ids.clone()),
                 label_filter_ids.clone(),
-                estimate,
+                stats,
             ));
         }
         if !query.endpoint_ids.is_empty() {
-            let estimate =
-                self.edge_endpoint_estimate(&query.endpoint_ids, Direction::Both, label_filter_ids.as_deref());
+            let stats = self.edge_endpoint_planner_stats(
+                &query.endpoint_ids,
+                Direction::Both,
+                label_filter_ids.as_deref(),
+            );
             sources.push(PlannedEdgeCandidateSource::endpoint_adjacency(
                 EdgeQueryCandidateSourceKind::AnyEndpointAdjacency,
                 Arc::new(query.endpoint_ids.clone()),
                 label_filter_ids,
-                estimate,
+                stats,
             ));
         }
         if query.allow_full_scan {
@@ -9134,6 +10387,469 @@ impl ReadView {
         sources.iter().find(|source| source.kind == kind).cloned()
     }
 
+    fn warn_edge_streamable_rejects_demoted(
+        warnings: &mut Vec<QueryPlanWarning>,
+        streamable_rejects: &[EdgePhysicalPlan],
+    ) {
+        let mut native_reject_demoted = false;
+        for plan in streamable_rejects {
+            if plan.estimate().known_upper_bound().is_some() && plan.broad_skip_warnable() {
+                native_reject_demoted = true;
+            }
+        }
+        if native_reject_demoted {
+            add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
+            add_plan_warning(warnings, QueryPlanWarning::VerifyOnlyFilter);
+        }
+    }
+
+    fn edge_plan_all_inputs_eager_preferred(plan: &EdgePhysicalPlan) -> bool {
+        let mut inputs = Vec::new();
+        plan.collect_intersect_inputs(&mut inputs);
+        !inputs.is_empty()
+            && inputs.iter().all(|input| {
+                input
+                    .estimate()
+                    .known_upper_bound()
+                    .is_some_and(|count| count <= EAGER_PREFERRED_SOURCE_MAX)
+            })
+    }
+
+    fn edge_selected_anchor_count(inputs: &[EdgePhysicalPlan]) -> Option<u64> {
+        inputs
+            .iter()
+            .filter_map(|input| input.estimate().known_upper_bound())
+            .min()
+    }
+
+    fn corrected_gate_edge_universe_count(
+        legal_universe_sources: &[PlannedEdgeCandidateSource],
+    ) -> Option<u64> {
+        legal_universe_sources
+            .iter()
+            .filter(|source| {
+                matches!(
+                    source.kind,
+                    EdgeQueryCandidateSourceKind::EdgeLabelIndex
+                        | EdgeQueryCandidateSourceKind::FromEndpointAdjacency
+                        | EdgeQueryCandidateSourceKind::ToEndpointAdjacency
+                        | EdgeQueryCandidateSourceKind::AnyEndpointAdjacency
+                )
+            })
+            .filter_map(|source| source.estimate.known_upper_bound())
+            .min()
+    }
+
+    fn edge_stream_cursor_count_upper_bound(&self, plan: &EdgePhysicalPlan) -> usize {
+        let layer_count = 1usize
+            .saturating_add(self.immutable_epochs.len())
+            .saturating_add(self.segments.len());
+        match plan {
+            EdgePhysicalPlan::Empty => 0,
+            EdgePhysicalPlan::BufferedIdSort(_) => 1,
+            EdgePhysicalPlan::Intersect { inputs, .. } | EdgePhysicalPlan::Union { inputs, .. } => {
+                inputs
+                    .iter()
+                    .map(|input| self.edge_stream_cursor_count_upper_bound(input))
+                    .sum()
+            }
+            EdgePhysicalPlan::Source(source) => match &source.materialization {
+                EdgeCandidateMaterialization::Precomputed(_)
+                | EdgeCandidateMaterialization::EdgeTripleIndex { .. } => 1,
+                EdgeCandidateMaterialization::EdgeLabelIndex { .. } => layer_count,
+                EdgeCandidateMaterialization::EdgePropertyEqualityIndex { value_hashes, .. } => {
+                    layer_count.saturating_mul(value_hashes.len())
+                }
+                EdgeCandidateMaterialization::EdgeWeightIndex { .. }
+                | EdgeCandidateMaterialization::EdgeUpdatedAtIndex { .. }
+                | EdgeCandidateMaterialization::EdgeValidFromIndex { .. }
+                | EdgeCandidateMaterialization::EdgeValidToIndex { .. }
+                | EdgeCandidateMaterialization::EdgePropertyRangeIndex { .. } => 1,
+                EdgeCandidateMaterialization::FromEndpointAdjacency {
+                    stream_cursor_count_upper_bound,
+                    ..
+                }
+                | EdgeCandidateMaterialization::ToEndpointAdjacency {
+                    stream_cursor_count_upper_bound,
+                    ..
+                }
+                | EdgeCandidateMaterialization::AnyEndpointAdjacency {
+                    stream_cursor_count_upper_bound,
+                    ..
+                } => *stream_cursor_count_upper_bound,
+                EdgeCandidateMaterialization::CompoundPrefixIndex { .. }
+                | EdgeCandidateMaterialization::CompoundRangeIndex { .. }
+                | EdgeCandidateMaterialization::FallbackFullEdgeScan => STREAMED_MAX_TOTAL_CURSORS
+                    .saturating_add(1),
+            },
+        }
+    }
+
+    fn buffered_edge_stream_input_under_cap(
+        input: &EdgePhysicalPlan,
+        cap_context: EdgeQueryCapContext,
+        query_limit: Option<usize>,
+    ) -> bool {
+        let Some(source) = input.as_source() else {
+            return false;
+        };
+        let estimate = input.estimate();
+        let cap = cap_context.source_cap(source.kind, query_limit, estimate);
+        estimate
+            .known_upper_bound()
+            .is_some_and(|count| count <= cap as u64)
+    }
+
+    fn buffered_edge_stream_plan(input: &EdgePhysicalPlan) -> EdgePhysicalPlan {
+        match input {
+            EdgePhysicalPlan::BufferedIdSort(_) => input.clone(),
+            _ => EdgePhysicalPlan::BufferedIdSort(Box::new(input.clone())),
+        }
+    }
+
+    fn streamed_edge_leaf_input_plan(
+        &self,
+        input: &EdgePhysicalPlan,
+        cap_context: EdgeQueryCapContext,
+        query_limit: Option<usize>,
+    ) -> Result<EdgePhysicalPlan, StreamedInputRejection> {
+        match classify_edge_stream_input(input) {
+            EdgeStreamInputClass::NativeStream => {
+                if self.edge_stream_cursor_count_upper_bound(input) > STREAMED_MAX_TOTAL_CURSORS {
+                    Err(StreamedInputRejection::CursorCountExceeded)
+                } else {
+                    Ok(input.clone())
+                }
+            }
+            EdgeStreamInputClass::BufferedIdSort => {
+                if Self::buffered_edge_stream_input_under_cap(input, cap_context, query_limit) {
+                    Ok(Self::buffered_edge_stream_plan(input))
+                } else {
+                    Err(StreamedInputRejection::BufferedCapExceeded)
+                }
+            }
+            EdgeStreamInputClass::NotStreamable => Err(StreamedInputRejection::NotStreamable),
+        }
+    }
+
+    fn streamed_edge_union_branch_plan(
+        &self,
+        input: &EdgePhysicalPlan,
+        cap_context: EdgeQueryCapContext,
+        query_limit: Option<usize>,
+    ) -> Result<EdgePhysicalPlan, StreamedInputRejection> {
+        match input {
+            EdgePhysicalPlan::Union { inputs, .. } => {
+                self.streamed_edge_union_plan_from_inputs(inputs, cap_context, query_limit)
+            }
+            EdgePhysicalPlan::Intersect { .. } => Err(StreamedInputRejection::NotStreamable),
+            _ => self.streamed_edge_leaf_input_plan(input, cap_context, query_limit),
+        }
+    }
+
+    fn streamed_edge_union_plan_from_inputs(
+        &self,
+        inputs: &[EdgePhysicalPlan],
+        cap_context: EdgeQueryCapContext,
+        query_limit: Option<usize>,
+    ) -> Result<EdgePhysicalPlan, StreamedInputRejection> {
+        let mut streamed_inputs = Vec::new();
+        for input in inputs {
+            let input = self.streamed_edge_union_branch_plan(input, cap_context, query_limit)?;
+            match input {
+                EdgePhysicalPlan::Empty => {}
+                EdgePhysicalPlan::Union {
+                    inputs: children, ..
+                } => streamed_inputs.extend(children),
+                plan => streamed_inputs.push(plan),
+            }
+        }
+
+        let total_cursors: usize = streamed_inputs
+            .iter()
+            .map(|input| self.edge_stream_cursor_count_upper_bound(input))
+            .sum();
+        if total_cursors > STREAMED_MAX_TOTAL_CURSORS {
+            return Err(StreamedInputRejection::CursorCountExceeded);
+        }
+
+        Ok(EdgePhysicalPlan::streamed_union(streamed_inputs))
+    }
+
+    fn streamed_edge_union_branch_cursor_count(
+        &self,
+        input: &EdgePhysicalPlan,
+        cap_context: EdgeQueryCapContext,
+        query_limit: Option<usize>,
+    ) -> Result<usize, StreamedInputRejection> {
+        match input {
+            EdgePhysicalPlan::Empty => Ok(0),
+            EdgePhysicalPlan::Union { inputs, .. } => {
+                self.streamed_edge_union_inputs_cursor_count(
+                    inputs.iter(),
+                    cap_context,
+                    query_limit,
+                )
+            }
+            EdgePhysicalPlan::Intersect { .. } => Err(StreamedInputRejection::NotStreamable),
+            _ => match classify_edge_stream_input(input) {
+                EdgeStreamInputClass::NativeStream => {
+                    Ok(self.edge_stream_cursor_count_upper_bound(input))
+                }
+                EdgeStreamInputClass::BufferedIdSort => {
+                    if Self::buffered_edge_stream_input_under_cap(input, cap_context, query_limit) {
+                        Ok(1)
+                    } else {
+                        Err(StreamedInputRejection::BufferedCapExceeded)
+                    }
+                }
+                EdgeStreamInputClass::NotStreamable => Err(StreamedInputRejection::NotStreamable),
+            },
+        }
+    }
+
+    fn streamed_edge_union_inputs_cursor_count<'a>(
+        &self,
+        inputs: impl IntoIterator<Item = &'a EdgePhysicalPlan>,
+        cap_context: EdgeQueryCapContext,
+        query_limit: Option<usize>,
+    ) -> Result<usize, StreamedInputRejection> {
+        let mut total_cursors = 0usize;
+        for input in inputs {
+            total_cursors = total_cursors.saturating_add(
+                self.streamed_edge_union_branch_cursor_count(input, cap_context, query_limit)?,
+            );
+            if total_cursors > STREAMED_MAX_TOTAL_CURSORS {
+                return Err(StreamedInputRejection::CursorCountExceeded);
+            }
+        }
+        Ok(total_cursors)
+    }
+
+    fn streamed_edge_union_inputs_legal<'a>(
+        &self,
+        inputs: impl IntoIterator<Item = &'a EdgePhysicalPlan>,
+        cap_context: EdgeQueryCapContext,
+        query_limit: Option<usize>,
+    ) -> Result<(), StreamedInputRejection> {
+        self.streamed_edge_union_inputs_cursor_count(inputs, cap_context, query_limit)
+            .map(|_| ())
+    }
+
+    fn streamed_edge_input_plan(
+        &self,
+        input: &EdgePhysicalPlan,
+        cap_context: EdgeQueryCapContext,
+        query_limit: Option<usize>,
+    ) -> Result<EdgePhysicalPlan, StreamedInputRejection> {
+        match input {
+            EdgePhysicalPlan::Union { inputs, .. } => {
+                self.streamed_edge_union_plan_from_inputs(inputs, cap_context, query_limit)
+            }
+            EdgePhysicalPlan::Intersect { .. } => Err(StreamedInputRejection::NotStreamable),
+            _ => self.streamed_edge_leaf_input_plan(input, cap_context, query_limit),
+        }
+    }
+
+    fn edge_metadata_verifiable_stream_source(input: &EdgePhysicalPlan) -> bool {
+        input.as_source().is_some_and(|source| {
+            matches!(
+                source.kind,
+                EdgeQueryCandidateSourceKind::EdgeLabelIndex
+                    | EdgeQueryCandidateSourceKind::FromEndpointAdjacency
+                    | EdgeQueryCandidateSourceKind::ToEndpointAdjacency
+                    | EdgeQueryCandidateSourceKind::AnyEndpointAdjacency
+            )
+        })
+    }
+
+    fn native_single_source_edge_stream_allowed(
+        input: &EdgePhysicalPlan,
+        _cap_context: EdgeQueryCapContext,
+        _query_limit: Option<usize>,
+    ) -> bool {
+        if classify_edge_stream_input(input) != EdgeStreamInputClass::NativeStream {
+            return false;
+        }
+        if Self::edge_metadata_verifiable_stream_source(input) {
+            return false;
+        }
+        input
+            .estimate()
+            .known_upper_bound()
+            .is_none_or(|count| count > EAGER_PREFERRED_SOURCE_MAX)
+    }
+
+    fn select_streamed_edge_driver(
+        &self,
+        query: &NormalizedEdgeQuery,
+        cap_context: EdgeQueryCapContext,
+        eager_driver: &EdgePhysicalPlan,
+        streamable_rejects: &[EdgePhysicalPlan],
+        legal_universe_sources: &[PlannedEdgeCandidateSource],
+        warnings: &mut Vec<QueryPlanWarning>,
+    ) -> Option<EdgePhysicalPlan> {
+        let mut selected_inputs = Vec::new();
+        eager_driver.collect_intersect_inputs(&mut selected_inputs);
+        let selected_anchor_count = Self::edge_selected_anchor_count(&selected_inputs);
+        let edge_universe_count = Self::corrected_gate_edge_universe_count(legal_universe_sources);
+        let selected_eager_preferred = Self::edge_plan_all_inputs_eager_preferred(eager_driver);
+
+        let mut admitted = Vec::new();
+        let mut deferred_universe_inputs = Vec::new();
+        let mut admitted_extra_count = 0usize;
+        let mut selected_anchor_seen = false;
+        let mut sorted_selected_inputs = selected_inputs;
+        sorted_selected_inputs.sort_by_cached_key(EdgePhysicalPlan::plan_cost);
+        for input in sorted_selected_inputs {
+            if Self::edge_metadata_verifiable_stream_source(&input) {
+                deferred_universe_inputs.push(input);
+                continue;
+            }
+            let is_anchor = !selected_anchor_seen;
+            selected_anchor_seen = true;
+            let gate_admitted = is_anchor
+                || stream_reject_admitted_by_selectivity_gate(
+                    selected_anchor_count,
+                    input.estimate().known_upper_bound(),
+                    edge_universe_count,
+                );
+            match self.streamed_edge_input_plan(&input, cap_context, query.page.limit) {
+                Ok(streamed_input) => {
+                    if gate_admitted && admitted.len() < STREAMED_INTERSECT_MAX_INPUTS {
+                        if !is_anchor {
+                            admitted_extra_count += 1;
+                        }
+                        admitted.push(streamed_input);
+                    }
+                }
+                Err(StreamedInputRejection::BufferedCapExceeded) => {
+                    add_plan_warning(warnings, QueryPlanWarning::StreamedInputBufferCapExceeded);
+                }
+                Err(StreamedInputRejection::NotStreamable | StreamedInputRejection::CursorCountExceeded) => {}
+            }
+        }
+
+        let mut admitted_reject_count = 0usize;
+        let mut native_reject_demoted = false;
+        let mut sorted_rejects = streamable_rejects.to_vec();
+        sorted_rejects.sort_by_cached_key(EdgePhysicalPlan::plan_cost);
+        for input in sorted_rejects {
+            if Self::edge_metadata_verifiable_stream_source(&input) {
+                deferred_universe_inputs.push(input);
+                continue;
+            }
+            let gate_admitted = stream_reject_admitted_by_selectivity_gate(
+                selected_anchor_count,
+                input.estimate().known_upper_bound(),
+                edge_universe_count,
+            );
+            match self.streamed_edge_input_plan(&input, cap_context, query.page.limit) {
+                Ok(streamed_input) => {
+                    if gate_admitted && admitted.len() < STREAMED_INTERSECT_MAX_INPUTS {
+                        admitted.push(streamed_input);
+                        admitted_reject_count += 1;
+                        admitted_extra_count += 1;
+                    } else if input.estimate().known_upper_bound().is_some()
+                        && input.broad_skip_warnable()
+                    {
+                        native_reject_demoted = true;
+                    }
+                }
+                Err(StreamedInputRejection::BufferedCapExceeded) => {
+                    add_plan_warning(warnings, QueryPlanWarning::StreamedInputBufferCapExceeded);
+                }
+                Err(StreamedInputRejection::NotStreamable | StreamedInputRejection::CursorCountExceeded) => {}
+            }
+        }
+
+        if selected_eager_preferred && admitted_reject_count == 0 {
+            return None;
+        }
+        if admitted_extra_count == 0
+            && admitted.iter().all(|input| {
+                input
+                    .estimate()
+                    .known_upper_bound()
+                    .is_some_and(|count| count <= EAGER_PREFERRED_SOURCE_MAX)
+            })
+        {
+            return None;
+        }
+
+        if !admitted.is_empty() {
+            deferred_universe_inputs.sort_by_cached_key(EdgePhysicalPlan::plan_cost);
+            for input in deferred_universe_inputs {
+                let Some(universe_count) = input.estimate().known_upper_bound() else {
+                    continue;
+                };
+                let is_strictly_smallest = admitted.iter().all(|admitted_input| {
+                    admitted_input
+                        .estimate()
+                        .known_upper_bound()
+                        .is_some_and(|count| universe_count < count)
+                });
+                if !is_strictly_smallest {
+                    continue;
+                }
+                if let Ok(streamed_input) =
+                    self.streamed_edge_input_plan(&input, cap_context, query.page.limit)
+                {
+                    admitted.push(streamed_input);
+                    admitted.sort_by_cached_key(EdgePhysicalPlan::plan_cost);
+                    admitted.truncate(STREAMED_INTERSECT_MAX_INPUTS);
+                }
+            }
+        }
+
+        if admitted.is_empty() {
+            return None;
+        }
+
+        let total_cursors: usize = admitted
+            .iter()
+            .map(|input| self.edge_stream_cursor_count_upper_bound(input))
+            .sum();
+        if total_cursors > STREAMED_MAX_TOTAL_CURSORS {
+            return None;
+        }
+
+        if let Some(smallest_known_stream) = admitted
+            .iter()
+            .filter_map(|input| input.estimate().known_upper_bound())
+            .min()
+        {
+            if cap_context
+                .cheapest_legal_count()
+                .is_some_and(|legal| legal < smallest_known_stream)
+            {
+                return None;
+            }
+        }
+
+        admitted.sort_by_cached_key(EdgePhysicalPlan::plan_cost);
+        if native_reject_demoted {
+            add_plan_warning(warnings, QueryPlanWarning::IndexSkippedAsBroad);
+            add_plan_warning(warnings, QueryPlanWarning::VerifyOnlyFilter);
+        }
+        if admitted.len() == 1 {
+            let input = admitted.pop().expect("length checked");
+            if matches!(input, EdgePhysicalPlan::Union { .. })
+                || Self::native_single_source_edge_stream_allowed(
+                    &input,
+                    cap_context,
+                    query.page.limit,
+                )
+            {
+                Some(input.into_streamed_mode())
+            } else {
+                None
+            }
+        } else {
+            Some(EdgePhysicalPlan::intersect(admitted).into_streamed_mode())
+        }
+    }
+
     fn plan_normalized_edge_query(
         &self,
         query: &NormalizedEdgeQuery,
@@ -9165,6 +10881,7 @@ impl ReadView {
         if query.filter.is_always_false() {
             return Ok(PlannedEdgeQuery {
                 driver: EdgePhysicalPlan::Empty,
+                execution_mode: EdgeDriverExecutionMode::Eager,
                 cap_context,
                 legal_universe_fallback: None,
                 warnings,
@@ -9294,13 +11011,21 @@ impl ReadView {
             finalize_plan_warnings(&mut warnings);
             return Ok(PlannedEdgeQuery {
                 driver: EdgePhysicalPlan::Empty,
+                execution_mode: EdgeDriverExecutionMode::Eager,
                 cap_context,
                 legal_universe_fallback,
                 warnings,
                 followups: filter_followups,
             });
         }
-        if let EdgeBooleanPlanClassification::Bounded { plan, .. } = &filter_plan.classification {
+        let mut bounded_streamable_rejects = Vec::new();
+        if let EdgeBooleanPlanClassification::Bounded {
+            plan,
+            streamable_rejects,
+            ..
+        } = &filter_plan.classification
+        {
+            bounded_streamable_rejects = streamable_rejects.clone();
             inputs.push(plan.clone());
         }
         if has_filter && filter_plan.has_verify_only && edge_filter_requires_hydration(&query.filter) {
@@ -9343,40 +11068,59 @@ impl ReadView {
             add_plan_warning(&mut warnings, QueryPlanWarning::FullScanExplicitlyAllowed);
         }
 
-        for input in &inputs {
-            if let EdgePhysicalPlan::Source(source) = input {
-                if source.kind == EdgeQueryCandidateSourceKind::EdgeMetadataScan {
-                    add_plan_warning(&mut warnings, QueryPlanWarning::UsingFallbackScan);
-                }
-                if source.broad_skip_warnable()
-                    && cap_context.source_estimate_exceeds_cap(
-                        source.kind,
-                        query.page.limit,
-                        source.estimate,
-                    )
-                {
-                    add_plan_warning(&mut warnings, edge_cap_warning_for_source(source.kind));
+        inputs.sort_by_cached_key(EdgePhysicalPlan::plan_cost);
+        let eager_driver = EdgePhysicalPlan::intersect(inputs.clone());
+        let streamed_driver = self.select_streamed_edge_driver(
+            query,
+            cap_context,
+            &eager_driver,
+            &bounded_streamable_rejects,
+            &legal_universe_sources,
+            &mut warnings,
+        );
+
+        let (driver, execution_mode) = if let Some(driver) = streamed_driver {
+            (driver, EdgeDriverExecutionMode::Streamed)
+        } else {
+            Self::warn_edge_streamable_rejects_demoted(&mut warnings, &bounded_streamable_rejects);
+            for input in &inputs {
+                if let EdgePhysicalPlan::Source(source) = input {
+                    if source.kind == EdgeQueryCandidateSourceKind::EdgeMetadataScan {
+                        add_plan_warning(&mut warnings, QueryPlanWarning::UsingFallbackScan);
+                    }
+                    if source.broad_skip_warnable()
+                        && cap_context.source_estimate_exceeds_cap(
+                            source.kind,
+                            query.page.limit,
+                            source.estimate,
+                        )
+                    {
+                        add_plan_warning(&mut warnings, edge_cap_warning_for_source(source.kind));
+                    }
                 }
             }
-        }
-
-        inputs.sort_by_cached_key(EdgePhysicalPlan::plan_cost);
-        if let Some(driver) = inputs.first() {
-            if let Some(driver_count) = driver.estimate().known_upper_bound() {
-                for skipped in inputs.iter().skip(1) {
-                    if let Some(skipped_count) = skipped.estimate().known_upper_bound() {
-                        if skipped_count > driver_count.saturating_mul(QUERY_BROAD_SOURCE_FACTOR)
-                            && skipped.broad_skip_warnable()
-                        {
-                            add_plan_warning(&mut warnings, QueryPlanWarning::IndexSkippedAsBroad);
+            if let Some(driver) = inputs.first() {
+                if let Some(driver_count) = driver.estimate().known_upper_bound() {
+                    for skipped in inputs.iter().skip(1) {
+                        if let Some(skipped_count) = skipped.estimate().known_upper_bound() {
+                            if skipped_count > driver_count.saturating_mul(QUERY_BROAD_SOURCE_FACTOR)
+                                && skipped.broad_skip_warnable()
+                            {
+                                add_plan_warning(
+                                    &mut warnings,
+                                    QueryPlanWarning::IndexSkippedAsBroad,
+                                );
+                            }
                         }
                     }
                 }
             }
-        }
+            (eager_driver, EdgeDriverExecutionMode::Eager)
+        };
         finalize_plan_warnings(&mut warnings);
         Ok(PlannedEdgeQuery {
-            driver: EdgePhysicalPlan::intersect(inputs),
+            driver,
+            execution_mode,
             cap_context,
             legal_universe_fallback,
             warnings,
@@ -9437,6 +11181,19 @@ mod query_plan_unit_tests {
     }
 
     #[test]
+    fn demoted_buffered_edge_input_does_not_claim_materialization_overflow() {
+        let buffered = EdgePhysicalPlan::BufferedIdSort(Box::new(edge_source_plan(
+            EdgeQueryCandidateSourceKind::EdgeWeightIndex,
+            1_000,
+        )));
+        let mut warnings = Vec::new();
+
+        ReadView::warn_edge_streamable_rejects_demoted(&mut warnings, &[buffered]);
+
+        assert!(!warnings.contains(&QueryPlanWarning::StreamedInputBufferCapExceeded));
+    }
+
+    #[test]
     fn source_plan_cost_matches_source_plan_plan_cost() {
         // Large-anchor cleanup pin: cheapest-legal-universe and multi-label
         // probe selection now cost sources by reference; the source-level
@@ -9469,7 +11226,10 @@ mod query_plan_unit_tests {
                 EdgeQueryCandidateSourceKind::FromEndpointAdjacency,
                 Arc::new(vec![1, 2, 3]),
                 Some(vec![7]),
-                PlannerEstimate::upper_bound(3),
+                EdgeEndpointPlannerStats {
+                    estimate: PlannerEstimate::upper_bound(3),
+                    stream_cursor_count_upper_bound: 3,
+                },
             ),
             PlannedEdgeCandidateSource::fallback_full_scan(PlannerEstimate::unknown()),
         ];
@@ -9490,7 +11250,10 @@ mod query_plan_unit_tests {
                 EdgeQueryCandidateSourceKind::FromEndpointAdjacency,
                 Arc::new(ids),
                 None,
-                PlannerEstimate::upper_bound(3),
+                EdgeEndpointPlannerStats {
+                    estimate: PlannerEstimate::upper_bound(3),
+                    stream_cursor_count_upper_bound: 3,
+                },
             )
         };
         // Deterministic and content-keyed: same list → same key, any
@@ -9511,6 +11274,30 @@ mod query_plan_unit_tests {
             "endpoint adjacency canonical key grew with the ID list: {} bytes",
             large.canonical_key.len()
         );
+    }
+
+    #[test]
+    fn endpoint_adjacency_classifies_as_native_streamable() {
+        for kind in [
+            EdgeQueryCandidateSourceKind::FromEndpointAdjacency,
+            EdgeQueryCandidateSourceKind::ToEndpointAdjacency,
+            EdgeQueryCandidateSourceKind::AnyEndpointAdjacency,
+        ] {
+            let source = PlannedEdgeCandidateSource::endpoint_adjacency(
+                kind,
+                Arc::new(vec![1, 2, 3]),
+                Some(vec![7]),
+                EdgeEndpointPlannerStats {
+                    estimate: PlannerEstimate::upper_bound(3),
+                    stream_cursor_count_upper_bound: 6,
+                },
+            );
+            assert_eq!(
+                classify_edge_stream_input(&EdgePhysicalPlan::source(source)),
+                EdgeStreamInputClass::NativeStream,
+                "endpoint kind {kind:?} should be a native stream"
+            );
+        }
     }
 
     #[test]

@@ -229,6 +229,82 @@ fn query_test_engine() -> (TempDir, DatabaseEngine) {
     (dir, engine)
 }
 
+fn ensure_ready_edge_property_index(
+    engine: &DatabaseEngine,
+    label: &str,
+    key: &str,
+    kind: SecondaryIndexKind,
+) -> u64 {
+    let info = engine
+        .ensure_edge_property_index(
+            label,
+            SecondaryIndexSpec {
+                fields: vec![SecondaryIndexField::property(key)],
+                kind,
+            },
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(engine, info.index_id, SecondaryIndexState::Ready);
+    info.index_id
+}
+
+fn seed_streamed_edge_union_fixture(
+    engine: &DatabaseEngine,
+    label: &str,
+    total_edges: usize,
+) -> (Vec<u64>, Vec<u64>) {
+    let nodes = (0..=total_edges)
+        .map(|idx| NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("{label}-union-node-{idx}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect::<Vec<_>>();
+    let node_ids = engine.batch_upsert_nodes(nodes).unwrap();
+    let from = node_ids[0];
+    let edge_ids = engine
+        .batch_upsert_edges(
+            node_ids[1..]
+                .iter()
+                .enumerate()
+                .map(|(ordinal, to)| EdgeInput {
+                    from,
+                    to: *to,
+                    label: label.to_string(),
+                    props: query_test_props(&[
+                        (
+                            "status",
+                            PropValue::String(
+                                match ordinal % 3 {
+                                    0 => "hot",
+                                    1 => "warm",
+                                    _ => "cold",
+                                }
+                                .to_string(),
+                            ),
+                        ),
+                        (
+                            "region",
+                            PropValue::String(
+                                if ordinal.is_multiple_of(2) { "east" } else { "west" }
+                                    .to_string(),
+                            ),
+                        ),
+                        ("score", PropValue::Int(ordinal as i64)),
+                    ]),
+                    weight: ordinal as f32,
+                    valid_from: None,
+                    valid_to: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    (node_ids, edge_ids)
+}
+
 #[test]
 fn edge_query_normalizes_anchors_and_enforces_full_scan_opt_in() {
     let (_dir, engine) = query_test_engine();
@@ -856,6 +932,173 @@ fn edge_query_reads_segment_and_active_memtable_sources() {
     };
     let ids = engine.query_edge_ids(&query).unwrap();
     assert_eq!(ids.edge_ids, vec![flushed, active]);
+}
+
+#[test]
+fn edge_label_estimate_aggregates_active_and_immutable_posting_bounds() {
+    let (_dir, engine) = query_test_engine();
+    let a = insert_query_node(&engine, "EstimateSource", "estimate-a", &[], 1.0);
+    let b = insert_query_node(&engine, "EstimateTarget", "estimate-b", &[], 1.0);
+    let c = insert_query_node(&engine, "EstimateTarget", "estimate-c", &[], 1.0);
+    engine
+        .upsert_edge(a, b, "ESTIMATE_EDGE", UpsertEdgeOptions::default())
+        .unwrap();
+    let label_id = engine
+        .get_edge_label_id("ESTIMATE_EDGE")
+        .unwrap()
+        .unwrap();
+
+    engine.freeze_memtable().unwrap();
+    {
+        let (_guard, published) = engine.runtime.published_snapshot().unwrap();
+        assert_eq!(
+            published
+                .view
+                .memtable
+                .edge_label_posting_count_upper_bound(label_id),
+            0
+        );
+        assert_eq!(published.view.immutable_epochs.len(), 1);
+        assert_eq!(
+            published.view.immutable_epochs[0]
+                .memtable
+                .edge_label_posting_count_upper_bound(label_id),
+            1
+        );
+        let estimate = published.view.edge_label_estimate(label_id);
+        assert_eq!(estimate.kind, PlannerEstimateKind::UpperBound);
+        assert_eq!(estimate.known_upper_bound(), Some(1));
+    }
+
+    engine
+        .upsert_edge(a, c, "ESTIMATE_EDGE", UpsertEdgeOptions::default())
+        .unwrap();
+    let (_guard, published) = engine.runtime.published_snapshot().unwrap();
+    assert_eq!(
+        published
+            .view
+            .memtable
+            .edge_label_posting_count_upper_bound(label_id),
+        1
+    );
+    assert_eq!(
+        published
+            .view
+            .edge_label_estimate(label_id)
+            .known_upper_bound(),
+        Some(2)
+    );
+}
+
+#[test]
+fn segment_edge_delete_keeps_raw_label_bound_but_verifier_excludes_result() {
+    let (_dir, engine) = query_test_engine();
+    let a = insert_query_node(&engine, "EstimateDelete", "delete-a", &[], 1.0);
+    let b = insert_query_node(&engine, "EstimateDelete", "delete-b", &[], 1.0);
+    let edge = engine
+        .upsert_edge(a, b, "ESTIMATE_DELETE_EDGE", UpsertEdgeOptions::default())
+        .unwrap();
+    let label_id = engine
+        .get_edge_label_id("ESTIMATE_DELETE_EDGE")
+        .unwrap()
+        .unwrap();
+    engine.flush().unwrap();
+    engine.delete_edge(edge).unwrap();
+
+    {
+        let (_guard, published) = engine.runtime.published_snapshot().unwrap();
+        assert_eq!(
+            published
+                .view
+                .memtable
+                .edge_label_posting_count_upper_bound(label_id),
+            0,
+            "a segment-only delete carries no label into the active memtable"
+        );
+        assert_eq!(published.view.segments.len(), 1);
+        assert_eq!(
+            published.view.segments[0]
+                .edge_label_posting_count(label_id)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            published
+                .view
+                .edge_label_estimate(label_id)
+                .known_upper_bound(),
+            Some(1)
+        );
+    }
+
+    let result = engine
+        .query_edge_ids(&EdgeQuery {
+            label: Some("ESTIMATE_DELETE_EDGE".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(result.edge_ids.is_empty());
+}
+
+#[test]
+fn stale_active_edge_label_postings_only_loosen_estimate_and_preserve_results() {
+    let (_dir, engine) = query_test_engine();
+    let source = insert_query_node(&engine, "EstimateChurn", "churn-source", &[], 1.0);
+    let mut edge_ids = Vec::new();
+    for index in 0..80 {
+        let target = insert_query_node(
+            &engine,
+            "EstimateChurn",
+            &format!("churn-target-{index}"),
+            &[],
+            1.0,
+        );
+        edge_ids.push(
+            engine
+                .upsert_edge(
+                    source,
+                    target,
+                    "ESTIMATE_CHURN_EDGE",
+                    UpsertEdgeOptions::default(),
+                )
+                .unwrap(),
+        );
+    }
+    for &edge_id in edge_ids.iter().skip(1) {
+        engine.delete_edge(edge_id).unwrap();
+    }
+    let label_id = engine
+        .get_edge_label_id("ESTIMATE_CHURN_EDGE")
+        .unwrap()
+        .unwrap();
+
+    {
+        let (_guard, published) = engine.runtime.published_snapshot().unwrap();
+        assert_eq!(
+            published
+                .view
+                .memtable
+                .edge_label_posting_count_upper_bound(label_id),
+            80
+        );
+        let estimate = published.view.edge_label_estimate(label_id);
+        assert_eq!(estimate.kind, PlannerEstimateKind::UpperBound);
+        assert_eq!(estimate.known_upper_bound(), Some(80));
+        assert!(!estimate.proves_empty);
+    }
+
+    let query = EdgeQuery {
+        label: Some("ESTIMATE_CHURN_EDGE".to_string()),
+        ..Default::default()
+    };
+    let first = engine.query_edge_ids(&query).unwrap();
+    let second = engine.query_edge_ids(&query).unwrap();
+    assert_eq!(first.edge_ids, vec![edge_ids[0]]);
+    assert_eq!(second.edge_ids, first.edge_ids);
+    assert_eq!(
+        engine.explain_edge_query(&query).unwrap(),
+        engine.explain_edge_query(&query).unwrap()
+    );
 }
 
 #[test]
@@ -1618,6 +1861,2231 @@ fn edge_query_uses_ready_edge_property_range_index() {
         .contains(&QueryPlanWarning::EdgePropertyPostFilter));
     assert!(!plan.warnings.contains(&QueryPlanWarning::VerifyOnlyFilter));
     assert_eq!(engine.query_edge_ids(&query).unwrap().edge_ids, vec![keep]);
+}
+
+#[test]
+fn streamed_edge_and_executes_broad_native_inputs_with_pagination_staleness_and_counters() {
+    let (dir, engine) = query_test_engine();
+    let db_path = dir.path().join("db");
+    let status_info = engine
+        .ensure_edge_property_index(
+            "STREAMED_EDGE_AND",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let region_info = engine
+        .ensure_edge_property_index(
+            "STREAMED_EDGE_AND",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("region")]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_edge_property_index_state(&engine, region_info.index_id, SecondaryIndexState::Ready);
+
+    let total = 9_000usize;
+    let nodes = (0..=total)
+        .map(|idx| NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-edge-and-node-{idx}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect::<Vec<_>>();
+    let node_ids = engine.batch_upsert_nodes(nodes).unwrap();
+    let from = node_ids[0];
+    let edge_inputs = node_ids[1..]
+        .iter()
+        .enumerate()
+        .map(|(ordinal, to)| EdgeInput {
+            from,
+            to: *to,
+            label: "STREAMED_EDGE_AND".to_string(),
+            props: query_test_props(&[
+                (
+                    "status",
+                    PropValue::String(
+                        if ordinal % 5 < 3 { "hot" } else { "cold" }.to_string(),
+                    ),
+                ),
+                (
+                    "region",
+                    PropValue::String(if ordinal % 2 == 0 { "east" } else { "west" }.to_string()),
+                ),
+            ]),
+            weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+        })
+        .collect::<Vec<_>>();
+    let edge_ids = engine.batch_upsert_edges(edge_inputs).unwrap();
+    engine.flush().unwrap();
+
+    let deleted_edge_ordinal = 0usize;
+    let deleted_endpoint_ordinal = 10usize;
+    engine.delete_edge(edge_ids[deleted_edge_ordinal]).unwrap();
+    engine
+        .delete_node(node_ids[deleted_endpoint_ordinal + 1])
+        .unwrap();
+
+    let mut expected = edge_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, &edge_id)| {
+            (ordinal % 2 == 0
+                && ordinal % 5 < 3
+                && ordinal != deleted_edge_ordinal
+                && ordinal != deleted_endpoint_ordinal)
+                .then_some(edge_id)
+        })
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+
+    let query = EdgeQuery {
+        label: Some("STREAMED_EDGE_AND".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(10),
+            after: None,
+        },
+        ..Default::default()
+    };
+
+    let plan = engine.explain_edge_query(&query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Intersect { inputs, mode } = explain_edge_input_node(&plan) else {
+        panic!("expected streamed edge intersect, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(
+        inputs
+            .iter()
+            .filter(|input| **input == QueryPlanNode::EdgePropertyEqualityIndex)
+            .count(),
+        2
+    );
+
+    engine.reset_query_execution_counters_for_test();
+    let first_page = engine.query_edge_ids(&query).unwrap();
+    assert_eq!(first_page.edge_ids, expected[..10].to_vec());
+    assert_eq!(first_page.next_cursor, Some(expected[9]));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 1);
+    assert_eq!(counters.streamed_edge_single_source_drivers, 0);
+    assert_eq!(counters.streamed_intersect_drivers, 0);
+    assert_eq!(counters.streamed_single_source_drivers, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+    assert!(counters.streamed_edge_cursor_seeks > 0);
+    assert!(counters.streamed_edge_candidates_emitted > 0);
+
+    let second_page = engine
+        .query_edge_ids(&EdgeQuery {
+            page: PageRequest {
+                limit: Some(10),
+                after: first_page.next_cursor,
+            },
+            ..query.clone()
+        })
+        .unwrap();
+    assert_eq!(second_page.edge_ids, expected[10..20].to_vec());
+
+    let empty_after_max = engine
+        .query_edge_ids(&EdgeQuery {
+            page: PageRequest {
+                limit: Some(10),
+                after: Some(u64::MAX),
+            },
+            ..query.clone()
+        })
+        .unwrap();
+    assert!(empty_after_max.edge_ids.is_empty());
+    assert_eq!(empty_after_max.next_cursor, None);
+
+    let clamped = engine
+        .query_edge_ids(&EdgeQuery {
+            filter: Some(EdgeFilterExpr::And(vec![
+                EdgeFilterExpr::PropertyEquals {
+                    key: "status".to_string(),
+                    value: PropValue::String("hot".to_string()),
+                },
+                EdgeFilterExpr::PropertyEquals {
+                    key: "region".to_string(),
+                    value: PropValue::String("east".to_string()),
+                },
+                EdgeFilterExpr::IdRange {
+                    lower: Some(expected[20]),
+                    upper: Some(expected[25]),
+                    lower_inclusive: true,
+                    upper_inclusive: true,
+                },
+            ])),
+            page: PageRequest {
+                limit: None,
+                after: None,
+            },
+            ..query.clone()
+        })
+        .unwrap();
+    assert_eq!(clamped.edge_ids, expected[20..=25].to_vec());
+
+    let hydrated = engine
+        .query_edges(&EdgeQuery {
+            page: PageRequest {
+                limit: Some(5),
+                after: None,
+            },
+            ..query.clone()
+        })
+        .unwrap();
+    assert_eq!(hydrated.edges.len(), 5);
+    assert_eq!(hydrated.next_cursor, Some(expected[4]));
+
+    engine.close().unwrap();
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened_plan = reopened.explain_edge_query(&query).unwrap();
+    let QueryPlanNode::Intersect { mode, .. } = explain_edge_input_node(&reopened_plan) else {
+        panic!("expected reopened streamed edge intersect, got {reopened_plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    let reopened_page = reopened.query_edge_ids(&query).unwrap();
+    assert_eq!(reopened_page.edge_ids, expected[..10].to_vec());
+    assert_eq!(reopened_page.next_cursor, Some(expected[9]));
+    reopened.close().unwrap();
+}
+
+#[test]
+fn streamed_edge_endpoint_and_executes_with_pagination_staleness_and_counters() {
+    let (_dir, engine) = query_test_engine();
+    let label = "STREAMED_EDGE_ENDPOINT_EXEC";
+    let other_label = "STREAMED_EDGE_ENDPOINT_OTHER";
+    ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
+
+    let noise_count = EAGER_PREFERRED_SOURCE_MAX as usize + 128;
+    let node_count = noise_count + 160;
+    let nodes = (0..node_count)
+        .map(|idx| NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-endpoint-node-{idx}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect::<Vec<_>>();
+    let node_ids = engine.batch_upsert_nodes(nodes).unwrap();
+    let source = node_ids[0];
+    let any_endpoint = node_ids[1];
+    let deleted_endpoint = node_ids[2];
+
+    let edge_input = |from: u64, to: u64, label: &str, status: &str| EdgeInput {
+        from,
+        to,
+        label: label.to_string(),
+        props: query_test_props(&[("status", PropValue::String(status.to_string()))]),
+        weight: 1.0,
+        valid_from: None,
+        valid_to: None,
+    };
+
+    let mut segment_inputs = Vec::new();
+    for idx in 0..noise_count {
+        segment_inputs.push(edge_input(
+            node_ids[32 + idx],
+            node_ids[33 + idx],
+            label,
+            "hot",
+        ));
+    }
+    let mut segment_expected_positions = Vec::new();
+    for idx in 0..6 {
+        segment_expected_positions.push(segment_inputs.len());
+        segment_inputs.push(edge_input(source, node_ids[10 + idx], label, "hot"));
+    }
+    let deleted_edge_position = segment_inputs.len();
+    segment_inputs.push(edge_input(source, node_ids[24], label, "hot"));
+    segment_inputs.push(edge_input(source, deleted_endpoint, label, "hot"));
+    segment_inputs.push(edge_input(source, node_ids[25], other_label, "hot"));
+    let segment_edge_ids = engine.batch_upsert_edges(segment_inputs).unwrap();
+    let deleted_edge = segment_edge_ids[deleted_edge_position];
+    let mut expected = segment_expected_positions
+        .into_iter()
+        .map(|pos| segment_edge_ids[pos])
+        .collect::<Vec<_>>();
+    engine.flush().unwrap();
+
+    let immutable_inputs = vec![
+        edge_input(source, node_ids[40], label, "hot"),
+        edge_input(source, node_ids[41], label, "hot"),
+        edge_input(source, node_ids[42], label, "hot"),
+        edge_input(source, node_ids[43], label, "cold"),
+    ];
+    let immutable_edge_ids = engine.batch_upsert_edges(immutable_inputs).unwrap();
+    expected.extend_from_slice(&immutable_edge_ids[..3]);
+    engine.freeze_memtable().unwrap();
+
+    let active_inputs = vec![
+        edge_input(source, node_ids[50], label, "hot"),
+        edge_input(source, node_ids[51], label, "hot"),
+        edge_input(source, node_ids[52], label, "hot"),
+        edge_input(any_endpoint, node_ids[60], label, "hot"),
+        edge_input(node_ids[61], any_endpoint, label, "hot"),
+        edge_input(any_endpoint, any_endpoint, label, "hot"),
+    ];
+    let active_edge_ids = engine.batch_upsert_edges(active_inputs).unwrap();
+    expected.extend_from_slice(&active_edge_ids[..3]);
+    let mut any_expected = active_edge_ids[3..].to_vec();
+
+    engine.delete_edge(deleted_edge).unwrap();
+    engine.delete_node(deleted_endpoint).unwrap();
+    expected.sort_unstable();
+    any_expected.sort_unstable();
+
+    let status_filter = EdgeFilterExpr::PropertyEquals {
+        key: "status".to_string(),
+        value: PropValue::String("hot".to_string()),
+    };
+    let query = EdgeQuery {
+        label: Some(label.to_string()),
+        from_ids: vec![source],
+        filter: Some(status_filter.clone()),
+        page: PageRequest {
+            limit: Some(4),
+            after: None,
+        },
+        ..Default::default()
+    };
+
+    let plan = engine.explain_edge_query(&query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Intersect { inputs, mode } = explain_edge_input_node(&plan) else {
+        panic!("expected streamed endpoint AND intersect, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert!(inputs.contains(&QueryPlanNode::EdgeEndpointAdjacency));
+    assert!(inputs.contains(&QueryPlanNode::EdgePropertyEqualityIndex));
+
+    engine.reset_query_execution_counters_for_test();
+    let first_page = engine.query_edge_ids(&query).unwrap();
+    assert_eq!(first_page.edge_ids, expected[..4].to_vec());
+    assert_eq!(first_page.next_cursor, Some(expected[3]));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 1);
+    assert_eq!(counters.streamed_edge_single_source_drivers, 0);
+    assert_eq!(counters.streamed_intersect_drivers, 0);
+    assert_eq!(counters.streamed_single_source_drivers, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+    assert_eq!(counters.streamed_edge_buffered_inputs, 0);
+    assert!(counters.streamed_edge_cursor_seeks > 0);
+    assert!(counters.streamed_edge_candidates_emitted > 0);
+
+    let second_page = engine
+        .query_edge_ids(&EdgeQuery {
+            page: PageRequest {
+                limit: Some(4),
+                after: first_page.next_cursor,
+            },
+            ..query.clone()
+        })
+        .unwrap();
+    assert_eq!(second_page.edge_ids, expected[4..8].to_vec());
+    assert_eq!(second_page.next_cursor, Some(expected[7]));
+
+    let clamped = engine
+        .query_edge_ids(&EdgeQuery {
+            filter: Some(EdgeFilterExpr::And(vec![
+                status_filter.clone(),
+                EdgeFilterExpr::IdRange {
+                    lower: Some(expected[2]),
+                    upper: Some(expected[7]),
+                    lower_inclusive: true,
+                    upper_inclusive: false,
+                },
+            ])),
+            page: PageRequest {
+                limit: None,
+                after: None,
+            },
+            ..query.clone()
+        })
+        .unwrap();
+    assert_eq!(clamped.edge_ids, expected[2..7].to_vec());
+
+    let any_query = EdgeQuery {
+        label: Some(label.to_string()),
+        endpoint_ids: vec![any_endpoint],
+        filter: Some(status_filter),
+        page: PageRequest {
+            limit: None,
+            after: None,
+        },
+        ..Default::default()
+    };
+    let any_plan = engine.explain_edge_query(&any_query).unwrap();
+    let QueryPlanNode::Intersect { inputs, mode } = explain_edge_input_node(&any_plan) else {
+        panic!("expected streamed endpoint_ids intersect, got {any_plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert!(inputs.contains(&QueryPlanNode::EdgeEndpointAdjacency));
+    assert_eq!(engine.query_edge_ids(&any_query).unwrap().edge_ids, any_expected);
+
+    let endpoint_only_query = EdgeQuery {
+        from_ids: vec![source],
+        page: PageRequest {
+            limit: Some(2),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let endpoint_only_plan = engine.explain_edge_query(&endpoint_only_query).unwrap();
+    assert!(matches!(
+        explain_edge_input_node(&endpoint_only_plan),
+        QueryPlanNode::EdgeEndpointAdjacency
+    ));
+
+    engine.reset_query_execution_counters_for_test();
+    let endpoint_page = engine.query_edge_ids(&endpoint_only_query).unwrap();
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(endpoint_page.edge_ids, expected[..2].to_vec());
+    assert_eq!(endpoint_page.next_cursor, Some(expected[1]));
+    assert_eq!(counters.streamed_edge_intersect_drivers, 0);
+    assert_eq!(counters.streamed_edge_single_source_drivers, 0);
+    assert_eq!(counters.streamed_edge_cursor_seeks, 0);
+    assert!(counters.endpoint_adjacency_candidates > 0);
+}
+
+#[test]
+fn streamed_edge_all_small_and_stays_eager() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_edge_property_index(
+            "STREAMED_EDGE_SMALL",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let region_info = engine
+        .ensure_edge_property_index(
+            "STREAMED_EDGE_SMALL",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("region")]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_edge_property_index_state(&engine, region_info.index_id, SecondaryIndexState::Ready);
+
+    let total = 200usize;
+    let nodes = (0..=total)
+        .map(|idx| NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-edge-small-node-{idx}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect::<Vec<_>>();
+    let node_ids = engine.batch_upsert_nodes(nodes).unwrap();
+    let from = node_ids[0];
+    let edge_ids = engine
+        .batch_upsert_edges(
+            node_ids[1..]
+                .iter()
+                .enumerate()
+                .map(|(ordinal, to)| EdgeInput {
+                    from,
+                    to: *to,
+                    label: "STREAMED_EDGE_SMALL".to_string(),
+                    props: query_test_props(&[
+                        (
+                            "status",
+                            PropValue::String(
+                                if ordinal < 80 { "hot" } else { "cold" }.to_string(),
+                            ),
+                        ),
+                        (
+                            "region",
+                            PropValue::String(
+                                if ordinal.is_multiple_of(2) { "east" } else { "west" }
+                                    .to_string(),
+                            ),
+                        ),
+                    ]),
+                    weight: 1.0,
+                    valid_from: None,
+                    valid_to: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let query = EdgeQuery {
+        label: Some("STREAMED_EDGE_SMALL".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(10),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let plan = engine.explain_edge_query(&query).unwrap();
+    let QueryPlanNode::Intersect { mode, .. } = explain_edge_input_node(&plan) else {
+        panic!("expected eager edge intersect, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Eager);
+
+    engine.reset_query_execution_counters_for_test();
+    let page = engine.query_edge_ids(&query).unwrap();
+    assert_eq!(page.edge_ids, edge_ids[..80].iter().step_by(2).take(10).copied().collect::<Vec<_>>());
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 0);
+    assert_eq!(counters.streamed_edge_single_source_drivers, 0);
+}
+
+#[test]
+fn streamed_edge_single_source_and_or_in_mode_boundaries() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_edge_property_index(
+            "STREAMED_EDGE_SINGLE",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+
+    let total = EAGER_PREFERRED_SOURCE_MAX as usize * 2 + 128;
+    let nodes = (0..=total)
+        .map(|idx| NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-edge-single-node-{idx}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect::<Vec<_>>();
+    let node_ids = engine.batch_upsert_nodes(nodes).unwrap();
+    let from = node_ids[0];
+    let edge_ids = engine
+        .batch_upsert_edges(
+            node_ids[1..]
+                .iter()
+                .enumerate()
+                .map(|(ordinal, to)| EdgeInput {
+                    from,
+                    to: *to,
+                    label: "STREAMED_EDGE_SINGLE".to_string(),
+                    props: query_test_props(&[(
+                        "status",
+                        PropValue::String(if ordinal % 2 == 0 { "hot" } else { "warm" }.to_string()),
+                    )]),
+                    weight: 1.0,
+                    valid_from: None,
+                    valid_to: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    engine.flush().unwrap();
+    let expected_hot = edge_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, &edge_id)| (ordinal % 2 == 0).then_some(edge_id))
+        .collect::<Vec<_>>();
+
+    let single = EdgeQuery {
+        label: Some("STREAMED_EDGE_SINGLE".to_string()),
+        filter: Some(EdgeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("hot".to_string()),
+        }),
+        page: PageRequest {
+            limit: Some(10),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let plan = engine.explain_edge_query(&single).unwrap();
+    let QueryPlanNode::StreamedSource { input } = explain_edge_input_node(&plan) else {
+        panic!("expected streamed edge source, got {plan:?}");
+    };
+    assert_eq!(input.as_ref(), &QueryPlanNode::EdgePropertyEqualityIndex);
+
+    engine.reset_query_execution_counters_for_test();
+    let page = engine.query_edge_ids(&single).unwrap();
+    assert_eq!(page.edge_ids, expected_hot[..10].to_vec());
+    assert_eq!(page.next_cursor, Some(expected_hot[9]));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_single_source_drivers, 1);
+    assert_eq!(counters.streamed_edge_intersect_drivers, 0);
+    assert_eq!(counters.streamed_single_source_drivers, 0);
+
+    let in_query = EdgeQuery {
+        label: Some("STREAMED_EDGE_SINGLE".to_string()),
+        filter: Some(EdgeFilterExpr::PropertyIn {
+            key: "status".to_string(),
+            values: vec![
+                PropValue::String("hot".to_string()),
+                PropValue::String("warm".to_string()),
+                PropValue::String("hot".to_string()),
+            ],
+        }),
+        page: PageRequest {
+            limit: Some(10),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let in_plan = engine.explain_edge_query(&in_query).unwrap();
+    let QueryPlanNode::Union { inputs, mode } = explain_edge_input_node(&in_plan) else {
+        panic!("expected streamed edge IN union, got {in_plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(inputs.len(), 2, "duplicate IN probes should be deduped");
+    assert!(
+        inputs
+            .iter()
+            .all(|input| *input == QueryPlanNode::EdgePropertyEqualityIndex),
+        "{inputs:?}"
+    );
+    engine.reset_query_execution_counters_for_test();
+    let in_page = engine.query_edge_ids(&in_query).unwrap();
+    assert_eq!(in_page.edge_ids, edge_ids[..10].to_vec());
+    assert_eq!(in_page.next_cursor, Some(edge_ids[9]));
+    let second_page = engine
+        .query_edge_ids(&EdgeQuery {
+            page: PageRequest {
+                limit: Some(10),
+                after: in_page.next_cursor,
+            },
+            ..in_query.clone()
+        })
+        .unwrap();
+    assert_eq!(second_page.edge_ids, edge_ids[10..20].to_vec());
+    let empty_after_max = engine
+        .query_edge_ids(&EdgeQuery {
+            page: PageRequest {
+                limit: Some(10),
+                after: Some(u64::MAX),
+            },
+            ..in_query
+        })
+        .unwrap();
+    assert!(empty_after_max.edge_ids.is_empty());
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_union_drivers, 2);
+    assert_eq!(counters.streamed_edge_intersect_drivers, 0);
+    assert_eq!(counters.streamed_union_drivers, 0);
+    assert_eq!(counters.streamed_intersect_drivers, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+}
+
+#[test]
+fn streamed_edge_and_uses_buffered_range_and_weight_inputs() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_edge_property_index(
+            "STREAMED_EDGE_BUFFERED",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let score_info = engine
+        .ensure_edge_property_index(
+            "STREAMED_EDGE_BUFFERED",
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_edge_property_index_state(&engine, score_info.index_id, SecondaryIndexState::Ready);
+
+    let total = 5_000usize;
+    let nodes = (0..=total)
+        .map(|idx| NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-edge-buffered-node-{idx}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect::<Vec<_>>();
+    let node_ids = engine.batch_upsert_nodes(nodes).unwrap();
+    let from = node_ids[0];
+    let edge_ids = engine
+        .batch_upsert_edges(
+            node_ids[1..]
+                .iter()
+                .enumerate()
+                .map(|(ordinal, to)| EdgeInput {
+                    from,
+                    to: *to,
+                    label: "STREAMED_EDGE_BUFFERED".to_string(),
+                    props: query_test_props(&[
+                        (
+                            "status",
+                            PropValue::String(
+                                if ordinal < 3_000 { "hot" } else { "cold" }.to_string(),
+                            ),
+                        ),
+                        ("score", PropValue::Int(ordinal as i64)),
+                    ]),
+                    weight: ordinal as f32,
+                    valid_from: Some(if ordinal < 4_000 { 0 } else { 80 }),
+                    valid_to: Some(if (3_000..4_000).contains(&ordinal) {
+                        40
+                    } else {
+                        100
+                    }),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let range_query = EdgeQuery {
+        label: Some("STREAMED_EDGE_BUFFERED".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(0))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(2_999))),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let range_plan = engine.explain_edge_query(&range_query).unwrap();
+    let QueryPlanNode::Intersect { inputs, mode } = explain_edge_input_node(&range_plan) else {
+        panic!("expected streamed edge buffered range intersect, got {range_plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert!(inputs.contains(&QueryPlanNode::EdgePropertyEqualityIndex));
+    assert!(inputs.contains(&QueryPlanNode::BufferedIdSort {
+        input: Box::new(QueryPlanNode::EdgePropertyRangeIndex),
+    }));
+
+    engine.reset_query_execution_counters_for_test();
+    let range_page = engine.query_edge_ids(&range_query).unwrap();
+    assert_eq!(range_page.edge_ids, edge_ids[..20].to_vec());
+    assert_eq!(range_page.next_cursor, Some(edge_ids[19]));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 1);
+    assert_eq!(counters.streamed_edge_buffered_inputs, 1);
+    assert_eq!(counters.streamed_buffered_inputs, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+
+    let weight_query = EdgeQuery {
+        label: Some("STREAMED_EDGE_BUFFERED".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::WeightRange {
+                lower: Some(0.0),
+                upper: Some(2_999.0),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let weight_plan = engine.explain_edge_query(&weight_query).unwrap();
+    let QueryPlanNode::Intersect { inputs, mode } = explain_edge_input_node(&weight_plan) else {
+        panic!("expected streamed edge buffered weight intersect, got {weight_plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert!(inputs.contains(&QueryPlanNode::EdgePropertyEqualityIndex));
+    assert!(inputs.contains(&QueryPlanNode::BufferedIdSort {
+        input: Box::new(QueryPlanNode::EdgeWeightIndex),
+    }));
+
+    engine.reset_query_execution_counters_for_test();
+    let weight_page = engine.query_edge_ids(&weight_query).unwrap();
+    assert_eq!(weight_page.edge_ids, edge_ids[..20].to_vec());
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 1);
+    assert_eq!(counters.streamed_edge_buffered_inputs, 1);
+    assert_eq!(counters.streamed_buffered_inputs, 0);
+}
+
+#[test]
+fn streamed_edge_selector_applies_label_and_legal_universe_rules() {
+    let (_dir, engine) = query_test_engine();
+    let label_id = engine.ensure_edge_label("STREAMED_EDGE_RULES").unwrap();
+    let view = engine.published_state().view.clone();
+    let query = EdgeQuery {
+        label: Some("STREAMED_EDGE_RULES".to_string()),
+        page: PageRequest {
+            limit: Some(10),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let normalized = view.normalize_edge_query(&query).unwrap();
+    let equality = |index_id, key: &str, value: &str, count| {
+        EdgePhysicalPlan::source(PlannedEdgeCandidateSource::edge_property_equality_index(
+            label_id,
+            index_id,
+            key,
+            &PropValue::String(value.to_string()),
+            PlannerEstimate::upper_bound(count),
+        ))
+    };
+    let label = |count| {
+        let source =
+            PlannedEdgeCandidateSource::edge_label_index(label_id, PlannerEstimate::upper_bound(count));
+        (EdgePhysicalPlan::source(source.clone()), source)
+    };
+
+    let (strict_label_plan, strict_label_source) = label(3_000);
+    let strict_driver = EdgePhysicalPlan::intersect(vec![
+        strict_label_plan,
+        equality(41, "status", "hot", 5_000),
+        equality(42, "region", "east", 6_000),
+    ]);
+    let mut warnings = Vec::new();
+    let streamed = view
+        .select_streamed_edge_driver(
+            &normalized,
+            EdgeQueryCapContext {
+                cheapest_legal_universe: Some(PlannerEstimate::upper_bound(3_000)),
+            },
+            &strict_driver,
+            &[],
+            &[strict_label_source],
+            &mut warnings,
+        )
+        .expect("strictly smallest label should join streamed edge AND");
+    let node = streamed.plan_node();
+    let QueryPlanNode::Intersect { inputs, mode } = node else {
+        panic!("expected strict-label streamed intersect, got {node:?}");
+    };
+    assert_eq!(mode, QueryPlanExecutionMode::Streamed);
+    assert!(inputs.contains(&QueryPlanNode::EdgeLabelIndex));
+    assert!(inputs.contains(&QueryPlanNode::EdgePropertyEqualityIndex));
+    assert!(warnings.is_empty());
+
+    let (wide_label_plan, wide_label_source) = label(20_000);
+    let wide_driver = EdgePhysicalPlan::intersect(vec![
+        wide_label_plan,
+        equality(43, "status", "hot", 5_000),
+        equality(44, "region", "east", 6_000),
+    ]);
+    let mut warnings = Vec::new();
+    let streamed = view
+        .select_streamed_edge_driver(
+            &normalized,
+            EdgeQueryCapContext {
+                cheapest_legal_universe: Some(PlannerEstimate::upper_bound(20_000)),
+            },
+            &wide_driver,
+            &[],
+            &[wide_label_source],
+            &mut warnings,
+        )
+        .expect("broad equality inputs should still stream without the wider label");
+    let node = streamed.plan_node();
+    let QueryPlanNode::Intersect { inputs, mode } = node else {
+        panic!("expected wide-label streamed intersect, got {node:?}");
+    };
+    assert_eq!(mode, QueryPlanExecutionMode::Streamed);
+    assert!(!inputs.contains(&QueryPlanNode::EdgeLabelIndex));
+    assert_eq!(
+        inputs
+            .iter()
+            .filter(|input| **input == QueryPlanNode::EdgePropertyEqualityIndex)
+            .count(),
+        2
+    );
+    assert!(warnings.is_empty());
+
+    let valid_from_bounds =
+        crate::edge_metadata::RangeBoundFlags::inclusive(None, Some(50));
+    let valid_to_bounds = crate::edge_metadata::RangeBoundFlags {
+        lower: Some(50),
+        lower_inclusive: false,
+        upper: None,
+        upper_inclusive: true,
+    };
+    let validity_driver = EdgePhysicalPlan::intersect(vec![
+        equality(47, "status", "hot", 5_000),
+        EdgePhysicalPlan::source(PlannedEdgeCandidateSource::edge_valid_from_index(
+            Some(label_id),
+            valid_from_bounds,
+            true,
+            PlannerEstimate::upper_bound(6_000),
+        )),
+        EdgePhysicalPlan::source(PlannedEdgeCandidateSource::edge_valid_to_index(
+            Some(label_id),
+            valid_to_bounds,
+            true,
+            PlannerEstimate::upper_bound(6_000),
+        )),
+    ]);
+    let mut warnings = Vec::new();
+    let streamed = view
+        .select_streamed_edge_driver(
+            &normalized,
+            EdgeQueryCapContext {
+                cheapest_legal_universe: Some(PlannerEstimate::upper_bound(7_000)),
+            },
+            &validity_driver,
+            &[],
+            &[],
+            &mut warnings,
+        )
+        .expect("bounded ValidAt pair should stream as buffered validity inputs");
+    let node = streamed.plan_node();
+    let QueryPlanNode::Intersect { inputs, mode } = node else {
+        panic!("expected validity-pair streamed intersect, got {node:?}");
+    };
+    assert_eq!(mode, QueryPlanExecutionMode::Streamed);
+    assert!(inputs.contains(&QueryPlanNode::EdgePropertyEqualityIndex));
+    assert_eq!(
+        inputs
+            .iter()
+            .filter(|input| {
+                **input
+                    == QueryPlanNode::BufferedIdSort {
+                        input: Box::new(QueryPlanNode::EdgeValidityIndex),
+                    }
+            })
+            .count(),
+        2
+    );
+    assert!(warnings.is_empty());
+
+    let legal_veto_driver = EdgePhysicalPlan::intersect(vec![
+        equality(45, "status", "hot", 5_000),
+        equality(46, "region", "east", 6_000),
+    ]);
+    let mut warnings = Vec::new();
+    assert!(
+        view.select_streamed_edge_driver(
+            &normalized,
+            EdgeQueryCapContext {
+                cheapest_legal_universe: Some(PlannerEstimate::upper_bound(1_000)),
+            },
+            &legal_veto_driver,
+            &[],
+            &[],
+            &mut warnings,
+        )
+        .is_none(),
+        "legal universe smaller than every stream must veto streamed edge execution"
+    );
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn streamed_edge_selector_admits_endpoint_only_when_strictly_most_selective() {
+    let (_dir, engine) = query_test_engine();
+    let label_id = engine.ensure_edge_label("STREAMED_EDGE_ENDPOINT_RULES").unwrap();
+    let view = engine.published_state().view.clone();
+    let query = EdgeQuery {
+        label: Some("STREAMED_EDGE_ENDPOINT_RULES".to_string()),
+        page: PageRequest {
+            limit: Some(10),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let normalized = view.normalize_edge_query(&query).unwrap();
+    let equality = |index_id, count| {
+        EdgePhysicalPlan::source(PlannedEdgeCandidateSource::edge_property_equality_index(
+            label_id,
+            index_id,
+            "status",
+            &PropValue::String("hot".to_string()),
+            PlannerEstimate::upper_bound(count),
+        ))
+    };
+    let endpoint = |kind, count, cursor_count| {
+        PlannedEdgeCandidateSource::endpoint_adjacency(
+            kind,
+            Arc::new(vec![11, 13]),
+            Some(vec![label_id]),
+            EdgeEndpointPlannerStats {
+                estimate: PlannerEstimate::upper_bound(count),
+                stream_cursor_count_upper_bound: cursor_count,
+            },
+        )
+    };
+
+    for (kind, name) in [
+        (
+            EdgeQueryCandidateSourceKind::FromEndpointAdjacency,
+            "from_ids",
+        ),
+        (EdgeQueryCandidateSourceKind::ToEndpointAdjacency, "to_ids"),
+        (
+            EdgeQueryCandidateSourceKind::AnyEndpointAdjacency,
+            "endpoint_ids",
+        ),
+    ] {
+        let endpoint_source = endpoint(kind, 100, 4);
+        let driver = EdgePhysicalPlan::intersect(vec![
+            EdgePhysicalPlan::source(endpoint_source.clone()),
+            equality(51, 5_000),
+        ]);
+        let mut warnings = Vec::new();
+        let streamed = view
+            .select_streamed_edge_driver(
+                &normalized,
+                EdgeQueryCapContext {
+                    cheapest_legal_universe: Some(endpoint_source.estimate),
+                },
+                &driver,
+                &[],
+                &[endpoint_source],
+                &mut warnings,
+            )
+            .unwrap_or_else(|| panic!("{name} endpoint should join streamed AND"));
+        let node = streamed.plan_node();
+        let QueryPlanNode::Intersect { inputs, mode } = node else {
+            panic!("expected endpoint streamed intersect for {name}, got {node:?}");
+        };
+        assert_eq!(mode, QueryPlanExecutionMode::Streamed);
+        assert!(inputs.contains(&QueryPlanNode::EdgeEndpointAdjacency));
+        assert!(inputs.contains(&QueryPlanNode::EdgePropertyEqualityIndex));
+        assert!(warnings.is_empty());
+    }
+
+    let broad_endpoint = endpoint(
+        EdgeQueryCandidateSourceKind::FromEndpointAdjacency,
+        6_000,
+        4,
+    );
+    let driver = EdgePhysicalPlan::intersect(vec![
+        EdgePhysicalPlan::source(broad_endpoint.clone()),
+        equality(52, 5_000),
+    ]);
+    let mut warnings = Vec::new();
+    let streamed = view
+        .select_streamed_edge_driver(
+            &normalized,
+            EdgeQueryCapContext {
+                cheapest_legal_universe: Some(broad_endpoint.estimate),
+            },
+            &driver,
+            &[],
+            &[broad_endpoint],
+            &mut warnings,
+        )
+        .expect("broad equality should still stream without the wider endpoint");
+    let node = streamed.plan_node();
+    assert!(
+        !plan_contains_node(&node, &QueryPlanNode::EdgeEndpointAdjacency),
+        "non-selective endpoint should stay verifier-checked: {node:?}"
+    );
+    assert!(plan_contains_node(
+        &node,
+        &QueryPlanNode::EdgePropertyEqualityIndex
+    ));
+    assert!(warnings.is_empty());
+
+    let over_cursor_endpoint = endpoint(
+        EdgeQueryCandidateSourceKind::AnyEndpointAdjacency,
+        100,
+        STREAMED_MAX_TOTAL_CURSORS.saturating_add(1),
+    );
+    let driver = EdgePhysicalPlan::intersect(vec![
+        EdgePhysicalPlan::source(over_cursor_endpoint.clone()),
+        equality(53, 5_000),
+    ]);
+    let mut warnings = Vec::new();
+    assert!(
+        view.select_streamed_edge_driver(
+            &normalized,
+            EdgeQueryCapContext {
+                cheapest_legal_universe: Some(over_cursor_endpoint.estimate),
+            },
+            &driver,
+            &[],
+            &[over_cursor_endpoint],
+            &mut warnings,
+        )
+        .is_none(),
+        "over-cap endpoint should fall back to the existing legal-universe path"
+    );
+    assert!(!warnings.contains(&QueryPlanWarning::StreamedInputBufferCapExceeded));
+
+    let endpoint_only = endpoint(
+        EdgeQueryCandidateSourceKind::FromEndpointAdjacency,
+        100,
+        4,
+    );
+    let mut warnings = Vec::new();
+    assert!(
+        view.select_streamed_edge_driver(
+            &normalized,
+            EdgeQueryCapContext {
+                cheapest_legal_universe: Some(endpoint_only.estimate),
+            },
+            &EdgePhysicalPlan::source(endpoint_only.clone()),
+            &[],
+            std::slice::from_ref(&endpoint_only),
+            &mut warnings,
+        )
+        .is_none(),
+        "endpoint-only legal-universe drivers must stay on the scan path"
+    );
+
+    let label_source =
+        PlannedEdgeCandidateSource::edge_label_index(label_id, PlannerEstimate::upper_bound(120));
+    let endpoint_label_driver = EdgePhysicalPlan::intersect(vec![
+        EdgePhysicalPlan::source(endpoint_only.clone()),
+        EdgePhysicalPlan::source(label_source.clone()),
+    ]);
+    let mut warnings = Vec::new();
+    assert!(
+        view.select_streamed_edge_driver(
+            &normalized,
+            EdgeQueryCapContext {
+                cheapest_legal_universe: Some(endpoint_only.estimate),
+            },
+            &endpoint_label_driver,
+            &[],
+            &[endpoint_only, label_source],
+            &mut warnings,
+        )
+        .is_none(),
+        "endpoint+label-only legal-universe drivers must not become StreamedSource"
+    );
+}
+
+#[test]
+fn streamed_edge_buffered_metadata_adapters_execute_updated_at_and_valid_at() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_edge_property_index(
+            "STREAMED_EDGE_METADATA",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+
+    let total = 100usize;
+    let nodes = (0..=total)
+        .map(|idx| NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-edge-metadata-node-{idx}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect::<Vec<_>>();
+    let node_ids = engine.batch_upsert_nodes(nodes).unwrap();
+    let from = node_ids[0];
+    let edge_ids = engine
+        .batch_upsert_edges(
+            node_ids[1..]
+                .iter()
+                .enumerate()
+                .map(|(ordinal, to)| EdgeInput {
+                    from,
+                    to: *to,
+                    label: "STREAMED_EDGE_METADATA".to_string(),
+                    props: query_test_props(&[(
+                        "status",
+                        PropValue::String("hot".to_string()),
+                    )]),
+                    weight: 1.0,
+                    valid_from: Some(if ordinal < 70 { 0 } else { 80 }),
+                    valid_to: Some(if (50..70).contains(&ordinal) {
+                        40
+                    } else {
+                        100
+                    }),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    for (ordinal, edge_id) in edge_ids.iter().enumerate() {
+        set_query_edge_updated_at(&engine, *edge_id, ordinal as i64);
+    }
+    engine.flush().unwrap();
+
+    let label_id = engine
+        .get_edge_label_id("STREAMED_EDGE_METADATA")
+        .unwrap()
+        .unwrap();
+    let equality_source = || {
+        EdgePhysicalPlan::source(PlannedEdgeCandidateSource::edge_property_equality_index(
+            label_id,
+            status_info.index_id,
+            "status",
+            &PropValue::String("hot".to_string()),
+            PlannerEstimate::upper_bound(total as u64),
+        ))
+    };
+    let cap_context = EdgeQueryCapContext {
+        cheapest_legal_universe: Some(PlannerEstimate::upper_bound(total as u64)),
+    };
+
+    let updated_query = EdgeQuery {
+        label: Some("STREAMED_EDGE_METADATA".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::UpdatedAtRange {
+                lower_ms: Some(0),
+                upper_ms: Some(49),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let updated_normalized = engine
+        .published_state()
+        .view
+        .normalize_edge_query(&updated_query)
+        .unwrap();
+    let updated_bounds = crate::edge_metadata::RangeBoundFlags::inclusive(Some(0), Some(49));
+    let updated_driver = EdgePhysicalPlan::intersect(vec![
+        equality_source(),
+        EdgePhysicalPlan::BufferedIdSort(Box::new(EdgePhysicalPlan::source(
+            PlannedEdgeCandidateSource::edge_updated_at_index(
+                Some(label_id),
+                updated_bounds,
+                true,
+                PlannerEstimate::upper_bound(50),
+            ),
+        ))),
+    ])
+    .into_streamed_mode();
+    let updated_planned = PlannedEdgeQuery {
+        driver: updated_driver,
+        execution_mode: EdgeDriverExecutionMode::Streamed,
+        cap_context,
+        legal_universe_fallback: None,
+        warnings: Vec::new(),
+        followups: Vec::new(),
+    };
+
+    engine.reset_query_execution_counters_for_test();
+    let (updated_page, updated_followups) = engine
+        .published_state()
+        .view
+        .query_edge_page_planned(&updated_normalized, updated_planned, false, None)
+        .unwrap();
+    assert!(updated_followups.is_empty());
+    assert_eq!(updated_page.ids, edge_ids[..20].to_vec());
+    assert_eq!(updated_page.next_cursor, Some(edge_ids[19]));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 1);
+    assert_eq!(counters.streamed_edge_buffered_inputs, 1);
+    assert_eq!(counters.streamed_buffered_inputs, 0);
+
+    let valid_at_query = EdgeQuery {
+        label: Some("STREAMED_EDGE_METADATA".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::ValidAt { epoch_ms: 50 },
+        ])),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let valid_at_normalized = engine
+        .published_state()
+        .view
+        .normalize_edge_query(&valid_at_query)
+        .unwrap();
+    let valid_from_bounds = crate::edge_metadata::RangeBoundFlags::inclusive(None, Some(50));
+    let valid_to_bounds = crate::edge_metadata::RangeBoundFlags {
+        lower: Some(50),
+        lower_inclusive: false,
+        upper: None,
+        upper_inclusive: true,
+    };
+    let valid_at_driver = EdgePhysicalPlan::intersect(vec![
+        equality_source(),
+        EdgePhysicalPlan::BufferedIdSort(Box::new(EdgePhysicalPlan::source(
+            PlannedEdgeCandidateSource::edge_valid_from_index(
+                Some(label_id),
+                valid_from_bounds,
+                true,
+                PlannerEstimate::upper_bound(70),
+            ),
+        ))),
+        EdgePhysicalPlan::BufferedIdSort(Box::new(EdgePhysicalPlan::source(
+            PlannedEdgeCandidateSource::edge_valid_to_index(
+                Some(label_id),
+                valid_to_bounds,
+                true,
+                PlannerEstimate::upper_bound(80),
+            ),
+        ))),
+    ])
+    .into_streamed_mode();
+    let valid_at_planned = PlannedEdgeQuery {
+        driver: valid_at_driver,
+        execution_mode: EdgeDriverExecutionMode::Streamed,
+        cap_context,
+        legal_universe_fallback: None,
+        warnings: Vec::new(),
+        followups: Vec::new(),
+    };
+
+    engine.reset_query_execution_counters_for_test();
+    let (valid_at_page, valid_at_followups) = engine
+        .published_state()
+        .view
+        .query_edge_page_planned(&valid_at_normalized, valid_at_planned, false, None)
+        .unwrap();
+    assert!(valid_at_followups.is_empty());
+    assert_eq!(valid_at_page.ids, edge_ids[..20].to_vec());
+    assert_eq!(valid_at_page.next_cursor, Some(edge_ids[19]));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 1);
+    assert_eq!(counters.streamed_edge_buffered_inputs, 2);
+    assert_eq!(counters.streamed_buffered_inputs, 0);
+}
+
+#[test]
+fn streamed_edge_d1_buffer_overflow_demotes_to_verifier() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_edge_property_index(
+            "STREAMED_EDGE_D1",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let score_info = engine
+        .ensure_edge_property_index(
+            "STREAMED_EDGE_D1",
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_edge_property_index_state(&engine, score_info.index_id, SecondaryIndexState::Ready);
+
+    let total = 5_000usize;
+    let nodes = (0..=total)
+        .map(|idx| NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-edge-d1-node-{idx}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect::<Vec<_>>();
+    let node_ids = engine.batch_upsert_nodes(nodes).unwrap();
+    let from = node_ids[0];
+    let edge_ids = engine
+        .batch_upsert_edges(
+            node_ids[1..]
+                .iter()
+                .enumerate()
+                .map(|(ordinal, to)| EdgeInput {
+                    from,
+                    to: *to,
+                    label: "STREAMED_EDGE_D1".to_string(),
+                    props: query_test_props(&[
+                        ("status", PropValue::String("hot".to_string())),
+                        ("score", PropValue::Int(ordinal as i64)),
+                    ]),
+                    weight: 1.0,
+                    valid_from: None,
+                    valid_to: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let query = EdgeQuery {
+        label: Some("STREAMED_EDGE_D1".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(0))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(4_999))),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let normalized = engine
+        .published_state()
+        .view
+        .normalize_edge_query(&query)
+        .unwrap();
+    let label_id = engine
+        .get_edge_label_id("STREAMED_EDGE_D1")
+        .unwrap()
+        .unwrap();
+    let lower = PropertyRangeBound::Included(PropValue::Int(0));
+    let upper = PropertyRangeBound::Included(PropValue::Int(4_999));
+    let driver = EdgePhysicalPlan::intersect(vec![
+        EdgePhysicalPlan::source(PlannedEdgeCandidateSource::edge_property_equality_index(
+            label_id,
+            status_info.index_id,
+            "status",
+            &PropValue::String("hot".to_string()),
+            PlannerEstimate::stats_exact(total as u64),
+        )),
+        EdgePhysicalPlan::BufferedIdSort(Box::new(EdgePhysicalPlan::source(
+            PlannedEdgeCandidateSource::edge_property_range_index(
+                label_id,
+                score_info.index_id,
+                "score",
+                Some(&lower),
+                Some(&upper),
+                PlannerEstimate::exact_cheap(10),
+            ),
+        ))),
+    ])
+    .into_streamed_mode();
+    let planned = PlannedEdgeQuery {
+        driver,
+        execution_mode: EdgeDriverExecutionMode::Streamed,
+        cap_context: EdgeQueryCapContext::default(),
+        legal_universe_fallback: None,
+        warnings: Vec::new(),
+        followups: Vec::new(),
+    };
+
+    engine.reset_query_execution_counters_for_test();
+    let (page, followups) = engine
+        .published_state()
+        .view
+        .query_edge_page_planned(&normalized, planned, false, None)
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(page.ids, edge_ids[..20].to_vec());
+    assert_eq!(page.next_cursor, Some(edge_ids[19]));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 1);
+    assert_eq!(counters.streamed_edge_buffered_input_overflows, 1);
+    assert_eq!(counters.streamed_edge_buffered_inputs, 0);
+    assert!(counters.streamed_edge_candidates_emitted > 0);
+}
+
+#[test]
+fn streamed_edge_d1_terminal_buffer_overflow_falls_back_to_legal_universe() {
+    let (_dir, engine) = query_test_engine();
+    let score_info = engine
+        .ensure_edge_property_index(
+            "STREAMED_EDGE_D1_TERMINAL",
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, score_info.index_id, SecondaryIndexState::Ready);
+
+    let total = 5_000usize;
+    let nodes = (0..=total)
+        .map(|idx| NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-edge-d1-terminal-node-{idx}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect::<Vec<_>>();
+    let node_ids = engine.batch_upsert_nodes(nodes).unwrap();
+    let from = node_ids[0];
+    let edge_ids = engine
+        .batch_upsert_edges(
+            node_ids[1..]
+                .iter()
+                .enumerate()
+                .map(|(ordinal, to)| EdgeInput {
+                    from,
+                    to: *to,
+                    label: "STREAMED_EDGE_D1_TERMINAL".to_string(),
+                    props: query_test_props(&[("score", PropValue::Int(ordinal as i64))]),
+                    weight: 1.0,
+                    valid_from: None,
+                    valid_to: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let label_id = engine
+        .get_edge_label_id("STREAMED_EDGE_D1_TERMINAL")
+        .unwrap()
+        .unwrap();
+    let lower = PropertyRangeBound::Included(PropValue::Int(0));
+    let upper = PropertyRangeBound::Included(PropValue::Int((total - 1) as i64));
+    let make_query = |limit, after| EdgeQuery {
+        label: Some("STREAMED_EDGE_D1_TERMINAL".to_string()),
+        filter: Some(EdgeFilterExpr::PropertyRange {
+            key: "score".to_string(),
+            lower: Some(lower.clone()),
+            upper: Some(upper.clone()),
+        }),
+        page: PageRequest { limit, after },
+        ..Default::default()
+    };
+    let make_planned = || PlannedEdgeQuery {
+        driver: EdgePhysicalPlan::BufferedIdSort(Box::new(EdgePhysicalPlan::source(
+            PlannedEdgeCandidateSource::edge_property_range_index(
+                label_id,
+                score_info.index_id,
+                "score",
+                Some(&lower),
+                Some(&upper),
+                PlannerEstimate::exact_cheap(10),
+            ),
+        ))),
+        execution_mode: EdgeDriverExecutionMode::Streamed,
+        cap_context: EdgeQueryCapContext {
+            cheapest_legal_universe: Some(PlannerEstimate::stats_exact(1)),
+        },
+        legal_universe_fallback: Some(PlannedEdgeCandidateSource::edge_label_index(
+            label_id,
+            PlannerEstimate::stats_exact(total as u64),
+        )),
+        warnings: Vec::new(),
+        followups: Vec::new(),
+    };
+    let run_planned = |query: &EdgeQuery| {
+        let normalized = engine
+            .published_state()
+            .view
+            .normalize_edge_query(query)
+            .unwrap();
+        engine
+            .published_state()
+            .view
+            .query_edge_page_planned(&normalized, make_planned(), false, None)
+            .unwrap()
+    };
+
+    engine.reset_query_execution_counters_for_test();
+    let first_query = make_query(Some(20), None);
+    let (first_page, first_followups) = run_planned(&first_query);
+    assert!(first_followups.is_empty());
+    assert_eq!(first_page.ids, edge_ids[..20].to_vec());
+    assert_eq!(first_page.next_cursor, Some(edge_ids[19]));
+
+    let second_query = make_query(Some(20), first_page.next_cursor);
+    let (second_page, second_followups) = run_planned(&second_query);
+    assert!(second_followups.is_empty());
+    assert_eq!(second_page.ids, edge_ids[20..40].to_vec());
+    assert_eq!(second_page.next_cursor, Some(edge_ids[39]));
+
+    let all_query = make_query(Some(total), None);
+    let (all_page, all_followups) = run_planned(&all_query);
+    assert!(all_followups.is_empty());
+    assert_eq!(all_page.ids, edge_ids.clone());
+    assert_eq!(all_page.next_cursor, None);
+
+    let after_last_query = make_query(Some(20), Some(*edge_ids.last().unwrap()));
+    let (empty_page, empty_followups) = run_planned(&after_last_query);
+    assert!(empty_followups.is_empty());
+    assert!(empty_page.ids.is_empty());
+    assert_eq!(empty_page.next_cursor, None);
+
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_single_source_drivers, 4);
+    assert_eq!(counters.streamed_edge_buffered_input_overflows, 4);
+    assert_eq!(counters.streamed_edge_buffered_inputs, 0);
+    assert_eq!(counters.streamed_edge_candidates_emitted, 0);
+    assert_eq!(counters.streamed_single_source_drivers, 0);
+}
+
+#[test]
+fn streamed_edge_d3_equality_sidecar_failure_demotes_leaf_with_followup() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    seed_query_test_catalog(&engine);
+    let status_index;
+    let segment_id;
+    let expected;
+    {
+        let status_info = engine
+            .ensure_edge_property_index(
+                "STREAMED_EDGE_D3",
+                SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+            )
+            .unwrap();
+        let region_info = engine
+            .ensure_edge_property_index(
+                "STREAMED_EDGE_D3",
+                SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("region")]),
+            )
+            .unwrap();
+        wait_for_edge_property_index_state(
+            &engine,
+            status_info.index_id,
+            SecondaryIndexState::Ready,
+        );
+        wait_for_edge_property_index_state(
+            &engine,
+            region_info.index_id,
+            SecondaryIndexState::Ready,
+        );
+        status_index = status_info.index_id;
+
+        let total = 9_000usize;
+        let nodes = (0..=total)
+            .map(|idx| NodeInput {
+                labels: vec!["Person".to_string()],
+                key: format!("streamed-edge-d3-node-{idx}"),
+                props: BTreeMap::new(),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            })
+            .collect::<Vec<_>>();
+        let node_ids = engine.batch_upsert_nodes(nodes).unwrap();
+        let from = node_ids[0];
+        let edge_ids = engine
+            .batch_upsert_edges(
+                node_ids[1..]
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, to)| EdgeInput {
+                        from,
+                        to: *to,
+                        label: "STREAMED_EDGE_D3".to_string(),
+                        props: query_test_props(&[
+                            (
+                                "status",
+                                PropValue::String(
+                                    if ordinal % 5 < 3 { "hot" } else { "cold" }.to_string(),
+                                ),
+                            ),
+                            (
+                                "region",
+                                PropValue::String(
+                                    if ordinal % 2 == 0 { "east" } else { "west" }.to_string(),
+                                ),
+                            ),
+                        ]),
+                        weight: 1.0,
+                        valid_from: None,
+                        valid_to: None,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        engine.flush().unwrap();
+        segment_id = engine.segments_for_test()[0].segment_id;
+        expected = edge_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, &edge_id)| {
+                (ordinal % 2 == 0 && ordinal % 5 < 3).then_some(edge_id)
+            })
+            .collect::<Vec<_>>();
+    }
+    let query = EdgeQuery {
+        label: Some("STREAMED_EDGE_D3".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let published = engine.published_state();
+    let normalized = published.view.normalize_edge_query(&query).unwrap();
+    let planned = published.view.plan_normalized_edge_query(&normalized).unwrap();
+    let plan = planned
+        .explain_plan(published.view.public_inputs_for_edge_query(&query).unwrap());
+    let QueryPlanNode::Intersect { mode, .. } = explain_edge_input_node(&plan) else {
+        panic!("expected streamed edge D3 intersect, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+
+    let sidecar_path = crate::segment_writer::edge_prop_eq_sidecar_path(
+        &crate::segment_writer::segment_dir(&db_path, segment_id),
+        status_index,
+    );
+    corrupt_sidecar_header_in_place(&sidecar_path);
+
+    engine.reset_query_execution_counters_for_test();
+    let (page, followups) = published
+        .view
+        .query_edge_page_planned(&normalized, planned, false, None)
+        .unwrap();
+    assert_eq!(page.ids, expected[..20].to_vec());
+    assert!(followups.iter().any(|followup| {
+        matches!(
+            followup,
+            SecondaryIndexReadFollowup::EqualitySidecarFailure { index_id, .. }
+                if *index_id == status_index
+        )
+    }));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 1);
+    assert_eq!(counters.streamed_edge_leaf_demotions, 1);
+    assert!(counters.streamed_edge_candidates_emitted > 0);
+}
+
+#[test]
+fn streamed_edge_or_union_executes_with_dedup_pagination_and_staleness() {
+    let (_dir, engine) = query_test_engine();
+    let label = "STREAMED_EDGE_OR";
+    ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
+    ensure_ready_edge_property_index(&engine, label, "region", SecondaryIndexKind::Equality);
+
+    let total = 5_000usize;
+    let (node_ids, edge_ids) = seed_streamed_edge_union_fixture(&engine, label, total);
+    engine.flush().unwrap();
+
+    let stale_ordinal = 0usize;
+    engine.delete_edge(edge_ids[stale_ordinal]).unwrap();
+    let changed_ordinal = 6usize;
+    set_query_edge_props(
+        &engine,
+        edge_ids[changed_ordinal],
+        query_test_props(&[
+            ("status", PropValue::String("cold".to_string())),
+            ("region", PropValue::String("west".to_string())),
+            ("score", PropValue::Int(changed_ordinal as i64)),
+        ]),
+    );
+
+    let expected = edge_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, &edge_id)| {
+            ((ordinal % 3 == 0 || ordinal.is_multiple_of(2))
+                && ordinal != stale_ordinal
+                && ordinal != changed_ordinal)
+                .then_some(edge_id)
+        })
+        .collect::<Vec<_>>();
+
+    let query = EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(EdgeFilterExpr::Or(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(12),
+            after: None,
+        },
+        ..Default::default()
+    };
+
+    let plan = engine.explain_edge_query(&query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Union { inputs, mode } = explain_edge_input_node(&plan) else {
+        panic!("expected streamed edge OR union, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(
+        inputs
+            .iter()
+            .filter(|input| **input == QueryPlanNode::EdgePropertyEqualityIndex)
+            .count(),
+        2
+    );
+
+    engine.reset_query_execution_counters_for_test();
+    let first_page = engine.query_edge_ids(&query).unwrap();
+    assert_eq!(first_page.edge_ids, expected[..12].to_vec());
+    assert_eq!(first_page.next_cursor, Some(expected[11]));
+    let second_page = engine
+        .query_edge_ids(&EdgeQuery {
+            page: PageRequest {
+                limit: Some(12),
+                after: first_page.next_cursor,
+            },
+            ..query.clone()
+        })
+        .unwrap();
+    assert_eq!(second_page.edge_ids, expected[12..24].to_vec());
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_union_drivers, 2);
+    assert_eq!(counters.streamed_edge_intersect_drivers, 0);
+    assert_eq!(counters.streamed_union_drivers, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+    assert!(counters.streamed_edge_candidates_emitted > 0);
+
+    let endpoint_query = EdgeQuery {
+        from_ids: vec![node_ids[0]],
+        ..query
+    };
+    let endpoint_plan = engine.explain_edge_query(&endpoint_query).unwrap();
+    assert!(!plan_contains_node(
+        &endpoint_plan.root,
+        &QueryPlanNode::EdgeEndpointAdjacency
+    ));
+    let QueryPlanNode::Union { mode, .. } = explain_edge_input_node(&endpoint_plan) else {
+        panic!("endpoint-constrained broad OR should still be driven by the union, got {endpoint_plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+}
+
+#[test]
+fn streamed_edge_union_composes_inside_and_as_leapfrog_input() {
+    let (_dir, engine) = query_test_engine();
+    let label = "STREAMED_EDGE_OR_AND";
+    ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
+    ensure_ready_edge_property_index(&engine, label, "region", SecondaryIndexKind::Equality);
+
+    let total = 9_000usize;
+    let (_node_ids, edge_ids) = seed_streamed_edge_union_fixture(&engine, label, total);
+    engine.flush().unwrap();
+
+    let expected = edge_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, &edge_id)| {
+            ((ordinal % 3 != 2) && ordinal.is_multiple_of(2)).then_some(edge_id)
+        })
+        .collect::<Vec<_>>();
+
+    let query = EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::Or(vec![
+                EdgeFilterExpr::PropertyEquals {
+                    key: "status".to_string(),
+                    value: PropValue::String("hot".to_string()),
+                },
+                EdgeFilterExpr::PropertyEquals {
+                    key: "status".to_string(),
+                    value: PropValue::String("warm".to_string()),
+                },
+            ]),
+            EdgeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+
+    let plan = engine.explain_edge_query(&query).unwrap();
+    let QueryPlanNode::Intersect { inputs, mode } = explain_edge_input_node(&plan) else {
+        panic!("expected streamed edge intersect with union input, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert!(inputs.contains(&QueryPlanNode::EdgePropertyEqualityIndex));
+    assert!(inputs.iter().any(|input| matches!(
+        input,
+        QueryPlanNode::Union {
+            mode: QueryPlanExecutionMode::Streamed,
+            ..
+        }
+    )));
+
+    engine.reset_query_execution_counters_for_test();
+    let page = engine.query_edge_ids(&query).unwrap();
+    assert_eq!(page.edge_ids, expected[..20].to_vec());
+    assert_eq!(page.next_cursor, Some(expected[19]));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 1);
+    assert_eq!(counters.streamed_edge_union_drivers, 0);
+    assert_eq!(counters.streamed_edge_buffered_input_overflows, 0);
+    assert_eq!(counters.streamed_union_drivers, 0);
+}
+
+#[test]
+fn streamed_edge_union_uses_buffered_branch_under_cap() {
+    let (_dir, engine) = query_test_engine();
+    let label = "STREAMED_EDGE_UNION_BUFFERED";
+    ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
+    ensure_ready_edge_property_index(&engine, label, "score", SecondaryIndexKind::Range);
+
+    let total = 13_000usize;
+    let (_node_ids, edge_ids) = seed_streamed_edge_union_fixture(&engine, label, total);
+    engine.flush().unwrap();
+
+    let expected = edge_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, &edge_id)| {
+            (ordinal % 3 == 0 || ordinal < 100).then_some(edge_id)
+        })
+        .collect::<Vec<_>>();
+
+    let query = EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(EdgeFilterExpr::Or(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(0))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(99))),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+
+    let plan = engine.explain_edge_query(&query).unwrap();
+    let QueryPlanNode::Union { inputs, mode } = explain_edge_input_node(&plan) else {
+        panic!("expected streamed edge union with buffered branch, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert!(inputs.contains(&QueryPlanNode::EdgePropertyEqualityIndex));
+    assert!(inputs.contains(&QueryPlanNode::BufferedIdSort {
+        input: Box::new(QueryPlanNode::EdgePropertyRangeIndex),
+    }));
+
+    engine.reset_query_execution_counters_for_test();
+    let page = engine.query_edge_ids(&query).unwrap();
+    assert_eq!(page.edge_ids, expected[..20].to_vec());
+    assert_eq!(page.next_cursor, Some(expected[19]));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_union_drivers, 1);
+    assert_eq!(counters.streamed_edge_buffered_inputs, 1);
+    assert_eq!(counters.streamed_edge_buffered_input_overflows, 0);
+
+    let overflow_query = EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(EdgeFilterExpr::Or(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::WeightRange {
+                lower: Some(0.0),
+                upper: Some((total - 1) as f32),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let overflow_plan = engine.explain_edge_query(&overflow_query).unwrap();
+    assert!(
+        overflow_plan
+            .warnings
+            .contains(&QueryPlanWarning::StreamedInputBufferCapExceeded),
+        "{overflow_plan:?}"
+    );
+    assert!(
+        overflow_plan
+            .warnings
+            .contains(&QueryPlanWarning::BooleanBranchFallback),
+        "{overflow_plan:?}"
+    );
+    engine.reset_query_execution_counters_for_test();
+    let overflow_page = engine.query_edge_ids(&overflow_query).unwrap();
+    assert_eq!(overflow_page.edge_ids, edge_ids[..20].to_vec());
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_union_drivers, 0);
+}
+
+#[test]
+fn streamed_edge_union_d2_buffer_overflow_falls_back_complete() {
+    let (_dir, engine) = query_test_engine();
+    let label = "STREAMED_EDGE_UNION_D2";
+    let status_index =
+        ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
+    let score_index =
+        ensure_ready_edge_property_index(&engine, label, "score", SecondaryIndexKind::Range);
+
+    let total = 5_000usize;
+    let (_node_ids, edge_ids) = seed_streamed_edge_union_fixture(&engine, label, total);
+    engine.flush().unwrap();
+    let label_id = engine.get_edge_label_id(label).unwrap().unwrap();
+    let lower = PropertyRangeBound::Included(PropValue::Int(0));
+    let upper = PropertyRangeBound::Included(PropValue::Int((total - 1) as i64));
+    let query = EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(EdgeFilterExpr::Or(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("missing".to_string()),
+            },
+            EdgeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(lower.clone()),
+                upper: Some(upper.clone()),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let normalized = engine
+        .published_state()
+        .view
+        .normalize_edge_query(&query)
+        .unwrap();
+    let driver = EdgePhysicalPlan::streamed_union(vec![
+        EdgePhysicalPlan::source(PlannedEdgeCandidateSource::edge_property_equality_index(
+            label_id,
+            status_index,
+            "status",
+            &PropValue::String("missing".to_string()),
+            PlannerEstimate::exact_cheap(0),
+        )),
+        EdgePhysicalPlan::BufferedIdSort(Box::new(EdgePhysicalPlan::source(
+            PlannedEdgeCandidateSource::edge_property_range_index(
+                label_id,
+                score_index,
+                "score",
+                Some(&lower),
+                Some(&upper),
+                PlannerEstimate::exact_cheap(10),
+            ),
+        ))),
+    ]);
+    let planned = PlannedEdgeQuery {
+        driver,
+        execution_mode: EdgeDriverExecutionMode::Streamed,
+        cap_context: EdgeQueryCapContext {
+            cheapest_legal_universe: Some(PlannerEstimate::stats_exact(total as u64)),
+        },
+        legal_universe_fallback: Some(PlannedEdgeCandidateSource::edge_label_index(
+            label_id,
+            PlannerEstimate::stats_exact(total as u64),
+        )),
+        warnings: Vec::new(),
+        followups: Vec::new(),
+    };
+
+    engine.reset_query_execution_counters_for_test();
+    let (page, followups) = engine
+        .published_state()
+        .view
+        .query_edge_page_planned(&normalized, planned, false, None)
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(page.ids, edge_ids[..20].to_vec());
+    assert_eq!(page.next_cursor, Some(edge_ids[19]));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_union_drivers, 1);
+    assert_eq!(counters.streamed_edge_buffered_input_overflows, 1);
+    assert_eq!(counters.streamed_edge_buffered_inputs, 0);
+    assert_eq!(counters.streamed_edge_leaf_demotions, 0);
+    assert_eq!(counters.streamed_edge_candidates_emitted, 0);
+}
+
+#[test]
+fn streamed_edge_union_cursor_overflow_and_non_streamable_branches_fallback() {
+    let (_dir, engine) = query_test_engine();
+    let label = "STREAMED_EDGE_UNION_CURSOR";
+    let status_index =
+        ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
+
+    let branch_count = (STREAMED_MAX_TOTAL_CURSORS / MAX_BOOLEAN_UNION_INPUTS) + 1;
+    let total_edges = branch_count * MAX_BOOLEAN_UNION_INPUTS;
+    let nodes = (0..=total_edges)
+        .map(|idx| NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("{label}-cursor-node-{idx}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect::<Vec<_>>();
+    let node_ids = engine.batch_upsert_nodes(nodes).unwrap();
+    let from = node_ids[0];
+    let mut all_edge_ids = engine
+        .batch_upsert_edges(
+            node_ids[1..]
+                .iter()
+                .enumerate()
+                .map(|(global, to)| {
+                    let branch = global / MAX_BOOLEAN_UNION_INPUTS;
+                    let ordinal = global % MAX_BOOLEAN_UNION_INPUTS;
+                    EdgeInput {
+                        from,
+                        to: *to,
+                        label: label.to_string(),
+                        props: query_test_props(&[
+                            ("status", PropValue::String(format!("v{branch}-{ordinal}"))),
+                            ("region", PropValue::String(format!("s{branch}"))),
+                            ("score", PropValue::Int(global as i64)),
+                        ]),
+                        weight: 1.0,
+                        valid_from: None,
+                        valid_to: None,
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let label_id = engine.get_edge_label_id(label).unwrap().unwrap();
+    let nested_plans = (0..branch_count)
+        .map(|branch| {
+            EdgePhysicalPlan::union(
+                (0..MAX_BOOLEAN_UNION_INPUTS)
+                    .map(|ordinal| {
+                        EdgePhysicalPlan::source(
+                            PlannedEdgeCandidateSource::edge_property_equality_index(
+                                label_id,
+                                status_index,
+                                "status",
+                                &PropValue::String(format!("v{branch}-{ordinal}")),
+                                PlannerEstimate::upper_bound(1),
+                            ),
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let view = engine.published_state().view.clone();
+    assert!(matches!(
+        view.streamed_edge_union_plan_from_inputs(&nested_plans, EdgeQueryCapContext::default(), None),
+        Err(StreamedInputRejection::CursorCountExceeded)
+    ));
+
+    let cursor_query = EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(EdgeFilterExpr::Or(
+            (0..branch_count)
+                .map(|branch| EdgeFilterExpr::PropertyIn {
+                    key: "status".to_string(),
+                    values: (0..MAX_BOOLEAN_UNION_INPUTS)
+                        .map(|ordinal| PropValue::String(format!("v{branch}-{ordinal}")))
+                        .collect(),
+                })
+                .collect(),
+        )),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let cursor_plan = engine.explain_edge_query(&cursor_query).unwrap();
+    if let QueryPlanNode::Union { mode, .. } = explain_edge_input_node(&cursor_plan) {
+        assert_ne!(*mode, QueryPlanExecutionMode::Streamed, "{cursor_plan:?}");
+    }
+    engine.reset_query_execution_counters_for_test();
+    let page = engine.query_edge_ids(&cursor_query).unwrap();
+    all_edge_ids.sort_unstable();
+    assert_eq!(page.edge_ids, all_edge_ids[..20].to_vec());
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_union_drivers, 0);
+
+    let non_streamable = EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(EdgeFilterExpr::Or(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("v0".to_string()),
+            },
+            EdgeFilterExpr::PropertyMissing {
+                key: "status".to_string(),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let non_streamable_plan = engine.explain_edge_query(&non_streamable).unwrap();
+    assert!(non_streamable_plan
+        .warnings
+        .contains(&QueryPlanWarning::BooleanBranchFallback));
+    engine.reset_query_execution_counters_for_test();
+    let _ = engine.query_edge_ids(&non_streamable).unwrap();
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_union_drivers, 0);
+
+    let no_label = EdgeQuery {
+        allow_full_scan: true,
+        filter: Some(EdgeFilterExpr::PropertyIn {
+            key: "status".to_string(),
+            values: vec![
+                PropValue::String("v0".to_string()),
+                PropValue::String("v1".to_string()),
+            ],
+        }),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let no_label_plan = engine.explain_edge_query(&no_label).unwrap();
+    assert!(no_label_plan
+        .warnings
+        .contains(&QueryPlanWarning::MissingReadyIndex));
+    engine.reset_query_execution_counters_for_test();
+    let _ = engine.query_edge_ids(&no_label).unwrap();
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_union_drivers, 0);
 }
 
 #[test]
@@ -3158,6 +5626,77 @@ fn edge_query_paginates_edge_ids_by_cursor() {
 }
 
 #[test]
+fn edge_query_verified_metadata_page_adapter_preserves_proof_row_cursor_and_hydration() {
+    let (_dir, engine) = query_test_engine();
+    let source = insert_query_node(&engine, "Person", "metadata-page-source", &[], 1.0);
+    let targets = (0..3)
+        .map(|index| {
+            insert_query_node(
+                &engine,
+                "Person",
+                &format!("metadata-page-target-{index}"),
+                &[],
+                1.0,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut expected = targets
+        .iter()
+        .map(|target| {
+            engine
+                .upsert_edge(
+                    source,
+                    *target,
+                    "VERIFIED_METADATA_PAGE",
+                    UpsertEdgeOptions::default(),
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    let query = EdgeQuery {
+        label: Some("VERIFIED_METADATA_PAGE".to_string()),
+        page: PageRequest {
+            limit: Some(2),
+            after: None,
+        },
+        ..Default::default()
+    };
+
+    let view = engine.published_state().view.clone();
+    let normalized = view.normalize_edge_query(&query).unwrap();
+    let planned = view.plan_normalized_edge_query(&normalized).unwrap();
+    let (metadata_page, followups) = view
+        .query_edge_metadata_page_planned(&normalized, planned, None)
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(
+        metadata_page
+            .metadata
+            .iter()
+            .map(|meta| meta.id)
+            .collect::<Vec<_>>(),
+        expected[..2]
+    );
+    assert_eq!(metadata_page.next_cursor, Some(expected[1]));
+
+    let ids = engine.query_edge_ids(&query).unwrap();
+    assert_eq!(ids.edge_ids, expected[..2]);
+    assert_eq!(ids.next_cursor, metadata_page.next_cursor);
+
+    engine.reset_query_execution_counters_for_test();
+    let hydrated = engine.query_edges(&query).unwrap();
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(
+        hydrated.edges.iter().map(|edge| edge.id).collect::<Vec<_>>(),
+        expected[..2]
+    );
+    assert_eq!(hydrated.next_cursor, metadata_page.next_cursor);
+    assert_eq!(counters.edge_record_hydration_calls, 1);
+    assert_eq!(counters.edge_record_hydration_reads, 2);
+}
+
+#[test]
 fn edge_query_broad_label_source_uses_streaming_fallback_page() {
     let (_dir, engine) = query_test_engine();
     let edge_count = crate::planner_stats::PLANNER_STATS_DEFAULT_SELECTED_SOURCE_CAP + 1;
@@ -3786,6 +6325,12 @@ fn set_query_edge_props(engine: &DatabaseEngine, edge_id: u64, props: BTreeMap<S
         .unwrap();
 }
 
+fn set_query_edge_updated_at(engine: &DatabaseEngine, edge_id: u64, updated_at: i64) {
+    let edge = internal_edge_record(engine, edge_id).unwrap().unwrap();
+    write_internal_wal_op(engine, &WalOp::UpsertEdge(EdgeRecord { updated_at, ..edge }))
+        .unwrap();
+}
+
 fn replace_equality_sidecar_group_id_in_place(
     path: &std::path::Path,
     value_hash: u64,
@@ -3840,8 +6385,11 @@ fn plan_contains_node(node: &QueryPlanNode, expected: &QueryPlanNode) -> bool {
         return true;
     }
     match node {
-        QueryPlanNode::Intersect { inputs } | QueryPlanNode::Union { inputs } => {
+        QueryPlanNode::Intersect { inputs, .. } | QueryPlanNode::Union { inputs, .. } => {
             inputs.iter().any(|input| plan_contains_node(input, expected))
+        }
+        QueryPlanNode::StreamedSource { input } | QueryPlanNode::BufferedIdSort { input } => {
+            plan_contains_node(input, expected)
         }
         QueryPlanNode::VerifyNodeFilter { input }
         | QueryPlanNode::VerifyEdgeFilter { input }
@@ -3857,9 +6405,23 @@ fn explain_input_node(plan: &QueryPlan) -> &QueryPlanNode {
     }
 }
 
+fn explain_edge_input_node(plan: &QueryPlan) -> &QueryPlanNode {
+    match &plan.root {
+        QueryPlanNode::VerifyEdgeFilter { input } => input.as_ref(),
+        other => panic!("expected VerifyEdgeFilter root, got {other:?}"),
+    }
+}
+
+fn assert_repeated_node_explain(engine: &DatabaseEngine, query: &NodeQuery) -> QueryPlan {
+    let first = engine.explain_node_query(query).unwrap();
+    let second = engine.explain_node_query(query).unwrap();
+    assert_eq!(first, second, "node explain must be deterministic");
+    first
+}
+
 fn explain_input_nodes(plan: &QueryPlan) -> Vec<QueryPlanNode> {
     match explain_input_node(plan) {
-        QueryPlanNode::Intersect { inputs } => inputs.clone(),
+        QueryPlanNode::Intersect { inputs, .. } => inputs.clone(),
         node => vec![node.clone()],
     }
 }
@@ -3886,9 +6448,12 @@ fn find_compound_details(
     match node {
         QueryPlanNode::CompoundEqualityIndex { details } if !range => Some(details),
         QueryPlanNode::CompoundRangeIndex { details } if range => Some(details),
-        QueryPlanNode::Intersect { inputs } | QueryPlanNode::Union { inputs } => inputs
+        QueryPlanNode::Intersect { inputs, .. } | QueryPlanNode::Union { inputs, .. } => inputs
             .iter()
             .find_map(|input| find_compound_details(input, range)),
+        QueryPlanNode::StreamedSource { input } | QueryPlanNode::BufferedIdSort { input } => {
+            find_compound_details(input, range)
+        }
         QueryPlanNode::VerifyNodeFilter { input }
         | QueryPlanNode::VerifyEdgeFilter { input }
         | QueryPlanNode::VerifyEdgePredicates { input } => {
@@ -4460,10 +7025,13 @@ fn collect_compound_index_ids(node: &QueryPlanNode, ids: &mut Vec<u64>) {
     match node {
         QueryPlanNode::CompoundEqualityIndex { details }
         | QueryPlanNode::CompoundRangeIndex { details } => ids.push(details.index_id),
-        QueryPlanNode::Intersect { inputs } | QueryPlanNode::Union { inputs } => {
+        QueryPlanNode::Intersect { inputs, .. } | QueryPlanNode::Union { inputs, .. } => {
             for input in inputs {
                 collect_compound_index_ids(input, ids);
             }
+        }
+        QueryPlanNode::StreamedSource { input } | QueryPlanNode::BufferedIdSort { input } => {
+            collect_compound_index_ids(input, ids);
         }
         QueryPlanNode::VerifyNodeFilter { input }
         | QueryPlanNode::VerifyEdgeFilter { input }
@@ -5332,7 +7900,7 @@ fn test_edge_triple_index_estimate_ranks_first_in_intersect() {
     let QueryPlanNode::VerifyEdgeFilter { input } = &plan.root else {
         panic!("expected VerifyEdgeFilter root, got {:?}", plan.root)
     };
-    let QueryPlanNode::Intersect { inputs } = input.as_ref() else {
+    let QueryPlanNode::Intersect { inputs, .. } = input.as_ref() else {
         panic!("expected Intersect input, got {input:?}")
     };
     assert_eq!(
@@ -7771,7 +10339,7 @@ fn test_planner_stats_rare_residual_equality_beats_broad_label_source() {
 }
 
 #[test]
-fn test_planner_stats_broad_heavy_hitter_equality_uses_cheaper_label_scan() {
+fn test_planner_stats_broad_heavy_hitter_equality_streams_equality_source() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
@@ -7780,7 +10348,9 @@ fn test_planner_stats_broad_heavy_hitter_equality_uses_cheaper_label_scan() {
         .unwrap();
     wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
-    let inputs: Vec<_> = (0..=QUERY_RANGE_CANDIDATE_CAP)
+    let broad_count = EAGER_PREFERRED_SOURCE_MAX as usize + 64;
+    let cold_count = 512usize;
+    let mut inputs: Vec<_> = (0..broad_count)
         .map(|index| NodeInput {
             labels: vec!["Person".to_string()],
             key: format!("broad-heavy-{index}"),
@@ -7790,6 +10360,14 @@ fn test_planner_stats_broad_heavy_hitter_equality_uses_cheaper_label_scan() {
             sparse_vector: None,
         })
         .collect();
+    inputs.extend((0..cold_count).map(|index| NodeInput {
+        labels: vec!["Person".to_string()],
+        key: format!("broad-heavy-cold-{index}"),
+        props: query_test_props(&[("status", PropValue::String("cold".to_string()))]),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }));
     let all_ids = engine.batch_upsert_nodes(inputs).unwrap();
     engine.flush().unwrap();
 
@@ -7805,15 +10383,11 @@ fn test_planner_stats_broad_heavy_hitter_equality_uses_cheaper_label_scan() {
         oracle_query_ids(&engine, &all_ids, &query)
     );
     let plan = engine.explain_node_query(&query).unwrap();
-    assert_eq!(
-        plan.warnings,
-        vec![
-            QueryPlanWarning::UsingFallbackScan,
-            QueryPlanWarning::CandidateCapExceeded,
-            QueryPlanWarning::VerifyOnlyFilter,
-        ]
-    );
-    assert_plan_input_nodes(&plan, vec![QueryPlanNode::FallbackNodeLabelScan]);
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::StreamedSource { input } = explain_input_node(&plan) else {
+        panic!("expected streamed equality source, got {plan:?}");
+    };
+    assert_eq!(input.as_ref(), &QueryPlanNode::PropertyEqualityIndex);
 
     engine.close().unwrap();
 }
@@ -8536,6 +11110,7 @@ fn test_query_filter_in_dedupes_by_canonical_value_and_uses_union() {
                 QueryPlanNode::PropertyEqualityIndex,
                 QueryPlanNode::PropertyEqualityIndex,
             ],
+            mode: QueryPlanExecutionMode::Eager,
         }],
     );
 
@@ -8808,6 +11383,7 @@ fn test_query_filter_or_and_in_extract_complete_index_candidates() {
                 QueryPlanNode::PropertyEqualityIndex,
                 QueryPlanNode::PropertyEqualityIndex,
             ],
+            mode: QueryPlanExecutionMode::Eager,
         }],
     );
 
@@ -8873,6 +11449,7 @@ fn test_query_filter_or_and_in_extract_complete_index_candidates() {
                 QueryPlanNode::PropertyEqualityIndex,
                 QueryPlanNode::PropertyEqualityIndex,
             ],
+            mode: QueryPlanExecutionMode::Eager,
         }],
     );
 
@@ -8971,6 +11548,7 @@ fn test_query_filter_or_in_union_final_verification_and_pagination() {
                 QueryPlanNode::PropertyEqualityIndex,
                 QueryPlanNode::PropertyEqualityIndex,
             ],
+            mode: QueryPlanExecutionMode::Eager,
         }],
     );
 
@@ -9072,6 +11650,7 @@ fn test_query_filter_and_of_or_intersects_range() {
                     QueryPlanNode::PropertyEqualityIndex,
                     QueryPlanNode::PropertyEqualityIndex,
                 ],
+                mode: QueryPlanExecutionMode::Eager,
             },
             QueryPlanNode::PropertyRangeIndex,
         ],
@@ -9260,6 +11839,83 @@ fn test_query_or_unknown_branch_falls_back_without_partial_union() {
         vec![
             QueryPlanWarning::MissingReadyIndex,
             QueryPlanWarning::UsingFallbackScan,
+            QueryPlanWarning::VerifyOnlyFilter,
+            QueryPlanWarning::BooleanBranchFallback,
+        ]
+    );
+    assert_plan_input_nodes(&plan, vec![QueryPlanNode::FallbackNodeLabelScan]);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn test_query_or_preserves_broad_warning_from_streamable_and_reject() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let score_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_property_index_state(&engine, score_info.index_id, SecondaryIndexState::Ready);
+
+    let total = EAGER_PREFERRED_SOURCE_MAX as usize + 1;
+    let mut inputs = Vec::with_capacity(total);
+    for ordinal in 0..total {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("or-streamable-reject-{ordinal}"),
+            props: query_test_props(&[
+                ("status", PropValue::String("inactive".to_string())),
+                ("score", PropValue::Int(ordinal as i64)),
+            ]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let ids = engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: Some(NodeFilterExpr::Or(vec![
+            NodeFilterExpr::And(vec![
+                NodeFilterExpr::PropertyEquals {
+                    key: "status".to_string(),
+                    value: PropValue::String("inactive".to_string()),
+                },
+                NodeFilterExpr::PropertyRange {
+                    key: "score".to_string(),
+                    lower: Some(PropertyRangeBound::Included(PropValue::Int(0))),
+                    upper: Some(PropertyRangeBound::Included(PropValue::Int(7))),
+                },
+            ]),
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("missing".to_string()),
+            },
+        ])),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        engine.query_node_ids(&query).unwrap().items,
+        ids[..8].to_vec()
+    );
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert_eq!(
+        plan.warnings,
+        vec![
+            QueryPlanWarning::UsingFallbackScan,
+            QueryPlanWarning::IndexSkippedAsBroad,
             QueryPlanWarning::VerifyOnlyFilter,
             QueryPlanWarning::BooleanBranchFallback,
         ]
@@ -10333,6 +12989,7 @@ fn node_query_property_index_candidates_verify_key_from_selected_fields() {
             &PropValue::String("active".to_string()),
             PlannerEstimate::upper_bound(2),
         )),
+        execution_mode: NodeDriverExecutionMode::Eager,
         cap_context,
         legal_universe_fallback: None,
         warnings: Vec::new(),
@@ -10353,6 +13010,3304 @@ fn node_query_property_index_candidates_verify_key_from_selected_fields() {
 
     drop(published);
     drop(_guard);
+    engine.close().unwrap();
+}
+
+#[test]
+fn stream_reject_selectivity_gate_matches_locked_vectors() {
+    assert!(!stream_reject_admitted_by_selectivity_gate(
+        Some(100),
+        Some(9_000),
+        Some(10_000)
+    ));
+    assert!(!stream_reject_admitted_by_selectivity_gate(
+        Some(3_000),
+        Some(9_000),
+        Some(10_000)
+    ));
+    assert!(stream_reject_admitted_by_selectivity_gate(
+        Some(100),
+        Some(350),
+        Some(10_000)
+    ));
+    assert!(stream_reject_admitted_by_selectivity_gate(
+        Some(3_000),
+        Some(5_000),
+        Some(200_000)
+    ));
+    assert!(!stream_reject_admitted_by_selectivity_gate(
+        Some(3_000),
+        Some(10_000),
+        Some(10_000)
+    ));
+    assert!(stream_reject_admitted_by_selectivity_gate(
+        Some(100),
+        Some(350),
+        None
+    ));
+    assert!(!stream_reject_admitted_by_selectivity_gate(
+        Some(100),
+        Some(401),
+        None
+    ));
+    assert!(!stream_reject_admitted_by_selectivity_gate(
+        Some(100),
+        None,
+        Some(10_000)
+    ));
+}
+
+const STREAMING_SCALE_SEGMENT_COUNT: usize = 3;
+const STREAMING_SCALE_NODES_PER_SEGMENT: usize = 60_000;
+const STREAMING_SCALE_MEMTABLE_TAIL_COUNT: usize = 20_000;
+const STREAMING_SCALE_TOTAL_NODES: usize = STREAMING_SCALE_SEGMENT_COUNT
+    * STREAMING_SCALE_NODES_PER_SEGMENT
+    + STREAMING_SCALE_MEMTABLE_TAIL_COUNT;
+const STREAMING_SCALE_IN_TENANT_COUNT: usize = 20;
+const STREAMING_SCALE_SELECTED_TENANT_SIZE: usize = 210;
+const EDGE_STREAMING_SCALE_NODE_COUNT: usize = 10_000;
+const EDGE_STREAMING_SCALE_SEGMENT_COUNT: usize = 3;
+const EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT: usize = 60_000;
+const EDGE_STREAMING_SCALE_MEMTABLE_TAIL_COUNT: usize = 20_000;
+const EDGE_STREAMING_SCALE_TOTAL_EDGES: usize = EDGE_STREAMING_SCALE_SEGMENT_COUNT
+    * EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT
+    + EDGE_STREAMING_SCALE_MEMTABLE_TAIL_COUNT;
+const EDGE_STREAMING_SCALE_HUB_EDGE_COUNT: usize = 5_000;
+
+struct StreamingScaleTestFixture {
+    _dir: TempDir,
+    engine: DatabaseEngine,
+    all_ids: Vec<u64>,
+    hot_ids: Vec<u64>,
+    stale_rewrite_count: usize,
+}
+
+struct EdgeStreamingScaleTestFixture {
+    _dir: TempDir,
+    engine: DatabaseEngine,
+    edge_ids: Vec<u64>,
+    hot_ids: Vec<u64>,
+    hub_source_ids: Vec<u64>,
+    stale_rewrite_count: usize,
+}
+
+fn streaming_scale_tenant_ordinal(ordinal: usize) -> usize {
+    let selected_tenant_rows = STREAMING_SCALE_IN_TENANT_COUNT * STREAMING_SCALE_SELECTED_TENANT_SIZE;
+    if ordinal < selected_tenant_rows {
+        ordinal % STREAMING_SCALE_IN_TENANT_COUNT
+    } else {
+        STREAMING_SCALE_IN_TENANT_COUNT
+            + ((ordinal - selected_tenant_rows)
+                % (1_000 - STREAMING_SCALE_IN_TENANT_COUNT))
+    }
+}
+
+fn streaming_scale_score(ordinal: usize) -> i64 {
+    if ordinal.is_multiple_of(4) {
+        990 + (ordinal % 10) as i64
+    } else {
+        (ordinal % 990) as i64
+    }
+}
+
+fn streaming_scale_props(
+    ordinal: usize,
+    status_override: Option<&str>,
+) -> BTreeMap<String, PropValue> {
+    query_test_props(&[
+        (
+            "status",
+            PropValue::String(
+                status_override
+                    .unwrap_or(if ordinal.is_multiple_of(2) {
+                        "hot"
+                    } else {
+                        "cold"
+                    })
+                    .to_string(),
+            ),
+        ),
+        (
+            "region",
+            PropValue::String(if ordinal.is_multiple_of(4) {
+                "east"
+            } else {
+                "west"
+            }
+            .to_string()),
+        ),
+        (
+            "tenant",
+            PropValue::String(format!("t{:03}", streaming_scale_tenant_ordinal(ordinal))),
+        ),
+        ("score", PropValue::Int(streaming_scale_score(ordinal))),
+    ])
+}
+
+fn streaming_scale_node(ordinal: usize, status_override: Option<&str>) -> NodeInput {
+    NodeInput {
+        labels: vec!["Person".to_string()],
+        key: format!("streaming-scale-{ordinal}"),
+        props: streaming_scale_props(ordinal, status_override),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }
+}
+
+fn ensure_streaming_scale_indexes(engine: &DatabaseEngine) {
+    for prop_key in ["status", "region", "tenant"] {
+        let info = engine
+            .ensure_node_property_index(
+                "Person",
+                SecondaryIndexSpec::equality(vec![SecondaryIndexField::property(prop_key)]),
+            )
+            .unwrap();
+        wait_for_property_index_state(engine, info.index_id, SecondaryIndexState::Ready);
+    }
+    let score = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(engine, score.index_id, SecondaryIndexState::Ready);
+}
+
+fn build_streaming_scale_test_fixture(
+    indexes_before_load: bool,
+    stale_heavy: bool,
+) -> StreamingScaleTestFixture {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let engine = DatabaseEngine::open(
+        &db_path,
+        &DbOptions {
+            compact_after_n_flushes: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    seed_query_test_catalog(&engine);
+    if indexes_before_load {
+        ensure_streaming_scale_indexes(&engine);
+    }
+
+    let mut all_ids = Vec::with_capacity(STREAMING_SCALE_TOTAL_NODES);
+    for segment in 0..STREAMING_SCALE_SEGMENT_COUNT {
+        let start = segment * STREAMING_SCALE_NODES_PER_SEGMENT;
+        let nodes = (start..start + STREAMING_SCALE_NODES_PER_SEGMENT)
+            .map(|ordinal| streaming_scale_node(ordinal, None))
+            .collect::<Vec<_>>();
+        all_ids.extend(engine.batch_upsert_nodes(nodes).unwrap());
+        engine.flush().unwrap();
+    }
+    let tail_start = STREAMING_SCALE_SEGMENT_COUNT * STREAMING_SCALE_NODES_PER_SEGMENT;
+    let tail_nodes = (tail_start..tail_start + STREAMING_SCALE_MEMTABLE_TAIL_COUNT)
+        .map(|ordinal| streaming_scale_node(ordinal, None))
+        .collect::<Vec<_>>();
+    all_ids.extend(engine.batch_upsert_nodes(tail_nodes).unwrap());
+    assert_eq!(all_ids.len(), STREAMING_SCALE_TOTAL_NODES);
+    assert_eq!(engine.segments_for_test().len(), STREAMING_SCALE_SEGMENT_COUNT);
+
+    let mut stale_ordinals = std::collections::BTreeSet::new();
+    let mut stale_rewrite_count = 0usize;
+    if stale_heavy {
+        assert!(indexes_before_load, "stale-heavy fixture requires segment postings");
+        let segment_hot_total =
+            STREAMING_SCALE_SEGMENT_COUNT * STREAMING_SCALE_NODES_PER_SEGMENT / 2;
+        let stale_target = segment_hot_total * 95 / 100;
+        let mut stale_updates = Vec::with_capacity(stale_target);
+        for ordinal in (0..tail_start).filter(|ordinal| ordinal.is_multiple_of(2)) {
+            if stale_updates.len() == stale_target {
+                break;
+            }
+            stale_ordinals.insert(ordinal);
+            stale_updates.push(streaming_scale_node(ordinal, Some("cold")));
+        }
+        stale_rewrite_count = stale_updates.len();
+        assert_eq!(stale_rewrite_count, stale_target);
+        engine.batch_upsert_nodes(stale_updates).unwrap();
+    }
+
+    let hot_ids = all_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, &id)| {
+            (ordinal.is_multiple_of(2) && !stale_ordinals.contains(&ordinal)).then_some(id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        (0..STREAMING_SCALE_TOTAL_NODES)
+            .filter(|ordinal| ordinal.is_multiple_of(4))
+            .count(),
+        STREAMING_SCALE_TOTAL_NODES / 4
+    );
+    assert!(
+        (0..STREAMING_SCALE_TOTAL_NODES)
+            .filter(|&ordinal| streaming_scale_tenant_ordinal(ordinal)
+                < STREAMING_SCALE_IN_TENANT_COUNT)
+            .count()
+            > EAGER_PREFERRED_SOURCE_MAX as usize
+    );
+    assert!(
+        (0..STREAMING_SCALE_TOTAL_NODES)
+            .filter(|&ordinal| (990..=999).contains(&streaming_scale_score(ordinal)))
+            .count()
+            > EAGER_PREFERRED_SOURCE_MAX as usize
+    );
+    assert!(hot_ids.len() > EAGER_PREFERRED_SOURCE_MAX as usize);
+
+    StreamingScaleTestFixture {
+        _dir: dir,
+        engine,
+        all_ids,
+        hot_ids,
+        stale_rewrite_count,
+    }
+}
+
+fn ensure_edge_streaming_scale_indexes(engine: &DatabaseEngine) {
+    for prop_key in ["status", "region", "tenant"] {
+        let info = engine
+            .ensure_edge_property_index(
+                "RELATES_TO",
+                SecondaryIndexSpec::equality(vec![SecondaryIndexField::property(prop_key)]),
+            )
+            .unwrap();
+        wait_for_edge_property_index_state(engine, info.index_id, SecondaryIndexState::Ready);
+    }
+    let score = engine
+        .ensure_edge_property_index(
+            "RELATES_TO",
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(engine, score.index_id, SecondaryIndexState::Ready);
+}
+
+fn edge_streaming_scale_node(ordinal: usize) -> NodeInput {
+    NodeInput {
+        labels: vec!["Person".to_string()],
+        key: format!("edge-streaming-scale-node-{ordinal}"),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }
+}
+
+fn edge_streaming_scale_tenant_ordinal(ordinal: usize) -> usize {
+    streaming_scale_tenant_ordinal(ordinal)
+}
+
+fn edge_streaming_scale_score(ordinal: usize) -> i64 {
+    if ordinal.is_multiple_of(4) {
+        990 + (ordinal % 10) as i64
+    } else {
+        (ordinal % 990) as i64
+    }
+}
+
+fn edge_streaming_scale_weight(ordinal: usize) -> f32 {
+    if ordinal.is_multiple_of(4) {
+        0.995 + ((ordinal % 10) as f32 / 10_000.0)
+    } else {
+        (ordinal % 990) as f32 / 1000.0
+    }
+}
+
+fn edge_streaming_scale_props(
+    ordinal: usize,
+    status_override: Option<&str>,
+) -> BTreeMap<String, PropValue> {
+    query_test_props(&[
+        (
+            "status",
+            PropValue::String(
+                status_override
+                    .unwrap_or(if ordinal.is_multiple_of(2) {
+                        "hot"
+                    } else {
+                        "cold"
+                    })
+                    .to_string(),
+            ),
+        ),
+        (
+            "region",
+            PropValue::String(if ordinal.is_multiple_of(4) {
+                "east"
+            } else {
+                "west"
+            }
+            .to_string()),
+        ),
+        (
+            "tenant",
+            PropValue::String(format!(
+                "t{:03}",
+                edge_streaming_scale_tenant_ordinal(ordinal)
+            )),
+        ),
+        ("score", PropValue::Int(edge_streaming_scale_score(ordinal))),
+    ])
+}
+
+fn edge_streaming_scale_endpoints(node_ids: &[u64], ordinal: usize) -> (u64, u64) {
+    if ordinal < EDGE_STREAMING_SCALE_HUB_EDGE_COUNT {
+        return (node_ids[0], node_ids[2 + ordinal]);
+    }
+    if ordinal < EDGE_STREAMING_SCALE_HUB_EDGE_COUNT * 2 {
+        return (
+            node_ids[1],
+            node_ids[2 + (ordinal - EDGE_STREAMING_SCALE_HUB_EDGE_COUNT)],
+        );
+    }
+
+    let local = ordinal - EDGE_STREAMING_SCALE_HUB_EDGE_COUNT * 2;
+    let spread = EDGE_STREAMING_SCALE_NODE_COUNT - 2;
+    let from_slot = local % spread;
+    let offset = (local / spread) + 1;
+    let to_slot = (from_slot + offset) % spread;
+    (node_ids[2 + from_slot], node_ids[2 + to_slot])
+}
+
+fn edge_streaming_scale_input(
+    node_ids: &[u64],
+    ordinal: usize,
+    status_override: Option<&str>,
+) -> EdgeInput {
+    let (from, to) = edge_streaming_scale_endpoints(node_ids, ordinal);
+    EdgeInput {
+        from,
+        to,
+        label: "RELATES_TO".to_string(),
+        props: edge_streaming_scale_props(ordinal, status_override),
+        weight: edge_streaming_scale_weight(ordinal),
+        valid_from: None,
+        valid_to: None,
+    }
+}
+
+fn build_edge_streaming_scale_test_fixture(stale_heavy: bool) -> EdgeStreamingScaleTestFixture {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let engine = DatabaseEngine::open(
+        &db_path,
+        &DbOptions {
+            compact_after_n_flushes: 0,
+            edge_uniqueness: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    seed_query_test_catalog(&engine);
+    ensure_edge_streaming_scale_indexes(&engine);
+
+    let node_ids = engine
+        .batch_upsert_nodes(
+            (0..EDGE_STREAMING_SCALE_NODE_COUNT)
+                .map(edge_streaming_scale_node)
+                .collect(),
+        )
+        .unwrap();
+    assert_eq!(node_ids.len(), EDGE_STREAMING_SCALE_NODE_COUNT);
+
+    let mut edge_ids = Vec::with_capacity(EDGE_STREAMING_SCALE_TOTAL_EDGES);
+    for segment in 0..EDGE_STREAMING_SCALE_SEGMENT_COUNT {
+        let start = segment * EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT;
+        let inputs = (start..start + EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT)
+            .map(|ordinal| edge_streaming_scale_input(&node_ids, ordinal, None))
+            .collect::<Vec<_>>();
+        edge_ids.extend(engine.batch_upsert_edges(inputs).unwrap());
+        engine.flush().unwrap();
+    }
+
+    let tail_start = EDGE_STREAMING_SCALE_SEGMENT_COUNT * EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT;
+    let tail_inputs = (tail_start..tail_start + EDGE_STREAMING_SCALE_MEMTABLE_TAIL_COUNT)
+        .map(|ordinal| edge_streaming_scale_input(&node_ids, ordinal, None))
+        .collect::<Vec<_>>();
+    edge_ids.extend(engine.batch_upsert_edges(tail_inputs).unwrap());
+    assert_eq!(edge_ids.len(), EDGE_STREAMING_SCALE_TOTAL_EDGES);
+    assert_eq!(engine.segments_for_test().len(), EDGE_STREAMING_SCALE_SEGMENT_COUNT);
+
+    let mut stale_ordinals = std::collections::BTreeSet::new();
+    let mut stale_rewrite_count = 0usize;
+    if stale_heavy {
+        let segment_hot_total =
+            EDGE_STREAMING_SCALE_SEGMENT_COUNT * EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT / 2;
+        let stale_target = segment_hot_total * 95 / 100;
+        let mut stale_updates = Vec::with_capacity(stale_target);
+        for ordinal in (0..tail_start).filter(|ordinal| ordinal.is_multiple_of(2)) {
+            if stale_updates.len() == stale_target {
+                break;
+            }
+            stale_ordinals.insert(ordinal);
+            stale_updates.push(edge_streaming_scale_input(&node_ids, ordinal, Some("cold")));
+        }
+        let rewritten_ids = engine.batch_upsert_edges(stale_updates).unwrap();
+        stale_rewrite_count = rewritten_ids.len();
+        assert_eq!(stale_rewrite_count, stale_target);
+        for (ordinal, rewritten_id) in stale_ordinals.iter().zip(rewritten_ids) {
+            assert_eq!(
+                rewritten_id, edge_ids[*ordinal],
+                "stale-heavy edge rewrite must preserve edge ID"
+            );
+        }
+    }
+
+    let hot_ids = edge_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, &edge_id)| {
+            (ordinal.is_multiple_of(2) && !stale_ordinals.contains(&ordinal)).then_some(edge_id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        (0..EDGE_STREAMING_SCALE_TOTAL_EDGES)
+            .filter(|ordinal| ordinal.is_multiple_of(4))
+            .count(),
+        EDGE_STREAMING_SCALE_TOTAL_EDGES / 4
+    );
+    assert!(
+        (0..EDGE_STREAMING_SCALE_TOTAL_EDGES)
+            .filter(|&ordinal| edge_streaming_scale_tenant_ordinal(ordinal)
+                < STREAMING_SCALE_IN_TENANT_COUNT)
+            .count()
+            > EAGER_PREFERRED_SOURCE_MAX as usize
+    );
+    assert!(
+        (0..EDGE_STREAMING_SCALE_TOTAL_EDGES)
+            .filter(|&ordinal| (990..=999).contains(&edge_streaming_scale_score(ordinal)))
+            .count()
+            > EAGER_PREFERRED_SOURCE_MAX as usize
+    );
+    assert!(
+        (0..EDGE_STREAMING_SCALE_TOTAL_EDGES)
+            .filter(|&ordinal| edge_streaming_scale_weight(ordinal) >= 0.99)
+            .count()
+            > EAGER_PREFERRED_SOURCE_MAX as usize
+    );
+    assert!(hot_ids.len() > EAGER_PREFERRED_SOURCE_MAX as usize);
+
+    EdgeStreamingScaleTestFixture {
+        _dir: dir,
+        engine,
+        edge_ids,
+        hot_ids,
+        hub_source_ids: vec![node_ids[0], node_ids[1]],
+        stale_rewrite_count,
+    }
+}
+
+fn streaming_scale_status_region_tenant_query(limit: Option<usize>) -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("t000".to_string()),
+            },
+        ],
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn streaming_scale_status_region_query(limit: Option<usize>) -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+        ],
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn streaming_scale_status_hot_query(limit: Option<usize>) -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![NodeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("hot".to_string()),
+        }],
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn streaming_scale_range_plus_equality_query(limit: Option<usize>) -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![
+            NodeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(990))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(999))),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+        ],
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn streaming_scale_in_union_broad_query(limit: Option<usize>) -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: Some(NodeFilterExpr::PropertyIn {
+            key: "tenant".to_string(),
+            values: (0..STREAMING_SCALE_IN_TENANT_COUNT)
+                .map(|tenant| PropValue::String(format!("t{tenant:03}")))
+                .collect(),
+        }),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn streaming_scale_expected_page(
+    engine: &DatabaseEngine,
+    all_ids: &[u64],
+    query: &NodeQuery,
+) -> (Vec<u64>, Option<u64>) {
+    let mut ids = oracle_query_ids(engine, all_ids, query);
+    if let Some(after) = query.page.after {
+        ids.retain(|id| *id > after);
+    }
+    match query.page.limit {
+        Some(limit) => {
+            let next_cursor = if limit > 0 && ids.len() > limit {
+                Some(ids[limit - 1])
+            } else {
+                None
+            };
+            (ids.into_iter().take(limit).collect(), next_cursor)
+        }
+        None => (ids, None),
+    }
+}
+
+fn assert_streaming_scale_page_matches_oracle(
+    engine: &DatabaseEngine,
+    all_ids: &[u64],
+    query: &NodeQuery,
+) {
+    let (expected_items, expected_cursor) = streaming_scale_expected_page(engine, all_ids, query);
+    let page = engine.query_node_ids(query).unwrap();
+    assert_eq!(page.items, expected_items);
+    assert_eq!(page.next_cursor, expected_cursor);
+}
+
+fn assert_scale_declines_to_eager(engine: &DatabaseEngine, query: &NodeQuery) {
+    let plan = engine.explain_node_query(query).unwrap();
+    assert_eq!(
+        plan.warnings,
+        vec![
+            QueryPlanWarning::IndexSkippedAsBroad,
+            QueryPlanWarning::VerifyOnlyFilter
+        ]
+    );
+    assert_plan_input_nodes(&plan, vec![QueryPlanNode::PropertyEqualityIndex]);
+}
+
+fn assert_scale_streamed_intersect(engine: &DatabaseEngine, query: &NodeQuery) {
+    let plan = engine.explain_node_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Intersect { inputs, mode } = explain_input_node(&plan) else {
+        panic!("expected streamed intersect, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(
+        inputs,
+        &vec![
+            QueryPlanNode::PropertyEqualityIndex,
+            QueryPlanNode::PropertyEqualityIndex
+        ]
+    );
+}
+
+fn assert_scale_streamed_source(engine: &DatabaseEngine, query: &NodeQuery) {
+    let plan = engine.explain_node_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    assert_eq!(
+        explain_input_node(&plan),
+        &QueryPlanNode::StreamedSource {
+            input: Box::new(QueryPlanNode::PropertyEqualityIndex),
+        }
+    );
+}
+
+fn assert_scale_streamed_range_plus_equality(engine: &DatabaseEngine, query: &NodeQuery) {
+    let plan = engine.explain_node_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Intersect { inputs, mode } = explain_input_node(&plan) else {
+        panic!("expected streamed range/equality intersect, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert!(inputs.contains(&QueryPlanNode::PropertyEqualityIndex));
+    assert!(inputs.contains(&QueryPlanNode::BufferedIdSort {
+        input: Box::new(QueryPlanNode::PropertyRangeIndex),
+    }));
+}
+
+fn assert_scale_streamed_union(engine: &DatabaseEngine, query: &NodeQuery) {
+    let plan = engine.explain_node_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Union { inputs, mode } = explain_input_node(&plan) else {
+        panic!("expected streamed IN union, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(inputs.len(), STREAMING_SCALE_IN_TENANT_COUNT);
+}
+
+fn edge_streaming_scale_status_region_tenant_query(limit: Option<usize>) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("RELATES_TO".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("t000".to_string()),
+            },
+        ])),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn edge_streaming_scale_status_region_query(limit: Option<usize>) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("RELATES_TO".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+        ])),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn edge_streaming_scale_status_hot_query(limit: Option<usize>) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("RELATES_TO".to_string()),
+        filter: Some(EdgeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("hot".to_string()),
+        }),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn edge_streaming_scale_range_plus_equality_query(limit: Option<usize>) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("RELATES_TO".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(990))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(999))),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+        ])),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn edge_streaming_scale_weight_plus_equality_query(limit: Option<usize>) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("RELATES_TO".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::WeightRange {
+                lower: Some(0.99),
+                upper: Some(1.0),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+        ])),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn edge_streaming_scale_endpoint_hub_equality_query(
+    hub_source_id: u64,
+    limit: Option<usize>,
+) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("RELATES_TO".to_string()),
+        from_ids: vec![hub_source_id],
+        filter: Some(EdgeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("hot".to_string()),
+        }),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn edge_streaming_scale_in_union_broad_query(limit: Option<usize>) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("RELATES_TO".to_string()),
+        filter: Some(EdgeFilterExpr::PropertyIn {
+            key: "tenant".to_string(),
+            values: (0..STREAMING_SCALE_IN_TENANT_COUNT)
+                .map(|tenant| PropValue::String(format!("t{tenant:03}")))
+                .collect(),
+        }),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn edge_streaming_scale_hydrated_final_page_query(after: u64) -> EdgeQuery {
+    EdgeQuery {
+        page: PageRequest {
+            limit: Some(10),
+            after: Some(after),
+        },
+        ..edge_streaming_scale_status_hot_query(None)
+    }
+}
+
+fn edge_streaming_scale_expected_page(
+    engine: &DatabaseEngine,
+    edge_ids: &[u64],
+    query: &EdgeQuery,
+) -> (Vec<u64>, Option<u64>) {
+    let view = engine.published_state().view.clone();
+    let normalized = view.normalize_edge_query(query).unwrap();
+    let records = internal_edge_records(engine, edge_ids).unwrap();
+    let mut ids = edge_ids
+        .iter()
+        .copied()
+        .zip(records.iter())
+        .filter(|(edge_id, _)| query.page.after.is_none_or(|after| *edge_id > after))
+        .filter(|(_, edge)| {
+            edge.as_ref()
+                .is_some_and(|edge| edge_query_matches(&normalized, edge))
+        })
+        .map(|(edge_id, _)| edge_id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    match query.page.limit {
+        Some(limit) => {
+            let next_cursor = if limit > 0 && ids.len() > limit {
+                Some(ids[limit - 1])
+            } else {
+                None
+            };
+            (ids.into_iter().take(limit).collect(), next_cursor)
+        }
+        None => (ids, None),
+    }
+}
+
+fn edge_streaming_scale_forced_eager_page(
+    engine: &DatabaseEngine,
+    query: &EdgeQuery,
+) -> (Vec<u64>, Option<u64>) {
+    let view = engine.published_state().view.clone();
+    let normalized = view.normalize_edge_query(query).unwrap();
+    let mut planned = view.plan_normalized_edge_query(&normalized).unwrap();
+    planned.execution_mode = EdgeDriverExecutionMode::Eager;
+    let (page, followups) = view
+        .query_edge_page_planned(&normalized, planned, false, None)
+        .unwrap();
+    assert!(followups.is_empty());
+    (page.ids, page.next_cursor)
+}
+
+fn edge_streaming_scale_forced_fallback_page(
+    engine: &DatabaseEngine,
+    query: &EdgeQuery,
+) -> (Vec<u64>, Option<u64>) {
+    let view = engine.published_state().view.clone();
+    let normalized = view.normalize_edge_query(query).unwrap();
+    let planned = view.plan_normalized_edge_query(&normalized).unwrap();
+    let (page, followups) = view
+        .query_edge_metadata_page_from_legal_universe(&normalized, planned.cap_context, None)
+        .unwrap();
+    assert!(followups.is_empty());
+    (
+        page.metadata.into_iter().map(|meta| meta.id).collect(),
+        page.next_cursor,
+    )
+}
+
+fn assert_edge_streaming_scale_page_matches_oracles(
+    fixture: &EdgeStreamingScaleTestFixture,
+    name: &str,
+    query: &EdgeQuery,
+) {
+    let (expected_items, expected_cursor) =
+        edge_streaming_scale_expected_page(&fixture.engine, &fixture.edge_ids, query);
+    let (eager_items, eager_cursor) = edge_streaming_scale_forced_eager_page(&fixture.engine, query);
+    assert_eq!(eager_items, expected_items, "forced eager mismatch for {name}");
+    assert_eq!(
+        eager_cursor, expected_cursor,
+        "forced eager cursor mismatch for {name}"
+    );
+    let (fallback_items, fallback_cursor) =
+        edge_streaming_scale_forced_fallback_page(&fixture.engine, query);
+    assert_eq!(
+        fallback_items, expected_items,
+        "forced fallback mismatch for {name}"
+    );
+    assert_eq!(
+        fallback_cursor, expected_cursor,
+        "forced fallback cursor mismatch for {name}"
+    );
+    let streamed = fixture.engine.query_edge_ids(query).unwrap();
+    assert_eq!(
+        streamed.edge_ids, expected_items,
+        "streamed mismatch for {name}"
+    );
+    assert_eq!(
+        streamed.next_cursor, expected_cursor,
+        "streamed cursor mismatch for {name}"
+    );
+}
+
+fn assert_edge_scale_declines_to_eager(engine: &DatabaseEngine, query: &EdgeQuery) {
+    let plan = engine.explain_edge_query(query).unwrap();
+    assert!(plan.warnings.contains(&QueryPlanWarning::IndexSkippedAsBroad));
+    assert!(plan.warnings.contains(&QueryPlanWarning::VerifyOnlyFilter));
+    assert!(plan_contains_node(
+        explain_edge_input_node(&plan),
+        &QueryPlanNode::EdgePropertyEqualityIndex
+    ));
+    assert!(!matches!(
+        explain_edge_input_node(&plan),
+        QueryPlanNode::Intersect {
+            mode: QueryPlanExecutionMode::Streamed,
+            ..
+        } | QueryPlanNode::StreamedSource { .. }
+            | QueryPlanNode::Union {
+                mode: QueryPlanExecutionMode::Streamed,
+                ..
+            }
+    ));
+}
+
+fn assert_edge_scale_streamed_intersect(engine: &DatabaseEngine, query: &EdgeQuery) {
+    let plan = engine.explain_edge_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Intersect { inputs, mode } = explain_edge_input_node(&plan) else {
+        panic!("expected streamed edge intersect, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(
+        inputs
+            .iter()
+            .filter(|input| **input == QueryPlanNode::EdgePropertyEqualityIndex)
+            .count(),
+        2
+    );
+}
+
+fn assert_edge_scale_streamed_source(engine: &DatabaseEngine, query: &EdgeQuery) {
+    let plan = engine.explain_edge_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    assert_eq!(
+        explain_edge_input_node(&plan),
+        &QueryPlanNode::StreamedSource {
+            input: Box::new(QueryPlanNode::EdgePropertyEqualityIndex),
+        }
+    );
+}
+
+fn assert_edge_scale_streamed_buffered_input(
+    engine: &DatabaseEngine,
+    query: &EdgeQuery,
+    buffered_input: QueryPlanNode,
+) {
+    let plan = engine.explain_edge_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Intersect { inputs, mode } = explain_edge_input_node(&plan) else {
+        panic!("expected streamed buffered edge intersect, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert!(inputs.contains(&QueryPlanNode::EdgePropertyEqualityIndex));
+    assert!(inputs.contains(&QueryPlanNode::BufferedIdSort {
+        input: Box::new(buffered_input),
+    }));
+}
+
+fn assert_edge_scale_streamed_endpoint(engine: &DatabaseEngine, query: &EdgeQuery) {
+    let plan = engine.explain_edge_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Intersect { inputs, mode } = explain_edge_input_node(&plan) else {
+        panic!("expected streamed endpoint edge intersect, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert!(inputs.contains(&QueryPlanNode::EdgeEndpointAdjacency));
+    assert!(inputs.contains(&QueryPlanNode::EdgePropertyEqualityIndex));
+}
+
+fn assert_edge_scale_streamed_union(engine: &DatabaseEngine, query: &EdgeQuery) {
+    let plan = engine.explain_edge_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Union { inputs, mode } = explain_edge_input_node(&plan) else {
+        panic!("expected streamed edge union, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(inputs.len(), STREAMING_SCALE_IN_TENANT_COUNT);
+}
+
+#[test]
+fn streaming_scale_fixture_oracle_equivalence_for_streamed_shapes() {
+    let fixture = build_streaming_scale_test_fixture(false, false);
+
+    let decline = streaming_scale_status_region_tenant_query(Some(100));
+    let two_broad = streaming_scale_status_region_query(Some(10));
+    let single_broad = streaming_scale_status_hot_query(Some(10));
+    let range_plus_equality = streaming_scale_range_plus_equality_query(Some(100));
+    let in_union = streaming_scale_in_union_broad_query(Some(100));
+    let after = fixture.hot_ids[fixture.hot_ids.len() - 11];
+    let hydrated_final_page = NodeQuery {
+        page: PageRequest {
+            limit: Some(10),
+            after: Some(after),
+        },
+        ..streaming_scale_status_hot_query(None)
+    };
+
+    let fallback_pages = [
+        ("decline", decline.clone()),
+        ("two_broad", two_broad.clone()),
+        ("single_broad", single_broad.clone()),
+        ("range_plus_equality", range_plus_equality.clone()),
+        ("in_union", in_union.clone()),
+        ("hydrated_final_page", hydrated_final_page.clone()),
+    ]
+    .into_iter()
+    .map(|(name, query)| {
+        let fallback = fixture.engine.query_node_ids(&query).unwrap();
+        let (oracle_items, oracle_cursor) =
+            streaming_scale_expected_page(&fixture.engine, &fixture.all_ids, &query);
+        assert_eq!(fallback.items, oracle_items, "fallback mismatch for {name}");
+        assert_eq!(
+            fallback.next_cursor, oracle_cursor,
+            "fallback cursor mismatch for {name}"
+        );
+        (name, query, fallback)
+    })
+    .collect::<Vec<_>>();
+
+    ensure_streaming_scale_indexes(&fixture.engine);
+
+    assert_scale_declines_to_eager(&fixture.engine, &decline);
+    fixture.engine.reset_query_execution_counters_for_test();
+    assert_streaming_scale_page_matches_oracle(&fixture.engine, &fixture.all_ids, &decline);
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_intersect_drivers, 0);
+    assert_eq!(counters.streamed_union_drivers, 0);
+    assert_eq!(counters.streamed_single_source_drivers, 0);
+
+    assert_scale_streamed_intersect(&fixture.engine, &two_broad);
+    fixture.engine.reset_query_execution_counters_for_test();
+    assert_streaming_scale_page_matches_oracle(&fixture.engine, &fixture.all_ids, &two_broad);
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_intersect_drivers, 1);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+    assert!(counters.streamed_cursor_seeks > 0);
+    assert!(counters.streamed_candidates_emitted > 0);
+
+    assert_scale_streamed_source(&fixture.engine, &single_broad);
+    fixture.engine.reset_query_execution_counters_for_test();
+    assert_streaming_scale_page_matches_oracle(&fixture.engine, &fixture.all_ids, &single_broad);
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_single_source_drivers, 1);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+
+    assert_scale_streamed_range_plus_equality(&fixture.engine, &range_plus_equality);
+    fixture.engine.reset_query_execution_counters_for_test();
+    assert_streaming_scale_page_matches_oracle(
+        &fixture.engine,
+        &fixture.all_ids,
+        &range_plus_equality,
+    );
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_intersect_drivers, 1);
+    assert_eq!(counters.streamed_buffered_inputs, 1);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+
+    assert_scale_streamed_union(&fixture.engine, &in_union);
+    fixture.engine.reset_query_execution_counters_for_test();
+    assert_streaming_scale_page_matches_oracle(&fixture.engine, &fixture.all_ids, &in_union);
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_union_drivers, 1);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+
+    assert_scale_streamed_source(&fixture.engine, &hydrated_final_page);
+    let (expected_ids, expected_cursor) =
+        streaming_scale_expected_page(&fixture.engine, &fixture.all_ids, &hydrated_final_page);
+    fixture.engine.reset_query_execution_counters_for_test();
+    let hydrated = fixture.engine.query_nodes(&hydrated_final_page).unwrap();
+    assert_eq!(
+        hydrated.items.iter().map(|node| node.id).collect::<Vec<_>>(),
+        expected_ids
+    );
+    assert_eq!(hydrated.next_cursor, expected_cursor);
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_single_source_drivers, 1);
+    assert_eq!(counters.node_record_hydration_reads, hydrated.items.len());
+
+    let explain = fixture.engine.explain_node_query(&two_broad).unwrap();
+    let QueryPlanNode::Intersect { mode, .. } = explain_input_node(&explain) else {
+        panic!("expected streamed explain intersect, got {explain:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+
+    for (name, query, fallback) in fallback_pages {
+        let streamed = fixture.engine.query_node_ids(&query).unwrap();
+        assert_eq!(streamed.items, fallback.items, "streamed mismatch for {name}");
+        assert_eq!(
+            streamed.next_cursor, fallback.next_cursor,
+            "streamed cursor mismatch for {name}"
+        );
+    }
+
+    fixture.engine.close().unwrap();
+}
+
+#[test]
+fn streaming_scale_stale_heavy_equality_reports_verifier_waste() {
+    let fixture = build_streaming_scale_test_fixture(true, true);
+    assert_eq!(fixture.stale_rewrite_count, 85_500);
+
+    let query = streaming_scale_status_hot_query(Some(100));
+    assert_scale_streamed_source(&fixture.engine, &query);
+
+    fixture.engine.reset_query_execution_counters_for_test();
+    assert_streaming_scale_page_matches_oracle(&fixture.engine, &fixture.all_ids, &query);
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_single_source_drivers, 1);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+    assert_eq!(counters.streamed_candidates_emitted, 85_760);
+    assert!(
+        counters.streamed_candidates_emitted > fixture.stale_rewrite_count,
+        "stale-heavy verifier should expose wasted candidates, got {} emitted for {} rewrites",
+        counters.streamed_candidates_emitted,
+        fixture.stale_rewrite_count
+    );
+
+    fixture.engine.close().unwrap();
+}
+
+#[test]
+fn streaming_scale_edge_fixture_oracle_equivalence_for_streamed_shapes() {
+    let fixture = build_edge_streaming_scale_test_fixture(false);
+
+    let decline = edge_streaming_scale_status_region_tenant_query(Some(100));
+    let two_broad = edge_streaming_scale_status_region_query(Some(10));
+    let single_broad = edge_streaming_scale_status_hot_query(Some(10));
+    let range_plus_equality = edge_streaming_scale_range_plus_equality_query(Some(100));
+    let weight_plus_equality = edge_streaming_scale_weight_plus_equality_query(Some(100));
+    let endpoint_hub = edge_streaming_scale_endpoint_hub_equality_query(
+        fixture.hub_source_ids[0],
+        Some(100),
+    );
+    let in_union = edge_streaming_scale_in_union_broad_query(Some(100));
+    let after = fixture.hot_ids[fixture.hot_ids.len() - 11];
+    let hydrated_final_page = edge_streaming_scale_hydrated_final_page_query(after);
+
+    assert_edge_scale_declines_to_eager(&fixture.engine, &decline);
+    assert_edge_streaming_scale_page_matches_oracles(&fixture, "decline", &decline);
+    fixture.engine.reset_query_execution_counters_for_test();
+    let decline_page = fixture.engine.query_edge_ids(&decline).unwrap();
+    assert_eq!(decline_page.next_cursor, Some(decline_page.edge_ids[99]));
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 0);
+    assert_eq!(counters.streamed_edge_union_drivers, 0);
+    assert_eq!(counters.streamed_edge_single_source_drivers, 0);
+    assert_eq!(counters.streamed_intersect_drivers, 0);
+
+    assert_edge_scale_streamed_intersect(&fixture.engine, &two_broad);
+    assert_edge_streaming_scale_page_matches_oracles(&fixture, "two_broad", &two_broad);
+    fixture.engine.reset_query_execution_counters_for_test();
+    let first_page = fixture.engine.query_edge_ids(&two_broad).unwrap();
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 1);
+    assert_eq!(counters.streamed_edge_single_source_drivers, 0);
+    assert_eq!(counters.streamed_intersect_drivers, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+    assert!(counters.streamed_edge_cursor_seeks > 0);
+    assert!(counters.streamed_edge_candidates_emitted > 0);
+    let second_page = fixture
+        .engine
+        .query_edge_ids(&EdgeQuery {
+            page: PageRequest {
+                limit: Some(10),
+                after: first_page.next_cursor,
+            },
+            ..two_broad.clone()
+        })
+        .unwrap();
+    let (expected_second, expected_second_cursor) = edge_streaming_scale_expected_page(
+        &fixture.engine,
+        &fixture.edge_ids,
+        &EdgeQuery {
+            page: PageRequest {
+                limit: Some(10),
+                after: first_page.next_cursor,
+            },
+            ..two_broad.clone()
+        },
+    );
+    assert_eq!(second_page.edge_ids, expected_second);
+    assert_eq!(second_page.next_cursor, expected_second_cursor);
+
+    assert_edge_scale_streamed_source(&fixture.engine, &single_broad);
+    assert_edge_streaming_scale_page_matches_oracles(&fixture, "single_broad", &single_broad);
+    fixture.engine.reset_query_execution_counters_for_test();
+    let single_page = fixture.engine.query_edge_ids(&single_broad).unwrap();
+    assert_eq!(single_page.next_cursor, Some(single_page.edge_ids[9]));
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_single_source_drivers, 1);
+    assert_eq!(counters.streamed_edge_intersect_drivers, 0);
+    assert_eq!(counters.streamed_single_source_drivers, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+
+    assert_edge_scale_streamed_buffered_input(
+        &fixture.engine,
+        &range_plus_equality,
+        QueryPlanNode::EdgePropertyRangeIndex,
+    );
+    assert_edge_streaming_scale_page_matches_oracles(
+        &fixture,
+        "range_plus_equality",
+        &range_plus_equality,
+    );
+    fixture.engine.reset_query_execution_counters_for_test();
+    let _ = fixture.engine.query_edge_ids(&range_plus_equality).unwrap();
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 1);
+    assert_eq!(counters.streamed_edge_buffered_inputs, 1);
+    assert_eq!(counters.streamed_buffered_inputs, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+
+    assert_edge_scale_streamed_buffered_input(
+        &fixture.engine,
+        &weight_plus_equality,
+        QueryPlanNode::EdgeWeightIndex,
+    );
+    assert_edge_streaming_scale_page_matches_oracles(
+        &fixture,
+        "weight_plus_equality",
+        &weight_plus_equality,
+    );
+    fixture.engine.reset_query_execution_counters_for_test();
+    let _ = fixture.engine.query_edge_ids(&weight_plus_equality).unwrap();
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 1);
+    assert_eq!(counters.streamed_edge_buffered_inputs, 1);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+
+    assert_edge_scale_streamed_endpoint(&fixture.engine, &endpoint_hub);
+    assert_edge_streaming_scale_page_matches_oracles(&fixture, "endpoint_hub", &endpoint_hub);
+    fixture.engine.reset_query_execution_counters_for_test();
+    let endpoint_page = fixture.engine.query_edge_ids(&endpoint_hub).unwrap();
+    assert_eq!(endpoint_page.next_cursor, Some(endpoint_page.edge_ids[99]));
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 1);
+    assert_eq!(counters.streamed_edge_single_source_drivers, 0);
+    assert_eq!(counters.streamed_intersect_drivers, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+    assert!(counters.streamed_edge_cursor_seeks > 0);
+
+    assert_edge_scale_streamed_union(&fixture.engine, &in_union);
+    assert_edge_streaming_scale_page_matches_oracles(&fixture, "in_union", &in_union);
+    fixture.engine.reset_query_execution_counters_for_test();
+    let _ = fixture.engine.query_edge_ids(&in_union).unwrap();
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_union_drivers, 1);
+    assert_eq!(counters.streamed_edge_intersect_drivers, 0);
+    assert_eq!(counters.streamed_union_drivers, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+
+    assert_edge_scale_streamed_source(&fixture.engine, &hydrated_final_page);
+    let (expected_ids, expected_cursor) =
+        edge_streaming_scale_expected_page(&fixture.engine, &fixture.edge_ids, &hydrated_final_page);
+    fixture.engine.reset_query_execution_counters_for_test();
+    let hydrated = fixture.engine.query_edges(&hydrated_final_page).unwrap();
+    assert_eq!(
+        hydrated.edges.iter().map(|edge| edge.id).collect::<Vec<_>>(),
+        expected_ids
+    );
+    assert_eq!(hydrated.next_cursor, expected_cursor);
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_single_source_drivers, 1);
+    assert_eq!(counters.edge_record_hydration_reads, hydrated.edges.len());
+    assert_eq!(counters.node_record_hydration_reads, 0);
+
+    let explain = fixture.engine.explain_edge_query(&two_broad).unwrap();
+    let QueryPlanNode::Intersect { mode, .. } = explain_edge_input_node(&explain) else {
+        panic!("expected streamed edge explain intersect, got {explain:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+
+    fixture.engine.close().unwrap();
+}
+
+#[test]
+fn streaming_scale_edge_stale_heavy_equality_reports_verifier_waste() {
+    let fixture = build_edge_streaming_scale_test_fixture(true);
+    assert_eq!(fixture.stale_rewrite_count, 85_500);
+
+    let query = edge_streaming_scale_status_hot_query(Some(100));
+    assert_edge_scale_streamed_source(&fixture.engine, &query);
+    assert_edge_streaming_scale_page_matches_oracles(&fixture, "stale_heavy", &query);
+
+    fixture.engine.reset_query_execution_counters_for_test();
+    let page = fixture.engine.query_edge_ids(&query).unwrap();
+    assert_eq!(page.next_cursor, Some(page.edge_ids[99]));
+    let counters = fixture.engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_single_source_drivers, 1);
+    assert_eq!(counters.streamed_edge_intersect_drivers, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+    assert!(
+        counters.streamed_edge_candidates_emitted > fixture.stale_rewrite_count,
+        "stale-heavy edge verifier should expose wasted candidates, got {} emitted for {} rewrites",
+        counters.streamed_edge_candidates_emitted,
+        fixture.stale_rewrite_count
+    );
+
+    fixture.engine.close().unwrap();
+}
+
+#[test]
+fn streamed_and_executes_broad_native_inputs_with_pagination_and_staleness() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let region_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("region")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_property_index_state(&engine, region_info.index_id, SecondaryIndexState::Ready);
+
+    let total = EAGER_PREFERRED_SOURCE_MAX as usize * 3;
+    let mut inputs = Vec::with_capacity(total);
+    for ordinal in 0..total {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-and-{ordinal}"),
+            props: query_test_props(&[
+                (
+                    "status",
+                    PropValue::String(
+                        if ordinal % 5 < 3 { "hot" } else { "cold" }.to_string(),
+                    ),
+                ),
+                (
+                    "region",
+                    PropValue::String(if ordinal % 2 == 0 { "east" } else { "west" }.to_string()),
+                ),
+            ]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let ids = engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+
+    let stale_east_id = ids[2];
+    engine
+        .upsert_node(
+            "Person",
+            "streamed-and-2",
+            UpsertNodeOptions {
+                props: query_test_props(&[
+                    ("status", PropValue::String("cold".to_string())),
+                    ("region", PropValue::String("west".to_string())),
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut expected: Vec<u64> = ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, &id)| {
+            (ordinal % 2 == 0 && ordinal % 5 < 3 && id != stale_east_id).then_some(id)
+        })
+        .collect();
+    expected.sort_unstable();
+
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            }
+        ],
+        page: PageRequest {
+            limit: Some(10),
+            after: None,
+        },
+        ..Default::default()
+    };
+
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert!(!plan.warnings.contains(&QueryPlanWarning::IndexSkippedAsBroad));
+    let QueryPlanNode::Intersect { inputs, mode } = explain_input_node(&plan) else {
+        panic!("expected streamed intersect, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(
+        inputs,
+        &vec![
+            QueryPlanNode::PropertyEqualityIndex,
+            QueryPlanNode::PropertyEqualityIndex
+        ]
+    );
+
+    engine.reset_query_execution_counters_for_test();
+    let page = engine.query_node_ids(&query).unwrap();
+    assert_eq!(page.items, expected[..10].to_vec());
+    assert_eq!(page.next_cursor, Some(expected[9]));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_intersect_drivers, 1);
+    assert_eq!(counters.streamed_single_source_drivers, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+    assert!(counters.streamed_cursor_seeks > 0);
+    assert!(counters.streamed_candidates_emitted > 0);
+
+    let second = engine
+        .query_node_ids(&NodeQuery {
+            page: PageRequest {
+                limit: Some(10),
+                after: page.next_cursor,
+            },
+            ..query.clone()
+        })
+        .unwrap();
+    assert_eq!(second.items, expected[10..20].to_vec());
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn streamed_single_source_driver_explains_and_counts() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+
+    let total = EAGER_PREFERRED_SOURCE_MAX as usize + 64;
+    let mut inputs = Vec::with_capacity(total);
+    for ordinal in 0..total {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-single-{ordinal}"),
+            props: query_test_props(&[("status", PropValue::String("hot".to_string()))]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let expected = engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![NodeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("hot".to_string()),
+        }],
+        page: PageRequest {
+            limit: Some(10),
+            after: None,
+        },
+        ..Default::default()
+    };
+
+    let plan = engine.explain_node_query(&query).unwrap();
+    let QueryPlanNode::StreamedSource { input } = explain_input_node(&plan) else {
+        panic!("expected streamed source, got {plan:?}");
+    };
+    assert_eq!(input.as_ref(), &QueryPlanNode::PropertyEqualityIndex);
+
+    engine.reset_query_execution_counters_for_test();
+    let page = engine.query_node_ids(&query).unwrap();
+    assert_eq!(page.items, expected[..10].to_vec());
+    assert_eq!(page.next_cursor, Some(expected[9]));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_single_source_drivers, 1);
+    assert_eq!(counters.streamed_intersect_drivers, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn streamed_and_declines_far_broad_native_reject_for_small_range_anchor() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let score_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_property_index_state(&engine, score_info.index_id, SecondaryIndexState::Ready);
+
+    let total = EAGER_PREFERRED_SOURCE_MAX as usize + 1;
+    let mut inputs = Vec::with_capacity(total);
+    for ordinal in 0..total {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("range-anchor-{ordinal}"),
+            props: query_test_props(&[
+                ("status", PropValue::String("inactive".to_string())),
+                ("score", PropValue::Int(ordinal as i64)),
+            ]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let ids = engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("inactive".to_string()),
+            },
+            NodeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(0))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(7))),
+            }
+        ],
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert_eq!(
+        plan.warnings,
+        vec![
+            QueryPlanWarning::IndexSkippedAsBroad,
+            QueryPlanWarning::VerifyOnlyFilter
+        ]
+    );
+    assert_plan_input_nodes(&plan, vec![QueryPlanNode::PropertyRangeIndex]);
+
+    engine.reset_query_execution_counters_for_test();
+    let page = engine.query_node_ids(&query).unwrap();
+    assert_eq!(page.items, ids[..8].to_vec());
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_intersect_drivers, 0);
+    assert_eq!(counters.streamed_single_source_drivers, 0);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn streamed_node_selectivity_demotion_does_not_claim_buffer_overflow() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let score_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_property_index_state(&engine, score_info.index_id, SecondaryIndexState::Ready);
+
+    let total = 10_000usize;
+    let mut inputs = Vec::with_capacity(total);
+    for ordinal in 0..total {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("buffered-reject-warning-{ordinal}"),
+            props: query_test_props(&[
+                (
+                    "status",
+                    PropValue::String(if ordinal < 100 { "hot" } else { "cold" }.to_string()),
+                ),
+                ("score", PropValue::Int(ordinal as i64)),
+            ]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let ids = engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            NodeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(0))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(8_999))),
+            }
+        ],
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert_eq!(
+        plan.warnings,
+        vec![
+            QueryPlanWarning::IndexSkippedAsBroad,
+            QueryPlanWarning::VerifyOnlyFilter,
+        ]
+    );
+    assert_plan_input_nodes(&plan, vec![QueryPlanNode::PropertyEqualityIndex]);
+
+    engine.reset_query_execution_counters_for_test();
+    let page = engine.query_node_ids(&query).unwrap();
+    assert_eq!(page.items, ids[..20].to_vec());
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_intersect_drivers, 0);
+    assert_eq!(counters.streamed_single_source_drivers, 0);
+    assert_eq!(counters.streamed_buffered_inputs, 0);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn streamed_edge_selectivity_demotion_does_not_claim_buffer_overflow() {
+    let (_dir, engine) = query_test_engine();
+    let label = "EDGE_BUFFERED_DEMOTION_WARNING";
+    ensure_ready_edge_property_index(
+        &engine,
+        label,
+        "status",
+        SecondaryIndexKind::Equality,
+    );
+    ensure_ready_edge_property_index(&engine, label, "score", SecondaryIndexKind::Range);
+
+    let total = 10_000usize;
+    let node_ids = engine
+        .batch_upsert_nodes(
+            (0..=total)
+                .map(|ordinal| NodeInput {
+                    labels: vec!["Person".to_string()],
+                    key: format!("edge-buffered-reject-warning-{ordinal}"),
+                    props: BTreeMap::new(),
+                    weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
+                })
+                .collect(),
+        )
+        .unwrap();
+    let from = node_ids[0];
+    let edge_ids = engine
+        .batch_upsert_edges(
+            node_ids[1..]
+                .iter()
+                .enumerate()
+                .map(|(ordinal, &to)| EdgeInput {
+                    from,
+                    to,
+                    label: label.to_string(),
+                    props: query_test_props(&[
+                        (
+                            "status",
+                            PropValue::String(
+                                if ordinal < 100 { "hot" } else { "cold" }.to_string(),
+                            ),
+                        ),
+                        ("score", PropValue::Int(ordinal as i64)),
+                    ]),
+                    weight: 1.0,
+                    valid_from: None,
+                    valid_to: None,
+                })
+                .collect(),
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let query = EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(0))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(8_999))),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+
+    let plan = engine.explain_edge_query(&query).unwrap();
+    assert_eq!(
+        plan.warnings,
+        vec![
+            QueryPlanWarning::IndexSkippedAsBroad,
+            QueryPlanWarning::CandidateCapExceeded,
+            QueryPlanWarning::VerifyOnlyFilter,
+        ]
+    );
+    let QueryPlanNode::Intersect { inputs, mode } = explain_edge_input_node(&plan) else {
+        panic!("expected unchanged eager edge intersect, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Eager);
+    assert_eq!(
+        inputs,
+        &vec![
+            QueryPlanNode::EdgePropertyEqualityIndex,
+            QueryPlanNode::EdgeLabelIndex,
+        ]
+    );
+
+    engine.reset_query_execution_counters_for_test();
+    let page = engine.query_edge_ids(&query).unwrap();
+    assert_eq!(page.edge_ids, edge_ids[..20].to_vec());
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 0);
+    assert_eq!(counters.streamed_edge_single_source_drivers, 0);
+    assert_eq!(counters.streamed_edge_buffered_inputs, 0);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn streamed_node_and_edge_input_count_and_legal_universe_demotions_are_truthful() {
+    let (_dir, engine) = query_test_engine();
+    // One more than query_plan.rs's locked STREAMED_INTERSECT_MAX_INPUTS (16).
+    const INPUTS: usize = 17;
+    const TOTAL: usize = 10_000;
+    const MATCHING: usize = 5_000;
+    let edge_label = "EDGE_BUFFERED_INPUT_COUNT_WARNING";
+    let keys = (0..INPUTS)
+        .map(|index| format!("input_{index}"))
+        .collect::<Vec<_>>();
+    for key in &keys {
+        let info = engine
+            .ensure_node_property_index(
+                "Person",
+                SecondaryIndexSpec::equality(vec![SecondaryIndexField::property(key)]),
+            )
+            .unwrap();
+        wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
+        ensure_ready_edge_property_index(
+            &engine,
+            edge_label,
+            key,
+            SecondaryIndexKind::Equality,
+        );
+    }
+
+    let shared_props = keys
+        .iter()
+        .map(|key| (key.clone(), PropValue::Int(1)))
+        .collect::<BTreeMap<_, _>>();
+    let node_ids = engine
+        .batch_upsert_nodes(
+            (0..=TOTAL)
+                .map(|ordinal| NodeInput {
+                    labels: vec!["Person".to_string()],
+                    key: format!("buffered-input-count-{ordinal}"),
+                    props: if ordinal < MATCHING {
+                        shared_props.clone()
+                    } else {
+                        BTreeMap::new()
+                    },
+                    weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
+                })
+                .collect(),
+        )
+        .unwrap();
+    let from = node_ids[0];
+    let edge_ids = engine
+        .batch_upsert_edges(
+            node_ids[1..]
+                .iter()
+                .enumerate()
+                .map(|(ordinal, &to)| EdgeInput {
+                    from,
+                    to,
+                    label: edge_label.to_string(),
+                    props: if ordinal < MATCHING {
+                        shared_props.clone()
+                    } else {
+                        BTreeMap::new()
+                    },
+                    weight: 1.0,
+                    valid_from: None,
+                    valid_to: None,
+                })
+                .collect(),
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    let node_filters = keys
+        .iter()
+        .map(|key| NodeFilterExpr::PropertyEquals {
+            key: key.clone(),
+            value: PropValue::Int(1),
+        })
+        .collect::<Vec<_>>();
+    let node_query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: Some(NodeFilterExpr::And(node_filters)),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let node_plan = engine.explain_node_query(&node_query).unwrap();
+    assert!(
+        !node_plan
+            .warnings
+            .contains(&QueryPlanWarning::StreamedInputBufferCapExceeded),
+        "input-count demotion did not overflow a node buffer: {node_plan:?}"
+    );
+    engine.reset_query_execution_counters_for_test();
+    assert_eq!(
+        engine.query_node_ids(&node_query).unwrap().items,
+        node_ids[..20].to_vec()
+    );
+    assert_eq!(
+        engine
+            .query_execution_counter_snapshot_for_test()
+            .streamed_intersect_drivers,
+        1
+    );
+
+    let edge_filters = keys
+        .iter()
+        .map(|key| EdgeFilterExpr::PropertyEquals {
+            key: key.clone(),
+            value: PropValue::Int(1),
+        })
+        .collect::<Vec<_>>();
+    let edge_query = EdgeQuery {
+        label: Some(edge_label.to_string()),
+        filter: Some(EdgeFilterExpr::And(edge_filters)),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let edge_plan = engine.explain_edge_query(&edge_query).unwrap();
+    assert!(
+        !edge_plan
+            .warnings
+            .contains(&QueryPlanWarning::StreamedInputBufferCapExceeded),
+        "input-count demotion did not overflow an edge buffer: {edge_plan:?}"
+    );
+    engine.reset_query_execution_counters_for_test();
+    assert_eq!(
+        engine.query_edge_ids(&edge_query).unwrap().edge_ids,
+        edge_ids[..20].to_vec()
+    );
+    assert_eq!(
+        engine
+            .query_execution_counter_snapshot_for_test()
+            .streamed_edge_intersect_drivers,
+        1
+    );
+
+    // An explicit-ID legal universe is strictly narrower than the broad indexed
+    // predicate. Demoting the buffered predicate to verification is not overflow.
+    let node_legal_universe_query = NodeQuery {
+        ids: node_ids[..100].to_vec(),
+        filter: Some(NodeFilterExpr::PropertyEquals {
+            key: keys[0].clone(),
+            value: PropValue::Int(1),
+        }),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let node_legal_plan = engine
+        .explain_node_query(&node_legal_universe_query)
+        .unwrap();
+    assert!(
+        !node_legal_plan
+            .warnings
+            .contains(&QueryPlanWarning::StreamedInputBufferCapExceeded),
+        "legal-universe node demotion did not overflow a buffer: {node_legal_plan:?}"
+    );
+    engine.reset_query_execution_counters_for_test();
+    assert_eq!(
+        engine
+            .query_node_ids(&node_legal_universe_query)
+            .unwrap()
+            .items,
+        node_ids[..20].to_vec()
+    );
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_intersect_drivers, 0);
+    assert_eq!(counters.streamed_single_source_drivers, 0);
+
+    let edge_legal_universe_query = EdgeQuery {
+        ids: edge_ids[..100].to_vec(),
+        filter: Some(EdgeFilterExpr::PropertyEquals {
+            key: keys[0].clone(),
+            value: PropValue::Int(1),
+        }),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let edge_legal_plan = engine
+        .explain_edge_query(&edge_legal_universe_query)
+        .unwrap();
+    assert!(
+        !edge_legal_plan
+            .warnings
+            .contains(&QueryPlanWarning::StreamedInputBufferCapExceeded),
+        "legal-universe edge demotion did not overflow a buffer: {edge_legal_plan:?}"
+    );
+    engine.reset_query_execution_counters_for_test();
+    assert_eq!(
+        engine
+            .query_edge_ids(&edge_legal_universe_query)
+            .unwrap()
+            .edge_ids,
+        edge_ids[..20].to_vec()
+    );
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_edge_intersect_drivers, 0);
+    assert_eq!(counters.streamed_edge_single_source_drivers, 0);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn streamed_and_public_planner_uses_buffered_range_with_native_equality() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let score_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_property_index_state(&engine, score_info.index_id, SecondaryIndexState::Ready);
+
+    let total = 10_000usize;
+    let mut inputs = Vec::with_capacity(total);
+    for ordinal in 0..total {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-buffered-range-{ordinal}"),
+            props: query_test_props(&[
+                (
+                    "status",
+                    PropValue::String(if ordinal < 5_000 { "hot" } else { "cold" }.to_string()),
+                ),
+                ("score", PropValue::Int(ordinal as i64)),
+            ]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let ids = engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+    let expected = ids[..3_000].to_vec();
+
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            NodeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(0))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(2_999))),
+            }
+        ],
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Intersect { inputs, mode } = explain_input_node(&plan) else {
+        panic!("expected streamed intersect, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(inputs.len(), 2);
+    assert!(inputs.contains(&QueryPlanNode::PropertyEqualityIndex));
+    assert!(inputs.contains(&QueryPlanNode::BufferedIdSort {
+        input: Box::new(QueryPlanNode::PropertyRangeIndex),
+    }));
+
+    engine.reset_query_execution_counters_for_test();
+    let page = engine.query_node_ids(&query).unwrap();
+    assert_eq!(page.items, expected[..20].to_vec());
+    assert_eq!(page.next_cursor, Some(expected[19]));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_intersect_drivers, 1);
+    assert_eq!(counters.streamed_single_source_drivers, 0);
+    assert_eq!(counters.streamed_buffered_inputs, 1);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn streamed_explain_snapshots_are_deterministic_across_repeated_runs_and_reopen() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    seed_query_test_catalog(&engine);
+
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let region_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("region")]),
+        )
+        .unwrap();
+    let score_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    let tenant_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("tenant")]),
+        )
+        .unwrap();
+    let cohort_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("cohort")]),
+        )
+        .unwrap();
+    for index_id in [
+        status_info.index_id,
+        region_info.index_id,
+        score_info.index_id,
+        tenant_info.index_id,
+        cohort_info.index_id,
+    ] {
+        wait_for_property_index_state(&engine, index_id, SecondaryIndexState::Ready);
+    }
+
+    let total = 10_000usize;
+    let mut inputs = Vec::with_capacity(total);
+    for ordinal in 0..total {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-explain-{ordinal}"),
+            props: query_test_props(&[
+                (
+                    "status",
+                    PropValue::String(if ordinal < 5_000 { "hot" } else { "cold" }.to_string()),
+                ),
+                (
+                    "region",
+                    PropValue::String(if ordinal % 2 == 0 { "east" } else { "west" }.to_string()),
+                ),
+                ("score", PropValue::Int(ordinal as i64)),
+                (
+                    "tenant",
+                    PropValue::String(if ordinal < 100 { "tiny" } else { "other" }.to_string()),
+                ),
+                (
+                    "cohort",
+                    PropValue::String(if ordinal < 300 { "focus" } else { "other" }.to_string()),
+                ),
+            ]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+
+    let eager_intersect = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("tiny".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "cohort".to_string(),
+                value: PropValue::String("focus".to_string()),
+            }
+        ],
+        ..Default::default()
+    };
+    let streamed_intersect = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            }
+        ],
+        ..Default::default()
+    };
+    let streamed_union = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: Some(NodeFilterExpr::PropertyIn {
+            key: "status".to_string(),
+            values: vec![
+                PropValue::String("hot".to_string()),
+                PropValue::String("cold".to_string()),
+            ],
+        }),
+        ..Default::default()
+    };
+    let streamed_source = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![NodeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("hot".to_string()),
+        }],
+        ..Default::default()
+    };
+    let buffered_range = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            NodeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(0))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(2_999))),
+            }
+        ],
+        ..Default::default()
+    };
+    let capped_buffer = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("tiny".to_string()),
+            },
+            NodeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(0))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(8_999))),
+            }
+        ],
+        ..Default::default()
+    };
+
+    let eager_plan = assert_repeated_node_explain(&engine, &eager_intersect);
+    assert_eq!(eager_plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Intersect { inputs, mode } = explain_input_node(&eager_plan) else {
+        panic!("expected eager intersect, got {eager_plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Eager);
+    assert_eq!(
+        inputs,
+        &vec![
+            QueryPlanNode::PropertyEqualityIndex,
+            QueryPlanNode::PropertyEqualityIndex,
+        ]
+    );
+
+    let intersect_plan = assert_repeated_node_explain(&engine, &streamed_intersect);
+    let QueryPlanNode::Intersect { inputs, mode } = explain_input_node(&intersect_plan) else {
+        panic!("expected streamed intersect, got {intersect_plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(
+        inputs,
+        &vec![
+            QueryPlanNode::PropertyEqualityIndex,
+            QueryPlanNode::PropertyEqualityIndex,
+        ]
+    );
+
+    let union_plan = assert_repeated_node_explain(&engine, &streamed_union);
+    let QueryPlanNode::Union { inputs, mode } = explain_input_node(&union_plan) else {
+        panic!("expected streamed union, got {union_plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(
+        inputs,
+        &vec![
+            QueryPlanNode::PropertyEqualityIndex,
+            QueryPlanNode::PropertyEqualityIndex,
+        ]
+    );
+
+    let source_plan = assert_repeated_node_explain(&engine, &streamed_source);
+    assert_eq!(
+        explain_input_node(&source_plan),
+        &QueryPlanNode::StreamedSource {
+            input: Box::new(QueryPlanNode::PropertyEqualityIndex),
+        }
+    );
+
+    let buffered_plan = assert_repeated_node_explain(&engine, &buffered_range);
+    let QueryPlanNode::Intersect { inputs, mode } = explain_input_node(&buffered_plan) else {
+        panic!("expected streamed buffered intersect, got {buffered_plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert!(inputs.contains(&QueryPlanNode::BufferedIdSort {
+        input: Box::new(QueryPlanNode::PropertyRangeIndex),
+    }));
+
+    let capped_plan = assert_repeated_node_explain(&engine, &capped_buffer);
+    // DEC-42-019: the capped-buffer shape is a selectivity demotion without a
+    // genuine buffer materialization overflow, so it no longer claims
+    // StreamedInputBufferCapExceeded.
+    assert_eq!(
+        capped_plan.warnings,
+        vec![
+            QueryPlanWarning::IndexSkippedAsBroad,
+            QueryPlanWarning::VerifyOnlyFilter,
+        ]
+    );
+    assert_plan_input_nodes(&capped_plan, vec![QueryPlanNode::PropertyEqualityIndex]);
+
+    let expected_plans = vec![
+        ("eager_intersect", eager_intersect.clone(), eager_plan),
+        (
+            "streamed_intersect",
+            streamed_intersect.clone(),
+            intersect_plan,
+        ),
+        ("streamed_union", streamed_union.clone(), union_plan),
+        ("streamed_source", streamed_source.clone(), source_plan),
+        ("buffered_range", buffered_range.clone(), buffered_plan),
+        ("capped_buffer", capped_buffer.clone(), capped_plan),
+    ];
+
+    engine.close().unwrap();
+
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    for index_id in [
+        status_info.index_id,
+        region_info.index_id,
+        score_info.index_id,
+        tenant_info.index_id,
+        cohort_info.index_id,
+    ] {
+        wait_for_property_index_state(&reopened, index_id, SecondaryIndexState::Ready);
+    }
+    for (name, query, expected) in expected_plans {
+        assert_eq!(
+            assert_repeated_node_explain(&reopened, &query),
+            expected,
+            "reopened explain drifted for {name}"
+        );
+    }
+    reopened.close().unwrap();
+}
+
+#[test]
+fn streamed_and_d1_buffer_overflow_demotes_to_verifier() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let score_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_property_index_state(&engine, score_info.index_id, SecondaryIndexState::Ready);
+
+    let total = EAGER_PREFERRED_SOURCE_MAX as usize + 32;
+    let mut inputs = Vec::with_capacity(total);
+    for ordinal in 0..total {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-d1-{ordinal}"),
+            props: query_test_props(&[
+                ("status", PropValue::String("hot".to_string())),
+                ("score", PropValue::Int(ordinal as i64)),
+            ]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let expected = engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+    let person_id = engine.get_node_label_id("Person").unwrap().unwrap();
+
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            NodeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(0))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(total as i64))),
+            }
+        ],
+        page: PageRequest {
+            limit: Some(10),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let (_guard, published) = engine.runtime.published_snapshot().unwrap();
+    let normalized = published.view.normalize_node_query(&query).unwrap();
+    let cap_context = published.view.query_cap_context(&normalized).unwrap();
+    let driver = NodePhysicalPlan::intersect(vec![
+        NodePhysicalPlan::source(PlannedNodeCandidateSource::property_equality_index(
+            person_id,
+            status_info.index_id,
+            "status",
+            &PropValue::String("hot".to_string()),
+            PlannerEstimate::upper_bound(total as u64),
+        )),
+        NodePhysicalPlan::BufferedIdSort(Box::new(NodePhysicalPlan::source(
+            PlannedNodeCandidateSource::property_range_index(
+                score_info.index_id,
+                "score",
+                Some(&PropertyRangeBound::Included(PropValue::Int(0))),
+                Some(&PropertyRangeBound::Included(PropValue::Int(total as i64))),
+                PlannerEstimate::upper_bound(1),
+            ),
+        ))),
+    ])
+    .into_streamed_mode();
+    let planned = PlannedNodeQuery {
+        driver,
+        execution_mode: NodeDriverExecutionMode::Streamed,
+        cap_context,
+        legal_universe_fallback: None,
+        warnings: Vec::new(),
+        followups: Vec::new(),
+    };
+    let policy_cutoffs = published.view.query_policy_cutoffs();
+
+    engine.reset_query_execution_counters_for_test();
+    let (page, followups) = published
+        .view
+        .query_node_page_planned(&normalized, planned, false, policy_cutoffs.as_ref())
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(page.ids, expected[..10].to_vec());
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_intersect_drivers, 1);
+    assert_eq!(counters.streamed_buffered_input_overflows, 1);
+    assert_eq!(counters.streamed_buffered_inputs, 0);
+
+    drop(published);
+    drop(_guard);
+    engine.close().unwrap();
+}
+
+#[test]
+fn streamed_and_d3_equality_sidecar_failure_demotes_leaf() {
+    let (dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let region_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("region")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_property_index_state(&engine, region_info.index_id, SecondaryIndexState::Ready);
+    let total = EAGER_PREFERRED_SOURCE_MAX as usize + 32;
+    let mut inputs = Vec::with_capacity(total);
+    for ordinal in 0..total {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-d3-{ordinal}"),
+            props: query_test_props(&[
+                ("status", PropValue::String("hot".to_string())),
+                (
+                    "region",
+                    PropValue::String(if ordinal % 2 == 0 { "east" } else { "west" }.to_string()),
+                ),
+            ]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let ids = engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+    let person_id = engine.get_node_label_id("Person").unwrap().unwrap();
+    let segment_id = engine.segments_for_test()[0].segment_id;
+    let seg_dir = crate::segment_writer::segment_dir(&dir.path().join("db"), segment_id);
+    let sidecar_path = crate::segment_writer::node_prop_eq_sidecar_path(
+        &seg_dir,
+        region_info.index_id,
+    );
+    corrupt_sidecar_header_in_place(&sidecar_path);
+
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            }
+        ],
+        page: PageRequest {
+            limit: Some(10),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let expected: Vec<u64> = ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, &id)| (ordinal % 2 == 0).then_some(id))
+        .take(10)
+        .collect();
+    let (_guard, published) = engine.runtime.published_snapshot().unwrap();
+    let normalized = published.view.normalize_node_query(&query).unwrap();
+    let cap_context = published.view.query_cap_context(&normalized).unwrap();
+    let driver = NodePhysicalPlan::intersect(vec![
+        NodePhysicalPlan::source(PlannedNodeCandidateSource::property_equality_index(
+            person_id,
+            status_info.index_id,
+            "status",
+            &PropValue::String("hot".to_string()),
+            PlannerEstimate::upper_bound(total as u64),
+        )),
+        NodePhysicalPlan::source(PlannedNodeCandidateSource::property_equality_index(
+            person_id,
+            region_info.index_id,
+            "region",
+            &PropValue::String("east".to_string()),
+            PlannerEstimate::upper_bound((total / 2) as u64),
+        )),
+    ])
+    .into_streamed_mode();
+    let planned = PlannedNodeQuery {
+        driver,
+        execution_mode: NodeDriverExecutionMode::Streamed,
+        cap_context,
+        legal_universe_fallback: None,
+        warnings: Vec::new(),
+        followups: Vec::new(),
+    };
+    let policy_cutoffs = published.view.query_policy_cutoffs();
+
+    engine.reset_query_execution_counters_for_test();
+    let (page, followups) = published
+        .view
+        .query_node_page_planned(&normalized, planned, false, policy_cutoffs.as_ref())
+        .unwrap();
+    assert_eq!(page.ids, expected);
+    assert_eq!(followups.len(), 1);
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_leaf_demotions, 1);
+    assert_eq!(counters.streamed_intersect_drivers, 1);
+
+    drop(published);
+    drop(_guard);
+    engine.close().unwrap();
+}
+
+#[test]
+fn streamed_or_and_in_plan_streamed_union_paginate_and_count() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+
+    let total = crate::planner_stats::PLANNER_STATS_HARD_CANDIDATE_CAP + 512;
+    let mut inputs = Vec::with_capacity(total);
+    for ordinal in 0..total {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-union-{ordinal}"),
+            props: query_test_props(&[(
+                "status",
+                PropValue::String(if ordinal % 2 == 0 { "red" } else { "blue" }.to_string()),
+            )]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let expected = engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+
+    let in_query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: Some(NodeFilterExpr::PropertyIn {
+            key: "status".to_string(),
+            values: vec![
+                PropValue::String("red".to_string()),
+                PropValue::String("blue".to_string()),
+                PropValue::String("red".to_string()),
+            ],
+        }),
+        page: PageRequest {
+            limit: Some(11),
+            after: None,
+        },
+        ..Default::default()
+    };
+
+    let plan = engine.explain_node_query(&in_query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Union { inputs, mode } = explain_input_node(&plan) else {
+        panic!("expected streamed IN union, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(
+        inputs,
+        &vec![
+            QueryPlanNode::PropertyEqualityIndex,
+            QueryPlanNode::PropertyEqualityIndex,
+        ]
+    );
+
+    engine.reset_query_execution_counters_for_test();
+    let first = engine.query_node_ids(&in_query).unwrap();
+    assert_eq!(first.items, expected[..11].to_vec());
+    assert_eq!(first.next_cursor, Some(expected[10]));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_union_drivers, 1);
+    assert_eq!(counters.streamed_intersect_drivers, 0);
+    assert_eq!(counters.streamed_single_source_drivers, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+    assert!(counters.streamed_cursor_seeks > 0);
+    assert!(counters.streamed_candidates_emitted > 0);
+
+    let second = engine
+        .query_node_ids(&NodeQuery {
+            page: PageRequest {
+                limit: Some(11),
+                after: first.next_cursor,
+            },
+            ..in_query.clone()
+        })
+        .unwrap();
+    assert_eq!(second.items, expected[11..22].to_vec());
+    assert_eq!(second.next_cursor, Some(expected[21]));
+
+    let or_query = NodeQuery {
+        filter: Some(NodeFilterExpr::Or(vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("red".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("blue".to_string()),
+            },
+        ])),
+        ..in_query.clone()
+    };
+    let or_plan = engine.explain_node_query(&or_query).unwrap();
+    let QueryPlanNode::Union { inputs, mode } = explain_input_node(&or_plan) else {
+        panic!("expected streamed OR union, got {or_plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(inputs.len(), 2);
+
+    engine.reset_query_execution_counters_for_test();
+    let or_page = engine.query_node_ids(&or_query).unwrap();
+    assert_eq!(or_page.items, expected[..11].to_vec());
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_union_drivers, 1);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn streamed_union_composes_inside_and_and_dedups_branch_candidates() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let region_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("region")]),
+        )
+        .unwrap();
+    let tier_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("tier")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_property_index_state(&engine, region_info.index_id, SecondaryIndexState::Ready);
+    wait_for_property_index_state(&engine, tier_info.index_id, SecondaryIndexState::Ready);
+
+    let total = EAGER_PREFERRED_SOURCE_MAX as usize * 8;
+    let hot_count = 1_000usize;
+    let keep_count = 1_500usize;
+    let east_stride = 10usize;
+    let east_count = total.div_ceil(east_stride);
+    let mut inputs = Vec::with_capacity(total);
+    for ordinal in 0..total {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("union-inside-and-{ordinal}"),
+            props: query_test_props(&[
+                (
+                    "status",
+                    PropValue::String(if ordinal < hot_count { "hot" } else { "cold" }.to_string()),
+                ),
+                (
+                    "region",
+                    PropValue::String(
+                        if ordinal % east_stride == 0 {
+                            "east"
+                        } else {
+                            "west"
+                        }
+                        .to_string(),
+                    ),
+                ),
+                (
+                    "tier",
+                    PropValue::String(if ordinal < keep_count { "keep" } else { "drop" }.to_string()),
+                ),
+            ]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let ids = engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+    let expected: Vec<u64> = ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, &id)| {
+            ((ordinal < hot_count || ordinal % east_stride == 0) && ordinal < keep_count)
+                .then_some(id)
+        })
+        .collect();
+
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: Some(NodeFilterExpr::And(vec![
+            NodeFilterExpr::Or(vec![
+                NodeFilterExpr::PropertyEquals {
+                    key: "status".to_string(),
+                    value: PropValue::String("hot".to_string()),
+                },
+                NodeFilterExpr::PropertyEquals {
+                    key: "region".to_string(),
+                    value: PropValue::String("east".to_string()),
+                },
+            ]),
+            NodeFilterExpr::PropertyEquals {
+                key: "tier".to_string(),
+                value: PropValue::String("keep".to_string()),
+            },
+        ])),
+        ..Default::default()
+    };
+    let public_plan = engine.explain_node_query(&query).unwrap();
+    let QueryPlanNode::Intersect { inputs, mode } = explain_input_node(&public_plan) else {
+        panic!("expected public streamed AND plan, got {public_plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed, "{public_plan:?}");
+    assert!(inputs.iter().any(|input| matches!(
+        input,
+        QueryPlanNode::Union {
+            mode: QueryPlanExecutionMode::Streamed,
+            ..
+        }
+    )));
+
+    engine.reset_query_execution_counters_for_test();
+    let public_page = engine.query_node_ids(&query).unwrap();
+    assert_eq!(public_page.items, expected);
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_intersect_drivers, 1);
+    assert_eq!(counters.streamed_union_drivers, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+
+    let person_id = engine.get_node_label_id("Person").unwrap().unwrap();
+    let (_guard, published) = engine.runtime.published_snapshot().unwrap();
+    let normalized = published.view.normalize_node_query(&query).unwrap();
+    let cap_context = published.view.query_cap_context(&normalized).unwrap();
+    let union = NodePhysicalPlan::streamed_union(vec![
+        NodePhysicalPlan::source(PlannedNodeCandidateSource::property_equality_index(
+            person_id,
+            status_info.index_id,
+            "status",
+            &PropValue::String("hot".to_string()),
+            PlannerEstimate::upper_bound(hot_count as u64),
+        )),
+        NodePhysicalPlan::source(PlannedNodeCandidateSource::property_equality_index(
+            person_id,
+            region_info.index_id,
+            "region",
+            &PropValue::String("east".to_string()),
+            PlannerEstimate::upper_bound(east_count as u64),
+        )),
+    ]);
+    let driver = NodePhysicalPlan::intersect(vec![
+        union,
+        NodePhysicalPlan::source(PlannedNodeCandidateSource::property_equality_index(
+            person_id,
+            tier_info.index_id,
+            "tier",
+            &PropValue::String("keep".to_string()),
+            PlannerEstimate::upper_bound(keep_count as u64),
+        )),
+    ])
+    .into_streamed_mode();
+    let planned = PlannedNodeQuery {
+        driver,
+        execution_mode: NodeDriverExecutionMode::Streamed,
+        cap_context,
+        legal_universe_fallback: None,
+        warnings: Vec::new(),
+        followups: Vec::new(),
+    };
+    let policy_cutoffs = published.view.query_policy_cutoffs();
+
+    engine.reset_query_execution_counters_for_test();
+    let (page, followups) = published
+        .view
+        .query_node_page_planned(&normalized, planned, false, policy_cutoffs.as_ref())
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(page.ids, public_page.items);
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_intersect_drivers, 1);
+    assert_eq!(counters.streamed_union_drivers, 0);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+
+    drop(published);
+    drop(_guard);
+    engine.close().unwrap();
+}
+
+#[test]
+fn streamed_union_d2_buffer_overflow_falls_back_without_partial_results() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let score_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_property_index_state(&engine, score_info.index_id, SecondaryIndexState::Ready);
+
+    let total = EAGER_PREFERRED_SOURCE_MAX as usize + 64;
+    let mut inputs = Vec::with_capacity(total);
+    for ordinal in 0..total {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("streamed-d2-{ordinal}"),
+            props: query_test_props(&[
+                (
+                    "status",
+                    PropValue::String(if ordinal < 8 { "hot" } else { "cold" }.to_string()),
+                ),
+                ("score", PropValue::Int(ordinal as i64)),
+            ]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let expected = engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+    let person_id = engine.get_node_label_id("Person").unwrap().unwrap();
+
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: Some(NodeFilterExpr::Or(vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            NodeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(0))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(total as i64))),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(20),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let (_guard, published) = engine.runtime.published_snapshot().unwrap();
+    let normalized = published.view.normalize_node_query(&query).unwrap();
+    let cap_context = published.view.query_cap_context(&normalized).unwrap();
+    let driver = NodePhysicalPlan::streamed_union(vec![
+        NodePhysicalPlan::source(PlannedNodeCandidateSource::property_equality_index(
+            person_id,
+            status_info.index_id,
+            "status",
+            &PropValue::String("hot".to_string()),
+            PlannerEstimate::upper_bound(8),
+        )),
+        NodePhysicalPlan::BufferedIdSort(Box::new(NodePhysicalPlan::source(
+            PlannedNodeCandidateSource::property_range_index(
+                score_info.index_id,
+                "score",
+                Some(&PropertyRangeBound::Included(PropValue::Int(0))),
+                Some(&PropertyRangeBound::Included(PropValue::Int(total as i64))),
+                PlannerEstimate::upper_bound(1),
+            ),
+        ))),
+    ]);
+    let planned = PlannedNodeQuery {
+        driver,
+        execution_mode: NodeDriverExecutionMode::Streamed,
+        cap_context,
+        legal_universe_fallback: None,
+        warnings: Vec::new(),
+        followups: Vec::new(),
+    };
+    let policy_cutoffs = published.view.query_policy_cutoffs();
+
+    engine.reset_query_execution_counters_for_test();
+    let (page, followups) = published
+        .view
+        .query_node_page_planned(&normalized, planned, false, policy_cutoffs.as_ref())
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(page.ids, expected[..20].to_vec());
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_union_drivers, 1);
+    assert_eq!(counters.streamed_buffered_input_overflows, 1);
+    assert_eq!(counters.streamed_buffered_inputs, 0);
+    assert_eq!(counters.streamed_candidates_emitted, 0);
+
+    drop(published);
+    drop(_guard);
+    engine.close().unwrap();
+}
+
+#[test]
+fn streamed_union_leaf_overflow_demotes_inside_and() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let region_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("region")]),
+        )
+        .unwrap();
+    let score_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_property_index_state(&engine, region_info.index_id, SecondaryIndexState::Ready);
+    wait_for_property_index_state(&engine, score_info.index_id, SecondaryIndexState::Ready);
+
+    let total = EAGER_PREFERRED_SOURCE_MAX as usize + 64;
+    let keep_count = 64usize;
+    let mut inputs = Vec::with_capacity(total);
+    for ordinal in 0..total {
+        inputs.push(NodeInput {
+            labels: vec!["Person".to_string()],
+            key: format!("union-leaf-demote-{ordinal}"),
+            props: query_test_props(&[
+                (
+                    "status",
+                    PropValue::String(if ordinal < keep_count { "keep" } else { "drop" }.to_string()),
+                ),
+                (
+                    "region",
+                    PropValue::String(if ordinal % 7 == 0 { "west" } else { "east" }.to_string()),
+                ),
+                ("score", PropValue::Int(ordinal as i64)),
+            ]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    let ids = engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+    let expected = ids[..keep_count].to_vec();
+    let person_id = engine.get_node_label_id("Person").unwrap().unwrap();
+
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: Some(NodeFilterExpr::And(vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("keep".to_string()),
+            },
+            NodeFilterExpr::Or(vec![
+                NodeFilterExpr::PropertyEquals {
+                    key: "region".to_string(),
+                    value: PropValue::String("west".to_string()),
+                },
+                NodeFilterExpr::PropertyRange {
+                    key: "score".to_string(),
+                    lower: Some(PropertyRangeBound::Included(PropValue::Int(0))),
+                    upper: Some(PropertyRangeBound::Included(PropValue::Int(total as i64))),
+                },
+            ]),
+        ])),
+        ..Default::default()
+    };
+    let (_guard, published) = engine.runtime.published_snapshot().unwrap();
+    let normalized = published.view.normalize_node_query(&query).unwrap();
+    let cap_context = published.view.query_cap_context(&normalized).unwrap();
+    let union = NodePhysicalPlan::streamed_union(vec![
+        NodePhysicalPlan::source(PlannedNodeCandidateSource::property_equality_index(
+            person_id,
+            region_info.index_id,
+            "region",
+            &PropValue::String("west".to_string()),
+            PlannerEstimate::upper_bound((total / 7) as u64),
+        )),
+        NodePhysicalPlan::BufferedIdSort(Box::new(NodePhysicalPlan::source(
+            PlannedNodeCandidateSource::property_range_index(
+                score_info.index_id,
+                "score",
+                Some(&PropertyRangeBound::Included(PropValue::Int(0))),
+                Some(&PropertyRangeBound::Included(PropValue::Int(total as i64))),
+                PlannerEstimate::upper_bound(1),
+            ),
+        ))),
+    ]);
+    let driver = NodePhysicalPlan::intersect(vec![
+        NodePhysicalPlan::source(PlannedNodeCandidateSource::property_equality_index(
+            person_id,
+            status_info.index_id,
+            "status",
+            &PropValue::String("keep".to_string()),
+            PlannerEstimate::upper_bound(keep_count as u64),
+        )),
+        union,
+    ])
+    .into_streamed_mode();
+    let planned = PlannedNodeQuery {
+        driver,
+        execution_mode: NodeDriverExecutionMode::Streamed,
+        cap_context,
+        legal_universe_fallback: None,
+        warnings: Vec::new(),
+        followups: Vec::new(),
+    };
+    let policy_cutoffs = published.view.query_policy_cutoffs();
+
+    engine.reset_query_execution_counters_for_test();
+    let (page, followups) = published
+        .view
+        .query_node_page_planned(&normalized, planned, false, policy_cutoffs.as_ref())
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(page.ids, expected);
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_intersect_drivers, 1);
+    assert_eq!(counters.streamed_union_drivers, 0);
+    assert_eq!(counters.streamed_buffered_input_overflows, 1);
+    assert_eq!(counters.streamed_leaf_demotions, 1);
+    assert!(counters.streamed_candidates_emitted > 0);
+
+    drop(published);
+    drop(_guard);
+    engine.close().unwrap();
+}
+
+#[test]
+fn streamed_union_allows_flattened_or_of_ins_over_expansion_cap_when_cursors_fit() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+
+    let values_per_in = MAX_BOOLEAN_UNION_INPUTS - 6;
+    let values_total = values_per_in * 2;
+    let ids_per_value = 10usize;
+    let mut inputs = Vec::with_capacity(values_total * ids_per_value);
+    for value_ordinal in 0..values_total {
+        for local in 0..ids_per_value {
+            inputs.push(NodeInput {
+                labels: vec!["Person".to_string()],
+                key: format!("flat-union-{value_ordinal}-{local}"),
+                props: query_test_props(&[(
+                    "status",
+                    PropValue::String(format!("v{value_ordinal}")),
+                )]),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            });
+        }
+    }
+    let expected = engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+
+    let left_values: Vec<PropValue> = (0..values_per_in)
+        .map(|ordinal| PropValue::String(format!("v{ordinal}")))
+        .collect();
+    let right_values: Vec<PropValue> = (values_per_in..values_total)
+        .map(|ordinal| PropValue::String(format!("v{ordinal}")))
+        .collect();
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: Some(NodeFilterExpr::Or(vec![
+            NodeFilterExpr::PropertyIn {
+                key: "status".to_string(),
+                values: left_values,
+            },
+            NodeFilterExpr::PropertyIn {
+                key: "status".to_string(),
+                values: right_values,
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(17),
+            after: None,
+        },
+        ..Default::default()
+    };
+
+    let plan = engine.explain_node_query(&query).unwrap();
+    let QueryPlanNode::Union { inputs, mode } = explain_input_node(&plan) else {
+        panic!("expected streamed OR-of-IN union, got {plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(inputs.len(), values_total);
+    assert!(inputs.len() > MAX_BOOLEAN_UNION_INPUTS);
+
+    engine.reset_query_execution_counters_for_test();
+    let page = engine.query_node_ids(&query).unwrap();
+    assert_eq!(page.items, expected[..17].to_vec());
+    assert_eq!(page.next_cursor, Some(expected[16]));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_union_drivers, 1);
+    assert_eq!(counters.equality_materialization_record_reads, 0);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn streamed_or_declines_when_any_branch_is_not_streamable() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+
+    let active = insert_query_node(
+        &engine,
+        "Person",
+        "or-active",
+        &[("status", PropValue::String("active".to_string()))],
+        1.0,
+    );
+    let tagged = insert_query_node(
+        &engine,
+        "Person",
+        "or-tagged",
+        &[("tag", PropValue::String("yes".to_string()))],
+        1.0,
+    );
+    engine.flush().unwrap();
+
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: Some(NodeFilterExpr::Or(vec![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("active".to_string()),
+            },
+            NodeFilterExpr::PropertyExists {
+                key: "tag".to_string(),
+            },
+        ])),
+        ..Default::default()
+    };
+
+    let plan = engine.explain_node_query(&query).unwrap();
+    assert!(plan.warnings.contains(&QueryPlanWarning::BooleanBranchFallback));
+    assert!(plan.warnings.contains(&QueryPlanWarning::VerifyOnlyFilter));
+    assert_plan_input_nodes(&plan, vec![QueryPlanNode::FallbackNodeLabelScan]);
+
+    engine.reset_query_execution_counters_for_test();
+    let page = engine.query_node_ids(&query).unwrap();
+    assert_eq!(page.items, vec![active, tagged]);
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_union_drivers, 0);
+    assert_eq!(counters.streamed_intersect_drivers, 0);
+    assert_eq!(counters.streamed_single_source_drivers, 0);
+    assert_eq!(counters.streamed_buffered_inputs, 0);
+    assert_eq!(counters.streamed_buffered_input_overflows, 0);
+    assert_eq!(counters.streamed_leaf_demotions, 0);
+    assert_eq!(counters.streamed_cursor_seeks, 0);
+    assert_eq!(counters.streamed_candidates_emitted, 0);
+
+    engine.close().unwrap();
+}
+
+#[test]
+fn streamed_union_cursor_count_overflow_is_not_streamable() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let engine = DatabaseEngine::open(
+        &db_path,
+        &DbOptions {
+            compact_after_n_flushes: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    seed_query_test_catalog(&engine);
+    let status_info = engine
+        .ensure_node_property_index(
+            "Person",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+
+    let mut expected = Vec::new();
+    for segment in 0..17usize {
+        let mut inputs = Vec::with_capacity(MAX_BOOLEAN_UNION_INPUTS);
+        for value_ordinal in 0..MAX_BOOLEAN_UNION_INPUTS {
+            inputs.push(NodeInput {
+                labels: vec!["Person".to_string()],
+                key: format!("cursor-overflow-{segment}-{value_ordinal}"),
+                props: query_test_props(&[(
+                    "status",
+                    PropValue::String(format!("v{value_ordinal}")),
+                )]),
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            });
+        }
+        expected.extend(engine.batch_upsert_nodes(inputs).unwrap());
+        engine.flush().unwrap();
+    }
+
+    let person_id = engine.get_node_label_id("Person").unwrap().unwrap();
+    let (_guard, published) = engine.runtime.published_snapshot().unwrap();
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        ..Default::default()
+    };
+    let normalized = published.view.normalize_node_query(&query).unwrap();
+    let cap_context = published.view.query_cap_context(&normalized).unwrap();
+    let plans: Vec<NodePhysicalPlan> = (0..MAX_BOOLEAN_UNION_INPUTS)
+        .map(|ordinal| {
+            NodePhysicalPlan::source(PlannedNodeCandidateSource::property_equality_index(
+                person_id,
+                status_info.index_id,
+                "status",
+                &PropValue::String(format!("v{ordinal}")),
+                PlannerEstimate::upper_bound(1),
+            ))
+        })
+        .collect();
+
+    assert!(matches!(
+        published
+            .view
+            .streamed_union_plan_from_inputs(&plans, cap_context, None),
+        Err(StreamedInputRejection::CursorCountExceeded)
+    ));
+
+    drop(published);
+    drop(_guard);
+
+    let values: Vec<PropValue> = (0..MAX_BOOLEAN_UNION_INPUTS)
+        .map(|ordinal| PropValue::String(format!("v{ordinal}")))
+        .collect();
+    let query = NodeQuery {
+        label_filter: Some(node_label_filter(&["Person"], LabelMatchMode::All)),
+        filter: Some(NodeFilterExpr::PropertyIn {
+            key: "status".to_string(),
+            values,
+        }),
+        ..Default::default()
+    };
+    let plan = engine.explain_node_query(&query).unwrap();
+    if let QueryPlanNode::Union { mode, .. } = explain_input_node(&plan) {
+        assert_ne!(*mode, QueryPlanExecutionMode::Streamed, "{plan:?}");
+    }
+
+    engine.reset_query_execution_counters_for_test();
+    let page = engine.query_node_ids(&query).unwrap();
+    assert_eq!(page.items, expected);
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_union_drivers, 0);
+    assert_eq!(counters.streamed_intersect_drivers, 0);
+    assert_eq!(counters.streamed_single_source_drivers, 0);
+
     engine.close().unwrap();
 }
 
@@ -11755,7 +17710,7 @@ fn test_query_scan_parity_after_flush_reopen_overwrite_delete_and_prune() {
 
 
 #[test]
-fn test_query_broad_index_warning_priority_and_selective_source_choice() {
+fn test_query_broad_index_declines_streaming_for_small_source_choice() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
@@ -11809,10 +17764,30 @@ fn test_query_broad_index_warning_priority_and_selective_source_choice() {
         oracle_query_ids(&engine, &all_ids, &cap_query)
     );
     let cap_plan = engine.explain_node_query(&cap_query).unwrap();
-    assert!(cap_plan
-        .warnings
-        .contains(&QueryPlanWarning::CandidateCapExceeded));
+    assert!(
+        !cap_plan
+            .warnings
+            .contains(&QueryPlanWarning::CandidateCapExceeded),
+        "stream-declined equality rejects should not surface as cap warnings, got {:?}",
+        cap_plan.warnings
+    );
+    assert_eq!(
+        cap_plan.warnings,
+        vec![
+            QueryPlanWarning::IndexSkippedAsBroad,
+            QueryPlanWarning::VerifyOnlyFilter
+        ]
+    );
     assert_plan_input_nodes(&cap_plan, vec![QueryPlanNode::PropertyEqualityIndex]);
+
+    engine.reset_query_execution_counters_for_test();
+    assert_eq!(
+        engine.query_node_ids(&cap_query).unwrap().items,
+        oracle_query_ids(&engine, &all_ids, &cap_query)
+    );
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.streamed_intersect_drivers, 0);
+    assert_eq!(counters.streamed_single_source_drivers, 0);
 
     let broad_skip_query = query_ids(Some("Person"),
         vec![
@@ -11835,10 +17810,7 @@ fn test_query_broad_index_warning_priority_and_selective_source_choice() {
             QueryPlanWarning::VerifyOnlyFilter
         ]
     );
-    assert_plan_input_nodes(
-        &broad_skip_plan,
-        vec![QueryPlanNode::PropertyEqualityIndex],
-    );
+    assert_plan_input_nodes(&broad_skip_plan, vec![QueryPlanNode::PropertyEqualityIndex]);
 
     engine.close().unwrap();
 }
@@ -12042,6 +18014,7 @@ fn test_query_node_page_planned_preserves_planning_followups_for_core_outcomes()
 
     let empty_plan = PlannedNodeQuery {
         driver: NodePhysicalPlan::Empty,
+        execution_mode: NodeDriverExecutionMode::Eager,
         cap_context,
         legal_universe_fallback: None,
         warnings: Vec::new(),
@@ -12059,6 +18032,7 @@ fn test_query_node_page_planned_preserves_planning_followups_for_core_outcomes()
             person_id,
             PlannerEstimate::upper_bound(2),
         )),
+        execution_mode: NodeDriverExecutionMode::Eager,
         cap_context,
         legal_universe_fallback: None,
         warnings: Vec::new(),
@@ -12079,6 +18053,7 @@ fn test_query_node_page_planned_preserves_planning_followups_for_core_outcomes()
             &PropValue::String("active".to_string()),
             PlannerEstimate::upper_bound(1),
         )),
+        execution_mode: NodeDriverExecutionMode::Eager,
         cap_context,
         legal_universe_fallback: None,
         warnings: Vec::new(),
@@ -12158,6 +18133,7 @@ fn test_query_unknown_selected_index_source_falls_back_when_execution_cap_exceed
                     &PropValue::String("inactive".to_string()),
                     PlannerEstimate::unknown(),
             )),
+            execution_mode: NodeDriverExecutionMode::Eager,
             cap_context,
             legal_universe_fallback: None,
             warnings: Vec::new(),
@@ -12212,6 +18188,7 @@ fn test_query_unknown_selected_index_source_falls_back_when_execution_cap_exceed
                     PlannerEstimate::upper_bound(1),
                 )),
             ]),
+            execution_mode: NodeDriverExecutionMode::Eager,
             cap_context,
             legal_universe_fallback: None,
             warnings: Vec::new(),

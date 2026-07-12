@@ -368,6 +368,10 @@ def wait_for_edge_property_index_ready(db: OverGraph, index_id: int) -> None:
     raise RuntimeError(f"timed out waiting for edge property index {index_id} to become ready")
 
 
+def property_index_spec(prop_key: str, kind: str) -> dict[str, Any]:
+    return {"kind": kind, "fields": [{"source": "property", "key": prop_key}]}
+
+
 def query_benchmark_layout(preload_nodes: int) -> dict[str, int]:
     segments = 1 if preload_nodes >= 2 else 0
     segment_nodes = 0 if segments == 0 else max(1, preload_nodes // (segments + 1))
@@ -387,11 +391,11 @@ def query_bench_nodes(start: int, count: int) -> list[dict[str, Any]]:
 
 def build_query_benchmark_db(path: Path, preload_nodes: int) -> tuple[OverGraph, dict[str, int]]:
     db = OverGraph.open(str(path))
-    status = db.ensure_node_property_index("Person", "status", "equality")
+    status = db.ensure_node_property_index("Person", property_index_spec("status", "equality"))
     wait_for_property_index_ready(db, status.index_id)
-    tier = db.ensure_node_property_index("Person", "tier", "equality")
+    tier = db.ensure_node_property_index("Person", property_index_spec("tier", "equality"))
     wait_for_property_index_ready(db, tier.index_id)
-    score = db.ensure_node_property_index("Person", "score", "range")
+    score = db.ensure_node_property_index("Person", property_index_spec("score", "range"))
     wait_for_property_index_ready(db, score.index_id)
 
     layout = query_benchmark_layout(preload_nodes)
@@ -453,9 +457,9 @@ def build_indexed_edge_query_benchmark_db(
     preload_edges: int,
 ) -> tuple[OverGraph, dict[str, int], int]:
     db, layout, source_id = build_edge_query_benchmark_db(path, preload_edges)
-    role = db.ensure_edge_property_index("WORKS_AT", "role", "equality")
+    role = db.ensure_edge_property_index("WORKS_AT", property_index_spec("role", "equality"))
     wait_for_edge_property_index_ready(db, role.index_id)
-    score = db.ensure_edge_property_index("WORKS_AT", "score", "range")
+    score = db.ensure_edge_property_index("WORKS_AT", property_index_spec("score", "range"))
     wait_for_edge_property_index_ready(db, score.index_id)
     return db, layout, source_id
 
@@ -512,9 +516,9 @@ def build_graph_row_benchmark_db(path: Path, preload_edges: int) -> tuple[OverGr
             ]
         )
 
-    role = db.ensure_edge_property_index("WORKS_AT", "role", "equality")
+    role = db.ensure_edge_property_index("WORKS_AT", property_index_spec("role", "equality"))
     wait_for_edge_property_index_ready(db, role.index_id)
-    score = db.ensure_edge_property_index("WORKS_AT", "score", "range")
+    score = db.ensure_edge_property_index("WORKS_AT", property_index_spec("score", "range"))
     wait_for_edge_property_index_ready(db, score.index_id)
     return (
         db,

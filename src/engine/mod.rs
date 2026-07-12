@@ -3456,6 +3456,7 @@ pub(crate) struct PublishedReadSources {
 struct QueryPlanningProbeCounters {
     range: AtomicUsize,
     timestamp: AtomicUsize,
+    edge_validity_range_estimates: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -3463,6 +3464,7 @@ struct QueryPlanningProbeCounters {
 pub(crate) struct QueryPlanningProbeSnapshot {
     pub range: usize,
     pub timestamp: usize,
+    pub edge_validity_range_estimates: usize,
 }
 
 #[cfg(test)]
@@ -3472,14 +3474,34 @@ struct QueryExecutionCounters {
     node_visibility_meta_reads: AtomicUsize,
     edge_record_hydration_reads: AtomicUsize,
     edge_record_hydration_calls: AtomicUsize,
+    edge_verifier_metadata_lookup_calls: AtomicUsize,
+    edge_verifier_metadata_lookup_ids: AtomicUsize,
     equality_materialization_record_reads: AtomicUsize,
     final_verifier_record_reads: AtomicUsize,
     edge_full_scan_pages: AtomicUsize,
     endpoint_adjacency_candidates: AtomicUsize,
     graph_row_query_calls: AtomicUsize,
+    graph_row_delegated_edge_queries: AtomicUsize,
+    graph_row_delegated_verified_candidates: AtomicUsize,
     selected_field_reads: SelectedFieldReadCounters,
     public_node_query_calls: AtomicUsize,
     public_edge_query_calls: AtomicUsize,
+    streamed_intersect_drivers: AtomicUsize,
+    streamed_union_drivers: AtomicUsize,
+    streamed_single_source_drivers: AtomicUsize,
+    streamed_buffered_inputs: AtomicUsize,
+    streamed_buffered_input_overflows: AtomicUsize,
+    streamed_leaf_demotions: AtomicUsize,
+    streamed_cursor_seeks: AtomicUsize,
+    streamed_candidates_emitted: AtomicUsize,
+    streamed_edge_intersect_drivers: AtomicUsize,
+    streamed_edge_union_drivers: AtomicUsize,
+    streamed_edge_single_source_drivers: AtomicUsize,
+    streamed_edge_buffered_inputs: AtomicUsize,
+    streamed_edge_buffered_input_overflows: AtomicUsize,
+    streamed_edge_leaf_demotions: AtomicUsize,
+    streamed_edge_cursor_seeks: AtomicUsize,
+    streamed_edge_candidates_emitted: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -3489,11 +3511,15 @@ pub(crate) struct QueryExecutionCounterSnapshot {
     pub node_visibility_meta_reads: usize,
     pub edge_record_hydration_reads: usize,
     pub edge_record_hydration_calls: usize,
+    pub edge_verifier_metadata_lookup_calls: usize,
+    pub edge_verifier_metadata_lookup_ids: usize,
     pub equality_materialization_record_reads: usize,
     pub final_verifier_record_reads: usize,
     pub edge_full_scan_pages: usize,
     pub endpoint_adjacency_candidates: usize,
     pub graph_row_query_calls: usize,
+    pub graph_row_delegated_edge_queries: usize,
+    pub graph_row_delegated_verified_candidates: usize,
     pub node_selected_field_batches: usize,
     pub node_selected_field_ids: usize,
     pub edge_selected_field_batches: usize,
@@ -3502,6 +3528,22 @@ pub(crate) struct QueryExecutionCounterSnapshot {
     pub node_sparse_vector_projection_reads: usize,
     pub public_node_query_calls: usize,
     pub public_edge_query_calls: usize,
+    pub streamed_intersect_drivers: usize,
+    pub streamed_union_drivers: usize,
+    pub streamed_single_source_drivers: usize,
+    pub streamed_buffered_inputs: usize,
+    pub streamed_buffered_input_overflows: usize,
+    pub streamed_leaf_demotions: usize,
+    pub streamed_cursor_seeks: usize,
+    pub streamed_candidates_emitted: usize,
+    pub streamed_edge_intersect_drivers: usize,
+    pub streamed_edge_union_drivers: usize,
+    pub streamed_edge_single_source_drivers: usize,
+    pub streamed_edge_buffered_inputs: usize,
+    pub streamed_edge_buffered_input_overflows: usize,
+    pub streamed_edge_leaf_demotions: usize,
+    pub streamed_edge_cursor_seeks: usize,
+    pub streamed_edge_candidates_emitted: usize,
 }
 
 /// Published read-visible snapshot for CP1 point/dedup reads.
@@ -5240,6 +5282,13 @@ impl ReadView {
     }
 
     #[cfg(test)]
+    fn note_edge_validity_range_estimate(&self) {
+        self.planning_probe_counters
+            .edge_validity_range_estimates
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
     fn note_node_record_hydration_reads(&self, count: usize) {
         self.query_execution_counters
             .node_record_hydration_reads
@@ -5264,6 +5313,16 @@ impl ReadView {
     }
 
     #[cfg(test)]
+    fn note_edge_verifier_metadata_lookup(&self, count: usize) {
+        self.query_execution_counters
+            .edge_verifier_metadata_lookup_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.query_execution_counters
+            .edge_verifier_metadata_lookup_ids
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
     fn note_equality_materialization_record_reads(&self, count: usize) {
         self.query_execution_counters
             .equality_materialization_record_reads
@@ -5282,6 +5341,134 @@ impl ReadView {
         self.query_execution_counters
             .endpoint_adjacency_candidates
             .fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_delegated_edge_query(&self) {
+        self.query_execution_counters
+            .graph_row_delegated_edge_queries
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_delegated_verified_candidates(&self, count: usize) {
+        self.query_execution_counters
+            .graph_row_delegated_verified_candidates
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_streamed_intersect_driver(&self) {
+        self.query_execution_counters
+            .streamed_intersect_drivers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // CP40.3 wires streamed union execution.
+    fn note_streamed_union_driver(&self) {
+        self.query_execution_counters
+            .streamed_union_drivers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_streamed_single_source_driver(&self) {
+        self.query_execution_counters
+            .streamed_single_source_drivers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_streamed_buffered_input(&self) {
+        self.query_execution_counters
+            .streamed_buffered_inputs
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_streamed_buffered_input_overflow(&self) {
+        self.query_execution_counters
+            .streamed_buffered_input_overflows
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_streamed_leaf_demotion(&self) {
+        self.query_execution_counters
+            .streamed_leaf_demotions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_streamed_cursor_seek(&self) {
+        self.query_execution_counters
+            .streamed_cursor_seeks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_streamed_candidate_emitted(&self) {
+        self.query_execution_counters
+            .streamed_candidates_emitted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_streamed_edge_intersect_driver(&self) {
+        self.query_execution_counters
+            .streamed_edge_intersect_drivers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // CP41.3 wires streamed edge union execution.
+    fn note_streamed_edge_union_driver(&self) {
+        self.query_execution_counters
+            .streamed_edge_union_drivers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_streamed_edge_single_source_driver(&self) {
+        self.query_execution_counters
+            .streamed_edge_single_source_drivers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_streamed_edge_buffered_input(&self) {
+        self.query_execution_counters
+            .streamed_edge_buffered_inputs
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_streamed_edge_buffered_input_overflow(&self) {
+        self.query_execution_counters
+            .streamed_edge_buffered_input_overflows
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_streamed_edge_leaf_demotion(&self) {
+        self.query_execution_counters
+            .streamed_edge_leaf_demotions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_streamed_edge_cursor_seek(&self) {
+        self.query_execution_counters
+            .streamed_edge_cursor_seeks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_streamed_edge_candidate_emitted(&self) {
+        self.query_execution_counters
+            .streamed_edge_candidates_emitted
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn node_property_index_entry(
@@ -7178,6 +7365,11 @@ impl DatabaseEngine {
                 .planning_probe_counters
                 .timestamp
                 .load(Ordering::Relaxed),
+            edge_validity_range_estimates: published
+                .view
+                .planning_probe_counters
+                .edge_validity_range_estimates
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -7193,6 +7385,11 @@ impl DatabaseEngine {
             .view
             .planning_probe_counters
             .timestamp
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .planning_probe_counters
+            .edge_validity_range_estimates
             .store(0, Ordering::Relaxed);
     }
 
@@ -7222,6 +7419,16 @@ impl DatabaseEngine {
                 .query_execution_counters
                 .edge_record_hydration_calls
                 .load(Ordering::Relaxed),
+            edge_verifier_metadata_lookup_calls: published
+                .view
+                .query_execution_counters
+                .edge_verifier_metadata_lookup_calls
+                .load(Ordering::Relaxed),
+            edge_verifier_metadata_lookup_ids: published
+                .view
+                .query_execution_counters
+                .edge_verifier_metadata_lookup_ids
+                .load(Ordering::Relaxed),
             equality_materialization_record_reads: published
                 .view
                 .query_execution_counters
@@ -7246,6 +7453,16 @@ impl DatabaseEngine {
                 .view
                 .query_execution_counters
                 .graph_row_query_calls
+                .load(Ordering::Relaxed),
+            graph_row_delegated_edge_queries: published
+                .view
+                .query_execution_counters
+                .graph_row_delegated_edge_queries
+                .load(Ordering::Relaxed),
+            graph_row_delegated_verified_candidates: published
+                .view
+                .query_execution_counters
+                .graph_row_delegated_verified_candidates
                 .load(Ordering::Relaxed),
             node_selected_field_batches: published
                 .view
@@ -7287,6 +7504,86 @@ impl DatabaseEngine {
                 .query_execution_counters
                 .public_edge_query_calls
                 .load(Ordering::Relaxed),
+            streamed_intersect_drivers: published
+                .view
+                .query_execution_counters
+                .streamed_intersect_drivers
+                .load(Ordering::Relaxed),
+            streamed_union_drivers: published
+                .view
+                .query_execution_counters
+                .streamed_union_drivers
+                .load(Ordering::Relaxed),
+            streamed_single_source_drivers: published
+                .view
+                .query_execution_counters
+                .streamed_single_source_drivers
+                .load(Ordering::Relaxed),
+            streamed_buffered_inputs: published
+                .view
+                .query_execution_counters
+                .streamed_buffered_inputs
+                .load(Ordering::Relaxed),
+            streamed_buffered_input_overflows: published
+                .view
+                .query_execution_counters
+                .streamed_buffered_input_overflows
+                .load(Ordering::Relaxed),
+            streamed_leaf_demotions: published
+                .view
+                .query_execution_counters
+                .streamed_leaf_demotions
+                .load(Ordering::Relaxed),
+            streamed_cursor_seeks: published
+                .view
+                .query_execution_counters
+                .streamed_cursor_seeks
+                .load(Ordering::Relaxed),
+            streamed_candidates_emitted: published
+                .view
+                .query_execution_counters
+                .streamed_candidates_emitted
+                .load(Ordering::Relaxed),
+            streamed_edge_intersect_drivers: published
+                .view
+                .query_execution_counters
+                .streamed_edge_intersect_drivers
+                .load(Ordering::Relaxed),
+            streamed_edge_union_drivers: published
+                .view
+                .query_execution_counters
+                .streamed_edge_union_drivers
+                .load(Ordering::Relaxed),
+            streamed_edge_single_source_drivers: published
+                .view
+                .query_execution_counters
+                .streamed_edge_single_source_drivers
+                .load(Ordering::Relaxed),
+            streamed_edge_buffered_inputs: published
+                .view
+                .query_execution_counters
+                .streamed_edge_buffered_inputs
+                .load(Ordering::Relaxed),
+            streamed_edge_buffered_input_overflows: published
+                .view
+                .query_execution_counters
+                .streamed_edge_buffered_input_overflows
+                .load(Ordering::Relaxed),
+            streamed_edge_leaf_demotions: published
+                .view
+                .query_execution_counters
+                .streamed_edge_leaf_demotions
+                .load(Ordering::Relaxed),
+            streamed_edge_cursor_seeks: published
+                .view
+                .query_execution_counters
+                .streamed_edge_cursor_seeks
+                .load(Ordering::Relaxed),
+            streamed_edge_candidates_emitted: published
+                .view
+                .query_execution_counters
+                .streamed_edge_candidates_emitted
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -7316,6 +7613,16 @@ impl DatabaseEngine {
         published
             .view
             .query_execution_counters
+            .edge_verifier_metadata_lookup_calls
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .edge_verifier_metadata_lookup_ids
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
             .equality_materialization_record_reads
             .store(0, Ordering::Relaxed);
         published
@@ -7341,6 +7648,16 @@ impl DatabaseEngine {
         published
             .view
             .query_execution_counters
+            .graph_row_delegated_edge_queries
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_delegated_verified_candidates
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
             .selected_field_reads
             .reset();
         published
@@ -7352,6 +7669,86 @@ impl DatabaseEngine {
             .view
             .query_execution_counters
             .public_edge_query_calls
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_intersect_drivers
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_union_drivers
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_single_source_drivers
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_buffered_inputs
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_buffered_input_overflows
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_leaf_demotions
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_cursor_seeks
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_candidates_emitted
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_edge_intersect_drivers
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_edge_union_drivers
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_edge_single_source_drivers
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_edge_buffered_inputs
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_edge_buffered_input_overflows
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_edge_leaf_demotions
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_edge_cursor_seeks
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .streamed_edge_candidates_emitted
             .store(0, Ordering::Relaxed);
     }
 
@@ -12415,7 +12812,10 @@ include!("write.rs");
 include!("read.rs");
 include!("schema_management.rs");
 include!("query_ir.rs");
+include!("stream_core.rs");
+include!("node_stream.rs");
 include!("query_plan.rs");
+include!("edge_stream.rs");
 include!("projection.rs");
 include!("query_exec.rs");
 include!("pipeline_ir.rs");

@@ -56,6 +56,17 @@ def plan_has_kind(node, kind):
     return any(plan_has_kind(child, kind) for child in node.get("inputs", []))
 
 
+def plan_nodes(node, kind):
+    if not node:
+        return []
+    matches = [node] if node.get("kind") == kind else []
+    if "input" in node:
+        matches.extend(plan_nodes(node["input"], kind))
+    for child in node.get("inputs", []):
+        matches.extend(plan_nodes(child, kind))
+    return matches
+
+
 def property_index_spec(prop_key, kind):
     return {"kind": kind, "fields": [{"source": "property", "key": prop_key}]}
 
@@ -310,6 +321,299 @@ class TestPropertyIndexes:
         assert plan_has_kind(plan["root"], "compound_range_index")
         assert db.drop_node_property_index("Person", compound_spec) is True
         assert db.drop_node_property_index("Person", compound_spec) is False
+
+    def test_streamed_explain_serialization_and_result_parity(self, db):
+        label = "PyStreamParity"
+        for key, kind in [
+            ("status", "equality"),
+            ("region", "equality"),
+            ("score", "range"),
+            ("tenant", "equality"),
+            ("cohort", "equality"),
+        ]:
+            db.ensure_node_property_index(label, property_index_spec(key, kind))
+        for key, kind in [
+            ("status", "equality"),
+            ("region", "equality"),
+            ("score", "range"),
+            ("tenant", "equality"),
+            ("cohort", "equality"),
+        ]:
+            wait_for_index_state(
+                db,
+                lambda infos, key=key, kind=kind: next(
+                    (
+                        info
+                        for info in infos
+                        if info.label == label and has_property_field(info, key) and info.kind == kind
+                    ),
+                    None,
+                ),
+            )
+
+        total = 10_000
+        ids = db.batch_upsert_nodes(
+            [
+                {
+                    "labels": [label],
+                    "key": f"py-stream-parity-{ordinal}",
+                    "props": {
+                        "status": "hot" if ordinal < 5_000 else "cold",
+                        "region": "east" if ordinal % 2 == 0 else "west",
+                        "score": ordinal,
+                        "tenant": "tiny" if ordinal < 100 else "other",
+                        "cohort": "focus" if ordinal < 300 else "other",
+                    },
+                }
+                for ordinal in range(total)
+            ]
+        )
+        db.flush()
+
+        label_filter = {"labels": [label], "mode": "all"}
+        eager_intersect_query = {
+            "label_filter": label_filter,
+            "filter": {"and": [{"property": "tenant", "eq": "tiny"}, {"property": "cohort", "eq": "focus"}]},
+            "limit": 25,
+        }
+        streamed_intersect_query = {
+            "label_filter": label_filter,
+            "filter": {"and": [{"property": "status", "eq": "hot"}, {"property": "region", "eq": "east"}]},
+            "limit": 25,
+        }
+        streamed_union_query = {
+            "label_filter": label_filter,
+            "filter": {"property": "status", "in": ["hot", "cold"]},
+            "limit": 25,
+        }
+        streamed_source_query = {
+            "label_filter": label_filter,
+            "filter": {"property": "status", "eq": "hot"},
+            "limit": 25,
+        }
+        buffered_range_query = {
+            "label_filter": label_filter,
+            "filter": {"and": [{"property": "status", "eq": "hot"}, {"property": "score", "gte": 0, "lte": 2_999}]},
+            "limit": 25,
+        }
+        capped_range_query = {
+            "label_filter": label_filter,
+            "filter": {"and": [{"property": "tenant", "eq": "tiny"}, {"property": "score", "gte": 0, "lte": 8_999}]},
+            "limit": 25,
+        }
+
+        eager_intersect = plan_nodes(db.explain_node_query(eager_intersect_query)["root"], "intersect")[0]
+        assert eager_intersect["mode"] == "eager"
+
+        streamed_intersect_plan = db.explain_node_query(streamed_intersect_query)
+        streamed_intersect = plan_nodes(streamed_intersect_plan["root"], "intersect")[0]
+        assert streamed_intersect["mode"] == "streamed"
+        assert db.query_node_ids(streamed_intersect_query).items.to_list() == [
+            node_id for ordinal, node_id in enumerate(ids) if ordinal < 5_000 and ordinal % 2 == 0
+        ][:25]
+
+        streamed_union = plan_nodes(db.explain_node_query(streamed_union_query)["root"], "union")[0]
+        assert streamed_union["mode"] == "streamed"
+        assert db.query_node_ids(streamed_union_query).items.to_list() == ids[:25]
+
+        streamed_source = plan_nodes(db.explain_node_query(streamed_source_query)["root"], "streamed_source")[0]
+        assert streamed_source["input"]["kind"] == "property_equality_index"
+        assert db.query_node_ids(streamed_source_query).items.to_list() == ids[:25]
+
+        buffered_plan = db.explain_node_query(buffered_range_query)
+        buffered_intersect = plan_nodes(buffered_plan["root"], "intersect")[0]
+        assert buffered_intersect["mode"] == "streamed"
+        buffered = plan_nodes(buffered_plan["root"], "buffered_id_sort")[0]
+        assert buffered["input"]["kind"] == "property_range_index"
+        assert db.query_node_ids(buffered_range_query).items.to_list() == ids[:25]
+
+        capped_plan = db.explain_node_query(capped_range_query)
+        assert capped_plan["warnings"] == ["index_skipped_as_broad", "verify_only_filter"]
+        assert len(plan_nodes(capped_plan["root"], "property_equality_index")) == 1
+        assert len(plan_nodes(capped_plan["root"], "property_range_index")) == 0
+        assert len(plan_nodes(capped_plan["root"], "buffered_id_sort")) == 0
+        assert db.query_node_ids(capped_range_query).items.to_list() == ids[:25]
+
+        edge_label = "PY_STREAM_PARITY_EDGE"
+        for key, kind in [
+            ("status", "equality"),
+            ("region", "equality"),
+            ("score", "range"),
+            ("tenant", "equality"),
+        ]:
+            db.ensure_edge_property_index(edge_label, property_index_spec(key, kind))
+        for key, kind in [
+            ("status", "equality"),
+            ("region", "equality"),
+            ("score", "range"),
+            ("tenant", "equality"),
+        ]:
+            wait_for_edge_index_state(
+                db,
+                lambda infos, key=key, kind=kind: next(
+                    (
+                        info
+                        for info in infos
+                        if info.label == edge_label and has_property_field(info, key) and info.kind == kind
+                    ),
+                    None,
+                ),
+            )
+
+        edge_source = db.upsert_node("PyStreamParityEdgeNode", "source")
+        edge_targets = db.batch_upsert_nodes(
+            [
+                {"labels": ["PyStreamParityEdgeNode"], "key": f"target-{ordinal}"}
+                for ordinal in range(9_000)
+            ]
+        )
+        edge_ids = db.batch_upsert_edges(
+            [
+                {
+                    "from_id": edge_source,
+                    "to_id": to,
+                    "label": edge_label,
+                    "props": {
+                        "status": "hot" if ordinal < 5_000 else "cold",
+                        "region": "east" if ordinal % 2 == 0 else "west",
+                        "score": ordinal,
+                        "tenant": "tiny" if ordinal < 100 else "other",
+                    },
+                }
+                for ordinal, to in enumerate(edge_targets)
+            ]
+        )
+        db.flush()
+
+        edge_streamed_intersect_query = {
+            "label": edge_label,
+            "filter": {"and": [{"property": "status", "eq": "hot"}, {"property": "region", "eq": "east"}]},
+            "limit": 25,
+        }
+        edge_streamed_union_query = {
+            "label": edge_label,
+            "filter": {"property": "status", "in": ["hot", "cold"]},
+            "limit": 25,
+        }
+        edge_streamed_source_query = {
+            "label": edge_label,
+            "filter": {"property": "status", "eq": "hot"},
+            "limit": 25,
+        }
+        edge_buffered_range_query = {
+            "label": edge_label,
+            "filter": {"and": [{"property": "status", "eq": "hot"}, {"property": "score", "gte": 0, "lte": 2_999}]},
+            "limit": 25,
+        }
+        edge_capped_range_query = {
+            "label": edge_label,
+            "filter": {"and": [{"property": "tenant", "eq": "tiny"}, {"property": "score", "gte": 0, "lte": 7_999}]},
+            "limit": 25,
+        }
+
+        edge_streamed_intersect = plan_nodes(db.explain_edge_query(edge_streamed_intersect_query)["root"], "intersect")[0]
+        assert edge_streamed_intersect["mode"] == "streamed"
+        assert db.query_edge_ids(edge_streamed_intersect_query).items.to_list() == [
+            edge_id for ordinal, edge_id in enumerate(edge_ids) if ordinal < 5_000 and ordinal % 2 == 0
+        ][:25]
+
+        edge_streamed_union = plan_nodes(db.explain_edge_query(edge_streamed_union_query)["root"], "union")[0]
+        assert edge_streamed_union["mode"] == "streamed"
+        assert db.query_edge_ids(edge_streamed_union_query).items.to_list() == edge_ids[:25]
+
+        edge_streamed_source = plan_nodes(db.explain_edge_query(edge_streamed_source_query)["root"], "streamed_source")[0]
+        assert edge_streamed_source["input"]["kind"] == "edge_property_equality_index"
+        assert db.query_edge_ids(edge_streamed_source_query).items.to_list() == edge_ids[:25]
+
+        edge_buffered_plan = db.explain_edge_query(edge_buffered_range_query)
+        edge_buffered_intersect = plan_nodes(edge_buffered_plan["root"], "intersect")[0]
+        assert edge_buffered_intersect["mode"] == "streamed"
+        edge_buffered = plan_nodes(edge_buffered_plan["root"], "buffered_id_sort")[0]
+        assert edge_buffered["input"]["kind"] == "edge_property_range_index"
+        assert db.query_edge_ids(edge_buffered_range_query).items.to_list() == edge_ids[:25]
+
+        edge_capped_plan = db.explain_edge_query(edge_capped_range_query)
+        assert edge_capped_plan["warnings"] == [
+            "index_skipped_as_broad",
+            "candidate_cap_exceeded",
+            "verify_only_filter",
+        ]
+        assert len(plan_nodes(edge_capped_plan["root"], "edge_property_equality_index")) == 1
+        assert len(plan_nodes(edge_capped_plan["root"], "edge_property_range_index")) == 0
+        assert len(plan_nodes(edge_capped_plan["root"], "buffered_id_sort")) == 0
+        assert db.query_edge_ids(edge_capped_range_query).items.to_list() == edge_ids[:25]
+
+        gql_streamed = db.execute_gql(
+            f"""
+            MATCH (source)-[edge:{edge_label}]->(target)
+            WHERE id(source) = {edge_source} AND edge.status = 'hot' AND edge.region = 'east'
+            RETURN id(edge) AS edge_id, id(target) AS target_id
+            ORDER BY id(edge) LIMIT 25
+            """,
+            include_plan=True,
+        )
+        expected_gql_rows = [
+            {"edge_id": edge_id, "target_id": edge_targets[ordinal]}
+            for ordinal, edge_id in enumerate(edge_ids)
+            if ordinal < 5_000 and ordinal % 2 == 0
+        ][:25]
+        assert gql_streamed["rows"] == expected_gql_rows
+        assert len(gql_streamed["rows"]) == 25
+        assert any("edge.status" in item for item in gql_streamed["plan"]["read"]["pushed_down"])
+        assert any("edge.region" in item for item in gql_streamed["plan"]["read"]["pushed_down"])
+        gql_runtime_plan = "\n".join(gql_streamed["plan"]["read"]["projection"])
+        for fragment in [
+            "GraphRowSourceRead",
+            "DelegatedEdgeQuery",
+            "EdgeCandidateSource",
+            "EdgePropertyEqualityIndex",
+            "planned_modes=streamed",
+            "planned_warnings=[",
+        ]:
+            assert fragment in gql_runtime_plan, (
+                f"missing executed delegated GQL plan fragment {fragment!r}: {gql_runtime_plan}"
+            )
+
+        small_edge_label = "PY_STREAM_PARITY_EDGE_SMALL"
+        db.ensure_edge_property_index(small_edge_label, property_index_spec("status", "equality"))
+        wait_for_edge_index_state(
+            db,
+            lambda infos: next(
+                (
+                    info
+                    for info in infos
+                    if info.label == small_edge_label and has_property_field(info, "status") and info.kind == "equality"
+                ),
+                None,
+            ),
+        )
+        small_targets = db.batch_upsert_nodes(
+            [
+                {"labels": ["PyStreamParitySmallEdgeNode"], "key": f"small-target-{ordinal}"}
+                for ordinal in range(100)
+            ]
+        )
+        db.batch_upsert_edges(
+            [
+                {
+                    "from_id": edge_source,
+                    "to_id": to,
+                    "label": small_edge_label,
+                    "props": {"status": "hot" if ordinal < 50 else "cold"},
+                }
+                for ordinal, to in enumerate(small_targets)
+            ]
+        )
+        db.flush()
+        small_edge_plan = db.explain_edge_query(
+            {
+                "label": small_edge_label,
+                "filter": {"property": "status", "eq": "hot"},
+                "limit": 25,
+            }
+        )
+        assert len(plan_nodes(small_edge_plan["root"], "edge_property_equality_index")) == 1
+        assert len(plan_nodes(small_edge_plan["root"], "streamed_source")) == 0
 
 
 @pytest.mark.asyncio

@@ -7921,13 +7921,23 @@ fn query_plan_node_to_js(node: QueryPlanNode) -> serde_json::Value {
         QueryPlanNode::EdgePropertyRangeIndex => {
             serde_json::json!({ "kind": "edge_property_range_index" })
         }
-        QueryPlanNode::Intersect { inputs } => serde_json::json!({
+        QueryPlanNode::Intersect { inputs, mode } => serde_json::json!({
             "kind": "intersect",
+            "mode": query_plan_execution_mode_to_js(mode),
             "inputs": inputs.into_iter().map(query_plan_node_to_js).collect::<Vec<_>>(),
         }),
-        QueryPlanNode::Union { inputs } => serde_json::json!({
+        QueryPlanNode::Union { inputs, mode } => serde_json::json!({
             "kind": "union",
+            "mode": query_plan_execution_mode_to_js(mode),
             "inputs": inputs.into_iter().map(query_plan_node_to_js).collect::<Vec<_>>(),
+        }),
+        QueryPlanNode::StreamedSource { input } => serde_json::json!({
+            "kind": "streamed_source",
+            "input": query_plan_node_to_js(*input),
+        }),
+        QueryPlanNode::BufferedIdSort { input } => serde_json::json!({
+            "kind": "buffered_id_sort",
+            "input": query_plan_node_to_js(*input),
         }),
         QueryPlanNode::VerifyNodeFilter { input } => serde_json::json!({
             "kind": "verify_node_filter",
@@ -7954,6 +7964,13 @@ fn query_plan_node_to_js(node: QueryPlanNode) -> serde_json::Value {
             serde_json::json!({ "kind": "fallback_full_edge_scan" })
         }
         QueryPlanNode::EmptyResult => serde_json::json!({ "kind": "empty_result" }),
+    }
+}
+
+fn query_plan_execution_mode_to_js(mode: overgraph::QueryPlanExecutionMode) -> &'static str {
+    match mode {
+        overgraph::QueryPlanExecutionMode::Eager => "eager",
+        overgraph::QueryPlanExecutionMode::Streamed => "streamed",
     }
 }
 
@@ -8016,6 +8033,7 @@ fn query_plan_warning_to_js(warning: &QueryPlanWarning) -> &'static str {
         QueryPlanWarning::BooleanBranchFallback => "boolean_branch_fallback",
         QueryPlanWarning::PlanningProbeBudgetExceeded => "planning_probe_budget_exceeded",
         QueryPlanWarning::CompoundIndexPrefixNotSatisfied => "compound_index_prefix_not_satisfied",
+        QueryPlanWarning::StreamedInputBufferCapExceeded => "streamed_input_buffer_cap_exceeded",
         QueryPlanWarning::UnknownNodeLabel => "unknown_node_label",
         QueryPlanWarning::UnknownEdgeLabel => "unknown_edge_label",
     }

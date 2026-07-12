@@ -59,6 +59,21 @@ struct VerifiedEdgePage {
     next_cursor: Option<u64>,
 }
 
+struct VerifiedEdgeMetadataPage {
+    metadata: Vec<EdgeMetadataForQuery>,
+    next_cursor: Option<u64>,
+}
+
+enum VerifiedEdgeMetadataMaterializationResult {
+    Ready {
+        metadata: Vec<EdgeMetadataForQuery>,
+        followups: Vec<SecondaryIndexReadFollowup>,
+    },
+    TooBroad {
+        followups: Vec<SecondaryIndexReadFollowup>,
+    },
+}
+
 enum CandidateMaterializationResult {
     Ready {
         ids: Vec<u64>,
@@ -365,7 +380,8 @@ fn edge_plan_is_filter_source(plan: &EdgePhysicalPlan) -> bool {
                 | EdgeQueryCandidateSourceKind::CompoundRangeIndex
                 | EdgeQueryCandidateSourceKind::EdgeMetadataScan
         ),
-        EdgePhysicalPlan::Intersect(inputs) | EdgePhysicalPlan::Union(inputs) => {
+        EdgePhysicalPlan::BufferedIdSort(input) => edge_plan_is_filter_source(input),
+        EdgePhysicalPlan::Intersect { inputs, .. } | EdgePhysicalPlan::Union { inputs, .. } => {
             inputs.iter().all(edge_plan_is_filter_source)
         }
         EdgePhysicalPlan::Empty => false,
@@ -408,24 +424,19 @@ fn finalize_verified_page(
     }
 }
 
-fn finalize_verified_edge_page(
-    mut ids: Vec<u64>,
-    mut edges: Vec<EdgeRecord>,
+fn finalize_verified_edge_metadata_page(
+    mut metadata: Vec<EdgeMetadataForQuery>,
     limit: usize,
-) -> VerifiedEdgePage {
-    let next_cursor = if limit > 0 && ids.len() > limit {
-        ids.truncate(limit);
-        if !edges.is_empty() {
-            edges.truncate(limit);
-        }
-        ids.last().copied()
+) -> VerifiedEdgeMetadataPage {
+    let next_cursor = if limit > 0 && metadata.len() > limit {
+        metadata.truncate(limit);
+        metadata.last().map(|meta| meta.id)
     } else {
         None
     };
 
-    VerifiedEdgePage {
-        ids,
-        edges,
+    VerifiedEdgeMetadataPage {
+        metadata,
         next_cursor,
     }
 }
@@ -446,7 +457,8 @@ fn edge_physical_plan_contains_compound(plan: &EdgePhysicalPlan) -> bool {
             EdgeCandidateMaterialization::CompoundPrefixIndex { .. }
                 | EdgeCandidateMaterialization::CompoundRangeIndex { .. }
         ),
-        EdgePhysicalPlan::Intersect(inputs) | EdgePhysicalPlan::Union(inputs) => {
+        EdgePhysicalPlan::BufferedIdSort(input) => edge_physical_plan_contains_compound(input),
+        EdgePhysicalPlan::Intersect { inputs, .. } | EdgePhysicalPlan::Union { inputs, .. } => {
             inputs.iter().any(edge_physical_plan_contains_compound)
         }
     }
@@ -1322,6 +1334,47 @@ struct GraphRowVlpSearchResult {
     paths: Vec<GraphPath>,
 }
 
+#[derive(Default)]
+struct GraphRowVlpDelegatedStepStats {
+    queries: usize,
+    verified_step_edges: usize,
+    planned_modes: BTreeSet<&'static str>,
+    planned_warnings: BTreeSet<&'static str>,
+}
+
+impl GraphRowVlpDelegatedStepStats {
+    fn record(
+        &mut self,
+        queries: usize,
+        verified_step_edges: usize,
+        planned_modes: Vec<&'static str>,
+        planned_warnings: Vec<&'static str>,
+    ) {
+        self.queries = self.queries.saturating_add(queries);
+        self.verified_step_edges = self
+            .verified_step_edges
+            .saturating_add(verified_step_edges);
+        self.planned_modes.extend(planned_modes);
+        self.planned_warnings.extend(planned_warnings);
+    }
+
+    fn detail(&self, search_cache_hits: usize) -> Option<String> {
+        (self.queries > 0).then(|| {
+            format!(
+                "; step_source=DelegatedEdgeQuery{{queries={}; verified_step_edges={}; planned_modes={}; planned_warnings=[{}]; search_cache_hits={search_cache_hits}}}",
+                self.queries,
+                self.verified_step_edges,
+                self.planned_modes.iter().copied().collect::<Vec<_>>().join("|"),
+                self.planned_warnings
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+    }
+}
+
 struct GraphRowPartialPath {
     current: u64,
     nodes: Vec<u64>,
@@ -1357,6 +1410,7 @@ enum GraphRowEdgeCandidateSourceChoice {
     ExplicitIds,
     EndpointAdjacency,
     EdgeCandidateSource,
+    DelegatedEdgeQuery,
     MixedEndpointAndEdgeSource,
     EmptyResult,
     SkippedEmptyFrontier,
@@ -1376,11 +1430,30 @@ enum GraphRowEdgeSourceRead {
     NoLegalSource,
 }
 
+enum GraphRowDelegatedEdgeSourceRead {
+    Ready {
+        metadata: Vec<EdgeMetadataForQuery>,
+        verified_candidates: usize,
+        followups: Vec<SecondaryIndexReadFollowup>,
+        buckets: Vec<&'static str>,
+        label_branches: usize,
+        drivers: Vec<String>,
+        planned_modes: Vec<&'static str>,
+        planned_warnings: Vec<&'static str>,
+    },
+    NoLegalSource,
+}
+
 #[derive(Clone, Copy)]
 struct GraphRowOrientedEdge {
     meta: EdgeMetadataForQuery,
     logical_from: u64,
     logical_to: u64,
+}
+
+struct GraphRowFixedEdgeCandidates {
+    edges: Vec<GraphRowOrientedEdge>,
+    endpoints_verified: bool,
 }
 
 struct GraphRowEdgeCandidateBuckets {
@@ -1427,6 +1500,39 @@ fn graph_row_record_frontier_cap_peak(
         });
     }
     Ok(())
+}
+
+fn graph_row_merge_delegated_metadata(
+    target: &mut Vec<EdgeMetadataForQuery>,
+    incoming: Vec<EdgeMetadataForQuery>,
+) {
+    if target.is_empty() {
+        *target = incoming;
+        return;
+    }
+    if incoming.is_empty() {
+        return;
+    }
+
+    let left = std::mem::take(target);
+    let mut merged = Vec::with_capacity(left.len().saturating_add(incoming.len()));
+    let mut left = left.into_iter().peekable();
+    let mut right = incoming.into_iter().peekable();
+    while let (Some(left_meta), Some(right_meta)) = (left.peek(), right.peek()) {
+        match left_meta.id.cmp(&right_meta.id) {
+            std::cmp::Ordering::Less => merged.push(left.next().expect("peeked left metadata")),
+            std::cmp::Ordering::Greater => {
+                merged.push(right.next().expect("peeked right metadata"));
+            }
+            std::cmp::Ordering::Equal => {
+                merged.push(left.next().expect("peeked left metadata"));
+                let _ = right.next();
+            }
+        }
+    }
+    merged.extend(left);
+    merged.extend(right);
+    *target = merged;
 }
 
 fn graph_row_reverse_direction(direction: Direction) -> Direction {
@@ -1536,6 +1642,14 @@ fn graph_row_node_query_has_anchor(query: &NormalizedNodeQuery) -> bool {
         )
         || !query.filter.is_always_true()
         || query.filter.is_always_false()
+}
+
+fn graph_row_node_query_is_visibility_only(query: &NormalizedNodeQuery) -> bool {
+    query.single_label_id.is_none()
+        && matches!(query.label_filter, ResolvedNodeLabelFilter::Unconstrained)
+        && query.ids.is_empty()
+        && query.keys.is_empty()
+        && matches!(query.filter, NormalizedNodeFilter::AlwaysTrue)
 }
 
 fn graph_row_collect_endpoint_sources(
@@ -1869,12 +1983,62 @@ fn graph_row_source_choice_label(choice: GraphRowEdgeCandidateSourceChoice) -> &
         GraphRowEdgeCandidateSourceChoice::ExplicitIds => "ExplicitEdgeIds",
         GraphRowEdgeCandidateSourceChoice::EndpointAdjacency => "EndpointAdjacency",
         GraphRowEdgeCandidateSourceChoice::EdgeCandidateSource => "EdgeCandidateSource",
+        GraphRowEdgeCandidateSourceChoice::DelegatedEdgeQuery => "DelegatedEdgeQuery",
         GraphRowEdgeCandidateSourceChoice::MixedEndpointAndEdgeSource => {
             "MixedEndpointAndEdgeSource"
         }
         GraphRowEdgeCandidateSourceChoice::EmptyResult => "EmptyResult",
         GraphRowEdgeCandidateSourceChoice::SkippedEmptyFrontier => "SkippedEmptyFrontier",
     }
+}
+
+fn graph_row_planned_edge_mode_label(mode: EdgeDriverExecutionMode) -> &'static str {
+    match mode {
+        EdgeDriverExecutionMode::Eager => "eager",
+        EdgeDriverExecutionMode::Streamed => "streamed",
+    }
+}
+
+fn graph_row_plan_warning_label(warning: QueryPlanWarning) -> &'static str {
+    match warning {
+        QueryPlanWarning::MissingReadyIndex => "missing_ready_index",
+        QueryPlanWarning::UsingFallbackScan => "using_fallback_scan",
+        QueryPlanWarning::FullScanRequiresOptIn => "full_scan_requires_opt_in",
+        QueryPlanWarning::FullScanExplicitlyAllowed => "full_scan_explicitly_allowed",
+        QueryPlanWarning::EdgePropertyPostFilter => "edge_property_post_filter",
+        QueryPlanWarning::IndexSkippedAsBroad => "index_skipped_as_broad",
+        QueryPlanWarning::CandidateCapExceeded => "candidate_cap_exceeded",
+        QueryPlanWarning::RangeCandidateCapExceeded => "range_candidate_cap_exceeded",
+        QueryPlanWarning::TimestampCandidateCapExceeded => "timestamp_candidate_cap_exceeded",
+        QueryPlanWarning::VerifyOnlyFilter => "verify_only_filter",
+        QueryPlanWarning::BooleanBranchFallback => "boolean_branch_fallback",
+        QueryPlanWarning::PlanningProbeBudgetExceeded => "planning_probe_budget_exceeded",
+        QueryPlanWarning::CompoundIndexPrefixNotSatisfied => "compound_index_prefix_not_satisfied",
+        QueryPlanWarning::StreamedInputBufferCapExceeded => "streamed_input_buffer_cap_exceeded",
+        QueryPlanWarning::UnknownNodeLabel => "unknown_node_label",
+        QueryPlanWarning::UnknownEdgeLabel => "unknown_edge_label",
+    }
+}
+
+fn graph_row_delegated_filter_with_valid_at(
+    query: &NormalizedEdgeQuery,
+    effective_at_epoch: i64,
+) -> Result<NormalizedEdgeFilter, EngineError> {
+    // Callers establish independent legality by planning `query` before this
+    // verifier-only narrowing is constructed. The system predicate therefore
+    // cannot create an anchor even though it is always present during execution.
+    let mut flattened = match &query.filter {
+        NormalizedEdgeFilter::AlwaysFalse => {
+            return Ok(NormalizedEdgeFilter::AlwaysFalse);
+        }
+        NormalizedEdgeFilter::AlwaysTrue => Vec::new(),
+        NormalizedEdgeFilter::And(children) => children.clone(),
+        filter => vec![filter.clone()],
+    };
+    flattened.push(NormalizedEdgeFilter::ValidAt {
+        epoch_ms: effective_at_epoch,
+    });
+    normalize_normalized_edge_and_filter(flattened)
 }
 
 fn graph_row_edge_orientations(
@@ -4850,7 +5014,10 @@ impl ReadView {
             NodePhysicalPlan::Source(source) => {
                 self.materialize_node_candidate_source(query, cap_context, source)
             }
-            NodePhysicalPlan::Intersect(inputs) => {
+            NodePhysicalPlan::BufferedIdSort(input) => {
+                self.materialize_node_physical_plan(query, cap_context, input)
+            }
+            NodePhysicalPlan::Intersect { inputs, .. } => {
                 let mut materialized = Vec::with_capacity(inputs.len());
                 let mut followups = Vec::new();
                 for input in inputs {
@@ -4875,7 +5042,7 @@ impl ReadView {
                     followups,
                 })
             }
-            NodePhysicalPlan::Union(inputs) => {
+            NodePhysicalPlan::Union { inputs, .. } => {
                 let mut materialized = Vec::with_capacity(inputs.len());
                 let mut followups = Vec::new();
                 let mut total_len = 0usize;
@@ -5040,6 +5207,7 @@ impl ReadView {
     ) -> Result<(VerifiedNodePage, Vec<SecondaryIndexReadFollowup>), EngineError> {
         let PlannedNodeQuery {
             driver,
+            execution_mode,
             cap_context,
             legal_universe_fallback,
             warnings: _,
@@ -5055,7 +5223,7 @@ impl ReadView {
                 },
                 followups,
             )),
-            NodePhysicalPlan::Source(source) => {
+            NodePhysicalPlan::Source(source) if execution_mode == NodeDriverExecutionMode::Eager => {
                 let (page, mut source_followups) = self.query_node_page_from_source_driver(
                     source,
                     query,
@@ -5066,6 +5234,52 @@ impl ReadView {
                 )?;
                 followups.append(&mut source_followups);
                 Ok((page, followups))
+            }
+            plan if execution_mode == NodeDriverExecutionMode::Streamed => {
+                match self.execute_streamed_node_driver(
+                    query,
+                    cap_context,
+                    plan,
+                    hydrate,
+                    policy_cutoffs,
+                )? {
+                    CandidateMaterializationResult::Ready {
+                        ids,
+                        followups: mut streamed_followups,
+                    } => {
+                        let mut page = finalize_verified_page(ids, Vec::new(), page_limit(&query.page));
+                        if hydrate {
+                            self.populate_verified_node_records(&mut page)?;
+                        }
+                        followups.append(&mut streamed_followups);
+                        Ok((page, followups))
+                    }
+                    CandidateMaterializationResult::TooBroad {
+                        followups: mut streamed_followups,
+                    } => {
+                        let (page, mut fallback_followups) =
+                            if let Some(fallback_source) = legal_universe_fallback.as_ref() {
+                                self.query_node_page_from_source_driver(
+                                    fallback_source,
+                                    query,
+                                    cap_context,
+                                    None,
+                                    hydrate,
+                                    policy_cutoffs,
+                                )?
+                            } else {
+                                self.query_node_page_from_legal_universe(
+                                    query,
+                                    cap_context,
+                                    hydrate,
+                                    policy_cutoffs,
+                                )?
+                            };
+                        followups.append(&mut streamed_followups);
+                        followups.append(&mut fallback_followups);
+                        Ok((page, followups))
+                    }
+                }
             }
             plan => {
                 match self.materialize_node_physical_plan(query, cap_context, plan)? {
@@ -5218,6 +5432,7 @@ impl ReadView {
             EdgeCandidateMaterialization::FromEndpointAdjacency {
                 node_ids,
                 label_filter_ids,
+                ..
             } => self.edge_ids_by_endpoint_sources(
                 node_ids,
                 Direction::Outgoing,
@@ -5227,6 +5442,7 @@ impl ReadView {
             EdgeCandidateMaterialization::ToEndpointAdjacency {
                 node_ids,
                 label_filter_ids,
+                ..
             } => self.edge_ids_by_endpoint_sources(
                 node_ids,
                 Direction::Incoming,
@@ -5236,6 +5452,7 @@ impl ReadView {
             EdgeCandidateMaterialization::AnyEndpointAdjacency {
                 node_ids,
                 label_filter_ids,
+                ..
             } => self.edge_ids_by_endpoint_sources(
                 node_ids,
                 Direction::Both,
@@ -5424,7 +5641,10 @@ impl ReadView {
             EdgePhysicalPlan::Source(source) => {
                 self.materialize_edge_candidate_source(query, cap_context, source)
             }
-            EdgePhysicalPlan::Intersect(inputs) => {
+            EdgePhysicalPlan::BufferedIdSort(input) => {
+                self.materialize_edge_physical_plan(query, cap_context, input)
+            }
+            EdgePhysicalPlan::Intersect { inputs, .. } => {
                 let mut sets = Vec::with_capacity(inputs.len());
                 let mut followups = Vec::new();
                 for input in inputs {
@@ -5471,7 +5691,7 @@ impl ReadView {
                     })
                 }
             }
-            EdgePhysicalPlan::Union(inputs) => {
+            EdgePhysicalPlan::Union { inputs, .. } => {
                 let mut sets = Vec::with_capacity(inputs.len());
                 let mut followups = Vec::new();
                 let mut total_len = 0usize;
@@ -5742,13 +5962,13 @@ impl ReadView {
         &self,
         chunk: &[u64],
         query: &NormalizedEdgeQuery,
-        _hydrate: bool,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
         endpoint_cache: &mut EdgeEndpointVisibilityCache,
-        ids: &mut Vec<u64>,
-        _hydrated_records: &mut NodeIdMap<EdgeRecord>,
+        verified: &mut Vec<EdgeMetadataForQuery>,
         target: usize,
     ) -> Result<ControlFlow<()>, EngineError> {
+        #[cfg(test)]
+        self.note_edge_verifier_metadata_lookup(chunk.len());
         let metadata = self.sources().find_edge_metadata(chunk)?;
         let metas = metadata.iter().filter_map(|meta| *meta).collect::<Vec<_>>();
         {
@@ -5815,12 +6035,12 @@ impl ReadView {
             }
         }
 
-        for (edge_id, _, needs_properties) in decisions {
+        for (edge_id, query_meta, needs_properties) in decisions {
             if needs_properties && !property_matches.contains(&edge_id) {
                 continue;
             }
-            ids.push(edge_id);
-            if ids.len() >= target {
+            verified.push(query_meta);
+            if verified.len() >= target {
                 return Ok(ControlFlow::Break(()));
             }
         }
@@ -5828,34 +6048,30 @@ impl ReadView {
         Ok(ControlFlow::Continue(()))
     }
 
-    fn query_edge_page_from_candidates(
+    fn query_edge_metadata_page_from_candidates(
         &self,
         candidate_ids: &[u64],
         query: &NormalizedEdgeQuery,
-        hydrate: bool,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<VerifiedEdgePage, EngineError> {
+    ) -> Result<VerifiedEdgeMetadataPage, EngineError> {
         let limit = page_limit(&query.page);
         let target = page_verify_target(limit);
-        let mut ids = Vec::new();
-        let mut hydrated_records = NodeIdMap::default();
+        let mut verified = Vec::new();
         let mut endpoint_cache = EdgeEndpointVisibilityCache::default();
         let start = first_candidate_after(candidate_ids, query.page.after);
         let mut cursor = start;
 
-        while cursor < candidate_ids.len() && ids.len() < target {
+        while cursor < candidate_ids.len() && verified.len() < target {
             let end = (cursor + QUERY_VERIFY_CHUNK).min(candidate_ids.len());
             let chunk = &candidate_ids[cursor..end];
             if self
                 .verify_edge_candidate_chunk(
                     chunk,
                     query,
-                    hydrate,
-                policy_cutoffs,
-                &mut endpoint_cache,
-                &mut ids,
-                &mut hydrated_records,
-                target,
+                    policy_cutoffs,
+                    &mut endpoint_cache,
+                    &mut verified,
+                    target,
             )?
             .is_break()
             {
@@ -5865,67 +6081,53 @@ impl ReadView {
             cursor = end;
         }
 
-        let mut page = finalize_verified_edge_page(ids, Vec::new(), limit);
-        if hydrate {
-            self.populate_verified_edge_records(&mut page, &mut hydrated_records)?;
-        }
-        Ok(page)
+        Ok(finalize_verified_edge_metadata_page(verified, limit))
     }
 
-    fn query_edge_page_from_label_scan(
+    fn query_edge_metadata_page_from_label_scan(
         &self,
         label_id: u32,
         query: &NormalizedEdgeQuery,
-        hydrate: bool,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<VerifiedEdgePage, EngineError> {
+    ) -> Result<VerifiedEdgeMetadataPage, EngineError> {
         let limit = page_limit(&query.page);
         let target = page_verify_target(limit);
         let chunk_limit = match query.page.limit {
             Some(limit) if limit > 0 => limit.saturating_add(1).saturating_mul(4).max(limit + 1),
             _ => QUERY_VERIFY_CHUNK,
         };
-        let mut ids = Vec::new();
-        let mut hydrated_records = NodeIdMap::default();
+        let mut verified = Vec::new();
         let mut endpoint_cache = EdgeEndpointVisibilityCache::default();
 
         self.scan_label_edge_id_chunks(label_id, query.page.after, chunk_limit, |chunk| {
             self.verify_edge_candidate_chunk(
                 chunk,
                 query,
-                hydrate,
                 policy_cutoffs,
                 &mut endpoint_cache,
-                &mut ids,
-                &mut hydrated_records,
+                &mut verified,
                 target,
             )
         })?;
 
-        let mut page = finalize_verified_edge_page(ids, Vec::new(), limit);
-        if hydrate {
-            self.populate_verified_edge_records(&mut page, &mut hydrated_records)?;
-        }
-        Ok(page)
+        Ok(finalize_verified_edge_metadata_page(verified, limit))
     }
 
-    fn query_edge_page_from_endpoint_scan(
+    fn query_edge_metadata_page_from_endpoint_scan(
         &self,
         node_ids: &[u64],
         direction: Direction,
         label_filter_ids: Option<&[u32]>,
         query: &NormalizedEdgeQuery,
-        hydrate: bool,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<VerifiedEdgePage, EngineError> {
+    ) -> Result<VerifiedEdgeMetadataPage, EngineError> {
         let limit = page_limit(&query.page);
         let target = page_verify_target(limit);
         let chunk_limit = match query.page.limit {
             Some(limit) if limit > 0 => limit.saturating_add(1).saturating_mul(4).max(limit + 1),
             _ => QUERY_VERIFY_CHUNK,
         };
-        let mut ids = Vec::new();
-        let mut hydrated_records = NodeIdMap::default();
+        let mut verified = Vec::new();
         let mut endpoint_cache = EdgeEndpointVisibilityCache::default();
 
         self.scan_endpoint_edge_id_chunks(
@@ -5938,29 +6140,22 @@ impl ReadView {
                 self.verify_edge_candidate_chunk(
                     chunk,
                     query,
-                    hydrate,
                     policy_cutoffs,
                     &mut endpoint_cache,
-                    &mut ids,
-                    &mut hydrated_records,
+                    &mut verified,
                     target,
                 )
             },
         )?;
 
-        let mut page = finalize_verified_edge_page(ids, Vec::new(), limit);
-        if hydrate {
-            self.populate_verified_edge_records(&mut page, &mut hydrated_records)?;
-        }
-        Ok(page)
+        Ok(finalize_verified_edge_metadata_page(verified, limit))
     }
 
-    fn query_edge_page_from_full_scan(
+    fn query_edge_metadata_page_from_full_scan(
         &self,
         query: &NormalizedEdgeQuery,
-        hydrate: bool,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<VerifiedEdgePage, EngineError> {
+    ) -> Result<VerifiedEdgeMetadataPage, EngineError> {
         #[cfg(test)]
         self.note_edge_full_scan_page();
 
@@ -5970,56 +6165,48 @@ impl ReadView {
             Some(limit) if limit > 0 => limit.saturating_add(1).saturating_mul(4).max(limit + 1),
             _ => QUERY_VERIFY_CHUNK,
         };
-        let mut ids = Vec::new();
-        let mut hydrated_records = NodeIdMap::default();
+        let mut verified = Vec::new();
         let mut endpoint_cache = EdgeEndpointVisibilityCache::default();
 
         self.scan_full_edge_id_chunks(query.page.after, chunk_limit, |chunk| {
             self.verify_edge_candidate_chunk(
                 chunk,
                 query,
-                hydrate,
                 policy_cutoffs,
                 &mut endpoint_cache,
-                &mut ids,
-                &mut hydrated_records,
+                &mut verified,
                 target,
             )
         })?;
 
-        let mut page = finalize_verified_edge_page(ids, Vec::new(), limit);
-        if hydrate {
-            self.populate_verified_edge_records(&mut page, &mut hydrated_records)?;
-        }
-        Ok(page)
+        Ok(finalize_verified_edge_metadata_page(verified, limit))
     }
 
-    fn query_edge_page_from_source_driver(
+    fn query_edge_metadata_page_from_source_driver(
         &self,
         source: &PlannedEdgeCandidateSource,
         query: &NormalizedEdgeQuery,
         cap_context: EdgeQueryCapContext,
         legal_universe_fallback: Option<&PlannedEdgeCandidateSource>,
-        hydrate: bool,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<(VerifiedEdgePage, Vec<SecondaryIndexReadFollowup>), EngineError> {
+    ) -> Result<(VerifiedEdgeMetadataPage, Vec<SecondaryIndexReadFollowup>), EngineError> {
         match &source.materialization {
             EdgeCandidateMaterialization::EdgeLabelIndex { label_id } => {
                 Ok((
-                    self.query_edge_page_from_label_scan(*label_id, query, hydrate, policy_cutoffs)?,
+                    self.query_edge_metadata_page_from_label_scan(*label_id, query, policy_cutoffs)?,
                     Vec::new(),
                 ))
             }
             EdgeCandidateMaterialization::FromEndpointAdjacency {
                 node_ids,
                 label_filter_ids,
+                ..
             } => Ok((
-                self.query_edge_page_from_endpoint_scan(
+                self.query_edge_metadata_page_from_endpoint_scan(
                     node_ids,
                     Direction::Outgoing,
                     label_filter_ids.as_deref(),
                     query,
-                    hydrate,
                     policy_cutoffs,
                 )?,
                 Vec::new(),
@@ -6027,13 +6214,13 @@ impl ReadView {
             EdgeCandidateMaterialization::ToEndpointAdjacency {
                 node_ids,
                 label_filter_ids,
+                ..
             } => Ok((
-                self.query_edge_page_from_endpoint_scan(
+                self.query_edge_metadata_page_from_endpoint_scan(
                     node_ids,
                     Direction::Incoming,
                     label_filter_ids.as_deref(),
                     query,
-                    hydrate,
                     policy_cutoffs,
                 )?,
                 Vec::new(),
@@ -6041,26 +6228,26 @@ impl ReadView {
             EdgeCandidateMaterialization::AnyEndpointAdjacency {
                 node_ids,
                 label_filter_ids,
+                ..
             } => Ok((
-                self.query_edge_page_from_endpoint_scan(
+                self.query_edge_metadata_page_from_endpoint_scan(
                     node_ids,
                     Direction::Both,
                     label_filter_ids.as_deref(),
                     query,
-                    hydrate,
                     policy_cutoffs,
                 )?,
                 Vec::new(),
             )),
             EdgeCandidateMaterialization::FallbackFullEdgeScan => {
                 Ok((
-                    self.query_edge_page_from_full_scan(query, hydrate, policy_cutoffs)?,
+                    self.query_edge_metadata_page_from_full_scan(query, policy_cutoffs)?,
                     Vec::new(),
                 ))
             }
             _ => match self.materialize_edge_candidate_source(query, cap_context, source)? {
                 CandidateMaterializationResult::Ready { ids, followups } => Ok((
-                    self.query_edge_page_from_candidates(&ids, query, hydrate, policy_cutoffs)?,
+                    self.query_edge_metadata_page_from_candidates(&ids, query, policy_cutoffs)?,
                     followups,
                 )),
                 CandidateMaterializationResult::TooBroad {
@@ -6068,19 +6255,17 @@ impl ReadView {
                 } => {
                     let (page, mut fallback_followups) =
                         if let Some(fallback_source) = legal_universe_fallback {
-                            self.query_edge_page_from_source_driver(
+                            self.query_edge_metadata_page_from_source_driver(
                                 fallback_source,
                                 query,
                                 cap_context,
                                 None,
-                                hydrate,
                                 policy_cutoffs,
                             )?
                         } else {
-                            self.query_edge_page_from_legal_universe(
+                            self.query_edge_metadata_page_from_legal_universe(
                                 query,
                                 cap_context,
-                                hydrate,
                                 policy_cutoffs,
                             )?
                         };
@@ -6091,13 +6276,12 @@ impl ReadView {
         }
     }
 
-    fn query_edge_page_from_legal_universe(
+    fn query_edge_metadata_page_from_legal_universe(
         &self,
         query: &NormalizedEdgeQuery,
         cap_context: EdgeQueryCapContext,
-        hydrate: bool,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<(VerifiedEdgePage, Vec<SecondaryIndexReadFollowup>), EngineError> {
+    ) -> Result<(VerifiedEdgeMetadataPage, Vec<SecondaryIndexReadFollowup>), EngineError> {
         let mut sources = self.edge_legal_universe_sources(query);
         if sources.is_empty() {
             return Err(EngineError::InvalidOperation(
@@ -6109,14 +6293,122 @@ impl ReadView {
         let source = sources
             .first()
             .expect("legal edge universe sources must be non-empty");
-        self.query_edge_page_from_source_driver(
+        self.query_edge_metadata_page_from_source_driver(
             source,
             query,
             cap_context,
             None,
-            hydrate,
             policy_cutoffs,
         )
+    }
+
+    fn query_edge_metadata_page_planned(
+        &self,
+        query: &NormalizedEdgeQuery,
+        planned: PlannedEdgeQuery,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+    ) -> Result<(VerifiedEdgeMetadataPage, Vec<SecondaryIndexReadFollowup>), EngineError> {
+        let PlannedEdgeQuery {
+            driver,
+            execution_mode,
+            cap_context,
+            legal_universe_fallback,
+            warnings: _,
+            mut followups,
+        } = planned;
+
+        if execution_mode == EdgeDriverExecutionMode::Eager {
+            if let EdgePhysicalPlan::Source(source) = &driver {
+                let (page, mut source_followups) = self.query_edge_metadata_page_from_source_driver(
+                    source,
+                    query,
+                    cap_context,
+                    legal_universe_fallback.as_ref(),
+                    policy_cutoffs,
+                )?;
+                followups.append(&mut source_followups);
+                return Ok((page, followups));
+            }
+        }
+
+        if execution_mode == EdgeDriverExecutionMode::Streamed {
+            match self.execute_streamed_edge_driver(
+                query,
+                cap_context,
+                &driver,
+                policy_cutoffs,
+            )? {
+                VerifiedEdgeMetadataMaterializationResult::Ready {
+                    metadata,
+                    followups: mut streamed_followups,
+                } => {
+                    let page = finalize_verified_edge_metadata_page(
+                        metadata,
+                        page_limit(&query.page),
+                    );
+                    followups.append(&mut streamed_followups);
+                    return Ok((page, followups));
+                }
+                VerifiedEdgeMetadataMaterializationResult::TooBroad {
+                    followups: mut streamed_followups,
+                } => {
+                    let (page, mut fallback_followups) =
+                        if let Some(fallback_source) = legal_universe_fallback.as_ref() {
+                            self.query_edge_metadata_page_from_source_driver(
+                                fallback_source,
+                                query,
+                                cap_context,
+                                None,
+                                policy_cutoffs,
+                            )?
+                        } else {
+                            self.query_edge_metadata_page_from_legal_universe(
+                                query,
+                                cap_context,
+                                policy_cutoffs,
+                            )?
+                        };
+                    followups.append(&mut streamed_followups);
+                    followups.append(&mut fallback_followups);
+                    return Ok((page, followups));
+                }
+            }
+        }
+
+        match self.materialize_edge_physical_plan(query, cap_context, &driver)? {
+            CandidateMaterializationResult::Ready {
+                ids,
+                followups: mut materialization_followups,
+            } => {
+                let page =
+                    self.query_edge_metadata_page_from_candidates(&ids, query, policy_cutoffs)?;
+                followups.append(&mut materialization_followups);
+                Ok((page, followups))
+            }
+            CandidateMaterializationResult::TooBroad {
+                followups: mut materialization_followups,
+            } => {
+                let (page, mut fallback_followups) =
+                    if let Some(fallback_source) = legal_universe_fallback.as_ref() {
+                        self.query_edge_metadata_page_from_source_driver(
+                            fallback_source,
+                            query,
+                            cap_context,
+                            None,
+                            policy_cutoffs,
+                        )?
+                    } else {
+                        self.query_edge_metadata_page_from_legal_universe(
+                            query,
+                            cap_context,
+                            policy_cutoffs,
+                        )?
+                    };
+                followups.append(&mut materialization_followups);
+                followups.append(&mut fallback_followups);
+                Ok((page, followups))
+            }
+        }
     }
 
     fn query_edge_page_planned(
@@ -6126,67 +6418,23 @@ impl ReadView {
         hydrate: bool,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
     ) -> Result<(VerifiedEdgePage, Vec<SecondaryIndexReadFollowup>), EngineError> {
-        let PlannedEdgeQuery {
-            driver,
-            cap_context,
-            legal_universe_fallback,
-            warnings: _,
-            mut followups,
-        } = planned;
-
-        if let EdgePhysicalPlan::Source(source) = &driver {
-            let (page, mut source_followups) = self.query_edge_page_from_source_driver(
-                source,
-                query,
-                cap_context,
-                legal_universe_fallback.as_ref(),
-                hydrate,
-                policy_cutoffs,
-            )?;
-            followups.append(&mut source_followups);
-            return Ok((page, followups));
+        let (metadata_page, followups) =
+            self.query_edge_metadata_page_planned(query, planned, policy_cutoffs)?;
+        let ids = metadata_page
+            .metadata
+            .iter()
+            .map(|meta| meta.id)
+            .collect();
+        let mut page = VerifiedEdgePage {
+            ids,
+            edges: Vec::new(),
+            next_cursor: metadata_page.next_cursor,
+        };
+        if hydrate {
+            let mut hydrated_records = NodeIdMap::default();
+            self.populate_verified_edge_records(&mut page, &mut hydrated_records)?;
         }
-
-        match self.materialize_edge_physical_plan(query, cap_context, &driver)? {
-            CandidateMaterializationResult::Ready {
-                ids,
-                followups: mut materialization_followups,
-            } => {
-                let page = self.query_edge_page_from_candidates(
-                    &ids,
-                    query,
-                    hydrate,
-                    policy_cutoffs,
-                )?;
-                followups.append(&mut materialization_followups);
-                Ok((page, followups))
-            }
-            CandidateMaterializationResult::TooBroad {
-                followups: mut materialization_followups,
-            } => {
-                let (page, mut fallback_followups) =
-                    if let Some(fallback_source) = legal_universe_fallback.as_ref() {
-                        self.query_edge_page_from_source_driver(
-                            fallback_source,
-                            query,
-                            cap_context,
-                            None,
-                            hydrate,
-                            policy_cutoffs,
-                        )?
-                    } else {
-                        self.query_edge_page_from_legal_universe(
-                            query,
-                            cap_context,
-                            hydrate,
-                            policy_cutoffs,
-                        )?
-                    };
-                followups.append(&mut materialization_followups);
-                followups.append(&mut fallback_followups);
-                Ok((page, followups))
-            }
-        }
+        Ok((page, followups))
     }
 
     fn query_edge_ids_outcome(
@@ -7954,6 +8202,8 @@ impl ReadView {
         let mut search_cache: BTreeMap<GraphRowVlpSearchKey, GraphRowVlpSearchResult> =
             BTreeMap::new();
         let mut search_cache_hits = 0usize;
+        let mut delegated_step_stats =
+            explain_trace.is_some().then(GraphRowVlpDelegatedStepStats::default);
 
         for row in rows {
             let key = GraphRowVlpSearchKey {
@@ -7984,8 +8234,10 @@ impl ReadView {
                         seed,
                         effective_at_epoch,
                         policy_cutoffs,
+                        followups,
                         frontier_peak,
                         &mut per_start_counts,
+                        delegated_step_stats.as_mut(),
                     )?;
                     paths.extend(seed_paths);
                 }
@@ -8030,10 +8282,14 @@ impl ReadView {
         }
 
         if let Some(trace) = explain_trace {
+            let delegated_step_detail = delegated_step_stats
+                .as_ref()
+                .and_then(|stats| stats.detail(search_cache_hits))
+                .unwrap_or_default();
             trace.record_plan(
                 "VariableLengthPathRuntime",
                 format!(
-                    "piece_index={}; path={}; left_rows={}; starts_considered={}; distinct_search_groups={}; search_cache_hits={}; output_rows={}; min_hops={}; max_hops={}; direction={:?}; relationship_simple=true; max_frontier={}; max_paths_per_start={}; source_verification=latest_visible_edges_and_endpoints",
+                    "piece_index={}; path={}; left_rows={}; starts_considered={}; distinct_search_groups={}; search_cache_hits={}; output_rows={}; min_hops={}; max_hops={}; direction={:?}; relationship_simple=true; max_frontier={}; max_paths_per_start={}; source_verification=latest_visible_edges_and_endpoints{}",
                     path.piece_index,
                     graph_row_vlp_context(path),
                     left_count,
@@ -8045,7 +8301,8 @@ impl ReadView {
                     path.max_hops,
                     path.direction,
                     query.options.max_frontier,
-                    query.options.max_paths_per_start
+                    query.options.max_paths_per_start,
+                    delegated_step_detail
                 ),
             );
         }
@@ -8081,7 +8338,19 @@ impl ReadView {
             filter: path.filter.clone(),
             warnings: path.warnings.clone(),
         };
-        let candidates = self.graph_row_fixed_edge_candidates(
+        let delegated_one_hop = path.candidate_edge_ids.is_empty()
+            && !path.filter.is_always_true()
+            && !path.filter.is_always_false()
+            && !path
+                .label_filter_ids
+                .as_ref()
+                .is_some_and(|label_ids| label_ids.is_empty());
+        let edge_explain_trace = if delegated_one_hop {
+            explain_trace.as_deref_mut()
+        } else {
+            None
+        };
+        let candidate_batch = self.graph_row_fixed_edge_candidates(
             query,
             &temp_edge,
             None,
@@ -8090,10 +8359,10 @@ impl ReadView {
             policy_cutoffs,
             followups,
             frontier_peak,
-            None,
+            edge_explain_trace,
             Some(path),
         )?;
-        if candidates.is_empty() {
+        if candidate_batch.edges.is_empty() {
             if let Some(trace) = explain_trace.as_deref_mut() {
                 trace.record_plan(
                     "VariableLengthPathRuntime",
@@ -8109,20 +8378,30 @@ impl ReadView {
 
         let from_node = graph_row_runtime_node(runtime, &path.from_alias)?;
         let to_node = graph_row_runtime_node(runtime, &path.to_alias)?;
-        let mut from_candidates = Vec::with_capacity(candidates.len());
-        let mut to_candidates = Vec::with_capacity(candidates.len());
-        for candidate in &candidates {
+        let mut from_candidates = Vec::with_capacity(candidate_batch.edges.len());
+        let mut to_candidates = Vec::with_capacity(candidate_batch.edges.len());
+        for candidate in &candidate_batch.edges {
             from_candidates.push(candidate.logical_from);
             to_candidates.push(candidate.logical_to);
         }
-        let verified_from =
-            self.graph_row_verified_node_ids(from_node, from_candidates, policy_cutoffs)?;
+        let verified_from = self.graph_row_verified_or_proven_node_ids(
+            from_node,
+            from_candidates,
+            policy_cutoffs,
+            candidate_batch.endpoints_verified,
+        )?;
         let verified_to = if from_node.alias == to_node.alias {
             verified_from.clone()
         } else {
-            self.graph_row_verified_node_ids(to_node, to_candidates, policy_cutoffs)?
+            self.graph_row_verified_or_proven_node_ids(
+                to_node,
+                to_candidates,
+                policy_cutoffs,
+                candidate_batch.endpoints_verified,
+            )?
         };
 
+        let candidates = candidate_batch.edges;
         let buckets = GraphRowEdgeCandidateBuckets::new(&candidates);
         let mut output = Vec::new();
         for row in rows {
@@ -8322,9 +8601,12 @@ impl ReadView {
         seed: GraphRowPathSearchSeed,
         effective_at_epoch: i64,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
         frontier_peak: &mut usize,
         per_start_counts: &mut NodeIdMap<usize>,
+        delegated_step_stats: Option<&mut GraphRowVlpDelegatedStepStats>,
     ) -> Result<Vec<GraphPath>, EngineError> {
+        let mut delegated_step_stats = delegated_step_stats;
         let target_bound = if seed.reverse {
             row.node_id_for_slot_if_bound(path.from_slot)?
         } else {
@@ -8390,7 +8672,9 @@ impl ReadView {
                 frontier_nodes,
                 effective_at_epoch,
                 policy_cutoffs,
+                followups,
                 frontier_peak,
+                delegated_step_stats.as_deref_mut(),
             )?;
             if step_edges.is_empty() {
                 break;
@@ -8490,7 +8774,9 @@ impl ReadView {
         mut frontier_nodes: Vec<u64>,
         effective_at_epoch: i64,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
         frontier_peak: &mut usize,
+        delegated_step_stats: Option<&mut GraphRowVlpDelegatedStepStats>,
     ) -> Result<NodeIdMap<Vec<GraphRowVlpStepEdge>>, EngineError> {
         frontier_nodes.sort_unstable();
         frontier_nodes.dedup();
@@ -8516,7 +8802,23 @@ impl ReadView {
             path.direction
         };
         let mut candidate_ids = path.candidate_edge_ids.clone();
-        if candidate_ids.is_empty() {
+        let verified = if !candidate_ids.is_empty() {
+            candidate_ids.sort_unstable();
+            candidate_ids.dedup();
+            graph_row_record_frontier_cap_peak(
+                frontier_peak,
+                candidate_ids.len(),
+                query.options.max_frontier,
+                Some(path),
+            )?;
+            self.graph_row_verify_edge_candidate_ids(
+                &candidate_ids,
+                path.label_filter_ids.as_deref(),
+                &path.filter,
+                effective_at_epoch,
+                policy_cutoffs,
+            )?
+        } else if path.filter.is_always_true() {
             self.graph_row_collect_endpoint_edge_ids(
                 &mut candidate_ids,
                 match direction {
@@ -8536,24 +8838,73 @@ impl ReadView {
                 frontier_peak,
                 Some(path),
             )?;
+            self.graph_row_verify_edge_candidate_ids(
+                &candidate_ids,
+                path.label_filter_ids.as_deref(),
+                &path.filter,
+                effective_at_epoch,
+                policy_cutoffs,
+            )?
         } else {
-            candidate_ids.sort_unstable();
-            candidate_ids.dedup();
-            graph_row_record_frontier_cap_peak(
+            let temp_edge = GraphRowRuntimeEdge {
+                alias: path.edge_alias.clone(),
+                edge_slot: path.edge_slot,
+                hidden_slot: None,
+                from_alias: path.from_alias.clone(),
+                to_alias: path.to_alias.clone(),
+                from_slot: path.from_slot,
+                to_slot: path.to_slot,
+                direction,
+                candidate_edge_ids: Vec::new(),
+                label_filter_ids: path.label_filter_ids.clone(),
+                filter: path.filter.clone(),
+                warnings: path.warnings.clone(),
+            };
+            let (outgoing, incoming, both) = match direction {
+                Direction::Outgoing => (frontier_nodes.as_slice(), &[][..], &[][..]),
+                Direction::Incoming => (&[][..], frontier_nodes.as_slice(), &[][..]),
+                Direction::Both => (&[][..], &[][..], frontier_nodes.as_slice()),
+            };
+            match self.graph_row_delegated_bound_bucket_read(
+                query,
+                &temp_edge,
+                outgoing,
+                incoming,
+                both,
+                effective_at_epoch,
+                policy_cutoffs,
                 frontier_peak,
-                candidate_ids.len(),
-                query.options.max_frontier,
+                delegated_step_stats.is_some(),
                 Some(path),
-            )?;
-        }
-
-        let verified = self.graph_row_verify_edge_candidate_ids(
-            &candidate_ids,
-            path.label_filter_ids.as_deref(),
-            &path.filter,
-            effective_at_epoch,
-            policy_cutoffs,
-        )?;
+            )? {
+                GraphRowDelegatedEdgeSourceRead::Ready {
+                    metadata,
+                    verified_candidates,
+                    followups: mut source_followups,
+                    label_branches,
+                    planned_modes,
+                    planned_warnings,
+                    ..
+                } => {
+                    followups.append(&mut source_followups);
+                    if let Some(stats) = delegated_step_stats {
+                        stats.record(
+                            label_branches,
+                            verified_candidates,
+                            planned_modes,
+                            planned_warnings,
+                        );
+                    }
+                    metadata
+                }
+                GraphRowDelegatedEdgeSourceRead::NoLegalSource => {
+                    return Err(EngineError::InvalidOperation(
+                        "endpoint-anchored delegated graph row VLP step query had no legal source"
+                            .to_string(),
+                    ));
+                }
+            }
+        };
         let frontier_set: NodeIdSet = frontier_nodes.into_iter().collect();
         let mut by_source: NodeIdMap<Vec<GraphRowVlpStepEdge>> = NodeIdMap::default();
         for meta in verified {
@@ -8813,7 +9164,7 @@ impl ReadView {
             return Ok(rows);
         }
 
-        let candidates = self.graph_row_fixed_edge_candidates(
+        let candidate_batch = self.graph_row_fixed_edge_candidates(
             query,
             edge,
             planned_source_choice,
@@ -8825,7 +9176,7 @@ impl ReadView {
             explain_trace,
             None,
         )?;
-        if candidates.is_empty() {
+        if candidate_batch.edges.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -8848,18 +9199,28 @@ impl ReadView {
 
         let mut from_candidates = Vec::new();
         let mut to_candidates = Vec::new();
-        for candidate in &candidates {
+        for candidate in &candidate_batch.edges {
             from_candidates.push(candidate.logical_from);
             to_candidates.push(candidate.logical_to);
         }
-        let verified_from =
-            self.graph_row_verified_node_ids(from_node, from_candidates, policy_cutoffs)?;
+        let verified_from = self.graph_row_verified_or_proven_node_ids(
+            from_node,
+            from_candidates,
+            policy_cutoffs,
+            candidate_batch.endpoints_verified,
+        )?;
         let verified_to = if from_node.alias == to_node.alias {
             verified_from.clone()
         } else {
-            self.graph_row_verified_node_ids(to_node, to_candidates, policy_cutoffs)?
+            self.graph_row_verified_or_proven_node_ids(
+                to_node,
+                to_candidates,
+                policy_cutoffs,
+                candidate_batch.endpoints_verified,
+            )?
         };
 
+        let candidates = candidate_batch.edges;
         let buckets = GraphRowEdgeCandidateBuckets::new(&candidates);
         let mut next_rows = Vec::new();
         for row in rows {
@@ -8987,7 +9348,7 @@ impl ReadView {
         frontier_peak: &mut usize,
         mut explain_trace: Option<&mut GraphRowExplainTrace>,
         vlp_cap_context: Option<&GraphRowRuntimeVariableLength>,
-    ) -> Result<Vec<GraphRowOrientedEdge>, EngineError> {
+    ) -> Result<GraphRowFixedEdgeCandidates, EngineError> {
         let mut has_bound_endpoint = false;
         let mut has_unbound_endpoint_pair = false;
         let mut outgoing = Vec::new();
@@ -9020,6 +9381,9 @@ impl ReadView {
         }
 
         let mut candidate_ids = Vec::new();
+        let mut delegated_metadata = Vec::new();
+        let mut all_candidates_delegated = false;
+        let mut raw_candidates_contributed = false;
         let planned_driver =
             graph_row_source_choice_label(planned_source_choice.unwrap_or_else(|| {
                 graph_row_deterministic_fallback_edge_source_choice(edge, None)
@@ -9056,7 +9420,63 @@ impl ReadView {
                     0,
                 );
             }
-            return Ok(Vec::new());
+            return Ok(GraphRowFixedEdgeCandidates {
+                edges: Vec::new(),
+                endpoints_verified: false,
+            });
+        } else if has_bound_endpoint
+            && !has_unbound_endpoint_pair
+            && !edge.filter.is_always_true()
+        {
+            match self.graph_row_delegated_bound_bucket_read(
+                query,
+                edge,
+                &outgoing,
+                &incoming,
+                &both,
+                effective_at_epoch,
+                policy_cutoffs,
+                frontier_peak,
+                explain_trace.is_some(),
+                vlp_cap_context,
+            )? {
+                GraphRowDelegatedEdgeSourceRead::Ready {
+                    metadata,
+                    followups: mut source_followups,
+                    buckets,
+                    label_branches,
+                    drivers,
+                    planned_modes,
+                    planned_warnings,
+                    verified_candidates: _,
+                } => {
+                    followups.append(&mut source_followups);
+                    let verified_candidates = metadata.len();
+                    candidate_ids.extend(metadata.iter().map(|meta| meta.id));
+                    delegated_metadata = metadata;
+                    all_candidates_delegated = true;
+                    if let Some(trace) = explain_trace.as_deref_mut() {
+                        trace.record_runtime_edge_source(
+                            edge,
+                            GraphRowEdgeCandidateSourceChoice::DelegatedEdgeQuery,
+                            format!(
+                                "planned_driver={planned_driver}; materialized_source=DelegatedEdgeQuery{{buckets={}; label_branches={label_branches}; drivers={}; planned_modes={}; planned_warnings=[{}]}}; fallback_source=none; skipped_due_to_empty_frontier=false; verified_candidates={verified_candidates}",
+                                buckets.join(","),
+                                drivers.join("|"),
+                                planned_modes.join("|"),
+                                planned_warnings.join(",")
+                            ),
+                            verified_candidates,
+                        );
+                    }
+                }
+                GraphRowDelegatedEdgeSourceRead::NoLegalSource => {
+                    return Err(EngineError::InvalidOperation(
+                        "endpoint-anchored delegated graph row edge query had no legal source"
+                            .to_string(),
+                    ));
+                }
+            }
         } else if has_bound_endpoint && !has_unbound_endpoint_pair {
             let choice = self.graph_row_choose_bound_edge_source(
                 query,
@@ -9167,80 +9587,145 @@ impl ReadView {
                 }
             }
         } else {
+            let mut delegated_buckets = Vec::new();
+            let mut delegated_label_branches = 0;
+            let mut delegated_drivers = Vec::new();
+            let mut delegated_modes = Vec::new();
+            let mut delegated_warnings = Vec::new();
+
             if has_bound_endpoint {
-                self.graph_row_collect_endpoint_edge_ids(
-                    &mut candidate_ids,
-                    outgoing,
-                    incoming,
-                    both,
-                    edge.label_filter_ids.as_deref(),
-                    query.options.max_frontier,
-                    frontier_peak,
-                    vlp_cap_context,
-                )?;
-            }
-            if has_unbound_endpoint_pair {
-                match self.graph_row_materialize_edge_candidate_source(
-                    query,
-                    edge,
-                    policy_cutoffs,
-                    frontier_peak,
-                    vlp_cap_context,
-                )? {
-                    GraphRowEdgeSourceRead::Ready {
-                        mut ids,
-                        followups: mut source_followups,
-                        materialized_source,
-                        subset_source,
-                    } => {
-                        followups.append(&mut source_followups);
-                        candidate_ids.append(&mut ids);
-                        let runtime_choice = if has_bound_endpoint {
-                            GraphRowEdgeCandidateSourceChoice::MixedEndpointAndEdgeSource
-                        } else {
-                            GraphRowEdgeCandidateSourceChoice::EdgeCandidateSource
-                        };
-                        let runtime_planned_driver = if has_bound_endpoint {
-                            "MixedEndpointAndEdgeSource"
-                        } else {
-                            "EdgeCandidateSource"
-                        };
-                        let planned_driver = planned_source_choice
-                            .map(graph_row_source_choice_label)
-                            .unwrap_or(runtime_planned_driver);
-                        if let Some(trace) = explain_trace {
-                            trace.record_runtime_edge_source(
-                                edge,
-                                runtime_choice,
-                                format!(
-                                    "planned_driver={planned_driver}; materialized_source={materialized_source}; fallback_source=none; skipped_due_to_empty_frontier=false; subset_intersection_source_materialized={}",
-                                    subset_source.as_deref().unwrap_or("none")
-                                ),
-                                candidate_ids.len(),
+                if edge.filter.is_always_true() {
+                    raw_candidates_contributed = true;
+                    self.graph_row_collect_endpoint_edge_ids(
+                        &mut candidate_ids,
+                        outgoing.clone(),
+                        incoming.clone(),
+                        both.clone(),
+                        edge.label_filter_ids.as_deref(),
+                        query.options.max_frontier,
+                        frontier_peak,
+                        vlp_cap_context,
+                    )?;
+                } else {
+                    match self.graph_row_delegated_bound_bucket_read(
+                        query,
+                        edge,
+                        &outgoing,
+                        &incoming,
+                        &both,
+                        effective_at_epoch,
+                        policy_cutoffs,
+                        frontier_peak,
+                        explain_trace.is_some(),
+                        vlp_cap_context,
+                    )? {
+                        GraphRowDelegatedEdgeSourceRead::Ready {
+                            metadata,
+                            followups: mut source_followups,
+                            buckets,
+                            label_branches,
+                            drivers,
+                            planned_modes,
+                            planned_warnings,
+                            verified_candidates: _,
+                        } => {
+                            followups.append(&mut source_followups);
+                            graph_row_merge_delegated_metadata(
+                                &mut delegated_metadata,
+                                metadata,
                             );
+                            delegated_buckets.extend(buckets);
+                            delegated_label_branches = label_branches;
+                            delegated_drivers.extend(drivers);
+                            delegated_modes.extend(planned_modes);
+                            delegated_warnings.extend(planned_warnings);
                         }
-                    }
-                    GraphRowEdgeSourceRead::TooBroad { planned_source, .. } => {
-                        if let Some(path) = vlp_cap_context {
-                            return Err(graph_row_vlp_cap_error(
-                                "max_frontier",
-                                query.options.max_frontier,
-                                path,
+                        GraphRowDelegatedEdgeSourceRead::NoLegalSource => {
+                            return Err(EngineError::InvalidOperation(
+                                "endpoint-anchored delegated graph row edge query had no legal source"
+                                    .to_string(),
                             ));
                         }
-                        return Err(EngineError::InvalidOperation(format!(
-                            "graph row max_frontier exceeded configured cap {}; source=EdgeCandidateSource edge={} planned_source={planned_source}",
-                            query.options.max_frontier,
-                            edge.explain_name()
-                        )));
                     }
-                    GraphRowEdgeSourceRead::NoLegalSource => {
+                }
+            }
+
+            if has_unbound_endpoint_pair {
+                match self.graph_row_delegated_edge_candidate_read(
+                    query,
+                    edge,
+                    effective_at_epoch,
+                    policy_cutoffs,
+                    frontier_peak,
+                    explain_trace.is_some(),
+                    vlp_cap_context,
+                )? {
+                    GraphRowDelegatedEdgeSourceRead::Ready {
+                        metadata,
+                        followups: mut source_followups,
+                        buckets,
+                        label_branches,
+                        drivers,
+                        planned_modes,
+                        planned_warnings,
+                        verified_candidates: _,
+                    } => {
+                        followups.append(&mut source_followups);
+                        graph_row_merge_delegated_metadata(&mut delegated_metadata, metadata);
+                        delegated_buckets.extend(buckets);
+                        delegated_label_branches = label_branches;
+                        delegated_drivers.extend(drivers);
+                        delegated_modes.extend(planned_modes);
+                        delegated_warnings.extend(planned_warnings);
+                    }
+                    GraphRowDelegatedEdgeSourceRead::NoLegalSource => {
                         return Err(EngineError::InvalidOperation(
                             "graph row required edge pattern requires an anchor or allow_full_scan=true"
                                 .to_string(),
                         ));
                     }
                 }
+            }
+
+            candidate_ids.extend(delegated_metadata.iter().map(|meta| meta.id));
+            candidate_ids.sort_unstable();
+            candidate_ids.dedup();
+            graph_row_record_frontier_cap_peak(
+                frontier_peak,
+                candidate_ids.len(),
+                query.options.max_frontier,
+                vlp_cap_context,
+            )?;
+            all_candidates_delegated = !raw_candidates_contributed;
+
+            if let Some(trace) = explain_trace {
+                delegated_modes.sort_unstable();
+                delegated_modes.dedup();
+                delegated_warnings.sort_unstable();
+                delegated_warnings.dedup();
+                let verified_candidates = delegated_metadata.len();
+                let runtime_choice = if raw_candidates_contributed {
+                    GraphRowEdgeCandidateSourceChoice::MixedEndpointAndEdgeSource
+                } else {
+                    GraphRowEdgeCandidateSourceChoice::DelegatedEdgeQuery
+                };
+                let materialized_prefix = if raw_candidates_contributed {
+                    "EndpointAdjacency|"
+                } else {
+                    ""
+                };
+                trace.record_runtime_edge_source(
+                    edge,
+                    runtime_choice,
+                    format!(
+                        "planned_driver={planned_driver}; materialized_source={materialized_prefix}DelegatedEdgeQuery{{buckets={}; label_branches={delegated_label_branches}; drivers={}; planned_modes={}; planned_warnings=[{}]}}; fallback_source=none; skipped_due_to_empty_frontier=false; verified_candidates={verified_candidates}",
+                        delegated_buckets.join(","),
+                        delegated_drivers.join("|"),
+                        delegated_modes.join("|"),
+                        delegated_warnings.join(",")
+                    ),
+                    candidate_ids.len(),
+                );
             }
         }
         candidate_ids.sort_unstable();
@@ -9252,12 +9737,16 @@ impl ReadView {
             vlp_cap_context,
         )?;
 
-        let verified = self.graph_row_verify_edge_candidates(
-            &candidate_ids,
-            edge,
-            effective_at_epoch,
-            policy_cutoffs,
-        )?;
+        let verified = if all_candidates_delegated {
+            delegated_metadata
+        } else {
+            self.graph_row_verify_edge_candidates(
+                &candidate_ids,
+                edge,
+                effective_at_epoch,
+                policy_cutoffs,
+            )?
+        };
         let mut oriented = Vec::new();
         for meta in verified {
             for (logical_from, logical_to) in graph_row_edge_orientations(edge.direction, meta) {
@@ -9281,7 +9770,10 @@ impl ReadView {
             query.options.max_frontier,
             vlp_cap_context,
         )?;
-        Ok(oriented)
+        Ok(GraphRowFixedEdgeCandidates {
+            edges: oriented,
+            endpoints_verified: all_candidates_delegated,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9397,9 +9889,252 @@ impl ReadView {
             EdgeQueryCandidateSourceKind::AnyEndpointAdjacency,
             Arc::new(Vec::new()),
             label_filter_ids.map(Vec::from),
-            estimate,
+            EdgeEndpointPlannerStats {
+                estimate,
+                stream_cursor_count_upper_bound: 0,
+            },
         );
         source.plan_cost()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_delegated_edge_candidate_read(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        edge: &GraphRowRuntimeEdge,
+        effective_at_epoch: i64,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        frontier_peak: &mut usize,
+        explain_requested: bool,
+        vlp_cap_context: Option<&GraphRowRuntimeVariableLength>,
+    ) -> Result<GraphRowDelegatedEdgeSourceRead, EngineError> {
+        let cap = query.options.max_frontier;
+        let label_branches: Vec<Option<u32>> = match edge.label_filter_ids.as_deref() {
+            Some(label_ids) => label_ids.iter().copied().map(Some).collect(),
+            None => vec![None],
+        };
+        let label_branch_count = label_branches.len();
+        let mut all_metadata = Vec::new();
+        let mut verified_candidates = 0usize;
+        let mut followups = Vec::new();
+        let mut drivers = Vec::new();
+        let mut planned_modes = Vec::new();
+        let mut planned_warnings = Vec::new();
+
+        // The query is planned before the system validity predicate is added.
+        // Only `label_id` varies per branch; the execution query is the exact
+        // verifier-only narrowing locked by DEC-42-021.
+        let mut normalized = NormalizedEdgeQuery {
+            label_id: label_branches.first().copied().flatten(),
+            ids: edge.candidate_edge_ids.clone(),
+            from_ids: Vec::new(),
+            to_ids: Vec::new(),
+            endpoint_ids: Vec::new(),
+            filter: edge.filter.clone(),
+            allow_full_scan: query.options.allow_full_scan,
+            page: PageRequest {
+                limit: Some(cap.saturating_add(1)),
+                after: None,
+            },
+            warnings: Vec::new(),
+        };
+        for label_id in label_branches {
+            normalized.label_id = label_id;
+            let planned = match self.plan_normalized_edge_query(&normalized) {
+                Ok(planned) => planned,
+                Err(EngineError::InvalidOperation(_)) => {
+                    return Ok(GraphRowDelegatedEdgeSourceRead::NoLegalSource);
+                }
+                Err(error) => return Err(error),
+            };
+            if explain_requested {
+                drivers.push(format!("{:?}", planned.driver.plan_node()));
+                planned_modes.push(graph_row_planned_edge_mode_label(planned.execution_mode));
+                planned_warnings.extend(
+                    planned
+                        .warnings
+                        .iter()
+                        .copied()
+                        .map(graph_row_plan_warning_label),
+                );
+            }
+
+            let mut execution_query = normalized.clone();
+            execution_query.filter =
+                graph_row_delegated_filter_with_valid_at(&normalized, effective_at_epoch)?;
+
+            #[cfg(test)]
+            self.note_graph_row_delegated_edge_query();
+            let (page, mut source_followups) =
+                self.query_edge_metadata_page_planned(
+                    &execution_query,
+                    planned,
+                    policy_cutoffs,
+                )?;
+            #[cfg(test)]
+            self.note_graph_row_delegated_verified_candidates(page.metadata.len());
+            verified_candidates = verified_candidates.saturating_add(page.metadata.len());
+            followups.append(&mut source_followups);
+            graph_row_merge_delegated_metadata(&mut all_metadata, page.metadata);
+            if all_metadata.len() > cap {
+                return Err(match vlp_cap_context {
+                    Some(path) => graph_row_vlp_cap_error("max_frontier", cap, path),
+                    None => graph_row_cap_error("max_frontier", cap),
+                });
+            }
+            graph_row_record_frontier_cap_peak(
+                frontier_peak,
+                all_metadata.len(),
+                cap,
+                vlp_cap_context,
+            )?;
+        }
+
+        planned_modes.sort_unstable();
+        planned_modes.dedup();
+        planned_warnings.sort_unstable();
+        planned_warnings.dedup();
+
+        Ok(GraphRowDelegatedEdgeSourceRead::Ready {
+            metadata: all_metadata,
+            verified_candidates,
+            followups,
+            buckets: vec!["unbound"],
+            label_branches: label_branch_count,
+            drivers,
+            planned_modes,
+            planned_warnings,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_delegated_bound_bucket_read(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        edge: &GraphRowRuntimeEdge,
+        outgoing: &[u64],
+        incoming: &[u64],
+        both: &[u64],
+        effective_at_epoch: i64,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        frontier_peak: &mut usize,
+        explain_requested: bool,
+        vlp_cap_context: Option<&GraphRowRuntimeVariableLength>,
+    ) -> Result<GraphRowDelegatedEdgeSourceRead, EngineError> {
+        let cap = query.options.max_frontier;
+        let mut outgoing = outgoing.to_vec();
+        outgoing.sort_unstable();
+        outgoing.dedup();
+        let mut incoming = incoming.to_vec();
+        incoming.sort_unstable();
+        incoming.dedup();
+        let mut both = both.to_vec();
+        both.sort_unstable();
+        both.dedup();
+        let label_branches: Vec<Option<u32>> = match edge.label_filter_ids.as_deref() {
+            Some(label_ids) => label_ids.iter().copied().map(Some).collect(),
+            None => vec![None],
+        };
+        let label_branch_count = label_branches.len();
+        let mut all_metadata = Vec::new();
+        let mut verified_candidates = 0usize;
+        let mut followups = Vec::new();
+        let mut bucket_labels = Vec::new();
+        let mut drivers = Vec::new();
+        let mut planned_modes = Vec::new();
+        let mut planned_warnings = Vec::new();
+
+        for (bucket_label, from_ids, to_ids, endpoint_ids) in [
+            ("outgoing", outgoing.as_slice(), &[][..], &[][..]),
+            ("incoming", &[][..], incoming.as_slice(), &[][..]),
+            ("both", &[][..], &[][..], both.as_slice()),
+        ] {
+            let bucket = if !from_ids.is_empty() {
+                from_ids
+            } else if !to_ids.is_empty() {
+                to_ids
+            } else {
+                endpoint_ids
+            };
+            if bucket.is_empty() {
+                continue;
+            }
+            bucket_labels.push(bucket_label);
+
+            let mut normalized = NormalizedEdgeQuery {
+                label_id: label_branches.first().copied().flatten(),
+                ids: Vec::new(),
+                from_ids: from_ids.to_vec(),
+                to_ids: to_ids.to_vec(),
+                endpoint_ids: endpoint_ids.to_vec(),
+                filter: edge.filter.clone(),
+                allow_full_scan: query.options.allow_full_scan,
+                page: PageRequest {
+                    limit: Some(cap.saturating_add(1)),
+                    after: None,
+                },
+                warnings: Vec::new(),
+            };
+
+            for &label_id in &label_branches {
+                normalized.label_id = label_id;
+                // Endpoint anchoring makes the user query independently legal. Plan it
+                // before adding the verifier-only system validity constraint.
+                let planned = self.plan_normalized_edge_query(&normalized)?;
+                if explain_requested {
+                    drivers.push(format!("{:?}", planned.driver.plan_node()));
+                    planned_modes.push(graph_row_planned_edge_mode_label(planned.execution_mode));
+                    planned_warnings.extend(
+                        planned
+                            .warnings
+                            .iter()
+                            .copied()
+                            .map(graph_row_plan_warning_label),
+                    );
+                }
+
+                let mut execution_query = normalized.clone();
+                execution_query.filter = graph_row_delegated_filter_with_valid_at(
+                    &normalized,
+                    effective_at_epoch,
+                )?;
+
+                #[cfg(test)]
+                self.note_graph_row_delegated_edge_query();
+                let (page, mut source_followups) = self.query_edge_metadata_page_planned(
+                    &execution_query,
+                    planned,
+                    policy_cutoffs,
+                )?;
+                #[cfg(test)]
+                self.note_graph_row_delegated_verified_candidates(page.metadata.len());
+                verified_candidates = verified_candidates.saturating_add(page.metadata.len());
+                followups.append(&mut source_followups);
+                graph_row_merge_delegated_metadata(&mut all_metadata, page.metadata);
+                graph_row_record_frontier_cap_peak(
+                    frontier_peak,
+                    all_metadata.len(),
+                    cap,
+                    vlp_cap_context,
+                )?;
+            }
+        }
+
+        planned_modes.sort_unstable();
+        planned_modes.dedup();
+        planned_warnings.sort_unstable();
+        planned_warnings.dedup();
+
+        Ok(GraphRowDelegatedEdgeSourceRead::Ready {
+            metadata: all_metadata,
+            verified_candidates,
+            followups,
+            buckets: bucket_labels,
+            label_branches: label_branch_count,
+            drivers,
+            planned_modes,
+            planned_warnings,
+        })
     }
 
     fn graph_row_materialize_edge_candidate_source(
@@ -9455,7 +10190,10 @@ impl ReadView {
                 Err(error) => return Err(error),
             };
             let planned_source = format!("{:?}", planned.driver.plan_node());
-            let subset_source = if matches!(planned.driver, EdgePhysicalPlan::Intersect(_)) {
+            let subset_source = if matches!(
+                planned.driver,
+                EdgePhysicalPlan::Intersect { .. }
+            ) {
                 Some(planned_source.clone())
             } else {
                 None
@@ -9775,6 +10513,21 @@ impl ReadView {
             )?;
         }
         Ok(verified.into_iter().collect())
+    }
+
+    fn graph_row_verified_or_proven_node_ids(
+        &self,
+        node: &GraphRowRuntimeNode,
+        mut candidate_ids: Vec<u64>,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        endpoints_verified: bool,
+    ) -> Result<NodeIdSet, EngineError> {
+        if endpoints_verified && graph_row_node_query_is_visibility_only(&node.query) {
+            candidate_ids.sort_unstable();
+            candidate_ids.dedup();
+            return Ok(candidate_ids.into_iter().collect());
+        }
+        self.graph_row_verified_node_ids(node, candidate_ids, policy_cutoffs)
     }
 
     fn hydrate_graph_rows_for_needs(

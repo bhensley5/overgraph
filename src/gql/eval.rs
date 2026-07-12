@@ -866,22 +866,22 @@ fn eval_expr(expr: &Expr, context: &GqlEvalContext<'_>) -> Result<RuntimeValue, 
                         ));
                     };
                     let field_value = match kind {
-                        GqlAliasKind::Node => node_metadata_projection_field(metadata).map(
-                            |field| {
+                        GqlAliasKind::Node => {
+                            node_metadata_projection_field(metadata).map(|field| {
                                 context.value(GqlRuntimeValueKey::NodeMetadata {
                                     alias: alias.clone(),
                                     field,
                                 })
-                            },
-                        ),
-                        GqlAliasKind::Edge => edge_metadata_projection_field(metadata).map(
-                            |field| {
+                            })
+                        }
+                        GqlAliasKind::Edge => {
+                            edge_metadata_projection_field(metadata).map(|field| {
                                 context.value(GqlRuntimeValueKey::EdgeMetadata {
                                     alias: alias.clone(),
                                     field,
                                 })
-                            },
-                        ),
+                            })
+                        }
                         GqlAliasKind::Path | GqlAliasKind::Scalar => None,
                     };
                     let Some(value) = field_value else {

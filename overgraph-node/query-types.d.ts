@@ -814,6 +814,7 @@ export type QueryPlanWarning =
   | 'boolean_branch_fallback'
   | 'planning_probe_budget_exceeded'
   | 'compound_index_prefix_not_satisfied'
+  | 'streamed_input_buffer_cap_exceeded'
   | 'unknown_node_label'
   | 'unknown_edge_label'
 
@@ -837,6 +838,7 @@ export interface QueryPlanPublicInputs {
 
 export type QueryPlanCompoundTargetKind = 'node' | 'edge'
 export type QueryPlanSecondaryIndexKind = 'equality' | 'range'
+export type QueryPlanExecutionMode = 'eager' | 'streamed'
 export type QueryPlanNodeMetadataIndexField = 'id' | 'key' | 'weight' | 'created_at' | 'updated_at'
 export type QueryPlanEdgeMetadataIndexField =
   | 'id'
@@ -890,8 +892,10 @@ export type QueryPlanNode =
   | { kind: 'edge_metadata_scan' }
   | { kind: 'edge_property_equality_index' }
   | { kind: 'edge_property_range_index' }
-  | { kind: 'intersect'; inputs: Array<QueryPlanNode> }
-  | { kind: 'union'; inputs: Array<QueryPlanNode> }
+  | { kind: 'intersect'; inputs: Array<QueryPlanNode>; mode: QueryPlanExecutionMode }
+  | { kind: 'union'; inputs: Array<QueryPlanNode>; mode: QueryPlanExecutionMode }
+  | { kind: 'streamed_source'; input: QueryPlanNode }
+  | { kind: 'buffered_id_sort'; input: QueryPlanNode }
   | { kind: 'verify_node_filter'; input: QueryPlanNode }
   | { kind: 'verify_edge_filter'; input: QueryPlanNode }
   | { kind: 'verify_edge_predicates'; input: QueryPlanNode }

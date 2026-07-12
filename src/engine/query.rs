@@ -237,17 +237,7 @@ impl DatabaseEngine {
         if let Some(t) = snapshot_start {
             instr.snapshot_ns = t.elapsed().as_nanos() as u64;
         }
-        let mut plan = if options.include_plan {
-            Some(wrap_read_gql_explain(build_gql_explain(
-                &published.view,
-                &lowered,
-                &return_exprs,
-                &resolved_order_by,
-                options,
-            )?, options))
-        } else {
-            None
-        };
+        let mut plan = None;
         let mut warnings = warnings;
 
         let graph_row_start = instr.mark();
@@ -275,6 +265,25 @@ impl DatabaseEngine {
             instr.graph_row_execution_ns = graph_result.stats.execution_ns.unwrap_or(0);
         }
         warnings.extend(graph_result.stats.warnings.iter().cloned());
+        if options.include_plan {
+            let normalized = normalize_gql_graph_row_target(&lowered)?;
+            let graph_row_explain = graph_result.plan.as_ref().ok_or_else(|| {
+                EngineError::InvalidOperation(
+                    "executed GQL graph-row query did not produce a plan".to_string(),
+                )
+            })?;
+            plan = Some(wrap_read_gql_explain(
+                build_gql_graph_row_read_explain(
+                    &lowered,
+                    &return_exprs,
+                    &resolved_order_by,
+                    options,
+                    &normalized,
+                    graph_row_explain,
+                ),
+                options,
+            ));
+        }
 
         let effective_row_cap = options.max_rows.min(options.max_intermediate_bindings).max(1);
         let truncated_by_row_cap = graph_result.next_cursor.is_some()
@@ -11048,6 +11057,8 @@ struct GraphRowExplainRuntimeStats {
     rows_after_filter: usize,
     rows_seen_for_page: usize,
     intermediate_bindings_peak: usize,
+    /// Mirrors `GraphRowStats::frontier_peak`: verified candidates on delegated reads,
+    /// raw candidates on preserved non-delegated reads.
     frontier_peak: usize,
     paths_enumerated: usize,
     next_cursor: bool,
@@ -12451,7 +12462,6 @@ fn build_gql_explain(
         ));
     }
 
-    let mut warnings = lowered.warnings.clone();
     let normalized = normalize_gql_graph_row_target(lowered)?;
     let cursor_state = graph_row_prepare_cursor_state(
         &normalized.page,
@@ -12459,11 +12469,30 @@ fn build_gql_explain(
         &normalized.options,
     )?;
     let graph_row_explain = view.explain_graph_rows_normalized(&normalized, cursor_state)?;
+    Ok(build_gql_graph_row_read_explain(
+        lowered,
+        returns,
+        order_by,
+        options,
+        &normalized,
+        &graph_row_explain,
+    ))
+}
+
+fn build_gql_graph_row_read_explain(
+    lowered: &GqlLoweredPlan,
+    returns: &[GqlReturnExpr],
+    order_by: &[GqlResolvedOrderItem],
+    options: &GqlExecutionOptions,
+    normalized: &NormalizedGraphRowQuery,
+    graph_row_explain: &GraphRowExplain,
+) -> GqlExplain {
+    let mut warnings = lowered.warnings.clone();
     warnings.extend(graph_row_explain.warnings.iter().cloned());
     warnings.sort();
     warnings.dedup();
     let mut projection =
-        gql_projection_summaries(&normalized, returns, order_by, options.include_vectors);
+        gql_projection_summaries(normalized, returns, order_by, options.include_vectors);
     projection.extend(graph_row_explain.plan.iter().map(|node| {
         format!("graph row plan: {}: {}", node.kind, node.detail)
     }));
@@ -12502,7 +12531,7 @@ fn build_gql_explain(
             .iter()
             .map(|note| format!("graph row note: {note}")),
     );
-    Ok(GqlExplain {
+    GqlExplain {
         columns: returns
             .iter()
             .map(|return_expr| return_expr.output_name.clone())
@@ -12532,7 +12561,7 @@ fn build_gql_explain(
             max_literal_items: options.max_literal_items,
         },
         warnings,
-    })
+    }
 }
 
 fn build_gql_limit_zero_explain(

@@ -397,7 +397,8 @@ mod tests {
 
     #[test]
     fn ddl_metadata_function_names_match_case_insensitively() {
-        let node = bind_property("CREATE PROPERTY INDEX FOR (n:Person) ON (UPDATEDAT(n)) KIND RANGE");
+        let node =
+            bind_property("CREATE PROPERTY INDEX FOR (n:Person) ON (UPDATEDAT(n)) KIND RANGE");
         assert_eq!(
             node.fields,
             vec![SecondaryIndexField::node_meta(

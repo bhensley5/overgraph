@@ -4535,8 +4535,9 @@ mod tests {
 
     #[test]
     fn mutation_rejects_create_alias_collisions_and_invalid_create_shapes() {
-        let duplicate = bind_mut("CREATE (n:Person {elementKey: 'a'}), (n:Person {elementKey: 'b'})")
-            .expect_err("duplicate created alias should fail");
+        let duplicate =
+            bind_mut("CREATE (n:Person {elementKey: 'a'}), (n:Person {elementKey: 'b'})")
+                .expect_err("duplicate created alias should fail");
         expect_mut_semantic_code(duplicate, GqlSemanticErrorCode::DuplicateAlias);
 
         let bound_endpoint =
@@ -4617,13 +4618,19 @@ mod tests {
         // Kind-invalid metadata map keys still error.
         let edge_meta_on_node = bind_mut("CREATE (n:Person {elementKey: 'a', validFrom: 1})")
             .expect_err("edge-only metadata key on node map should fail");
-        expect_mut_semantic_code(edge_meta_on_node, GqlSemanticErrorCode::InvalidPropertyAccess);
+        expect_mut_semantic_code(
+            edge_meta_on_node,
+            GqlSemanticErrorCode::InvalidPropertyAccess,
+        );
 
         let node_meta_on_edge = bind_mut(
             "CREATE (a:Person {elementKey: 'a'})-[r:R {elementKey: 'x'}]->(b:Person {elementKey: 'b'})",
         )
         .expect_err("node-only metadata key on edge map should fail");
-        expect_mut_semantic_code(node_meta_on_edge, GqlSemanticErrorCode::InvalidPropertyAccess);
+        expect_mut_semantic_code(
+            node_meta_on_edge,
+            GqlSemanticErrorCode::InvalidPropertyAccess,
+        );
     }
 
     #[test]
@@ -4653,7 +4660,8 @@ mod tests {
 
     #[test]
     fn mutation_rejects_created_alias_rhs_sources_but_allows_targets_and_return() {
-        let ok = bind_mut("CREATE (n:Person {elementKey: 'a'}) SET n.name = 'Ada' RETURN n").unwrap();
+        let ok =
+            bind_mut("CREATE (n:Person {elementKey: 'a'}) SET n.name = 'Ada' RETURN n").unwrap();
         assert!(ok.aliases.contains_key("n"));
 
         let rhs = bind_mut("CREATE (n:Person {elementKey: 'a'}) SET n.name = n.key")
@@ -4694,7 +4702,7 @@ mod tests {
 
         let remove_deleted =
             bind_mut("MATCH (n:Person {elementKey: 'a'}) DETACH DELETE n REMOVE n.name")
-            .expect_err("REMOVE after DETACH DELETE of same alias should fail");
+                .expect_err("REMOVE after DETACH DELETE of same alias should fail");
         expect_mut_semantic_code(
             remove_deleted,
             GqlSemanticErrorCode::InvalidReturnExpression,

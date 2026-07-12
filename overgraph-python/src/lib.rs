@@ -6721,21 +6721,31 @@ fn query_plan_node_to_py(py: Python<'_>, node: QueryPlanNode) -> PyResult<PyObje
         QueryPlanNode::EdgePropertyRangeIndex => {
             dict.set_item("kind", "edge_property_range_index")?
         }
-        QueryPlanNode::Intersect { inputs } => {
+        QueryPlanNode::Intersect { inputs, mode } => {
             dict.set_item("kind", "intersect")?;
+            dict.set_item("mode", query_plan_execution_mode_to_py(mode))?;
             let inputs: PyResult<Vec<PyObject>> = inputs
                 .into_iter()
                 .map(|input| query_plan_node_to_py(py, input))
                 .collect();
             dict.set_item("inputs", inputs?)?;
         }
-        QueryPlanNode::Union { inputs } => {
+        QueryPlanNode::Union { inputs, mode } => {
             dict.set_item("kind", "union")?;
+            dict.set_item("mode", query_plan_execution_mode_to_py(mode))?;
             let inputs: PyResult<Vec<PyObject>> = inputs
                 .into_iter()
                 .map(|input| query_plan_node_to_py(py, input))
                 .collect();
             dict.set_item("inputs", inputs?)?;
+        }
+        QueryPlanNode::StreamedSource { input } => {
+            dict.set_item("kind", "streamed_source")?;
+            dict.set_item("input", query_plan_node_to_py(py, *input)?)?;
+        }
+        QueryPlanNode::BufferedIdSort { input } => {
+            dict.set_item("kind", "buffered_id_sort")?;
+            dict.set_item("input", query_plan_node_to_py(py, *input)?)?;
         }
         QueryPlanNode::VerifyNodeFilter { input } => {
             dict.set_item("kind", "verify_node_filter")?;
@@ -6810,6 +6820,13 @@ fn query_plan_public_name_to_py(py: Python<'_>, name: QueryPlanPublicName) -> Py
     Ok(dict.into_any().unbind())
 }
 
+fn query_plan_execution_mode_to_py(mode: eg::QueryPlanExecutionMode) -> &'static str {
+    match mode {
+        eg::QueryPlanExecutionMode::Eager => "eager",
+        eg::QueryPlanExecutionMode::Streamed => "streamed",
+    }
+}
+
 fn query_plan_warning_to_py(warning: &QueryPlanWarning) -> &'static str {
     match warning {
         QueryPlanWarning::MissingReadyIndex => "missing_ready_index",
@@ -6825,6 +6842,7 @@ fn query_plan_warning_to_py(warning: &QueryPlanWarning) -> &'static str {
         QueryPlanWarning::BooleanBranchFallback => "boolean_branch_fallback",
         QueryPlanWarning::PlanningProbeBudgetExceeded => "planning_probe_budget_exceeded",
         QueryPlanWarning::CompoundIndexPrefixNotSatisfied => "compound_index_prefix_not_satisfied",
+        QueryPlanWarning::StreamedInputBufferCapExceeded => "streamed_input_buffer_cap_exceeded",
         QueryPlanWarning::UnknownNodeLabel => "unknown_node_label",
         QueryPlanWarning::UnknownEdgeLabel => "unknown_edge_label",
     }

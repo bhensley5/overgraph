@@ -155,6 +155,73 @@ fn gql_query_profile_planning_counters_in_explain_note() {
     );
 }
 
+#[test]
+fn gql_single_match_include_plan_uses_executed_delegated_runtime_trace_once() {
+    let (_dir, engine) = query_test_engine();
+    let source = insert_query_node(&engine, "GqlDelegatedTrace", "trace-source", &[], 1.0);
+    let target = insert_query_node(&engine, "GqlDelegatedTrace", "trace-target", &[], 1.0);
+    let edge = engine
+        .upsert_edge(
+            source,
+            target,
+            "GQL_DELEGATED_TRACE",
+            UpsertEdgeOptions {
+                props: query_test_props(&[(
+                    "status",
+                    PropValue::String("keep".to_string()),
+                )]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let source_text = format!(
+        "MATCH (source:GqlDelegatedTrace)-[edge:GQL_DELEGATED_TRACE]->(target) \
+         WHERE id(source) = {source} AND edge.status = 'keep' RETURN id(edge)"
+    );
+
+    engine.reset_query_execution_counters_for_test();
+    let result = engine
+        .execute_gql(
+            &source_text,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                include_plan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_u64_column(&result, 0), vec![edge]);
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.graph_row_query_calls, 1);
+    assert_eq!(counters.graph_row_delegated_edge_queries, 1);
+    let read = gql_read_explain(result.plan.as_ref().expect("include_plan"));
+    let runtime = read
+        .projection
+        .iter()
+        .find(|item| item.contains("graph row plan: GraphRowSourceRead"))
+        .expect("executed graph-row source trace must reach GQL include_plan");
+    assert!(runtime.contains("materialized_source=DelegatedEdgeQuery"), "{runtime}");
+    assert!(runtime.contains("planned_modes=eager"), "{runtime}");
+    assert!(
+        runtime.contains(
+            "planned_warnings=[edge_property_post_filter,missing_ready_index,verify_only_filter]"
+        ),
+        "{runtime}"
+    );
+    assert!(result.stats.warnings.is_empty());
+
+    engine.reset_query_execution_counters_for_test();
+    let plain = execute_gql_ok(&engine, &source_text);
+    assert_eq!(gql_u64_column(&plain, 0), vec![edge]);
+    assert!(plain.plan.is_none());
+    assert_eq!(
+        engine
+            .query_execution_counter_snapshot_for_test()
+            .graph_row_query_calls,
+        1
+    );
+}
+
 fn execute_gql_with_params(
     engine: &DatabaseEngine,
     source: &str,
@@ -10394,6 +10461,193 @@ fn gql_index_compound_prefix_warning_renders_locked_message() {
 }
 
 #[test]
+fn gql_streamed_selectivity_demotion_does_not_claim_buffer_overflow() {
+    let (_dir, engine) = query_test_engine();
+    let status_info = engine
+        .ensure_node_property_index(
+            "GqlStreamedWarning",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let score_info = engine
+        .ensure_node_property_index(
+            "GqlStreamedWarning",
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_property_index_state(&engine, score_info.index_id, SecondaryIndexState::Ready);
+
+    let total = 10_000usize;
+    let mut inputs = Vec::with_capacity(total);
+    for ordinal in 0..total {
+        inputs.push(NodeInput {
+            labels: vec!["GqlStreamedWarning".to_string()],
+            key: format!("gql-streamed-warning-{ordinal}"),
+            props: query_test_props(&[
+                (
+                    "status",
+                    PropValue::String(if ordinal < 100 { "hot" } else { "cold" }.to_string()),
+                ),
+                ("score", PropValue::Int(ordinal as i64)),
+            ]),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        });
+    }
+    engine.batch_upsert_nodes(inputs).unwrap();
+    engine.flush().unwrap();
+
+    // DEC-42-019 truthfulness pin: this shape demotes the broad buffered range
+    // input on selectivity without any buffer materialization overflow, so the
+    // locked overflow warning must NOT surface through GQL. The genuine
+    // overflow positive is pinned natively in query_planner.rs; truthful
+    // planned_warnings reach GQL only via the delegated trace detail strings.
+    let warning = "streamed_input_buffer_cap_exceeded";
+    let source =
+        "MATCH (n:GqlStreamedWarning) WHERE n.status = 'hot' AND n.score >= 0 AND n.score <= 8999 RETURN id(n)";
+    let explained = engine
+        .explain_gql(source, &GqlParams::new(), &gql_opts())
+        .unwrap();
+    let read = gql_read_explain(&explained);
+    assert!(
+        read.warnings.iter().all(|actual| actual != warning),
+        "selectivity demotion must not claim a buffer overflow in explain, got {:?}",
+        read.warnings
+    );
+
+    let result = execute_gql_with_options(
+        &engine,
+        source,
+        GqlExecutionOptions {
+            include_plan: true,
+            ..gql_opts()
+        },
+    );
+    assert_eq!(result.rows.len(), 100);
+    let read = gql_read_explain(result.plan.as_ref().expect("include_plan should return plan"));
+    assert!(
+        read.warnings.iter().all(|actual| actual != warning),
+        "selectivity demotion must not claim a buffer overflow in include-plan read explain, got {:?}",
+        read.warnings
+    );
+}
+
+#[test]
+fn gql_streamed_edge_result_parity_reuses_delegated_graph_row_execution() {
+    let (_dir, engine) = query_test_engine();
+    let label = "GQL_STREAMED_EDGE_PARITY";
+    let status_info = engine
+        .ensure_edge_property_index(
+            label,
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]),
+        )
+        .unwrap();
+    let region_info = engine
+        .ensure_edge_property_index(
+            label,
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("region")]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(&engine, status_info.index_id, SecondaryIndexState::Ready);
+    wait_for_edge_property_index_state(&engine, region_info.index_id, SecondaryIndexState::Ready);
+
+    let total = 9_000usize;
+    let nodes = (0..=total)
+        .map(|ordinal| NodeInput {
+            labels: vec!["GqlStreamedEdgeParityNode".to_string()],
+            key: format!("gql-streamed-edge-parity-{ordinal}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect::<Vec<_>>();
+    let node_ids = engine.batch_upsert_nodes(nodes).unwrap();
+    let source = node_ids[0];
+    let edges = node_ids[1..]
+        .iter()
+        .enumerate()
+        .map(|(ordinal, to)| EdgeInput {
+            from: source,
+            to: *to,
+            label: label.to_string(),
+            props: query_test_props(&[
+                (
+                    "status",
+                    PropValue::String(if ordinal % 5 < 3 { "hot" } else { "cold" }.to_string()),
+                ),
+                (
+                    "region",
+                    PropValue::String(if ordinal % 2 == 0 { "east" } else { "west" }.to_string()),
+                ),
+            ]),
+            weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+        })
+        .collect::<Vec<_>>();
+    engine.batch_upsert_edges(edges).unwrap();
+    engine.flush().unwrap();
+
+    let direct = EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(25),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let direct_plan = engine.explain_edge_query(&direct).unwrap();
+    let QueryPlanNode::Intersect { mode, .. } = explain_edge_input_node(&direct_plan) else {
+        panic!("expected native streamed edge plan, got {direct_plan:?}");
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    let native_ids = engine.query_edge_ids(&direct).unwrap().edge_ids;
+
+    let source = "MATCH ()-[r:GQL_STREAMED_EDGE_PARITY]->() \
+         WHERE r.status = 'hot' AND r.region = 'east' \
+         RETURN id(r) ORDER BY id(r) LIMIT 25";
+    engine.reset_query_execution_counters_for_test();
+    let result = execute_gql_with_options(
+        &engine,
+        source,
+        GqlExecutionOptions {
+            include_plan: true,
+            ..gql_opts()
+        },
+    );
+    assert_eq!(gql_u64_column(&result, 0), native_ids);
+    let read = gql_read_explain(result.plan.as_ref().expect("include_plan should return plan"));
+    assert_eq!(read.target, GqlLoweringTarget::GraphRowQuery);
+    assert!(read.native_plan.is_none());
+    assert!(read
+        .pushed_down
+        .iter()
+        .any(|item| item.contains("r.status")));
+    assert!(read
+        .pushed_down
+        .iter()
+        .any(|item| item.contains("r.region")));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.graph_row_delegated_edge_queries, 1);
+    assert_eq!(counters.graph_row_delegated_verified_candidates, 2_700);
+    assert_eq!(counters.streamed_edge_intersect_drivers, 1);
+    assert!(counters.streamed_edge_cursor_seeks > 0);
+}
+
+#[test]
 fn gql_index_lifecycle_unsupported_explain_and_unknown_drop_have_no_side_effects() {
     let (_dir, engine) = query_test_engine();
     let before = gql_index_side_effect_snapshot(&engine);
@@ -11426,6 +11680,68 @@ fn gql_exists_subquery_probe_does_not_cap_raw_edge_candidates() {
         )
         .unwrap();
     assert_eq!(gql_string_column(&result, 0), vec!["source"]);
+}
+
+#[test]
+fn gql_exists_physical_probe_composes_with_complete_delegated_expansion_page() {
+    let (_dir, engine) = query_test_engine();
+    let source = insert_query_node(
+        &engine,
+        "GqlDelegatedExistsSource",
+        "delegated-exists-source",
+        &[],
+        1.0,
+    );
+    for index in 0..6 {
+        let target = insert_query_node(
+            &engine,
+            "GqlDelegatedExistsTarget",
+            &format!("delegated-exists-target-{index}"),
+            &[],
+            1.0,
+        );
+        engine
+            .upsert_edge(
+                source,
+                target,
+                "GQL_DELEGATED_EXISTS",
+                UpsertEdgeOptions {
+                    props: query_test_props(&[(
+                        "status",
+                        PropValue::String(if index == 5 { "hot" } else { "cold" }.to_string()),
+                    )]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    engine.reset_query_execution_counters_for_test();
+    let result = engine
+        .execute_gql(
+            "MATCH (source:GqlDelegatedExistsSource) \
+             WHERE EXISTS { \
+               MATCH (source)-[edge:GQL_DELEGATED_EXISTS]->(target) \
+               WHERE edge.status = 'hot' RETURN target \
+             } RETURN elementKey(source)",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                include_plan: true,
+                max_intermediate_bindings: 1,
+                max_frontier: 1,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_string_column(&result, 0), vec!["delegated-exists-source"]);
+    let read = gql_read_explain(result.plan.as_ref().expect("exists include_plan"));
+    assert!(read
+        .projection
+        .iter()
+        .any(|item| item.contains("physical_exists_probe=true")));
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.graph_row_delegated_edge_queries, 1);
+    assert_eq!(counters.graph_row_delegated_verified_candidates, 1);
 }
 
 #[test]
@@ -12462,6 +12778,61 @@ fn gql_with_pipeline_explain_reports_native_match_and_project_stages() {
         .projection
         .iter()
         .any(|item| item.contains("graph pipeline stage")));
+}
+
+#[test]
+fn gql_pipeline_nested_match_plans_preserve_delegated_runtime_details() {
+    let (_dir, engine) = query_test_engine();
+    let a = insert_query_node(&engine, "GqlPipelineDelegated", "pipeline-a", &[], 1.0);
+    let b = insert_query_node(&engine, "GqlPipelineDelegated", "pipeline-b", &[], 1.0);
+    let c = insert_query_node(&engine, "GqlPipelineDelegated", "pipeline-c", &[], 1.0);
+    let props = || UpsertEdgeOptions {
+        props: query_test_props(&[("status", PropValue::String("hot".to_string()))]),
+        ..Default::default()
+    };
+    engine
+        .upsert_edge(a, b, "GQL_PIPELINE_DELEGATED_A", props())
+        .unwrap();
+    engine
+        .upsert_edge(b, c, "GQL_PIPELINE_DELEGATED_B", props())
+        .unwrap();
+
+    engine.reset_query_execution_counters_for_test();
+    let result = engine
+        .execute_gql(
+            &format!(
+                "MATCH (a:GqlPipelineDelegated)-[first:GQL_PIPELINE_DELEGATED_A]->(b) \
+                 WHERE id(a) = {a} AND first.status = 'hot' WITH b \
+                 MATCH (b)-[second:GQL_PIPELINE_DELEGATED_B]->(c) \
+                 WHERE second.status = 'hot' RETURN id(c)"
+            ),
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                include_plan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_u64_column(&result, 0), vec![c]);
+    let read = gql_read_explain(result.plan.as_ref().expect("pipeline include_plan"));
+    assert_eq!(read.target, GqlLoweringTarget::GraphPipelineQuery);
+    let runtime_details = read
+        .projection
+        .iter()
+        .filter(|item| {
+            item.contains("nested graph row plan") && item.contains("DelegatedEdgeQuery")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(runtime_details.len(), 2, "{:#?}", read.projection);
+    assert!(runtime_details
+        .iter()
+        .all(|item| item.contains("planned_modes=eager") && item.contains("planned_warnings=[")));
+    assert_eq!(
+        engine
+            .query_execution_counter_snapshot_for_test()
+            .graph_row_delegated_edge_queries,
+        2
+    );
 }
 
 #[test]
@@ -14402,6 +14773,7 @@ fn gql_explain_reports_targets_row_ops_caps_and_does_not_execute_rows() {
         gql_read_explain(with_plan.plan.as_ref().unwrap()).target,
         GqlLoweringTarget::GraphRowQuery
     );
+    let counters_before_standalone = engine.query_execution_counter_snapshot_for_test();
 
     let standalone = engine
         .explain_gql(
@@ -14410,7 +14782,26 @@ fn gql_explain_reports_targets_row_ops_caps_and_does_not_execute_rows() {
             &gql_opts(),
         )
         .unwrap();
-    assert_eq!(with_plan.plan.unwrap(), standalone);
+    let counters_after_standalone = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(
+        counters_after_standalone.graph_row_query_calls,
+        counters_before_standalone.graph_row_query_calls
+    );
+
+    let with_plan = gql_read_explain(with_plan.plan.as_ref().unwrap());
+    let standalone = gql_read_explain(&standalone);
+    assert_eq!(with_plan.target, standalone.target);
+    assert_eq!(with_plan.columns, standalone.columns);
+    assert_eq!(with_plan.row_ops, standalone.row_ops);
+    assert_eq!(with_plan.caps, standalone.caps);
+    assert!(with_plan.projection.iter().any(|item| {
+        item.contains("graph row note: cap pressure: frontier_peak=")
+    }));
+    assert!(standalone.projection.iter().any(|item| {
+        item.contains(
+            "graph row note: cap pressure: standalone explain reports configured caps and planned operations without materializing rows",
+        )
+    }));
 }
 
 #[test]

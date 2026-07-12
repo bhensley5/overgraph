@@ -2261,6 +2261,8 @@ pub struct GraphRowStats {
     pub rows_after_filter: usize,
     pub rows_seen_for_page: usize,
     pub intermediate_bindings_peak: usize,
+    /// Largest edge frontier observed. Delegated edge reads count verified edge-query
+    /// matches; preserved raw paths retain raw-candidate accounting.
     pub frontier_peak: usize,
     pub paths_enumerated: usize,
     pub db_hits: usize,
@@ -2484,8 +2486,12 @@ pub enum QueryPlanNode {
     KeyLookup,
     NodeLabelIndex,
     NodeLabelAnyIndex,
-    CompoundEqualityIndex { details: CompoundIndexPlanDetails },
-    CompoundRangeIndex { details: CompoundIndexPlanDetails },
+    CompoundEqualityIndex {
+        details: CompoundIndexPlanDetails,
+    },
+    CompoundRangeIndex {
+        details: CompoundIndexPlanDetails,
+    },
     PropertyEqualityIndex,
     PropertyRangeIndex,
     TimestampIndex,
@@ -2500,16 +2506,40 @@ pub enum QueryPlanNode {
     EdgeMetadataScan,
     EdgePropertyEqualityIndex,
     EdgePropertyRangeIndex,
-    Intersect { inputs: Vec<QueryPlanNode> },
-    Union { inputs: Vec<QueryPlanNode> },
-    VerifyNodeFilter { input: Box<QueryPlanNode> },
-    VerifyEdgeFilter { input: Box<QueryPlanNode> },
-    VerifyEdgePredicates { input: Box<QueryPlanNode> },
+    Intersect {
+        inputs: Vec<QueryPlanNode>,
+        mode: QueryPlanExecutionMode,
+    },
+    Union {
+        inputs: Vec<QueryPlanNode>,
+        mode: QueryPlanExecutionMode,
+    },
+    StreamedSource {
+        input: Box<QueryPlanNode>,
+    },
+    BufferedIdSort {
+        input: Box<QueryPlanNode>,
+    },
+    VerifyNodeFilter {
+        input: Box<QueryPlanNode>,
+    },
+    VerifyEdgeFilter {
+        input: Box<QueryPlanNode>,
+    },
+    VerifyEdgePredicates {
+        input: Box<QueryPlanNode>,
+    },
     FallbackNodeLabelScan,
     FallbackFullNodeScan,
     FallbackEdgeLabelScan,
     FallbackFullEdgeScan,
     EmptyResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryPlanExecutionMode {
+    Eager,
+    Streamed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2552,6 +2582,7 @@ pub enum QueryPlanWarning {
     BooleanBranchFallback,
     PlanningProbeBudgetExceeded,
     CompoundIndexPrefixNotSatisfied,
+    StreamedInputBufferCapExceeded,
     UnknownNodeLabel,
     UnknownEdgeLabel,
 }
@@ -2573,6 +2604,9 @@ pub(crate) fn gql_query_plan_warning_message(warning: QueryPlanWarning) -> &'sta
         QueryPlanWarning::VerifyOnlyFilter => "VerifyOnlyFilter",
         QueryPlanWarning::BooleanBranchFallback => "BooleanBranchFallback",
         QueryPlanWarning::PlanningProbeBudgetExceeded => "PlanningProbeBudgetExceeded",
+        QueryPlanWarning::StreamedInputBufferCapExceeded => {
+            "streamed_input_buffer_cap_exceeded"
+        }
         QueryPlanWarning::UnknownNodeLabel => "UnknownNodeLabel",
         QueryPlanWarning::UnknownEdgeLabel => "UnknownEdgeLabel",
     }

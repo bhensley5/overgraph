@@ -4,8 +4,9 @@ use overgraph::{
     GqlExecutionOptions, GqlParamValue, GqlParams, GqlStatementKind, GraphBinaryOp,
     GraphEdgePattern, GraphExpr, GraphNodeField, GraphNodePattern, GraphOrderDirection,
     GraphOrderItem, GraphOutputOptions, GraphPageRequest, GraphParamValue, GraphPatternPiece,
-    GraphQueryOptions, GraphReturnItem, GraphReturnProjection, LabelMatchMode, NodeFilterExpr,
-    NodeInput, NodeLabelFilter, NodeQuery, PageRequest, PropValue, PropertyRangeBound,
+    GraphQueryOptions, GraphReturnItem, GraphReturnProjection, GraphVariableLengthPattern,
+    LabelMatchMode, NodeFilterExpr, NodeInput, NodeLabelFilter, NodeQuery, PageRequest, PropValue,
+    PropertyRangeBound, QueryPlanExecutionMode, QueryPlanNode, QueryPlanWarning,
     SecondaryIndexField, SecondaryIndexSpec, SecondaryIndexState,
 };
 use std::collections::BTreeMap;
@@ -18,6 +19,22 @@ const QUERY_LIMIT: usize = 100;
 const QUERY_LARGE_UNIVERSE_COUNT: usize = 25_000;
 const QUERY_SMALL_LABEL_COUNT: usize = 128;
 const QUERY_LARGE_IN_VALUE_COUNT: usize = 512;
+const STREAMING_SCALE_SEGMENT_COUNT: usize = 3;
+const STREAMING_SCALE_NODES_PER_SEGMENT: usize = 60_000;
+const STREAMING_SCALE_MEMTABLE_TAIL_COUNT: usize = 20_000;
+const STREAMING_SCALE_TOTAL_NODES: usize = STREAMING_SCALE_SEGMENT_COUNT
+    * STREAMING_SCALE_NODES_PER_SEGMENT
+    + STREAMING_SCALE_MEMTABLE_TAIL_COUNT;
+const STREAMING_SCALE_IN_TENANT_COUNT: usize = 20;
+const STREAMING_SCALE_SELECTED_TENANT_SIZE: usize = 210;
+const EDGE_STREAMING_SCALE_NODE_COUNT: usize = 10_000;
+const EDGE_STREAMING_SCALE_SEGMENT_COUNT: usize = 3;
+const EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT: usize = 60_000;
+const EDGE_STREAMING_SCALE_MEMTABLE_TAIL_COUNT: usize = 20_000;
+const EDGE_STREAMING_SCALE_TOTAL_EDGES: usize = EDGE_STREAMING_SCALE_SEGMENT_COUNT
+    * EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT
+    + EDGE_STREAMING_SCALE_MEMTABLE_TAIL_COUNT;
+const EDGE_STREAMING_SCALE_HUB_EDGE_COUNT: usize = 5_000;
 const GRAPH_ROW_PLANNER_EDGE_COUNT: usize = 6;
 const MEMTABLE_PLANNER_STRESS_COUNT: usize = 20_000;
 const MEMTABLE_PLANNER_SEGMENT_COUNT: usize = 512;
@@ -51,6 +68,18 @@ fn temp_db_with_edge_uniqueness(edge_uniqueness: bool) -> (tempfile::TempDir, Da
 
 fn temp_db() -> (tempfile::TempDir, DatabaseEngine) {
     temp_db_with_edge_uniqueness(true)
+}
+
+fn temp_db_without_auto_compaction() -> (tempfile::TempDir, DatabaseEngine) {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        compact_after_n_flushes: 0,
+        ..DbOptions::default()
+    };
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    seed_bench_label_tokens(&engine);
+    (dir, engine)
 }
 
 fn seed_bench_label_tokens(engine: &DatabaseEngine) {
@@ -160,6 +189,12 @@ fn query_nodes_with_props(
         .collect()
 }
 
+struct StreamingScaleEngine {
+    _dir: tempfile::TempDir,
+    engine: DatabaseEngine,
+    hot_ids: Vec<u64>,
+}
+
 fn wait_for_property_index_state(
     engine: &DatabaseEngine,
     index_id: u64,
@@ -249,6 +284,574 @@ fn build_indexed_query_engine() -> (tempfile::TempDir, DatabaseEngine) {
     let (dir, mut engine) = temp_db();
     ensure_query_indexes(&mut engine);
     load_query_mixed_sources(&engine, "indexed");
+    (dir, engine)
+}
+
+fn ensure_bench_equality_index(engine: &DatabaseEngine, prop_key: &str) {
+    let label = bench_node_label(1);
+    let info = engine
+        .ensure_node_property_index(
+            &label,
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property(prop_key)]),
+        )
+        .unwrap();
+    wait_for_property_index_state(engine, info.index_id, SecondaryIndexState::Ready);
+}
+
+fn ensure_streaming_scale_indexes(engine: &DatabaseEngine) {
+    for prop_key in ["status", "region", "tenant"] {
+        ensure_bench_equality_index(engine, prop_key);
+    }
+    let label = bench_node_label(1);
+    let score = engine
+        .ensure_node_property_index(
+            &label,
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(engine, score.index_id, SecondaryIndexState::Ready);
+}
+
+fn streaming_scale_tenant_ordinal(ordinal: usize) -> usize {
+    let selected_tenant_rows =
+        STREAMING_SCALE_IN_TENANT_COUNT * STREAMING_SCALE_SELECTED_TENANT_SIZE;
+    if ordinal < selected_tenant_rows {
+        ordinal % STREAMING_SCALE_IN_TENANT_COUNT
+    } else {
+        STREAMING_SCALE_IN_TENANT_COUNT
+            + ((ordinal - selected_tenant_rows) % (1_000 - STREAMING_SCALE_IN_TENANT_COUNT))
+    }
+}
+
+fn streaming_scale_score(ordinal: usize) -> i64 {
+    if ordinal.is_multiple_of(4) {
+        990 + (ordinal % 10) as i64
+    } else {
+        (ordinal % 990) as i64
+    }
+}
+
+fn streaming_scale_props(
+    ordinal: usize,
+    status_override: Option<&str>,
+) -> BTreeMap<String, PropValue> {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "status".to_string(),
+        PropValue::String(
+            status_override
+                .unwrap_or(if ordinal.is_multiple_of(2) {
+                    "hot"
+                } else {
+                    "cold"
+                })
+                .to_string(),
+        ),
+    );
+    props.insert(
+        "region".to_string(),
+        PropValue::String(
+            if ordinal.is_multiple_of(4) {
+                "east"
+            } else {
+                "west"
+            }
+            .to_string(),
+        ),
+    );
+    props.insert(
+        "tenant".to_string(),
+        PropValue::String(format!("t{:03}", streaming_scale_tenant_ordinal(ordinal))),
+    );
+    props.insert(
+        "score".to_string(),
+        PropValue::Int(streaming_scale_score(ordinal)),
+    );
+    props
+}
+
+fn streaming_scale_node(ordinal: usize, status_override: Option<&str>) -> NodeInput {
+    NodeInput {
+        labels: vec![bench_node_label(1)],
+        key: format!("stream-scale-{ordinal}"),
+        props: streaming_scale_props(ordinal, status_override),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }
+}
+
+fn build_streaming_scale_engine_variant(stale_heavy: bool) -> StreamingScaleEngine {
+    let (dir, engine) = temp_db_without_auto_compaction();
+    ensure_streaming_scale_indexes(&engine);
+
+    let mut all_ids = Vec::with_capacity(STREAMING_SCALE_TOTAL_NODES);
+    for segment in 0..STREAMING_SCALE_SEGMENT_COUNT {
+        let start = segment * STREAMING_SCALE_NODES_PER_SEGMENT;
+        let nodes = (start..start + STREAMING_SCALE_NODES_PER_SEGMENT)
+            .map(|ordinal| streaming_scale_node(ordinal, None))
+            .collect::<Vec<_>>();
+        all_ids.extend(engine.batch_upsert_nodes(nodes).unwrap());
+        engine.flush().unwrap();
+    }
+
+    let tail_start = STREAMING_SCALE_SEGMENT_COUNT * STREAMING_SCALE_NODES_PER_SEGMENT;
+    let tail_nodes = (tail_start..tail_start + STREAMING_SCALE_MEMTABLE_TAIL_COUNT)
+        .map(|ordinal| streaming_scale_node(ordinal, None))
+        .collect::<Vec<_>>();
+    all_ids.extend(engine.batch_upsert_nodes(tail_nodes).unwrap());
+    assert_eq!(all_ids.len(), STREAMING_SCALE_TOTAL_NODES);
+
+    let mut stale_segment_hot_ordinals = std::collections::BTreeSet::new();
+    if stale_heavy {
+        let segment_hot_total =
+            STREAMING_SCALE_SEGMENT_COUNT * STREAMING_SCALE_NODES_PER_SEGMENT / 2;
+        let stale_target = segment_hot_total * 95 / 100;
+        let mut stale_updates = Vec::with_capacity(stale_target);
+        for ordinal in (0..tail_start).filter(|ordinal| ordinal.is_multiple_of(2)) {
+            if stale_updates.len() == stale_target {
+                break;
+            }
+            stale_segment_hot_ordinals.insert(ordinal);
+            stale_updates.push(streaming_scale_node(ordinal, Some("cold")));
+        }
+        assert_eq!(stale_updates.len(), stale_target);
+        engine.batch_upsert_nodes(stale_updates).unwrap();
+    }
+
+    let hot_ids = all_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, &id)| {
+            (ordinal.is_multiple_of(2) && !stale_segment_hot_ordinals.contains(&ordinal))
+                .then_some(id)
+        })
+        .collect::<Vec<_>>();
+    let east_count = (0..STREAMING_SCALE_TOTAL_NODES)
+        .filter(|ordinal| ordinal.is_multiple_of(4))
+        .count();
+    let selected_tenant_count = (0..STREAMING_SCALE_TOTAL_NODES)
+        .filter(|&ordinal| {
+            streaming_scale_tenant_ordinal(ordinal) < STREAMING_SCALE_IN_TENANT_COUNT
+        })
+        .count();
+    let high_score_count = (0..STREAMING_SCALE_TOTAL_NODES)
+        .filter(|&ordinal| (990..=999).contains(&streaming_scale_score(ordinal)))
+        .count();
+    assert_eq!(east_count, STREAMING_SCALE_TOTAL_NODES / 4);
+    assert!(selected_tenant_count > 4_096);
+    assert!(high_score_count > 4_096);
+    assert!(hot_ids.len() > 4_096);
+
+    StreamingScaleEngine {
+        _dir: dir,
+        engine,
+        hot_ids,
+    }
+}
+
+fn build_streaming_scale_engine() -> StreamingScaleEngine {
+    build_streaming_scale_engine_variant(false)
+}
+
+fn build_streaming_scale_engine_stale_heavy() -> StreamingScaleEngine {
+    build_streaming_scale_engine_variant(true)
+}
+
+struct EdgeStreamingScaleEngine {
+    _dir: tempfile::TempDir,
+    engine: DatabaseEngine,
+    node_ids: Vec<u64>,
+    edge_ids: Vec<u64>,
+    hot_ids: Vec<u64>,
+    hub_source_ids: Vec<u64>,
+    stale_rewrite_count: usize,
+}
+
+fn temp_edge_streaming_scale_db() -> (tempfile::TempDir, DatabaseEngine) {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        compact_after_n_flushes: 0,
+        edge_uniqueness: true,
+        ..DbOptions::default()
+    };
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    seed_bench_label_tokens(&engine);
+    (dir, engine)
+}
+
+fn ensure_edge_streaming_scale_indexes(engine: &DatabaseEngine) {
+    let label = "BenchEdge1";
+    for prop_key in ["status", "region", "tenant"] {
+        let info = engine
+            .ensure_edge_property_index(
+                label,
+                SecondaryIndexSpec::equality(vec![SecondaryIndexField::property(prop_key)]),
+            )
+            .unwrap();
+        wait_for_edge_property_index_state(engine, info.index_id, SecondaryIndexState::Ready);
+    }
+    let score = engine
+        .ensure_edge_property_index(
+            label,
+            SecondaryIndexSpec::range(vec![SecondaryIndexField::property("score")]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(engine, score.index_id, SecondaryIndexState::Ready);
+}
+
+fn edge_streaming_scale_node(ordinal: usize) -> NodeInput {
+    NodeInput {
+        labels: vec![bench_node_label(2)],
+        key: format!("edge-stream-scale-node-{ordinal}"),
+        props: BTreeMap::new(),
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }
+}
+
+fn edge_streaming_scale_tenant_ordinal(ordinal: usize) -> usize {
+    streaming_scale_tenant_ordinal(ordinal)
+}
+
+fn edge_streaming_scale_score(ordinal: usize) -> i64 {
+    if ordinal.is_multiple_of(4) {
+        990 + (ordinal % 10) as i64
+    } else {
+        (ordinal % 990) as i64
+    }
+}
+
+fn edge_streaming_scale_weight(ordinal: usize) -> f32 {
+    if ordinal.is_multiple_of(4) {
+        0.995 + ((ordinal % 10) as f32 / 10_000.0)
+    } else {
+        (ordinal % 990) as f32 / 1000.0
+    }
+}
+
+fn edge_streaming_scale_props(
+    ordinal: usize,
+    status_override: Option<&str>,
+) -> BTreeMap<String, PropValue> {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "status".to_string(),
+        PropValue::String(
+            status_override
+                .unwrap_or(if ordinal.is_multiple_of(2) {
+                    "hot"
+                } else {
+                    "cold"
+                })
+                .to_string(),
+        ),
+    );
+    props.insert(
+        "region".to_string(),
+        PropValue::String(
+            if ordinal.is_multiple_of(4) {
+                "east"
+            } else {
+                "west"
+            }
+            .to_string(),
+        ),
+    );
+    props.insert(
+        "tenant".to_string(),
+        PropValue::String(format!(
+            "t{:03}",
+            edge_streaming_scale_tenant_ordinal(ordinal)
+        )),
+    );
+    props.insert(
+        "score".to_string(),
+        PropValue::Int(edge_streaming_scale_score(ordinal)),
+    );
+    props
+}
+
+fn edge_streaming_scale_endpoints(node_ids: &[u64], ordinal: usize) -> (u64, u64) {
+    debug_assert!(node_ids.len() >= EDGE_STREAMING_SCALE_NODE_COUNT);
+    if ordinal < EDGE_STREAMING_SCALE_HUB_EDGE_COUNT {
+        return (node_ids[0], node_ids[2 + ordinal]);
+    }
+    if ordinal < EDGE_STREAMING_SCALE_HUB_EDGE_COUNT * 2 {
+        return (
+            node_ids[1],
+            node_ids[2 + (ordinal - EDGE_STREAMING_SCALE_HUB_EDGE_COUNT)],
+        );
+    }
+
+    let local = ordinal - EDGE_STREAMING_SCALE_HUB_EDGE_COUNT * 2;
+    let spread = EDGE_STREAMING_SCALE_NODE_COUNT - 2;
+    let from_slot = local % spread;
+    let offset = (local / spread) + 1;
+    let to_slot = (from_slot + offset) % spread;
+    (node_ids[2 + from_slot], node_ids[2 + to_slot])
+}
+
+fn edge_streaming_scale_input(
+    node_ids: &[u64],
+    ordinal: usize,
+    status_override: Option<&str>,
+) -> EdgeInput {
+    let (from, to) = edge_streaming_scale_endpoints(node_ids, ordinal);
+    EdgeInput {
+        from,
+        to,
+        label: "BenchEdge1".to_string(),
+        props: edge_streaming_scale_props(ordinal, status_override),
+        weight: edge_streaming_scale_weight(ordinal),
+        valid_from: None,
+        valid_to: None,
+    }
+}
+
+fn build_edge_streaming_scale_engine_variant(stale_heavy: bool) -> EdgeStreamingScaleEngine {
+    let (dir, engine) = temp_edge_streaming_scale_db();
+    ensure_edge_streaming_scale_indexes(&engine);
+
+    let node_ids = engine
+        .batch_upsert_nodes(
+            (0..EDGE_STREAMING_SCALE_NODE_COUNT)
+                .map(edge_streaming_scale_node)
+                .collect(),
+        )
+        .unwrap();
+    assert_eq!(node_ids.len(), EDGE_STREAMING_SCALE_NODE_COUNT);
+
+    let mut edge_ids = Vec::with_capacity(EDGE_STREAMING_SCALE_TOTAL_EDGES);
+    for segment in 0..EDGE_STREAMING_SCALE_SEGMENT_COUNT {
+        let start = segment * EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT;
+        let inputs = (start..start + EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT)
+            .map(|ordinal| edge_streaming_scale_input(&node_ids, ordinal, None))
+            .collect::<Vec<_>>();
+        edge_ids.extend(engine.batch_upsert_edges(inputs).unwrap());
+        engine.flush().unwrap();
+    }
+
+    let tail_start = EDGE_STREAMING_SCALE_SEGMENT_COUNT * EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT;
+    let tail_inputs = (tail_start..tail_start + EDGE_STREAMING_SCALE_MEMTABLE_TAIL_COUNT)
+        .map(|ordinal| edge_streaming_scale_input(&node_ids, ordinal, None))
+        .collect::<Vec<_>>();
+    edge_ids.extend(engine.batch_upsert_edges(tail_inputs).unwrap());
+    assert_eq!(edge_ids.len(), EDGE_STREAMING_SCALE_TOTAL_EDGES);
+
+    let mut stale_segment_hot_ordinals = std::collections::BTreeSet::new();
+    let mut stale_rewrite_count = 0usize;
+    if stale_heavy {
+        let segment_hot_total =
+            EDGE_STREAMING_SCALE_SEGMENT_COUNT * EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT / 2;
+        let stale_target = segment_hot_total * 95 / 100;
+        let mut stale_updates = Vec::with_capacity(stale_target);
+        for ordinal in (0..tail_start).filter(|ordinal| ordinal.is_multiple_of(2)) {
+            if stale_updates.len() == stale_target {
+                break;
+            }
+            stale_segment_hot_ordinals.insert(ordinal);
+            stale_updates.push(edge_streaming_scale_input(&node_ids, ordinal, Some("cold")));
+        }
+        let rewritten_ids = engine.batch_upsert_edges(stale_updates).unwrap();
+        stale_rewrite_count = rewritten_ids.len();
+        assert_eq!(stale_rewrite_count, stale_target);
+        for (ordinal, rewritten_id) in stale_segment_hot_ordinals.iter().zip(rewritten_ids) {
+            assert_eq!(
+                rewritten_id, edge_ids[*ordinal],
+                "stale-heavy edge rewrite must preserve edge ID"
+            );
+        }
+    }
+
+    let hot_ids = edge_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, &edge_id)| {
+            (ordinal.is_multiple_of(2) && !stale_segment_hot_ordinals.contains(&ordinal))
+                .then_some(edge_id)
+        })
+        .collect::<Vec<_>>();
+    let east_count = (0..EDGE_STREAMING_SCALE_TOTAL_EDGES)
+        .filter(|ordinal| ordinal.is_multiple_of(4))
+        .count();
+    let selected_tenant_count = (0..EDGE_STREAMING_SCALE_TOTAL_EDGES)
+        .filter(|&ordinal| {
+            edge_streaming_scale_tenant_ordinal(ordinal) < STREAMING_SCALE_IN_TENANT_COUNT
+        })
+        .count();
+    let high_score_count = (0..EDGE_STREAMING_SCALE_TOTAL_EDGES)
+        .filter(|&ordinal| (990..=999).contains(&edge_streaming_scale_score(ordinal)))
+        .count();
+    let high_weight_count = (0..EDGE_STREAMING_SCALE_TOTAL_EDGES)
+        .filter(|&ordinal| edge_streaming_scale_weight(ordinal) >= 0.99)
+        .count();
+    assert_eq!(east_count, EDGE_STREAMING_SCALE_TOTAL_EDGES / 4);
+    assert!(selected_tenant_count > 4_096);
+    assert!(high_score_count > 4_096);
+    assert!(high_weight_count > 4_096);
+    assert!(hot_ids.len() > 4_096);
+
+    let hub_source_ids = vec![node_ids[0], node_ids[1]];
+    EdgeStreamingScaleEngine {
+        _dir: dir,
+        engine,
+        node_ids,
+        edge_ids,
+        hot_ids,
+        hub_source_ids,
+        stale_rewrite_count,
+    }
+}
+
+fn build_edge_streaming_scale_engine() -> EdgeStreamingScaleEngine {
+    build_edge_streaming_scale_engine_variant(false)
+}
+
+fn build_edge_streaming_scale_engine_stale_heavy() -> EdgeStreamingScaleEngine {
+    build_edge_streaming_scale_engine_variant(true)
+}
+
+struct GraphRowStreamingScaleEngine {
+    edge: EdgeStreamingScaleEngine,
+}
+
+fn build_graph_row_streaming_scale_engine() -> GraphRowStreamingScaleEngine {
+    GraphRowStreamingScaleEngine {
+        edge: build_edge_streaming_scale_engine(),
+    }
+}
+
+fn build_graph_row_streaming_scale_engine_stale_heavy() -> GraphRowStreamingScaleEngine {
+    GraphRowStreamingScaleEngine {
+        edge: build_edge_streaming_scale_engine_stale_heavy(),
+    }
+}
+
+struct GraphRowFo033ScaleEngine {
+    graph: GraphRowStreamingScaleEngine,
+    selected_role_count: usize,
+    optional_edge_count: usize,
+}
+
+fn build_graph_row_fo033_scale_engine() -> GraphRowFo033ScaleEngine {
+    let graph = build_graph_row_streaming_scale_engine();
+    let selected_ordinals = (0..EDGE_STREAMING_SCALE_TOTAL_EDGES)
+        .step_by(100)
+        .collect::<Vec<_>>();
+    let selected_updates = selected_ordinals
+        .iter()
+        .map(|&ordinal| {
+            let mut input = edge_streaming_scale_input(&graph.edge.node_ids, ordinal, None);
+            input.props.insert(
+                "role".to_string(),
+                PropValue::String("selected".to_string()),
+            );
+            input
+        })
+        .collect::<Vec<_>>();
+    let rewritten = graph
+        .edge
+        .engine
+        .batch_upsert_edges(selected_updates)
+        .unwrap();
+    assert_eq!(rewritten.len(), selected_ordinals.len());
+    for (&ordinal, &edge_id) in selected_ordinals.iter().zip(&rewritten) {
+        assert_eq!(edge_id, graph.edge.edge_ids[ordinal]);
+    }
+    let role = graph
+        .edge
+        .engine
+        .ensure_edge_property_index(
+            "BenchEdge1",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("role")]),
+        )
+        .unwrap();
+    wait_for_edge_property_index_state(
+        &graph.edge.engine,
+        role.index_id,
+        SecondaryIndexState::Ready,
+    );
+
+    let optional_ordinals = selected_ordinals
+        .iter()
+        .step_by(8)
+        .copied()
+        .collect::<Vec<_>>();
+    let docs = optional_ordinals
+        .iter()
+        .enumerate()
+        .map(|(index, _)| NodeInput {
+            labels: vec![bench_node_label(3)],
+            key: format!("graph-row-fo033-doc-{index}"),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect::<Vec<_>>();
+    let doc_ids = graph.edge.engine.batch_upsert_nodes(docs).unwrap();
+    let optional_edges = optional_ordinals
+        .iter()
+        .zip(doc_ids.iter())
+        .map(|(&ordinal, &doc_id)| {
+            let (_, target) = edge_streaming_scale_endpoints(&graph.edge.node_ids, ordinal);
+            EdgeInput {
+                from: target,
+                to: doc_id,
+                label: "BenchEdgeOptional".to_string(),
+                props: BTreeMap::new(),
+                weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let optional_edge_count = graph
+        .edge
+        .engine
+        .batch_upsert_edges(optional_edges)
+        .unwrap()
+        .len();
+    assert_eq!(optional_edge_count, optional_ordinals.len());
+
+    GraphRowFo033ScaleEngine {
+        graph,
+        selected_role_count: selected_ordinals.len(),
+        optional_edge_count,
+    }
+}
+
+fn build_corrected_gate_middle_zone_engine() -> (tempfile::TempDir, DatabaseEngine) {
+    let (dir, engine) = temp_db();
+    ensure_bench_equality_index(&engine, "anchor");
+    ensure_bench_equality_index(&engine, "broad");
+
+    let nodes = (0..10_000)
+        .map(|i| {
+            let mut props = BTreeMap::new();
+            props.insert(
+                "anchor".to_string(),
+                PropValue::String(if i < 3_000 { "yes" } else { "no" }.to_string()),
+            );
+            props.insert(
+                "broad".to_string(),
+                PropValue::String(if i < 9_000 { "yes" } else { "no" }.to_string()),
+            );
+            NodeInput {
+                labels: vec![bench_node_label(1)],
+                key: format!("corrected-gate-{i}"),
+                props,
+                weight: 1.0,
+                dense_vector: None,
+                sparse_vector: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    engine.batch_upsert_nodes(nodes).unwrap();
+    engine.flush().unwrap();
     (dir, engine)
 }
 
@@ -447,6 +1050,604 @@ fn broad_equality_and_selective_range_query(limit: Option<usize>) -> NodeQuery {
         page: PageRequest { limit, after: None },
         ..Default::default()
     }
+}
+
+fn corrected_gate_middle_zone_query(limit: Option<usize>) -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "anchor".to_string(),
+                value: PropValue::String("yes".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "broad".to_string(),
+                value: PropValue::String("yes".to_string()),
+            },
+        ],
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn assert_stream_declined_to_eager_anchor(engine: &DatabaseEngine, query: &NodeQuery) {
+    let plan = engine.explain_node_query(query).unwrap();
+    assert_eq!(
+        plan.warnings,
+        vec![
+            QueryPlanWarning::IndexSkippedAsBroad,
+            QueryPlanWarning::VerifyOnlyFilter
+        ]
+    );
+    let QueryPlanNode::VerifyNodeFilter { input } = &plan.root else {
+        panic!("expected verified eager anchor plan, got {:?}", plan.root);
+    };
+    assert_eq!(input.as_ref(), &QueryPlanNode::PropertyEqualityIndex);
+}
+
+fn assert_middle_zone_declines_stream(engine: &DatabaseEngine, query: &NodeQuery) {
+    let plan = engine.explain_node_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::VerifyNodeFilter { input } = &plan.root else {
+        panic!("expected verified eager plan, got {:?}", plan.root);
+    };
+    let QueryPlanNode::Intersect { inputs, mode } = input.as_ref() else {
+        panic!("expected eager intersect, got {:?}", input);
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Eager);
+    assert_eq!(
+        inputs,
+        &vec![
+            QueryPlanNode::PropertyEqualityIndex,
+            QueryPlanNode::PropertyEqualityIndex
+        ]
+    );
+}
+
+fn streaming_scale_status_region_tenant_query(limit: Option<usize>) -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("t000".to_string()),
+            },
+        ],
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn streaming_scale_status_region_query(limit: Option<usize>) -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
+        filter: filter_and![
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+        ],
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn streaming_scale_status_hot_query(limit: Option<usize>) -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
+        filter: filter_and![NodeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("hot".to_string()),
+        }],
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn streaming_scale_range_plus_equality_query(limit: Option<usize>) -> NodeQuery {
+    NodeQuery {
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
+        filter: filter_and![
+            NodeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(990))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(999))),
+            },
+            NodeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+        ],
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn streaming_scale_in_union_broad_query(limit: Option<usize>) -> NodeQuery {
+    let values = (0..STREAMING_SCALE_IN_TENANT_COUNT)
+        .map(|tenant| PropValue::String(format!("t{tenant:03}")))
+        .collect();
+    NodeQuery {
+        label_filter: Some(NodeLabelFilter {
+            labels: vec![bench_node_label(1)],
+            mode: LabelMatchMode::All,
+        }),
+        filter: Some(NodeFilterExpr::PropertyIn {
+            key: "tenant".to_string(),
+            values,
+        }),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn streaming_scale_hydrated_final_page_query(after: u64) -> NodeQuery {
+    NodeQuery {
+        page: PageRequest {
+            limit: Some(10),
+            after: Some(after),
+        },
+        ..streaming_scale_status_hot_query(None)
+    }
+}
+
+fn edge_streaming_scale_status_region_tenant_query(limit: Option<usize>) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("BenchEdge1".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "tenant".to_string(),
+                value: PropValue::String("t000".to_string()),
+            },
+        ])),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn edge_streaming_scale_status_region_query(limit: Option<usize>) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("BenchEdge1".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+        ])),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn edge_streaming_scale_status_hot_query(limit: Option<usize>) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("BenchEdge1".to_string()),
+        filter: Some(EdgeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("hot".to_string()),
+        }),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn edge_streaming_scale_range_plus_equality_query(limit: Option<usize>) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("BenchEdge1".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(990))),
+                upper: Some(PropertyRangeBound::Included(PropValue::Int(999))),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+        ])),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn edge_streaming_scale_weight_plus_equality_query(limit: Option<usize>) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("BenchEdge1".to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::WeightRange {
+                lower: Some(0.99),
+                upper: Some(1.0),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+        ])),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn edge_streaming_scale_endpoint_hub_equality_query(
+    hub_source_id: u64,
+    limit: Option<usize>,
+) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("BenchEdge1".to_string()),
+        from_ids: vec![hub_source_id],
+        filter: Some(EdgeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("hot".to_string()),
+        }),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn edge_streaming_scale_in_union_broad_query(limit: Option<usize>) -> EdgeQuery {
+    EdgeQuery {
+        label: Some("BenchEdge1".to_string()),
+        filter: Some(EdgeFilterExpr::PropertyIn {
+            key: "tenant".to_string(),
+            values: (0..STREAMING_SCALE_IN_TENANT_COUNT)
+                .map(|tenant| PropValue::String(format!("t{tenant:03}")))
+                .collect(),
+        }),
+        page: PageRequest { limit, after: None },
+        ..Default::default()
+    }
+}
+
+fn edge_streaming_scale_hydrated_final_page_query(after: u64) -> EdgeQuery {
+    EdgeQuery {
+        page: PageRequest {
+            limit: Some(10),
+            after: Some(after),
+        },
+        ..edge_streaming_scale_status_hot_query(None)
+    }
+}
+
+fn node_plan_input(plan: &QueryPlanNode) -> &QueryPlanNode {
+    match plan {
+        QueryPlanNode::VerifyNodeFilter { input } => input.as_ref(),
+        other => other,
+    }
+}
+
+fn edge_plan_input(plan: &QueryPlanNode) -> &QueryPlanNode {
+    match plan {
+        QueryPlanNode::VerifyEdgeFilter { input } => input.as_ref(),
+        other => other,
+    }
+}
+
+fn plan_contains(plan: &QueryPlanNode, expected: &QueryPlanNode) -> bool {
+    if plan == expected {
+        return true;
+    }
+    match plan {
+        QueryPlanNode::Intersect { inputs, .. } | QueryPlanNode::Union { inputs, .. } => {
+            inputs.iter().any(|input| plan_contains(input, expected))
+        }
+        QueryPlanNode::StreamedSource { input }
+        | QueryPlanNode::BufferedIdSort { input }
+        | QueryPlanNode::VerifyNodeFilter { input }
+        | QueryPlanNode::VerifyEdgeFilter { input }
+        | QueryPlanNode::VerifyEdgePredicates { input } => plan_contains(input, expected),
+        _ => false,
+    }
+}
+
+fn assert_streaming_scale_declines_to_eager(engine: &DatabaseEngine, query: &NodeQuery) {
+    let plan = engine.explain_node_query(query).unwrap();
+    assert_eq!(
+        plan.warnings,
+        vec![
+            QueryPlanWarning::IndexSkippedAsBroad,
+            QueryPlanWarning::VerifyOnlyFilter,
+        ]
+    );
+    assert_eq!(
+        node_plan_input(&plan.root),
+        &QueryPlanNode::PropertyEqualityIndex
+    );
+}
+
+fn assert_streamed_intersect(engine: &DatabaseEngine, query: &NodeQuery) {
+    let plan = engine.explain_node_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Intersect { mode, .. } = node_plan_input(&plan.root) else {
+        panic!("expected streamed intersect, got {:?}", plan.root);
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+}
+
+fn assert_streamed_range_plus_equality(engine: &DatabaseEngine, query: &NodeQuery) {
+    let plan = engine.explain_node_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Intersect { inputs, mode } = node_plan_input(&plan.root) else {
+        panic!(
+            "expected streamed range/equality intersect, got {:?}",
+            plan.root
+        );
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert!(inputs.contains(&QueryPlanNode::PropertyEqualityIndex));
+    assert!(inputs.contains(&QueryPlanNode::BufferedIdSort {
+        input: Box::new(QueryPlanNode::PropertyRangeIndex),
+    }));
+}
+
+fn assert_streamed_source(engine: &DatabaseEngine, query: &NodeQuery) {
+    let plan = engine.explain_node_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    assert_eq!(
+        node_plan_input(&plan.root),
+        &QueryPlanNode::StreamedSource {
+            input: Box::new(QueryPlanNode::PropertyEqualityIndex),
+        }
+    );
+}
+
+fn assert_streamed_union(engine: &DatabaseEngine, query: &NodeQuery) {
+    let plan = engine.explain_node_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Union { inputs, mode } = node_plan_input(&plan.root) else {
+        panic!("expected streamed union, got {:?}", plan.root);
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(inputs.len(), STREAMING_SCALE_IN_TENANT_COUNT);
+}
+
+fn assert_edge_stream_declines_to_eager(engine: &DatabaseEngine, query: &EdgeQuery) {
+    let plan = engine.explain_edge_query(query).unwrap();
+    assert!(plan
+        .warnings
+        .contains(&QueryPlanWarning::IndexSkippedAsBroad));
+    assert!(plan.warnings.contains(&QueryPlanWarning::VerifyOnlyFilter));
+    assert!(plan_contains(
+        edge_plan_input(&plan.root),
+        &QueryPlanNode::EdgePropertyEqualityIndex,
+    ));
+    assert!(
+        !matches!(
+            edge_plan_input(&plan.root),
+            QueryPlanNode::Intersect {
+                mode: QueryPlanExecutionMode::Streamed,
+                ..
+            } | QueryPlanNode::StreamedSource { .. }
+                | QueryPlanNode::Union {
+                    mode: QueryPlanExecutionMode::Streamed,
+                    ..
+                }
+        ),
+        "decline case must stay eager: {plan:?}"
+    );
+    assert!(
+        !plan_contains(
+            edge_plan_input(&plan.root),
+            &QueryPlanNode::StreamedSource {
+                input: Box::new(QueryPlanNode::EdgePropertyEqualityIndex)
+            }
+        ),
+        "decline case must not become streamed: {plan:?}"
+    );
+}
+
+fn assert_streamed_edge_intersect(engine: &DatabaseEngine, query: &EdgeQuery) {
+    let plan = engine.explain_edge_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Intersect { inputs, mode } = edge_plan_input(&plan.root) else {
+        panic!("expected streamed edge intersect, got {:?}", plan.root);
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(
+        inputs
+            .iter()
+            .filter(|input| **input == QueryPlanNode::EdgePropertyEqualityIndex)
+            .count(),
+        2
+    );
+}
+
+fn assert_streamed_edge_source(engine: &DatabaseEngine, query: &EdgeQuery) {
+    let plan = engine.explain_edge_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    assert_eq!(
+        edge_plan_input(&plan.root),
+        &QueryPlanNode::StreamedSource {
+            input: Box::new(QueryPlanNode::EdgePropertyEqualityIndex),
+        }
+    );
+}
+
+fn assert_streamed_edge_buffered_input(
+    engine: &DatabaseEngine,
+    query: &EdgeQuery,
+    buffered_input: QueryPlanNode,
+) {
+    let plan = engine.explain_edge_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Intersect { inputs, mode } = edge_plan_input(&plan.root) else {
+        panic!(
+            "expected streamed buffered edge intersect, got {:?}",
+            plan.root
+        );
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert!(inputs.contains(&QueryPlanNode::EdgePropertyEqualityIndex));
+    assert!(inputs.contains(&QueryPlanNode::BufferedIdSort {
+        input: Box::new(buffered_input),
+    }));
+}
+
+fn assert_streamed_edge_endpoint(engine: &DatabaseEngine, query: &EdgeQuery) {
+    let plan = engine.explain_edge_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Intersect { inputs, mode } = edge_plan_input(&plan.root) else {
+        panic!(
+            "expected streamed endpoint edge intersect, got {:?}",
+            plan.root
+        );
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert!(inputs.contains(&QueryPlanNode::EdgeEndpointAdjacency));
+    assert!(inputs.contains(&QueryPlanNode::EdgePropertyEqualityIndex));
+}
+
+fn assert_streamed_edge_union(engine: &DatabaseEngine, query: &EdgeQuery) {
+    let plan = engine.explain_edge_query(query).unwrap();
+    assert_eq!(plan.warnings, Vec::<QueryPlanWarning>::new());
+    let QueryPlanNode::Union { inputs, mode } = edge_plan_input(&plan.root) else {
+        panic!("expected streamed edge union, got {:?}", plan.root);
+    };
+    assert_eq!(*mode, QueryPlanExecutionMode::Streamed);
+    assert_eq!(inputs.len(), STREAMING_SCALE_IN_TENANT_COUNT);
+    assert!(
+        inputs
+            .iter()
+            .all(|input| *input == QueryPlanNode::EdgePropertyEqualityIndex),
+        "{inputs:?}"
+    );
+}
+
+fn criterion_filter_matches(candidates: &[&str]) -> bool {
+    let mut filters = Vec::new();
+    let mut skip_next = false;
+    for arg in std::env::args().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(
+            arg.as_str(),
+            "--baseline"
+                | "--save-baseline"
+                | "--load-baseline"
+                | "--sample-size"
+                | "--measurement-time"
+                | "--warm-up-time"
+                | "--profile-time"
+        ) {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        filters.push(arg);
+    }
+
+    filters.is_empty()
+        || filters.iter().any(|filter| {
+            candidates
+                .iter()
+                .any(|candidate| filter.contains(candidate) || candidate.contains(filter))
+        })
+}
+
+fn criterion_requested_benchmark(group: &str, scenario: &str) -> bool {
+    let mut filters = Vec::new();
+    let mut skip_next = false;
+    for arg in std::env::args().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(
+            arg.as_str(),
+            "--baseline"
+                | "--save-baseline"
+                | "--load-baseline"
+                | "--sample-size"
+                | "--measurement-time"
+                | "--warm-up-time"
+                | "--profile-time"
+        ) {
+            skip_next = true;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            filters.push(arg);
+        }
+    }
+
+    filters.is_empty()
+        || filters
+            .iter()
+            .any(|filter| filter == group || filter.contains(scenario))
+}
+
+fn criterion_requested_streaming_scale_group() -> bool {
+    const STREAMING_SCALE_FILTERS: &[&str] = &[
+        "query_node_planner_streamed",
+        "query_node_ids_stream_declines_tiny_anchor_broad_filters",
+        "query_node_ids_streamed_two_broad_small_limit",
+        "query_node_ids_streamed_single_broad_source_limit_ten",
+        "query_node_ids_streamed_stale_heavy_equality",
+        "query_node_ids_streamed_range_plus_equality",
+        "query_node_ids_streamed_in_union_broad",
+        "query_nodes_streamed_hydrated_final_page",
+        "explain_node_query_streamed_intersect",
+    ];
+    criterion_filter_matches(STREAMING_SCALE_FILTERS)
+}
+
+fn criterion_requested_edge_streaming_scale_group() -> bool {
+    const EDGE_STREAMING_SCALE_FILTERS: &[&str] = &[
+        "query_edge_planner_streamed",
+        "query_edge_ids_stream_declines_tiny_anchor_broad_filters",
+        "query_edge_ids_streamed_two_broad_small_limit",
+        "query_edge_ids_streamed_single_broad_source_limit_ten",
+        "query_edge_ids_streamed_stale_heavy_equality",
+        "query_edge_ids_streamed_range_plus_equality",
+        "query_edge_ids_streamed_weight_plus_equality",
+        "query_edge_ids_streamed_endpoint_hub_equality",
+        "query_edge_ids_streamed_in_union_broad",
+        "query_edges_streamed_hydrated_final_page",
+        "explain_edge_query_streamed_intersect",
+    ];
+    criterion_filter_matches(EDGE_STREAMING_SCALE_FILTERS)
 }
 
 fn range_stats_selective_query(limit: Option<usize>) -> NodeQuery {
@@ -1082,6 +2283,26 @@ fn bench_node_queries(c: &mut Criterion) {
         b.iter(|| black_box(engine.query_node_ids(black_box(&query)).unwrap()));
     });
 
+    group.bench_function(
+        "query_node_ids_stream_declines_tiny_anchor_broad_filters",
+        |b| {
+            let (_dir, engine) = build_indexed_query_engine();
+            let query = broad_equality_and_selective_equality_query(Some(QUERY_LIMIT));
+            assert_stream_declined_to_eager_anchor(&engine, &query);
+            b.iter(|| black_box(engine.query_node_ids(black_box(&query)).unwrap()));
+        },
+    );
+
+    group.bench_function(
+        "query_node_ids_corrected_gate_middle_zone_declines_stream",
+        |b| {
+            let (_dir, engine) = build_corrected_gate_middle_zone_engine();
+            let query = corrected_gate_middle_zone_query(None);
+            assert_middle_zone_declines_stream(&engine, &query);
+            b.iter(|| black_box(engine.query_node_ids(black_box(&query)).unwrap()));
+        },
+    );
+
     group.bench_function("query_node_ids_range_stats_selective", |b| {
         let (_dir, engine) = build_indexed_query_engine();
         let query = range_stats_selective_query(Some(QUERY_LIMIT));
@@ -1174,6 +2395,170 @@ fn bench_node_queries(c: &mut Criterion) {
             ..broad_equality_and_selective_equality_query(None)
         };
         b.iter(|| black_box(engine.query_nodes(black_box(&query)).unwrap()));
+    });
+
+    group.finish();
+}
+
+fn bench_streamed_node_queries(c: &mut Criterion) {
+    if !criterion_requested_streaming_scale_group() {
+        return;
+    }
+
+    // Build cost note: this group constructs one 200k-node scale fixture and one
+    // stale-heavy variant outside measured iterations so scenario medians measure
+    // query work, not fixture construction.
+    let normal = build_streaming_scale_engine();
+    let stale = build_streaming_scale_engine_stale_heavy();
+    let mut group = c.benchmark_group("query_node_planner_streamed");
+    group.sample_size(10);
+
+    group.bench_function(
+        "query_node_ids_stream_declines_tiny_anchor_broad_filters",
+        |b| {
+            let query = streaming_scale_status_region_tenant_query(Some(QUERY_LIMIT));
+            assert_streaming_scale_declines_to_eager(&normal.engine, &query);
+            b.iter(|| black_box(normal.engine.query_node_ids(black_box(&query)).unwrap()));
+        },
+    );
+
+    group.bench_function("query_node_ids_streamed_two_broad_small_limit", |b| {
+        let query = streaming_scale_status_region_query(Some(10));
+        assert_streamed_intersect(&normal.engine, &query);
+        b.iter(|| black_box(normal.engine.query_node_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function(
+        "query_node_ids_streamed_single_broad_source_limit_ten",
+        |b| {
+            let query = streaming_scale_status_hot_query(Some(10));
+            assert_streamed_source(&normal.engine, &query);
+            b.iter(|| black_box(normal.engine.query_node_ids(black_box(&query)).unwrap()));
+        },
+    );
+
+    group.bench_function("query_node_ids_streamed_stale_heavy_equality", |b| {
+        let query = streaming_scale_status_hot_query(Some(QUERY_LIMIT));
+        assert_streamed_source(&stale.engine, &query);
+        b.iter(|| black_box(stale.engine.query_node_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_node_ids_streamed_range_plus_equality", |b| {
+        let query = streaming_scale_range_plus_equality_query(Some(QUERY_LIMIT));
+        assert_streamed_range_plus_equality(&normal.engine, &query);
+        b.iter(|| black_box(normal.engine.query_node_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_node_ids_streamed_in_union_broad", |b| {
+        let query = streaming_scale_in_union_broad_query(Some(QUERY_LIMIT));
+        assert_streamed_union(&normal.engine, &query);
+        b.iter(|| black_box(normal.engine.query_node_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_nodes_streamed_hydrated_final_page", |b| {
+        let after = normal.hot_ids[normal.hot_ids.len() - 11];
+        let query = streaming_scale_hydrated_final_page_query(after);
+        assert_streamed_source(&normal.engine, &query);
+        b.iter(|| black_box(normal.engine.query_nodes(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("explain_node_query_streamed_intersect", |b| {
+        let query = streaming_scale_status_region_query(Some(10));
+        assert_streamed_intersect(&normal.engine, &query);
+        b.iter(|| black_box(normal.engine.explain_node_query(black_box(&query)).unwrap()));
+    });
+
+    group.finish();
+}
+
+fn bench_streamed_edge_queries(c: &mut Criterion) {
+    if !criterion_requested_edge_streaming_scale_group() {
+        return;
+    }
+
+    // Build cost note: this group constructs one 200k-edge scale fixture and one
+    // stale-heavy variant outside measured iterations so scenario medians measure
+    // query work, not fixture construction.
+    let normal = build_edge_streaming_scale_engine();
+    let stale = build_edge_streaming_scale_engine_stale_heavy();
+    assert_eq!(normal.edge_ids.len(), EDGE_STREAMING_SCALE_TOTAL_EDGES);
+    assert_eq!(stale.stale_rewrite_count, 85_500);
+
+    let mut group = c.benchmark_group("query_edge_planner_streamed");
+    group.sample_size(10);
+
+    group.bench_function(
+        "query_edge_ids_stream_declines_tiny_anchor_broad_filters",
+        |b| {
+            let query = edge_streaming_scale_status_region_tenant_query(Some(QUERY_LIMIT));
+            assert_edge_stream_declines_to_eager(&normal.engine, &query);
+            b.iter(|| black_box(normal.engine.query_edge_ids(black_box(&query)).unwrap()));
+        },
+    );
+
+    group.bench_function("query_edge_ids_streamed_two_broad_small_limit", |b| {
+        let query = edge_streaming_scale_status_region_query(Some(10));
+        assert_streamed_edge_intersect(&normal.engine, &query);
+        b.iter(|| black_box(normal.engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function(
+        "query_edge_ids_streamed_single_broad_source_limit_ten",
+        |b| {
+            let query = edge_streaming_scale_status_hot_query(Some(10));
+            assert_streamed_edge_source(&normal.engine, &query);
+            b.iter(|| black_box(normal.engine.query_edge_ids(black_box(&query)).unwrap()));
+        },
+    );
+
+    group.bench_function("query_edge_ids_streamed_stale_heavy_equality", |b| {
+        let query = edge_streaming_scale_status_hot_query(Some(QUERY_LIMIT));
+        assert_streamed_edge_source(&stale.engine, &query);
+        b.iter(|| black_box(stale.engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_edge_ids_streamed_range_plus_equality", |b| {
+        let query = edge_streaming_scale_range_plus_equality_query(Some(QUERY_LIMIT));
+        assert_streamed_edge_buffered_input(
+            &normal.engine,
+            &query,
+            QueryPlanNode::EdgePropertyRangeIndex,
+        );
+        b.iter(|| black_box(normal.engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_edge_ids_streamed_weight_plus_equality", |b| {
+        let query = edge_streaming_scale_weight_plus_equality_query(Some(QUERY_LIMIT));
+        assert_streamed_edge_buffered_input(&normal.engine, &query, QueryPlanNode::EdgeWeightIndex);
+        b.iter(|| black_box(normal.engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_edge_ids_streamed_endpoint_hub_equality", |b| {
+        let query = edge_streaming_scale_endpoint_hub_equality_query(
+            normal.hub_source_ids[0],
+            Some(QUERY_LIMIT),
+        );
+        assert_streamed_edge_endpoint(&normal.engine, &query);
+        b.iter(|| black_box(normal.engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_edge_ids_streamed_in_union_broad", |b| {
+        let query = edge_streaming_scale_in_union_broad_query(Some(QUERY_LIMIT));
+        assert_streamed_edge_union(&normal.engine, &query);
+        b.iter(|| black_box(normal.engine.query_edge_ids(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("query_edges_streamed_hydrated_final_page", |b| {
+        let after = normal.hot_ids[normal.hot_ids.len() - 11];
+        let query = edge_streaming_scale_hydrated_final_page_query(after);
+        assert_streamed_edge_source(&normal.engine, &query);
+        b.iter(|| black_box(normal.engine.query_edges(black_box(&query)).unwrap()));
+    });
+
+    group.bench_function("explain_edge_query_streamed_intersect", |b| {
+        let query = edge_streaming_scale_status_region_query(Some(10));
+        assert_streamed_edge_intersect(&normal.engine, &query);
+        b.iter(|| black_box(normal.engine.explain_edge_query(black_box(&query)).unwrap()));
     });
 
     group.finish();
@@ -2138,6 +3523,163 @@ fn graph_row_order_by_score_then_target() -> Vec<GraphOrderItem> {
     ]
 }
 
+fn graph_row_streaming_fixed_query(
+    source_id: Option<u64>,
+    filter: Option<EdgeFilterExpr>,
+    limit: usize,
+) -> overgraph::GraphRowQuery {
+    overgraph::GraphRowQuery {
+        nodes: vec![
+            GraphNodePattern {
+                alias: "source".to_string(),
+                label_filter: source_id.map(|_| NodeLabelFilter {
+                    labels: vec![bench_node_label(2)],
+                    mode: LabelMatchMode::All,
+                }),
+                ids: source_id.into_iter().collect(),
+                keys: Vec::new(),
+                filter: None,
+            },
+            GraphNodePattern {
+                alias: "target".to_string(),
+                label_filter: None,
+                ids: Vec::new(),
+                keys: Vec::new(),
+                filter: None,
+            },
+        ],
+        pieces: vec![GraphPatternPiece::Edge(GraphEdgePattern {
+            alias: Some("edge".to_string()),
+            from_alias: "source".to_string(),
+            to_alias: "target".to_string(),
+            direction: Direction::Outgoing,
+            label_filter: vec!["BenchEdge1".to_string()],
+            filter,
+        })],
+        where_: None,
+        return_items: Some(vec![
+            graph_row_return_binding("edge"),
+            graph_row_return_binding("target"),
+        ]),
+        order_by: Vec::new(),
+        page: GraphPageRequest {
+            skip: 0,
+            limit,
+            cursor: None,
+        },
+        at_epoch: None,
+        params: BTreeMap::new(),
+        output: GraphOutputOptions::default(),
+        options: GraphQueryOptions {
+            allow_full_scan: false,
+            include_plan: true,
+            ..GraphQueryOptions::default()
+        },
+    }
+}
+
+fn graph_row_streaming_vlp_query(source_id: u64, limit: usize) -> overgraph::GraphRowQuery {
+    overgraph::GraphRowQuery {
+        nodes: vec![
+            GraphNodePattern {
+                alias: "source".to_string(),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec![bench_node_label(2)],
+                    mode: LabelMatchMode::All,
+                }),
+                ids: vec![source_id],
+                keys: Vec::new(),
+                filter: None,
+            },
+            GraphNodePattern {
+                alias: "target".to_string(),
+                label_filter: None,
+                ids: Vec::new(),
+                keys: Vec::new(),
+                filter: None,
+            },
+        ],
+        pieces: vec![GraphPatternPiece::VariableLength(
+            GraphVariableLengthPattern {
+                path_alias: Some("path".to_string()),
+                edge_alias: None,
+                from_alias: "source".to_string(),
+                to_alias: "target".to_string(),
+                direction: Direction::Outgoing,
+                label_filter: vec!["BenchEdge1".to_string()],
+                filter: Some(EdgeFilterExpr::PropertyEquals {
+                    key: "status".to_string(),
+                    value: PropValue::String("hot".to_string()),
+                }),
+                min_hops: 1,
+                max_hops: 2,
+            },
+        )],
+        where_: None,
+        return_items: Some(vec![graph_row_return_binding("target")]),
+        order_by: Vec::new(),
+        page: GraphPageRequest {
+            skip: 0,
+            limit,
+            cursor: None,
+        },
+        at_epoch: None,
+        params: BTreeMap::new(),
+        output: GraphOutputOptions::default(),
+        options: GraphQueryOptions {
+            allow_full_scan: false,
+            include_plan: true,
+            ..GraphQueryOptions::default()
+        },
+    }
+}
+
+fn graph_row_streaming_plan_text(result: &overgraph::GraphRowResult) -> String {
+    fn append_node(node: &overgraph::GraphExplainNode, text: &mut String) {
+        text.push_str(&node.kind);
+        text.push(' ');
+        text.push_str(&node.detail);
+        text.push('\n');
+        for child in &node.children {
+            append_node(child, text);
+        }
+    }
+
+    let plan = result
+        .plan
+        .as_ref()
+        .expect("benchmark query must include plan");
+    let mut text = String::new();
+    for node in &plan.plan {
+        append_node(node, &mut text);
+    }
+    for op in &plan.row_ops {
+        text.push_str(&op.kind);
+        text.push(' ');
+        text.push_str(&op.detail);
+        text.push('\n');
+    }
+    text
+}
+
+fn assert_graph_row_streaming_success(
+    engine: &DatabaseEngine,
+    query: &overgraph::GraphRowQuery,
+    expected_rows: usize,
+    expected_plan_fragments: &[&str],
+) {
+    let result = engine.query_graph_rows(query).unwrap();
+    assert_eq!(result.rows.len(), expected_rows);
+    assert_eq!(result.stats.rows_returned, expected_rows);
+    let plan = graph_row_streaming_plan_text(&result);
+    for fragment in expected_plan_fragments {
+        assert!(
+            plan.contains(fragment),
+            "unexpected graph-row plan; missing {fragment:?} from {plan}"
+        );
+    }
+}
+
 fn assert_graph_row_result_count(
     result: overgraph::GraphRowResult,
     expected: usize,
@@ -2145,6 +3687,414 @@ fn assert_graph_row_result_count(
     assert_eq!(result.rows.len(), expected);
     assert_eq!(result.stats.rows_returned, expected);
     result
+}
+
+fn bench_graph_row_streamed(c: &mut Criterion) {
+    const GROUP: &str = "graph_row_streamed";
+    const HUB_BROAD: &str = "graph_row_hub_frontier_broad_equality";
+    const HUB_SELECTIVE: &str = "graph_row_hub_frontier_selective_anchor";
+    const HUB_UNFILTERED: &str = "graph_row_hub_frontier_unfiltered_traversal";
+    const UNBOUND_INTERSECT: &str = "graph_row_unbound_pair_broad_intersect_limit";
+    const STALE_HEAVY: &str = "graph_row_stale_heavy_edge_match";
+    const FO033: &str = "graph_row_fo033_optional_order_limit";
+    const VLP_FILTERED: &str = "graph_row_vlp_filtered_two_hop";
+    const GQL_HUB_BROAD: &str = "gql_graph_row_hub_frontier_broad_equality";
+
+    let requested = [
+        HUB_BROAD,
+        HUB_SELECTIVE,
+        HUB_UNFILTERED,
+        UNBOUND_INTERSECT,
+        STALE_HEAVY,
+        FO033,
+        VLP_FILTERED,
+        GQL_HUB_BROAD,
+    ]
+    .map(|scenario| criterion_requested_benchmark(GROUP, scenario));
+    if !requested.iter().any(|requested| *requested) {
+        return;
+    }
+
+    let needs_normal = requested[0]
+        || requested[1]
+        || requested[2]
+        || requested[3]
+        || requested[6]
+        || requested[7];
+    let normal = needs_normal.then(build_graph_row_streaming_scale_engine);
+    let stale = requested[4].then(build_graph_row_streaming_scale_engine_stale_heavy);
+    let fo033 = requested[5].then(build_graph_row_fo033_scale_engine);
+
+    if let Some(fixture) = normal.as_ref() {
+        assert_eq!(fixture.edge.node_ids.len(), EDGE_STREAMING_SCALE_NODE_COUNT);
+        assert_eq!(
+            fixture.edge.edge_ids.len(),
+            EDGE_STREAMING_SCALE_TOTAL_EDGES
+        );
+        assert_eq!(fixture.edge.hub_source_ids.len(), 2);
+        assert_eq!(
+            fixture.edge.hot_ids.len(),
+            EDGE_STREAMING_SCALE_TOTAL_EDGES / 2
+        );
+    }
+    if let Some(fixture) = stale.as_ref() {
+        assert_eq!(fixture.edge.node_ids.len(), EDGE_STREAMING_SCALE_NODE_COUNT);
+        assert_eq!(
+            fixture.edge.edge_ids.len(),
+            EDGE_STREAMING_SCALE_TOTAL_EDGES
+        );
+        assert_eq!(fixture.edge.stale_rewrite_count, 85_500);
+        assert_eq!(fixture.edge.hot_ids.len(), 14_500);
+    }
+    if let Some(fixture) = fo033.as_ref() {
+        assert_eq!(fixture.selected_role_count, 2_000);
+        assert_eq!(fixture.optional_edge_count, 250);
+    }
+
+    let mut group = c.benchmark_group(GROUP);
+    group.sample_size(10);
+
+    if requested[0] {
+        let fixture = normal.as_ref().unwrap();
+        let query = graph_row_streaming_fixed_query(
+            Some(fixture.edge.hub_source_ids[0]),
+            Some(EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            }),
+            QUERY_LIMIT,
+        );
+        assert_graph_row_streaming_success(
+            &fixture.edge.engine,
+            &query,
+            QUERY_LIMIT,
+            &[
+                "source=DelegatedEdgeQuery",
+                "EdgeEndpointAdjacency",
+                "EdgePropertyEqualityIndex",
+                "planned_modes=streamed",
+            ],
+        );
+        group.bench_function(HUB_BROAD, |b| {
+            b.iter(|| {
+                black_box(
+                    fixture
+                        .edge
+                        .engine
+                        .query_graph_rows(black_box(&query))
+                        .unwrap(),
+                )
+            })
+        });
+    }
+
+    if requested[1] {
+        let fixture = normal.as_ref().unwrap();
+        let query = graph_row_streaming_fixed_query(
+            Some(fixture.edge.hub_source_ids[0]),
+            Some(EdgeFilterExpr::And(vec![
+                EdgeFilterExpr::PropertyEquals {
+                    key: "status".to_string(),
+                    value: PropValue::String("hot".to_string()),
+                },
+                EdgeFilterExpr::PropertyEquals {
+                    key: "tenant".to_string(),
+                    value: PropValue::String("t000".to_string()),
+                },
+            ])),
+            QUERY_LIMIT,
+        );
+        assert_graph_row_streaming_success(
+            &fixture.edge.engine,
+            &query,
+            QUERY_LIMIT,
+            &[
+                "source=DelegatedEdgeQuery",
+                "EdgePropertyEqualityIndex",
+                "planned_modes=eager",
+            ],
+        );
+        group.bench_function(HUB_SELECTIVE, |b| {
+            b.iter(|| {
+                black_box(
+                    fixture
+                        .edge
+                        .engine
+                        .query_graph_rows(black_box(&query))
+                        .unwrap(),
+                )
+            })
+        });
+    }
+
+    if requested[2] {
+        let fixture = normal.as_ref().unwrap();
+        let query = graph_row_streaming_fixed_query(
+            Some(fixture.edge.hub_source_ids[0]),
+            None,
+            QUERY_LIMIT,
+        );
+        assert_graph_row_streaming_success(
+            &fixture.edge.engine,
+            &query,
+            QUERY_LIMIT,
+            &["source=EndpointAdjacency"],
+        );
+        let unfiltered_plan =
+            graph_row_streaming_plan_text(&fixture.edge.engine.query_graph_rows(&query).unwrap());
+        assert!(!unfiltered_plan.contains("DelegatedEdgeQuery"));
+        group.bench_function(HUB_UNFILTERED, |b| {
+            b.iter(|| {
+                black_box(
+                    fixture
+                        .edge
+                        .engine
+                        .query_graph_rows(black_box(&query))
+                        .unwrap(),
+                )
+            })
+        });
+    }
+
+    if requested[3] {
+        let fixture = normal.as_ref().unwrap();
+        let query = graph_row_streaming_fixed_query(
+            None,
+            Some(EdgeFilterExpr::And(vec![
+                EdgeFilterExpr::PropertyEquals {
+                    key: "status".to_string(),
+                    value: PropValue::String("hot".to_string()),
+                },
+                EdgeFilterExpr::PropertyEquals {
+                    key: "tenant".to_string(),
+                    value: PropValue::String("t000".to_string()),
+                },
+            ])),
+            QUERY_LIMIT,
+        );
+        assert_graph_row_streaming_success(
+            &fixture.edge.engine,
+            &query,
+            QUERY_LIMIT,
+            &[
+                "source=DelegatedEdgeQuery",
+                "planned_modes=eager",
+                "verified_candidates=210",
+            ],
+        );
+        group.bench_function(UNBOUND_INTERSECT, |b| {
+            b.iter(|| {
+                black_box(
+                    fixture
+                        .edge
+                        .engine
+                        .query_graph_rows(black_box(&query))
+                        .unwrap(),
+                )
+            })
+        });
+    }
+
+    if requested[4] {
+        let fixture = stale.as_ref().unwrap();
+        let query = graph_row_streaming_fixed_query(
+            None,
+            Some(EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            }),
+            QUERY_LIMIT,
+        );
+        match fixture.edge.engine.query_graph_rows(&query) {
+            Ok(result) => {
+                assert_eq!(result.rows.len(), QUERY_LIMIT);
+                let plan = graph_row_streaming_plan_text(&result);
+                for fragment in [
+                    "DelegatedEdgeQuery",
+                    "EdgePropertyEqualityIndex",
+                    "planned_modes=streamed",
+                ] {
+                    assert!(
+                        plan.contains(fragment),
+                        "stale-heavy capability must prove executed delegated/streamed edge plan fragment {fragment:?}: {plan}"
+                    );
+                }
+                eprintln!("{GROUP}/{STALE_HEAVY}: class=capability-postphase-success");
+            }
+            Err(error) => {
+                assert!(error.to_string().contains("max_frontier"), "{error:?}");
+                eprintln!("{GROUP}/{STALE_HEAVY}: class=capability-prephase-error");
+            }
+        }
+        group.bench_function(STALE_HEAVY, |b| {
+            b.iter(|| black_box(fixture.edge.engine.query_graph_rows(black_box(&query))))
+        });
+    }
+
+    if requested[5] {
+        let fixture = fo033.as_ref().unwrap();
+        let params = GqlParams::new();
+        let options = GqlExecutionOptions {
+            include_plan: true,
+            ..GqlExecutionOptions::default()
+        };
+        let query = "MATCH (source)-[edge:BenchEdge1]->(target) WHERE edge.role = 'selected' OPTIONAL MATCH (target)-[opt:BenchEdgeOptional]->(doc) RETURN id(target) AS target_id, edge.score AS score ORDER BY edge.score DESC, id(target) LIMIT 100";
+        match fixture
+            .graph
+            .edge
+            .engine
+            .execute_gql(query, &params, &options)
+        {
+            Ok(result) => {
+                assert_eq!(result.rows.len(), QUERY_LIMIT);
+                let read = result
+                    .plan
+                    .as_ref()
+                    .and_then(|plan| plan.read.as_ref())
+                    .expect("FO-033 benchmark must include a read plan");
+                assert!(
+                    read.pushed_down
+                        .iter()
+                        .any(|item| item.contains("edge.role")),
+                    "FO-033 benchmark must prove the role predicate was pushed down: {read:?}"
+                );
+                let runtime_plan = read.projection.join("\n");
+                for fragment in [
+                    "GraphRowSourceRead",
+                    "DelegatedEdgeQuery",
+                    "planned_modes=eager",
+                    "planned_warnings=[",
+                ] {
+                    assert!(
+                        runtime_plan.contains(fragment),
+                        "FO-033 benchmark must expose executed runtime fragment {fragment:?}: {runtime_plan}"
+                    );
+                }
+                let delegated_probe = graph_row_streaming_fixed_query(
+                    None,
+                    Some(EdgeFilterExpr::PropertyEquals {
+                        key: "role".to_string(),
+                        value: PropValue::String("selected".to_string()),
+                    }),
+                    QUERY_LIMIT,
+                );
+                assert_graph_row_streaming_success(
+                    &fixture.graph.edge.engine,
+                    &delegated_probe,
+                    QUERY_LIMIT,
+                    &["source=DelegatedEdgeQuery", "planned_modes=eager"],
+                );
+                eprintln!("{GROUP}/{FO033}: class=comparable-prephase-success");
+            }
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("max_frontier")
+                        || error.to_string().contains("max_intermediate_bindings"),
+                    "{error:?}"
+                );
+                eprintln!("{GROUP}/{FO033}: class=capability-prephase-error");
+            }
+        }
+        group.bench_function(FO033, |b| {
+            b.iter(|| {
+                black_box(fixture.graph.edge.engine.execute_gql(
+                    black_box(query),
+                    black_box(&params),
+                    black_box(&options),
+                ))
+            })
+        });
+    }
+
+    if requested[6] {
+        let fixture = normal.as_ref().unwrap();
+        let query = graph_row_streaming_vlp_query(fixture.edge.node_ids[2], QUERY_LIMIT);
+        let result = fixture.edge.engine.query_graph_rows(&query).unwrap();
+        assert!(!result.rows.is_empty());
+        assert!(result.rows.len() <= QUERY_LIMIT);
+        let plan = graph_row_streaming_plan_text(&result);
+        assert!(plan.contains("VariableLengthPathRuntime"));
+        assert!(plan.contains("step_source=DelegatedEdgeQuery"));
+        assert!(plan.contains("queries="));
+        assert!(plan.contains("verified_step_edges="));
+        assert!(plan.contains("planned_modes="));
+        assert!(plan.contains("planned_warnings=["));
+        group.bench_function(VLP_FILTERED, |b| {
+            b.iter(|| {
+                black_box(
+                    fixture
+                        .edge
+                        .engine
+                        .query_graph_rows(black_box(&query))
+                        .unwrap(),
+                )
+            })
+        });
+    }
+
+    if requested[7] {
+        let fixture = normal.as_ref().unwrap();
+        let params = GqlParams::from([(
+            "source_id".to_string(),
+            GqlParamValue::UInt(fixture.edge.hub_source_ids[0]),
+        )]);
+        let options = GqlExecutionOptions {
+            include_plan: true,
+            ..GqlExecutionOptions::default()
+        };
+        let query = "MATCH (source)-[edge:BenchEdge1]->(target) WHERE id(source) = $source_id AND edge.status = 'hot' RETURN id(target) AS target_id LIMIT 100";
+        let result = fixture
+            .edge
+            .engine
+            .execute_gql(query, &params, &options)
+            .unwrap();
+        assert_eq!(result.rows.len(), QUERY_LIMIT);
+        let plan = format!("{:?}", result.plan.as_ref().expect("GQL hub plan"));
+        for fragment in [
+            "id(source)",
+            "edge.status",
+            "GraphRowSourceRead",
+            "DelegatedEdgeQuery",
+            "planned_modes=streamed",
+            "planned_warnings=[",
+        ] {
+            assert!(plan.contains(fragment), "missing {fragment:?} from {plan}");
+        }
+        // The native probe additionally pins the endpoint-intersect counters, which are
+        // intentionally not part of the public GQL explain shape.
+        let delegated_probe = graph_row_streaming_fixed_query(
+            Some(fixture.edge.hub_source_ids[0]),
+            Some(EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            }),
+            QUERY_LIMIT,
+        );
+        assert_graph_row_streaming_success(
+            &fixture.edge.engine,
+            &delegated_probe,
+            QUERY_LIMIT,
+            &[
+                "source=DelegatedEdgeQuery",
+                "EdgeEndpointAdjacency",
+                "EdgePropertyEqualityIndex",
+                "planned_modes=streamed",
+            ],
+        );
+        group.bench_function(GQL_HUB_BROAD, |b| {
+            b.iter(|| {
+                black_box(
+                    fixture
+                        .edge
+                        .engine
+                        .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                        .unwrap(),
+                )
+            })
+        });
+    }
+
+    group.finish();
 }
 
 fn temp_gql_mutation_bench_db() -> (tempfile::TempDir, DatabaseEngine) {
@@ -2791,8 +4741,11 @@ fn bench_gql_queries(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_node_queries,
+    bench_streamed_node_queries,
+    bench_streamed_edge_queries,
     bench_edge_queries,
     bench_compound_index_queries,
+    bench_graph_row_streamed,
     bench_gql_queries
 );
 criterion_main!(benches);
