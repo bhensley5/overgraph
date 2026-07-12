@@ -737,18 +737,16 @@ impl<'a> Parser<'a> {
             ));
         };
         match target_kind {
-            PropertyIndexTargetKindForParse::Node if !function.valid_for_node() => {
-                Err(self.gql_index_ddl_error_at(
+            PropertyIndexTargetKindForParse::Node if !function.valid_for_node() => Err(self
+                .gql_index_ddl_error_at(
                     span.clone(),
                     "validity metadata is valid only for edge property indexes",
-                ))
-            }
-            PropertyIndexTargetKindForParse::Edge if !function.valid_for_edge() => {
-                Err(self.gql_index_ddl_error_at(
+                )),
+            PropertyIndexTargetKindForParse::Edge if !function.valid_for_edge() => Err(self
+                .gql_index_ddl_error_at(
                     span.clone(),
                     "elementKey metadata is valid only for node property indexes",
-                ))
-            }
+                )),
             _ => Ok(function),
         }
     }
@@ -4962,7 +4960,9 @@ mod tests {
 
     #[test]
     fn parse_statement_rejects_read_after_write_matching() {
-        match parse_statement_err("MATCH (n) CREATE (m:Person {elementKey: 'm'}) MATCH (m) RETURN m") {
+        match parse_statement_err(
+            "MATCH (n) CREATE (m:Person {elementKey: 'm'}) MATCH (m) RETURN m",
+        ) {
             EngineError::GqlUnsupported { feature, span, .. } => {
                 assert_eq!(feature, "read-after-write clauses");
                 assert!(span.length > 0);

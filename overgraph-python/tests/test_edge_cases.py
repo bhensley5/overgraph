@@ -508,10 +508,9 @@ class TestPruneByAge:
     def test_prune_max_age_selective(self, db):
         """Only nodes older than threshold are pruned."""
         db.upsert_node("Person", "old")
-        time.sleep(0.05)  # 50ms
+        time.sleep(0.5)
         db.upsert_node("Person", "new")
-        # Prune anything older than 10ms
-        result = db.prune(max_age_ms=10)
+        result = db.prune(max_age_ms=250)
         assert result.nodes_pruned >= 1
         # "new" should survive
         assert db.get_node_by_key("Person", "new") is not None

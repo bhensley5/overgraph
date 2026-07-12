@@ -846,9 +846,11 @@ QueryPlanWarning = Literal[
     "boolean_branch_fallback",
     "planning_probe_budget_exceeded",
     "compound_index_prefix_not_satisfied",
+    "streamed_input_buffer_cap_exceeded",
     "unknown_node_label",
     "unknown_edge_label",
 ]
+QueryPlanExecutionMode = Literal["eager", "streamed"]
 QueryPlanNote = Literal[
     "node_label_any_dedupe_before_pagination",
     "node_label_any_final_verification",
@@ -909,10 +911,17 @@ class QueryPlanCompoundRangeNode(TypedDict):
 
 class QueryPlanInputsNode(TypedDict):
     kind: Literal["intersect", "union"]
+    mode: QueryPlanExecutionMode
     inputs: list["QueryPlanNode"]
 
 class QueryPlanInputNode(TypedDict):
-    kind: Literal["verify_node_filter", "verify_edge_filter", "verify_edge_predicates"]
+    kind: Literal[
+        "streamed_source",
+        "buffered_id_sort",
+        "verify_node_filter",
+        "verify_edge_filter",
+        "verify_edge_predicates",
+    ]
     input: "QueryPlanNode"
 
 QueryPlanNode = QueryPlanSimpleNode | QueryPlanCompoundEqualityNode | QueryPlanCompoundRangeNode | QueryPlanInputsNode | QueryPlanInputNode

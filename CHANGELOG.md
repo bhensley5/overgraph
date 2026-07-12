@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-11
+
+### Added
+
+#### Streaming Query Execution
+- **Streamed node candidate sources.** Broad node label and equality-index postings can now feed sorted candidate streams into leapfrog intersections and k-way unions, avoiding full posting-vector materialization while preserving final visible-record verification.
+- **Streamed edge candidate sources.** Edge labels, property indexes, endpoint adjacency, and bounded metadata sources now share the same streamed intersection and union substrate, including deterministic pagination and fallback behavior.
+- **Graph-row and GQL pattern streaming.** Filtered fixed-edge expansions, optional matches, variable-length path steps, pipeline matches, and physical `EXISTS` probes now delegate candidate production to the planner-backed edge executor.
+- **Streaming explain diagnostics.** Rust, Node.js, and Python explain surfaces now report eager, streamed, buffered, and fallback source modes together with execution counters, warnings, and runtime source details.
+
+### Changed
+
+#### Query Performance
+- **Broad selective queries avoid eager candidate materialization.** Planner statistics choose eager execution for small sources, streamed execution for broad useful indexes, and legal-universe fallback only when no useful stream is available.
+- **Graph-row frontier caps count verified candidates.** Delegated pattern reads apply edge filters, endpoint constraints, temporal validity, visibility, and stale-candidate rejection before charging verified matches against the frontier cap.
+- **Shared stream algebra serves nodes and edges.** Inclusive seek cursors, heap-based unions, leapfrog intersections, deduplication, and chunked verification now use one hardened internal implementation.
+- **Planning avoids repeated mutable-tail scans.** Edge-label posting estimates use constant-time maintained memtable bounds during delegated variable-length path planning.
+
+### Fixed
+
+- **Selective pattern cap failures.** Filtered graph-row and GQL patterns no longer fail merely because a broad raw posting or endpoint universe exceeds the configured cap when the verified result fits.
+- **Stream fallback correctness.** Hardened buffer-cap, corrupt-sidecar, stale-posting, tombstone, endpoint-visibility, self-loop, multi-label, cursor, and reopen behavior across eager, streamed, and fallback modes.
+- **Executed explain fidelity.** GQL `include_plan` now preserves the actual executed graph-row trace and runtime cap-pressure statistics without a planning-only prepass or second execution.
+- **Release quality cleanup.** Removed unused endpoint-adjacency code and resolved Clippy warnings across production, test, and benchmark targets.
+
 ## [0.14.0] - 2026-07-04
 
 ### Added
@@ -494,6 +519,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.15.0]: https://github.com/bhensley5/overgraph/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/bhensley5/overgraph/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/bhensley5/overgraph/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/bhensley5/overgraph/compare/v0.11.0...v0.12.0

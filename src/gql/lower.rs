@@ -8,8 +8,7 @@ use crate::gql::params::{validate_referenced_gql_mutation_params, validate_refer
 use crate::gql::semantic::{
     bind_mutation, bind_query, bind_subquery_pipeline_for_outer_aliases, edge_endpoint_id_call,
     expression_output_name, gql_semantic_error, variable_name, GqlAliasBinding, GqlAliasKind,
-    GqlAliasOrigin,
-    GqlAliasTable, GqlBoundCallSubquery, GqlBoundCreateEdge, GqlBoundCreateNode,
+    GqlAliasOrigin, GqlAliasTable, GqlBoundCallSubquery, GqlBoundCreateEdge, GqlBoundCreateNode,
     GqlBoundEdgePattern, GqlBoundMatchClause, GqlBoundMergeClause, GqlBoundMergePattern,
     GqlBoundMutationClause, GqlBoundNodePattern, GqlBoundPattern, GqlBoundPipelineClause,
     GqlBoundProjectionClause, GqlBoundRemoveItem, GqlBoundSetItem, GqlBoundShortestPathClause,
@@ -1991,12 +1990,10 @@ fn collect_set_value_exprs(
         match item {
             GqlBoundSetItem::Property { value, .. }
             | GqlBoundSetItem::Metadata { value, .. }
-            | GqlBoundSetItem::MapMerge { value, .. } => {
-                exprs.push(GqlMutationOperationExpr {
-                    expr: value.clone(),
-                    late: allow_late && expr_references_created_or_merged_alias(value, semantic),
-                })
-            }
+            | GqlBoundSetItem::MapMerge { value, .. } => exprs.push(GqlMutationOperationExpr {
+                expr: value.clone(),
+                late: allow_late && expr_references_created_or_merged_alias(value, semantic),
+            }),
             GqlBoundSetItem::NodeLabel { .. } => {}
         }
     }
@@ -2178,7 +2175,9 @@ fn lower_element_map(map: Option<&MapLiteral>, expr_cursor: &mut usize) -> Lower
             Some(GqlElementMapMetadataKey::ValidTo) => lowered.valid_to = Some(expr_ref),
             None => {
                 lowered.property_keys.push(entry.key.name.clone());
-                lowered.property_values.insert(entry.key.name.clone(), expr_ref);
+                lowered
+                    .property_values
+                    .insert(entry.key.name.clone(), expr_ref);
             }
         }
     }
@@ -4782,9 +4781,10 @@ fn entity_value_ref(
         ExprKind::FunctionCall { name, args } => {
             if let Some((endpoint, endpoint_arg)) = edge_endpoint_id_call(name, args) {
                 let alias = variable_name(endpoint_arg)?.to_string();
-                let kind = alias_kinds.get(&alias).copied().or_else(|| {
-                    (alias == DIRECT_EDGE_ALIAS).then_some(GqlAliasKind::Edge)
-                })?;
+                let kind = alias_kinds
+                    .get(&alias)
+                    .copied()
+                    .or_else(|| (alias == DIRECT_EDGE_ALIAS).then_some(GqlAliasKind::Edge))?;
                 if kind != GqlAliasKind::Edge {
                     return None;
                 }
@@ -4816,10 +4816,12 @@ fn entity_value_ref(
                 return Some(EntityValueRef::RelationshipLabelFunction { alias });
             }
             if lower == "labels" {
-                return (kind == Some(GqlAliasKind::Node)).then_some(EntityValueRef::NodeMetadata {
-                    alias,
-                    field: NodeMetadataField::Labels,
-                });
+                return (kind == Some(GqlAliasKind::Node)).then_some(
+                    EntityValueRef::NodeMetadata {
+                        alias,
+                        field: NodeMetadataField::Labels,
+                    },
+                );
             }
             let metadata = GqlMetadataFunction::from_lower(&lower)?;
             match (metadata, kind?) {
@@ -5773,7 +5775,8 @@ mod tests {
 
     #[test]
     fn lowers_create_only_mutation_without_read_prefix() {
-        let plan = lower_mut("CREATE (n:Person {elementKey: 'ada', name: 'Ada'}) RETURN n").unwrap();
+        let plan =
+            lower_mut("CREATE (n:Person {elementKey: 'ada', name: 'Ada'}) RETURN n").unwrap();
         assert!(plan.read_prefix.is_none());
         assert_eq!(plan.return_plan.as_ref().unwrap().columns, vec!["n"]);
         let [GqlMutationClausePlan::Create(patterns)] = plan.clauses.as_slice() else {
@@ -5979,9 +5982,10 @@ mod tests {
                 if alias == "r" && from_alias == "a" && to_alias == "b" && label == "KNOWS"
         ));
 
-        let with_prefix =
-            lower_mut("MATCH (s:Person) WITH s MERGE (n:GqlMergeWith {elementKey: s.key}) RETURN n")
-                .unwrap();
+        let with_prefix = lower_mut(
+            "MATCH (s:Person) WITH s MERGE (n:GqlMergeWith {elementKey: s.key}) RETURN n",
+        )
+        .unwrap();
         let read = with_prefix
             .read_prefix
             .as_ref()
@@ -6176,7 +6180,10 @@ mod tests {
         match err {
             EngineError::GqlSemantic { code, message, .. } => {
                 assert_eq!(code, GqlSemanticErrorCode::InvalidPropertyAccess);
-                assert!(message.contains("valid only for relationships"), "{message}");
+                assert!(
+                    message.contains("valid only for relationships"),
+                    "{message}"
+                );
             }
             other => panic!("expected semantic error, got {other:?}"),
         }

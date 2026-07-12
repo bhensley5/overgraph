@@ -1293,6 +1293,11 @@ def test_gql_stub_and_signature_smoke():
     assert "max_shortest_path_pairs: int | None" in text
     assert "class QueryPlanCompoundIndexDetails" in text
     assert "compound_index_prefix_not_satisfied" in text
+    assert "streamed_input_buffer_cap_exceeded" in text
+    assert "QueryPlanExecutionMode = Literal[\"eager\", \"streamed\"]" in text
+    assert "mode: QueryPlanExecutionMode" in text
+    assert "\"streamed_source\"" in text
+    assert "\"buffered_id_sort\"" in text
     assert "compound_equality_index" in text
     assert "compound_range_index" in text
     assert "fields: list[GqlIndexExplainField]" in text

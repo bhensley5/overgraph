@@ -91,6 +91,27 @@ pub(crate) struct SegmentAdjPostingCursor {
     prev_edge_id: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EndpointAdjPostingStats {
+    pub(crate) posting_total: usize,
+    pub(crate) cursor_count: usize,
+}
+
+impl EndpointAdjPostingStats {
+    fn add_posting(&mut self, posting_count: usize) {
+        if posting_count == 0 {
+            return;
+        }
+        self.posting_total = self.posting_total.saturating_add(posting_count);
+        self.cursor_count = self.cursor_count.saturating_add(1);
+    }
+
+    fn add_assign(&mut self, other: Self) {
+        self.posting_total = self.posting_total.saturating_add(other.posting_total);
+        self.cursor_count = self.cursor_count.saturating_add(other.cursor_count);
+    }
+}
+
 struct SecondaryEqSidecarCacheEntry {
     data: MappedData,
     validated: bool,
@@ -1196,6 +1217,22 @@ pub struct SegmentReader {
 pub(crate) struct SegmentLabelPosting {
     offset: usize,
     count: usize,
+}
+
+// CP40.1 storage substrate is consumed by streamed construction in CP40.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct SecondaryEqGroupSpan {
+    pub offset: usize,
+    pub id_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum SecondaryEqGroupSpanLookup {
+    MissingSidecar,
+    MissingValueGroup,
+    Found(SecondaryEqGroupSpan),
 }
 
 pub(crate) struct SecondaryEqPostingChunk {
@@ -3657,6 +3694,25 @@ impl SegmentReader {
         Ok(lo)
     }
 
+    pub(crate) fn node_label_posting_lower_bound_ge(
+        &self,
+        posting: &SegmentLabelPosting,
+        bound: u64,
+    ) -> Result<usize, EngineError> {
+        let mut lo = 0usize;
+        let mut hi = posting.count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let node_id = read_u64_at(&self.node_label_index_mmap, posting.offset + mid * 8)?;
+            if node_id < bound {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
+    }
+
     /// Return edge IDs for a given label_id from this segment's label index.
     /// Excludes tombstoned edges.
     pub fn edges_by_label_id(&self, label_id: u32) -> Result<Vec<u64>, EngineError> {
@@ -3699,6 +3755,25 @@ impl SegmentReader {
             let mid = lo + (hi - lo) / 2;
             let edge_id = read_u64_at(&self.edge_label_index_mmap, posting.offset + mid * 8)?;
             if edge_id <= after {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
+    }
+
+    pub(crate) fn edge_label_posting_lower_bound_ge(
+        &self,
+        posting: &SegmentLabelPosting,
+        bound: u64,
+    ) -> Result<usize, EngineError> {
+        let mut lo = 0usize;
+        let mut hi = posting.count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let edge_id = read_u64_at(&self.edge_label_index_mmap, posting.offset + mid * 8)?;
+            if edge_id < bound {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -5815,6 +5890,67 @@ impl SegmentReader {
         )
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn secondary_eq_group_span_if_present(
+        &self,
+        index_id: u64,
+        value_hash: u64,
+    ) -> Result<SecondaryEqGroupSpanLookup, EngineError> {
+        self.secondary_eq_group_span_if_present_for_target(
+            index_id,
+            PlannerStatsDeclaredIndexTarget::NodeProperty,
+            value_hash,
+        )
+    }
+
+    pub(crate) fn secondary_eq_group_span_if_present_for_target(
+        &self,
+        index_id: u64,
+        target: PlannerStatsDeclaredIndexTarget,
+        value_hash: u64,
+    ) -> Result<SecondaryEqGroupSpanLookup, EngineError> {
+        match self.with_secondary_eq_sidecar(index_id, target, |data| {
+            secondary_eq_group_span(data, value_hash)
+        })? {
+            Some(Some(span)) => Ok(SecondaryEqGroupSpanLookup::Found(span)),
+            Some(None) => Ok(SecondaryEqGroupSpanLookup::MissingValueGroup),
+            None => Ok(SecondaryEqGroupSpanLookup::MissingSidecar),
+        }
+    }
+
+    pub(crate) fn secondary_eq_posting_seek_ge(
+        &self,
+        index_id: u64,
+        offset: usize,
+        id_count: usize,
+        from_pos: usize,
+        bound: u64,
+    ) -> Result<Option<(usize, u64)>, EngineError> {
+        self.secondary_eq_posting_seek_ge_for_target(
+            index_id,
+            PlannerStatsDeclaredIndexTarget::NodeProperty,
+            offset,
+            id_count,
+            from_pos,
+            bound,
+        )
+    }
+
+    pub(crate) fn secondary_eq_posting_seek_ge_for_target(
+        &self,
+        index_id: u64,
+        target: PlannerStatsDeclaredIndexTarget,
+        offset: usize,
+        id_count: usize,
+        from_pos: usize,
+        bound: u64,
+    ) -> Result<Option<(usize, u64)>, EngineError> {
+        self.with_secondary_eq_sidecar_index_validated(index_id, target, |data| {
+            secondary_eq_posting_seek_ge(data, offset, id_count, from_pos, bound)
+        })
+        .map(|result| result.flatten())
+    }
+
     pub(crate) fn edge_secondary_eq_posting_chunk_if_present(
         &self,
         index_id: u64,
@@ -7392,16 +7528,38 @@ impl SegmentReader {
         Ok(cursors)
     }
 
-    pub(crate) fn endpoint_adj_posting_count(
+    pub(crate) fn endpoint_adj_posting_stats(
         &self,
         node_ids: &[u64],
         direction: Direction,
         label_filter_ids: Option<&[u32]>,
-    ) -> Result<usize, EngineError> {
-        let cursors = self.endpoint_adj_posting_cursors(node_ids, direction, label_filter_ids)?;
-        Ok(cursors.iter().fold(0usize, |total, cursor| {
-            total.saturating_add(cursor.remaining)
-        }))
+    ) -> Result<EndpointAdjPostingStats, EngineError> {
+        let mut stats = EndpointAdjPostingStats::default();
+        match direction {
+            Direction::Outgoing => stats.add_assign(self.collect_adj_posting_stats(
+                &self.adj_out_idx,
+                node_ids,
+                label_filter_ids,
+            )?),
+            Direction::Incoming => stats.add_assign(self.collect_adj_posting_stats(
+                &self.adj_in_idx,
+                node_ids,
+                label_filter_ids,
+            )?),
+            Direction::Both => {
+                stats.add_assign(self.collect_adj_posting_stats(
+                    &self.adj_out_idx,
+                    node_ids,
+                    label_filter_ids,
+                )?);
+                stats.add_assign(self.collect_adj_posting_stats(
+                    &self.adj_in_idx,
+                    node_ids,
+                    label_filter_ids,
+                )?);
+            }
+        }
+        Ok(stats)
     }
 
     fn collect_adj_posting_cursors(
@@ -7482,6 +7640,77 @@ impl SegmentReader {
         }
 
         Ok(())
+    }
+
+    fn collect_adj_posting_stats(
+        &self,
+        idx_mmap: &MappedData,
+        node_ids: &[u64],
+        label_filter_ids: Option<&[u32]>,
+    ) -> Result<EndpointAdjPostingStats, EngineError> {
+        let mut stats = EndpointAdjPostingStats::default();
+        let idx_data = &idx_mmap[..];
+        if idx_data.len() < 8 {
+            return Ok(stats);
+        }
+        let count = read_u64_at(idx_data, 0)? as usize;
+        if count == 0 {
+            return Ok(stats);
+        }
+
+        let idx_start = 8;
+        let min_key = node_ids.first().copied().unwrap_or(0);
+        let max_key = node_ids.last().copied().unwrap_or(0);
+        let use_seek = choose_batch_read_strategy(
+            idx_data,
+            idx_start,
+            count,
+            ADJ_INDEX_ENTRY_SIZE,
+            0,
+            node_ids.len(),
+            min_key,
+            max_key,
+        )? == BatchReadStrategy::SeekPerKey;
+        let mut idx_pos = 0usize;
+
+        for &target_id in node_ids {
+            if use_seek {
+                idx_pos = match self.find_first_adj_entry(idx_data, target_id)? {
+                    Some(pos) => pos,
+                    None => continue,
+                };
+            } else {
+                while idx_pos < count {
+                    let entry_off = idx_start + idx_pos * ADJ_INDEX_ENTRY_SIZE;
+                    let entry_node = read_u64_at(idx_data, entry_off)?;
+                    if entry_node < target_id {
+                        idx_pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            while idx_pos < count {
+                let entry_off = idx_start + idx_pos * ADJ_INDEX_ENTRY_SIZE;
+                let entry_node = read_u64_at(idx_data, entry_off)?;
+                if entry_node != target_id {
+                    break;
+                }
+
+                let entry_label_id = read_u32_at(idx_data, entry_off + 8)?;
+                let posting_count = read_u32_at(idx_data, entry_off + 20)? as usize;
+                idx_pos += 1;
+
+                if label_filter_ids.is_some_and(|label_ids| !label_ids.contains(&entry_label_id)) {
+                    continue;
+                }
+
+                stats.add_posting(posting_count);
+            }
+        }
+
+        Ok(stats)
     }
 
     pub(crate) fn next_adj_posting_edge_id(
@@ -8831,6 +9060,112 @@ fn secondary_eq_group_range(
     }
 
     Ok(None)
+}
+
+#[allow(dead_code)]
+fn secondary_eq_group_span(
+    data: &[u8],
+    value_hash: u64,
+) -> Result<Option<SecondaryEqGroupSpan>, EngineError> {
+    Ok(secondary_eq_group_range(data, value_hash)?
+        .map(|(offset, id_count)| SecondaryEqGroupSpan { offset, id_count }))
+}
+
+fn secondary_eq_posting_id_at(
+    data: &[u8],
+    offset: usize,
+    id_count: usize,
+    pos: usize,
+) -> Result<u64, EngineError> {
+    if pos >= id_count {
+        return Err(EngineError::CorruptRecord(format!(
+            "secondary equality posting position {} exceeds group count {}",
+            pos, id_count
+        )));
+    }
+    let byte_offset = offset
+        .checked_add(pos.checked_mul(8).ok_or_else(|| {
+            EngineError::CorruptRecord("secondary equality posting offset overflow".into())
+        })?)
+        .ok_or_else(|| {
+            EngineError::CorruptRecord("secondary equality posting byte offset overflow".into())
+        })?;
+    read_u64_at(data, byte_offset)
+}
+
+fn secondary_eq_posting_seek_ge(
+    data: &[u8],
+    offset: usize,
+    id_count: usize,
+    from_pos: usize,
+    bound: u64,
+) -> Result<Option<(usize, u64)>, EngineError> {
+    if id_count == 0 || from_pos >= id_count {
+        return Ok(None);
+    }
+
+    let end = id_count
+        .checked_mul(8)
+        .and_then(|bytes| offset.checked_add(bytes))
+        .ok_or_else(|| {
+            EngineError::CorruptRecord("secondary equality group range overflow".into())
+        })?;
+    if end > data.len() {
+        return Err(EngineError::CorruptRecord(format!(
+            "secondary equality group range [{}, {}) exceeds file length {}",
+            offset,
+            end,
+            data.len()
+        )));
+    }
+
+    let first = secondary_eq_posting_id_at(data, offset, id_count, from_pos)?;
+    if first >= bound {
+        return Ok(Some((from_pos, first)));
+    }
+
+    let mut previous_probe_id = first;
+    let mut step = 1usize;
+    let mut lo = from_pos + 1;
+    let mut hi = id_count;
+    while let Some(probe) = from_pos.checked_add(step) {
+        if probe >= id_count {
+            break;
+        }
+        let probe_id = secondary_eq_posting_id_at(data, offset, id_count, probe)?;
+        debug_assert!(
+            probe_id > previous_probe_id,
+            "secondary equality postings must be sorted for seek"
+        );
+        previous_probe_id = probe_id;
+        if probe_id >= bound {
+            hi = probe + 1;
+            break;
+        }
+        lo = probe + 1;
+        step = match step.checked_mul(2) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let node_id = secondary_eq_posting_id_at(data, offset, id_count, mid)?;
+        if node_id < bound {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    if lo >= id_count {
+        return Ok(None);
+    }
+    Ok(Some((
+        lo,
+        secondary_eq_posting_id_at(data, offset, id_count, lo)?,
+    )))
 }
 
 fn read_numeric_range_sidecar_key_at(
@@ -11004,6 +11339,76 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn node_label_posting_lower_bound_ge_is_inclusive() {
+        let mt = Memtable::new();
+        for id in [2, 5, 9, 14] {
+            mt.apply_op(&WalOp::UpsertNode(make_node(id, 7, &format!("n{id}"))), id);
+        }
+
+        let (_dir, reader) = write_and_open(&mt);
+        let posting = reader.node_label_posting(7).unwrap().unwrap();
+        for (bound, expected) in [
+            (0, Some(2)),
+            (2, Some(2)),
+            (3, Some(5)),
+            (9, Some(9)),
+            (10, Some(14)),
+            (14, Some(14)),
+            (15, None),
+            (u64::MAX, None),
+        ] {
+            let index = reader
+                .node_label_posting_lower_bound_ge(&posting, bound)
+                .unwrap();
+            assert_eq!(
+                reader.node_id_at_label_posting(posting, index).unwrap(),
+                expected,
+                "bound {bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_label_posting_lower_bound_ge_is_inclusive() {
+        let mt = Memtable::new();
+        for (seq, id) in [2, 5, 9, 14].into_iter().enumerate() {
+            mt.apply_op(&WalOp::UpsertEdge(make_edge(id, 1, 2, 7)), seq as u64 + 1);
+        }
+
+        let (_dir, reader) = write_and_open(&mt);
+        let posting = reader.edge_label_posting(7).unwrap().unwrap();
+        for (bound, expected) in [
+            (0, Some(2)),
+            (2, Some(2)),
+            (3, Some(5)),
+            (9, Some(9)),
+            (10, Some(14)),
+            (14, Some(14)),
+            (15, None),
+            (u64::MAX, None),
+        ] {
+            let index = reader
+                .edge_label_posting_lower_bound_ge(&posting, bound)
+                .unwrap();
+            assert_eq!(
+                reader.edge_label_id_at_posting(posting, index).unwrap(),
+                expected,
+                "bound {bound}"
+            );
+        }
+
+        let strict_index = reader
+            .edge_label_id_lower_bound_posting(posting, 9)
+            .unwrap();
+        assert_eq!(
+            reader
+                .edge_label_id_at_posting(posting, strict_index)
+                .unwrap(),
+            Some(14)
+        );
+    }
+
+    #[test]
     fn test_multi_label_flush_declared_property_sidecars_by_member_label() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
@@ -11428,6 +11833,15 @@ pub(crate) mod tests {
         );
 
         let reader = SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap();
+        assert_eq!(
+            reader
+                .endpoint_adj_posting_stats(&[1], Direction::Outgoing, Some(&[10]))
+                .unwrap(),
+            EndpointAdjPostingStats {
+                posting_total: 2,
+                cursor_count: 1,
+            }
+        );
         let err = reader
             .neighbors(1, Direction::Outgoing, Some(&[10]), 0)
             .unwrap_err();
@@ -11449,6 +11863,74 @@ pub(crate) mod tests {
         assert!(
             matches!(&err, EngineError::CorruptRecord(message) if message.contains("delta overflow")),
             "expected cursor delta overflow corruption, got {err}"
+        );
+    }
+
+    #[test]
+    fn endpoint_adj_posting_stats_counts_postings_and_cursors_by_direction_and_label() {
+        let mt = Memtable::new();
+        for id in 1..=5 {
+            mt.apply_op(&WalOp::UpsertNode(make_node(id, 1, &format!("n{}", id))), 0);
+        }
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 10)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(11, 1, 3, 10)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(12, 1, 4, 20)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(13, 2, 1, 10)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(14, 3, 1, 20)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(15, 4, 4, 10)), 0);
+
+        let (_dir, reader) = write_and_open(&mt);
+
+        assert_eq!(
+            reader
+                .endpoint_adj_posting_stats(&[1], Direction::Outgoing, None)
+                .unwrap(),
+            EndpointAdjPostingStats {
+                posting_total: 3,
+                cursor_count: 2,
+            }
+        );
+        assert_eq!(
+            reader
+                .endpoint_adj_posting_stats(&[1], Direction::Outgoing, Some(&[10]))
+                .unwrap(),
+            EndpointAdjPostingStats {
+                posting_total: 2,
+                cursor_count: 1,
+            }
+        );
+        assert_eq!(
+            reader
+                .endpoint_adj_posting_stats(&[1], Direction::Incoming, None)
+                .unwrap(),
+            EndpointAdjPostingStats {
+                posting_total: 2,
+                cursor_count: 2,
+            }
+        );
+        assert_eq!(
+            reader
+                .endpoint_adj_posting_stats(&[1], Direction::Both, Some(&[10]))
+                .unwrap(),
+            EndpointAdjPostingStats {
+                posting_total: 3,
+                cursor_count: 2,
+            }
+        );
+        assert_eq!(
+            reader
+                .endpoint_adj_posting_stats(&[4], Direction::Both, Some(&[10]))
+                .unwrap(),
+            EndpointAdjPostingStats {
+                posting_total: 2,
+                cursor_count: 2,
+            }
+        );
+        assert_eq!(
+            reader
+                .endpoint_adj_posting_stats(&[1], Direction::Both, Some(&[99]))
+                .unwrap(),
+            EndpointAdjPostingStats::default()
         );
     }
 
@@ -11671,6 +12153,483 @@ pub(crate) mod tests {
                 .unwrap(),
             vec![3]
         );
+    }
+
+    #[test]
+    fn secondary_eq_group_span_lookup_reports_storage_outcomes() {
+        let mt = Memtable::new();
+        let mut props = BTreeMap::new();
+        props.insert("color".to_string(), PropValue::String("red".to_string()));
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 1,
+                label_ids: NodeLabelSet::single(1).unwrap(),
+                key: "apple".to_string(),
+                props,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            0,
+        );
+
+        let entry = SecondaryIndexManifestEntry {
+            index_id: 47,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 1,
+                prop_key: "color".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let (_dir, reader) = write_and_open_with_secondary_eq_sidecar(&mt, &entry);
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
+        let blue_hash = hash_prop_equality_key(&PropValue::String("blue".to_string()));
+
+        match reader
+            .secondary_eq_group_span_if_present(entry.index_id, red_hash)
+            .unwrap()
+        {
+            SecondaryEqGroupSpanLookup::Found(span) => {
+                assert_eq!(span.id_count, 1);
+                assert_eq!(
+                    reader
+                        .secondary_eq_posting_seek_ge(
+                            entry.index_id,
+                            span.offset,
+                            span.id_count,
+                            0,
+                            1,
+                        )
+                        .unwrap(),
+                    Some((0, 1))
+                );
+            }
+            other => panic!("expected found group, got {other:?}"),
+        }
+        assert_eq!(
+            reader
+                .secondary_eq_group_span_if_present(entry.index_id, blue_hash)
+                .unwrap(),
+            SecondaryEqGroupSpanLookup::MissingValueGroup
+        );
+        assert_eq!(
+            reader
+                .secondary_eq_group_span_if_present(entry.index_id + 1, red_hash)
+                .unwrap(),
+            SecondaryEqGroupSpanLookup::MissingSidecar
+        );
+    }
+
+    #[test]
+    fn secondary_eq_group_span_for_target_separates_nodes_and_edges() {
+        let mt = Memtable::new();
+        let mut node_props = BTreeMap::new();
+        node_props.insert("status".to_string(), PropValue::String("hot".to_string()));
+        mt.apply_op(
+            &WalOp::UpsertNode(NodeRecord {
+                id: 11,
+                label_ids: NodeLabelSet::single(1).unwrap(),
+                key: "node-hot".to_string(),
+                props: node_props,
+                created_at: 1000,
+                updated_at: 1001,
+                weight: 0.5,
+                dense_vector: None,
+                sparse_vector: None,
+                last_write_seq: 0,
+            }),
+            1,
+        );
+
+        let mut edge_props = BTreeMap::new();
+        edge_props.insert("status".to_string(), PropValue::String("hot".to_string()));
+        mt.apply_op(
+            &WalOp::UpsertEdge(EdgeRecord {
+                props: edge_props,
+                ..make_edge(42, 1, 2, 7)
+            }),
+            2,
+        );
+
+        let node_entry = SecondaryIndexManifestEntry {
+            index_id: 71,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 1,
+                prop_key: "status".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let edge_entry = SecondaryIndexManifestEntry {
+            index_id: 72,
+            target: SecondaryIndexTarget::EdgeProperty {
+                label_id: 7,
+                prop_key: "status".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mt = mt.clone();
+        mt.register_secondary_index(&node_entry);
+        mt.register_secondary_index(&edge_entry);
+        let entries = vec![node_entry.clone(), edge_entry.clone()];
+        let info = crate::segment_writer::write_segment_without_degree_sidecar_with_secondary_indexes_for_test(
+            &seg_dir,
+            1,
+            &mt,
+            None,
+            &entries,
+        )
+        .unwrap();
+        let reader = SegmentReader::open_with_info(&seg_dir, &info, None, &entries).unwrap();
+        let hot_hash = hash_prop_equality_key(&PropValue::String("hot".to_string()));
+
+        let SecondaryEqGroupSpanLookup::Found(node_span) = reader
+            .secondary_eq_group_span_if_present(node_entry.index_id, hot_hash)
+            .unwrap()
+        else {
+            panic!("node group must exist");
+        };
+        assert_eq!(
+            reader
+                .secondary_eq_posting_seek_ge(
+                    node_entry.index_id,
+                    node_span.offset,
+                    node_span.id_count,
+                    0,
+                    11
+                )
+                .unwrap(),
+            Some((0, 11))
+        );
+        assert_eq!(
+            reader
+                .secondary_eq_group_span_if_present_for_target(
+                    node_entry.index_id,
+                    PlannerStatsDeclaredIndexTarget::EdgeProperty,
+                    hot_hash,
+                )
+                .unwrap(),
+            SecondaryEqGroupSpanLookup::MissingSidecar
+        );
+
+        let SecondaryEqGroupSpanLookup::Found(edge_span) = reader
+            .secondary_eq_group_span_if_present_for_target(
+                edge_entry.index_id,
+                PlannerStatsDeclaredIndexTarget::EdgeProperty,
+                hot_hash,
+            )
+            .unwrap()
+        else {
+            panic!("edge group must exist");
+        };
+        assert_eq!(
+            reader
+                .secondary_eq_posting_seek_ge_for_target(
+                    edge_entry.index_id,
+                    PlannerStatsDeclaredIndexTarget::EdgeProperty,
+                    edge_span.offset,
+                    edge_span.id_count,
+                    0,
+                    42,
+                )
+                .unwrap(),
+            Some((0, 42))
+        );
+        assert_eq!(
+            reader
+                .secondary_eq_group_span_if_present_for_target(
+                    edge_entry.index_id,
+                    PlannerStatsDeclaredIndexTarget::NodeProperty,
+                    hot_hash,
+                )
+                .unwrap(),
+            SecondaryEqGroupSpanLookup::MissingSidecar
+        );
+    }
+
+    #[test]
+    fn secondary_eq_group_span_lookup_rejects_unsorted_value_hash_index() {
+        let mt = Memtable::new();
+        for (seq, (id, color)) in [(1, "red"), (2, "blue")].into_iter().enumerate() {
+            let mut props = BTreeMap::new();
+            props.insert("color".to_string(), PropValue::String(color.to_string()));
+            mt.apply_op(
+                &WalOp::UpsertNode(NodeRecord {
+                    id,
+                    label_ids: NodeLabelSet::single(1).unwrap(),
+                    key: format!("node-{id}"),
+                    props,
+                    created_at: 1000,
+                    updated_at: 1001,
+                    weight: 0.5,
+                    dense_vector: None,
+                    sparse_vector: None,
+                    last_write_seq: 0,
+                }),
+                seq as u64 + 1,
+            );
+        }
+
+        let entry = SecondaryIndexManifestEntry {
+            index_id: 55,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 1,
+                prop_key: "color".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let (dir, _) = write_and_open_with_secondary_eq_sidecar(&mt, &entry);
+        let seg_dir = dir.path().join("seg_0001");
+        let kind = SegmentComponentKind::NodePropertyEqualityIndex {
+            index_id: entry.index_id,
+        };
+        rewrite_component_payload_for_test(&seg_dir, kind.clone(), |payload| {
+            let (count, _) = secondary_eq_sidecar_index_bounds(payload).unwrap();
+            assert!(count >= 2);
+            let first_hash = read_u64_at(payload, 8).unwrap();
+            write_u64_at_for_test(payload, 8 + SECONDARY_EQ_ENTRY_SIZE, first_hash);
+        });
+
+        let reader = reopen_test_segment_with_index(&seg_dir, &entry);
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
+        let err = reader
+            .secondary_eq_group_span_if_present(entry.index_id, red_hash)
+            .unwrap_err();
+        assert!(err.to_string().contains("value hashes"));
+        assert_eq!(
+            reader.declared_index_runtime_coverage_state(
+                entry.index_id,
+                PlannerStatsDeclaredIndexKind::Equality
+            ),
+            DeclaredIndexRuntimeCoverageState::Corrupt
+        );
+    }
+
+    #[test]
+    fn secondary_eq_group_span_lookup_rejects_unsorted_selected_posting_group() {
+        let mt = Memtable::new();
+        for (seq, (id, color)) in [(1, "red"), (2, "red"), (3, "blue")]
+            .into_iter()
+            .enumerate()
+        {
+            let mut props = BTreeMap::new();
+            props.insert("color".to_string(), PropValue::String(color.to_string()));
+            mt.apply_op(
+                &WalOp::UpsertNode(NodeRecord {
+                    id,
+                    label_ids: NodeLabelSet::single(1).unwrap(),
+                    key: format!("node-{id}"),
+                    props,
+                    created_at: 1000,
+                    updated_at: 1001,
+                    weight: 0.5,
+                    dense_vector: None,
+                    sparse_vector: None,
+                    last_write_seq: 0,
+                }),
+                seq as u64 + 1,
+            );
+        }
+
+        let entry = SecondaryIndexManifestEntry {
+            index_id: 56,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 1,
+                prop_key: "color".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let (dir, _) = write_and_open_with_secondary_eq_sidecar(&mt, &entry);
+        let seg_dir = dir.path().join("seg_0001");
+        let kind = SegmentComponentKind::NodePropertyEqualityIndex {
+            index_id: entry.index_id,
+        };
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
+        rewrite_component_payload_for_test(&seg_dir, kind.clone(), |payload| {
+            let (offset, id_count) = secondary_eq_group_range(payload, red_hash)
+                .unwrap()
+                .expect("red group must exist");
+            assert!(id_count >= 2);
+            let first = read_u64_at(payload, offset).unwrap();
+            let second = read_u64_at(payload, offset + 8).unwrap();
+            write_u64_at_for_test(payload, offset, second);
+            write_u64_at_for_test(payload, offset + 8, first);
+        });
+
+        let reader = reopen_test_segment_with_index(&seg_dir, &entry);
+        let err = reader
+            .secondary_eq_group_span_if_present(entry.index_id, red_hash)
+            .unwrap_err();
+        assert!(err.to_string().contains("node IDs"));
+        assert_eq!(
+            reader.declared_index_runtime_coverage_state(
+                entry.index_id,
+                PlannerStatsDeclaredIndexKind::Equality
+            ),
+            DeclaredIndexRuntimeCoverageState::Corrupt
+        );
+    }
+
+    #[test]
+    fn secondary_eq_posting_seek_ge_matches_binary_search() {
+        let mt = Memtable::new();
+        let entry = SecondaryIndexManifestEntry {
+            index_id: 48,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 1,
+                prop_key: "color".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let mut expected_ids = Vec::new();
+        for id in (1..=80).map(|n| n * 3) {
+            expected_ids.push(id);
+            let mut props = BTreeMap::new();
+            props.insert("color".to_string(), PropValue::String("red".to_string()));
+            mt.apply_op(
+                &WalOp::UpsertNode(NodeRecord {
+                    id,
+                    label_ids: NodeLabelSet::single(1).unwrap(),
+                    key: format!("n{id}"),
+                    props,
+                    created_at: 1000,
+                    updated_at: 1001,
+                    weight: 0.5,
+                    dense_vector: None,
+                    sparse_vector: None,
+                    last_write_seq: 0,
+                }),
+                id,
+            );
+        }
+        let (_dir, reader) = write_and_open_with_secondary_eq_sidecar(&mt, &entry);
+        let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
+        let SecondaryEqGroupSpanLookup::Found(span) = reader
+            .secondary_eq_group_span_if_present(entry.index_id, red_hash)
+            .unwrap()
+        else {
+            panic!("red group must exist");
+        };
+
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut from_pos = 0usize;
+        for _ in 0..512 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let bound = seed % 260;
+            let expected = expected_ids[from_pos..]
+                .binary_search(&bound)
+                .map(|relative| from_pos + relative)
+                .unwrap_or_else(|relative| from_pos + relative);
+            let got = reader
+                .secondary_eq_posting_seek_ge(
+                    entry.index_id,
+                    span.offset,
+                    span.id_count,
+                    from_pos,
+                    bound,
+                )
+                .unwrap();
+            if expected >= expected_ids.len() {
+                assert_eq!(got, None, "from_pos {from_pos}, bound {bound}");
+                from_pos = expected_ids.len();
+            } else {
+                assert_eq!(
+                    got,
+                    Some((expected, expected_ids[expected])),
+                    "from_pos {from_pos}, bound {bound}"
+                );
+                from_pos = expected;
+            }
+        }
+    }
+
+    #[test]
+    fn secondary_eq_posting_seek_ge_for_edge_target_matches_binary_search() {
+        let mt = Memtable::new();
+        let entry = SecondaryIndexManifestEntry {
+            index_id: 73,
+            target: SecondaryIndexTarget::EdgeProperty {
+                label_id: 7,
+                prop_key: "status".to_string(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        let mut expected_ids = Vec::new();
+        for (seq, id) in (1..=80).map(|n| n * 3).enumerate() {
+            expected_ids.push(id);
+            let mut props = BTreeMap::new();
+            props.insert("status".to_string(), PropValue::String("hot".to_string()));
+            mt.apply_op(
+                &WalOp::UpsertEdge(EdgeRecord {
+                    props,
+                    ..make_edge(id, 1, 2, 7)
+                }),
+                seq as u64 + 1,
+            );
+        }
+        let (_dir, reader) = write_and_open_with_secondary_eq_sidecar(&mt, &entry);
+        let hot_hash = hash_prop_equality_key(&PropValue::String("hot".to_string()));
+        let SecondaryEqGroupSpanLookup::Found(span) = reader
+            .secondary_eq_group_span_if_present_for_target(
+                entry.index_id,
+                PlannerStatsDeclaredIndexTarget::EdgeProperty,
+                hot_hash,
+            )
+            .unwrap()
+        else {
+            panic!("hot group must exist");
+        };
+
+        let mut seed = 0x517c_c1b7_2722_0a95u64;
+        let mut from_pos = 0usize;
+        for _ in 0..512 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let bound = seed % 260;
+            let expected = expected_ids[from_pos..]
+                .binary_search(&bound)
+                .map(|relative| from_pos + relative)
+                .unwrap_or_else(|relative| from_pos + relative);
+            let got = reader
+                .secondary_eq_posting_seek_ge_for_target(
+                    entry.index_id,
+                    PlannerStatsDeclaredIndexTarget::EdgeProperty,
+                    span.offset,
+                    span.id_count,
+                    from_pos,
+                    bound,
+                )
+                .unwrap();
+            if expected >= expected_ids.len() {
+                assert_eq!(got, None, "from_pos {from_pos}, bound {bound}");
+                from_pos = expected_ids.len();
+            } else {
+                assert_eq!(
+                    got,
+                    Some((expected, expected_ids[expected])),
+                    "from_pos {from_pos}, bound {bound}"
+                );
+                from_pos = expected;
+            }
+        }
     }
 
     #[test]

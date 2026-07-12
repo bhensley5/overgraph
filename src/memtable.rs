@@ -3227,17 +3227,12 @@ impl Memtable {
         ids
     }
 
-    pub(crate) fn visible_edges_by_label_id_count(
-        &self,
-        label_id: u32,
-        snapshot_seq: u64,
-    ) -> usize {
+    pub(crate) fn edge_label_posting_count_upper_bound(&self, label_id: u32) -> usize {
         let state = self.state.read().unwrap();
         state
-            .ordered_label_edge_index
-            .range((label_id, 0)..=(label_id, u64::MAX))
-            .filter(|(_, slot)| slot_option_visible(slot, snapshot_seq))
-            .count()
+            .label_edge_index
+            .get(&label_id)
+            .map_or(0, NodeIdMap::len)
     }
 
     #[cfg(test)]
@@ -3289,6 +3284,23 @@ impl Memtable {
         None
     }
 
+    pub(crate) fn next_visible_node_by_label_id_ge(
+        &self,
+        label_id: u32,
+        snapshot_seq: u64,
+        bound: u64,
+    ) -> Option<u64> {
+        let state = self.state.read().unwrap();
+        let start = Bound::Included((label_id, bound));
+        let end = Bound::Included((label_id, u64::MAX));
+        for (&(_, node_id), slot) in state.label_node_index.range((start, end)) {
+            if slot_option_visible(slot, snapshot_seq) {
+                return Some(node_id);
+            }
+        }
+        None
+    }
+
     pub(crate) fn next_visible_edge_by_label_id_after(
         &self,
         label_id: u32,
@@ -3301,6 +3313,23 @@ impl Memtable {
             Some(_) => Bound::Excluded(start_key),
             None => Bound::Included(start_key),
         };
+        let end = Bound::Included((label_id, u64::MAX));
+        for (&(_, edge_id), slot) in state.ordered_label_edge_index.range((start, end)) {
+            if slot_option_visible(slot, snapshot_seq) {
+                return Some(edge_id);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn next_visible_edge_by_label_id_ge(
+        &self,
+        label_id: u32,
+        snapshot_seq: u64,
+        bound: u64,
+    ) -> Option<u64> {
+        let state = self.state.read().unwrap();
+        let start = Bound::Included((label_id, bound));
         let end = Bound::Included((label_id, u64::MAX));
         for (&(_, edge_id), slot) in state.ordered_label_edge_index.range((start, end)) {
             if slot_option_visible(slot, snapshot_seq) {
@@ -3736,6 +3765,59 @@ impl Memtable {
         None
     }
 
+    fn next_visible_adj_edge_ge_in_state(
+        state: &MemtableState,
+        node_id: u64,
+        outgoing: bool,
+        label_filter_id: Option<u32>,
+        snapshot_seq: u64,
+        bound: u64,
+    ) -> Option<u64> {
+        if state.node_deleted_at(node_id, snapshot_seq) {
+            return None;
+        }
+        let source = if outgoing {
+            &state.ordered_adj_out
+        } else {
+            &state.ordered_adj_in
+        };
+        let entries = source.get(&node_id)?;
+        for (&edge_id, slot) in entries.range((Bound::Included(bound), Bound::Unbounded)) {
+            #[cfg(test)]
+            ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST.fetch_add(1, Ordering::Relaxed);
+            let Some(entry) = slot_option_at(slot, snapshot_seq) else {
+                continue;
+            };
+            if label_filter_id.is_some_and(|label_id| entry.label_id != label_id) {
+                continue;
+            }
+            if state.node_deleted_at(entry.neighbor_id, snapshot_seq) {
+                continue;
+            }
+            return Some(edge_id);
+        }
+        None
+    }
+
+    pub(crate) fn next_visible_adj_edge_ge(
+        &self,
+        node_id: u64,
+        outgoing: bool,
+        label_filter_id: Option<u32>,
+        snapshot_seq: u64,
+        bound: u64,
+    ) -> Option<u64> {
+        let state = self.state.read().unwrap();
+        Self::next_visible_adj_edge_ge_in_state(
+            &state,
+            node_id,
+            outgoing,
+            label_filter_id,
+            snapshot_seq,
+            bound,
+        )
+    }
+
     fn visible_adj_edge_count_estimate(
         state: &MemtableState,
         node_id: u64,
@@ -4011,6 +4093,25 @@ impl Memtable {
         ids
     }
 
+    // CP40.1 stream construction helper; CP40.2 wires it into query execution.
+    #[allow(dead_code)]
+    pub(crate) fn visible_secondary_eq_node_ids_sorted(
+        &self,
+        index_id: u64,
+        value_hash: u64,
+        snapshot_seq: u64,
+    ) -> Vec<u64> {
+        let mut ids = self.find_secondary_eq_nodes_by_hash_at_limited(
+            index_id,
+            value_hash,
+            snapshot_seq,
+            None,
+        );
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     pub(crate) fn secondary_eq_node_count_at(
         &self,
         index_id: u64,
@@ -4091,6 +4192,23 @@ impl Memtable {
             }
         }
         ids.sort_unstable();
+        ids
+    }
+
+    pub(crate) fn visible_secondary_eq_edge_ids_sorted(
+        &self,
+        index_id: u64,
+        value_hash: u64,
+        snapshot_seq: u64,
+    ) -> Vec<u64> {
+        let mut ids = self.find_secondary_eq_edges_by_hash_at_limited(
+            index_id,
+            value_hash,
+            snapshot_seq,
+            None,
+        );
+        ids.sort_unstable();
+        ids.dedup();
         ids
     }
 
@@ -4935,6 +5053,67 @@ mod tests {
     }
 
     #[test]
+    fn edge_label_posting_upper_bound_is_snapshot_safe_and_slot_stable() {
+        let mt = Memtable::new();
+        let visible_count =
+            |label_id, snapshot_seq| mt.visible_edges_by_label_id(label_id, snapshot_seq).len();
+
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)), 1);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 1);
+        assert_eq!(visible_count(5, 1), 1);
+
+        let mut same_label = make_edge(10, 1, 2, 5);
+        same_label.weight = 2.0;
+        mt.apply_op(&WalOp::UpsertEdge(same_label), 2);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 1);
+        assert_eq!(visible_count(5, 1), 1);
+        assert_eq!(visible_count(5, 2), 1);
+
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 10,
+                deleted_at: 3,
+            },
+            3,
+        );
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 1);
+        assert_eq!(visible_count(5, 1), 1);
+        assert_eq!(visible_count(5, 3), 0);
+
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)), 4);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 1);
+        assert_eq!(visible_count(5, 3), 0);
+        assert_eq!(visible_count(5, 4), 1);
+
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 6)), 5);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 1);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(6), 1);
+        assert_eq!(visible_count(5, 4), 1);
+        assert_eq!(visible_count(5, 5), 0);
+        assert_eq!(visible_count(6, 5), 1);
+
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)), 6);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 1);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(6), 1);
+        assert_eq!(visible_count(5, 6), 1);
+        assert_eq!(visible_count(6, 6), 0);
+
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(11, 1, 3, 5)), 7);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 2);
+        for snapshot_seq in 0..=7 {
+            assert!(
+                mt.edge_label_posting_count_upper_bound(5) >= visible_count(5, snapshot_seq),
+                "posting count must bound label 5 at snapshot {snapshot_seq}"
+            );
+            assert!(
+                mt.edge_label_posting_count_upper_bound(6) >= visible_count(6, snapshot_seq),
+                "posting count must bound label 6 at snapshot {snapshot_seq}"
+            );
+        }
+    }
+
+    #[test]
     fn edge_metadata_source_helpers_return_visible_ids() {
         let mt = Memtable::new();
         let mut edge_a = make_edge(10, 1, 2, 5);
@@ -5242,6 +5421,56 @@ mod tests {
     }
 
     #[test]
+    fn next_visible_adj_edge_ge_is_inclusive_label_filtered_and_skips_deleted() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 1);
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 2);
+        mt.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 3);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 7)), 4);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(12, 1, 3, 8)), 5);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(14, 1, 2, 7)), 6);
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 10,
+                deleted_at: 700,
+            },
+            7,
+        );
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 3,
+                deleted_at: 800,
+            },
+            8,
+        );
+
+        assert_eq!(mt.next_visible_adj_edge_ge(1, true, None, 6, 10), Some(10));
+        assert_eq!(
+            mt.next_visible_adj_edge_ge(1, true, Some(7), 6, 10),
+            Some(10)
+        );
+        assert_eq!(
+            mt.next_visible_adj_edge_ge(1, true, Some(8), 6, 10),
+            Some(12)
+        );
+        assert_eq!(
+            mt.next_visible_adj_edge_ge(1, true, Some(7), 6, 11),
+            Some(14)
+        );
+
+        assert_eq!(mt.next_visible_adj_edge_ge(1, true, None, 8, 10), Some(14));
+        assert_eq!(mt.next_visible_adj_edge_ge(1, true, Some(8), 8, 10), None);
+        assert_eq!(
+            mt.next_visible_adj_edge_ge(2, false, Some(7), 8, 0),
+            Some(14)
+        );
+        assert_eq!(
+            mt.next_visible_adj_edge_ge(1, true, None, 8, u64::MAX),
+            None
+        );
+    }
+
+    #[test]
     fn time_membership_history_is_snapshot_correct() {
         let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertNode(make_node_at(1, 1, "a", 100)), 1);
@@ -5395,6 +5624,64 @@ mod tests {
     }
 
     #[test]
+    fn next_visible_node_by_label_id_ge_is_snapshot_aware_and_inclusive() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 7, "a")), 1);
+        mt.apply_op(&WalOp::UpsertNode(make_node(3, 7, "b")), 2);
+        mt.apply_op(&WalOp::UpsertNode(make_node(5, 7, "c")), 3);
+        mt.apply_op(&WalOp::UpsertNode(make_node(3, 8, "b")), 4);
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 5,
+                deleted_at: 500,
+            },
+            5,
+        );
+        mt.apply_op(&WalOp::UpsertNode(make_node(2, 7, "d")), 6);
+
+        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 3, 0), Some(1));
+        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 3, 1), Some(1));
+        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 3, 2), Some(3));
+        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 3, 3), Some(3));
+        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 3, 4), Some(5));
+        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 3, 5), Some(5));
+        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 3, 6), None);
+
+        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 4, 2), Some(5));
+        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 5, 2), None);
+        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 6, 2), Some(2));
+    }
+
+    #[test]
+    fn next_visible_edge_by_label_id_ge_is_snapshot_aware_and_inclusive() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 7)), 1);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 1, 2, 7)), 2);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(5, 1, 2, 7)), 3);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 1, 2, 8)), 4);
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 5,
+                deleted_at: 500,
+            },
+            5,
+        );
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 2, 7)), 6);
+
+        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 3, 0), Some(1));
+        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 3, 1), Some(1));
+        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 3, 2), Some(3));
+        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 3, 3), Some(3));
+        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 3, 4), Some(5));
+        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 3, 5), Some(5));
+        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 3, 6), None);
+
+        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 4, 2), Some(5));
+        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 5, 2), None);
+        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 6, 2), Some(2));
+    }
+
+    #[test]
     fn multi_label_key_replacement_updates_all_label_memberships() {
         let mt = Memtable::new();
         mt.apply_op(
@@ -5470,6 +5757,164 @@ mod tests {
             .is_empty());
         assert_eq!(
             mt.find_secondary_eq_nodes_at(10, "name", &PropValue::String("bob".into()), 2),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn visible_secondary_eq_node_ids_sorted_is_visible_sorted_deduped_and_snapshot_aware() {
+        let mt = Memtable::new();
+        let entry = SecondaryIndexManifestEntry {
+            index_id: 12,
+            target: SecondaryIndexTarget::NodeProperty {
+                label_id: 1,
+                prop_key: "status".into(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        mt.register_secondary_index(&entry);
+
+        let hot = PropValue::String("hot".into());
+        let cold = PropValue::String("cold".into());
+        let hot_hash = hash_prop_equality_key(&hot);
+        let cold_hash = hash_prop_equality_key(&cold);
+
+        let mut hot_props = BTreeMap::new();
+        hot_props.insert("status".into(), hot.clone());
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(3, 1, "c", hot_props.clone())),
+            1,
+        );
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", hot_props.clone())),
+            2,
+        );
+
+        let mut cold_props = BTreeMap::new();
+        cold_props.insert("status".into(), cold.clone());
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(3, 1, "c", cold_props)),
+            3,
+        );
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(2, 1, "b", hot_props.clone())),
+            4,
+        );
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 2,
+                deleted_at: 500,
+            },
+            5,
+        );
+        mt.apply_op(
+            &WalOp::UpsertNode(make_node_with_props(1, 1, "a", hot_props)),
+            6,
+        );
+
+        assert_eq!(
+            mt.visible_secondary_eq_node_ids_sorted(12, hot_hash, 2),
+            vec![1, 3]
+        );
+        assert_eq!(
+            mt.visible_secondary_eq_node_ids_sorted(12, hot_hash, 3),
+            vec![1]
+        );
+        assert_eq!(
+            mt.visible_secondary_eq_node_ids_sorted(12, cold_hash, 3),
+            vec![3]
+        );
+        assert_eq!(
+            mt.visible_secondary_eq_node_ids_sorted(12, hot_hash, 4),
+            vec![1, 2]
+        );
+        assert_eq!(
+            mt.visible_secondary_eq_node_ids_sorted(12, hot_hash, 5),
+            vec![1]
+        );
+        assert_eq!(
+            mt.visible_secondary_eq_node_ids_sorted(12, hot_hash, 6),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn visible_secondary_eq_edge_ids_sorted_is_visible_sorted_deduped_and_snapshot_aware() {
+        let mt = Memtable::new();
+        let entry = SecondaryIndexManifestEntry {
+            index_id: 13,
+            target: SecondaryIndexTarget::EdgeProperty {
+                label_id: 7,
+                prop_key: "status".into(),
+            },
+            kind: SecondaryIndexKind::Equality,
+            state: SecondaryIndexState::Ready,
+            last_error: None,
+        };
+        mt.register_secondary_index(&entry);
+
+        let hot = PropValue::String("hot".into());
+        let cold = PropValue::String("cold".into());
+        let hot_hash = hash_prop_equality_key(&hot);
+        let cold_hash = hash_prop_equality_key(&cold);
+
+        let mut hot_props = BTreeMap::new();
+        hot_props.insert("status".into(), hot.clone());
+        mt.apply_op(
+            &WalOp::UpsertEdge(make_edge_with_props(3, 1, 2, 7, hot_props.clone())),
+            1,
+        );
+        mt.apply_op(
+            &WalOp::UpsertEdge(make_edge_with_props(1, 1, 2, 7, hot_props.clone())),
+            2,
+        );
+
+        let mut cold_props = BTreeMap::new();
+        cold_props.insert("status".into(), cold.clone());
+        mt.apply_op(
+            &WalOp::UpsertEdge(make_edge_with_props(3, 1, 2, 7, cold_props)),
+            3,
+        );
+        mt.apply_op(
+            &WalOp::UpsertEdge(make_edge_with_props(2, 1, 2, 7, hot_props.clone())),
+            4,
+        );
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 2,
+                deleted_at: 500,
+            },
+            5,
+        );
+        mt.apply_op(
+            &WalOp::UpsertEdge(make_edge_with_props(1, 1, 2, 7, hot_props)),
+            6,
+        );
+
+        assert_eq!(
+            mt.visible_secondary_eq_edge_ids_sorted(13, hot_hash, 2),
+            vec![1, 3]
+        );
+        assert_eq!(
+            mt.visible_secondary_eq_edge_ids_sorted(13, hot_hash, 3),
+            vec![1]
+        );
+        assert_eq!(
+            mt.visible_secondary_eq_edge_ids_sorted(13, cold_hash, 3),
+            vec![3]
+        );
+        assert_eq!(
+            mt.visible_secondary_eq_edge_ids_sorted(13, hot_hash, 4),
+            vec![1, 2]
+        );
+        assert_eq!(
+            mt.visible_secondary_eq_edge_ids_sorted(13, hot_hash, 5),
+            vec![1]
+        );
+        assert_eq!(
+            mt.visible_secondary_eq_edge_ids_sorted(13, hot_hash, 6),
             vec![1]
         );
     }

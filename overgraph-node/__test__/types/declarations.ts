@@ -1,8 +1,6 @@
 import type {
   DatabaseScrubFinding,
-  DatabaseScrubFindingType,
   DatabaseScrubReport,
-  DatabaseScrubSeverity,
   EdgeInput,
   EdgeLabelInfo,
   EdgeSchema,
@@ -23,7 +21,6 @@ import type {
   NodePropertyIndexInfo,
   NodeSchema,
   NodeSchemaInfo,
-  ManifestScrubSource,
   ManifestScrubSummary,
   OrphanSegmentScrubResult,
   OverGraph,
@@ -36,7 +33,6 @@ import type {
   SchemaSetOptions,
   SchemaValidationReport,
   WalScrubResult,
-  WalScrubRole,
 } from '../../index.js'
 import { scrubPath, scrubPathAsync } from '../../index.js'
 import type {
@@ -66,6 +62,11 @@ import type * as QueryTypes from '../../query-types.js'
 
 declare const db: OverGraph
 declare const dbPath: string
+
+type DatabaseScrubFindingType = NonNullable<DatabaseScrubFinding['findingType']>
+type DatabaseScrubSeverity = NonNullable<DatabaseScrubFinding['severity']>
+type ManifestScrubSource = NonNullable<ManifestScrubSummary['source']>
+type WalScrubRole = NonNullable<WalScrubResult['role']>
 
 const scrubPathOptions: ScrubPathOptions = {
   validateWal: true,
@@ -119,7 +120,7 @@ const nodeIndexSpec: SecondaryIndexSpec = {
 const nodeIndexInfo: NodePropertyIndexInfo = db.ensureNodePropertyIndex('Person', nodeIndexSpec)
 const nodeIndexField: SecondaryIndexField = nodeIndexInfo.fields[0]
 const nodeIndexCompound: boolean = nodeIndexInfo.compound
-const nodeIndexState: 'building' | 'ready' | 'failed' = nodeIndexInfo.state
+const nodeIndexState: string = nodeIndexInfo.state
 const droppedNodeIndex: boolean = db.dropNodePropertyIndex('Person', nodeIndexSpec)
 const nodeIndexInfoAsync: Promise<NodePropertyIndexInfo> = db.ensureNodePropertyIndexAsync('Person', nodeIndexSpec)
 const droppedNodeIndexAsync: Promise<boolean> = db.dropNodePropertyIndexAsync('Person', nodeIndexSpec)
@@ -157,11 +158,20 @@ const compoundPlanNode: QueryPlanNode = {
   details: compoundPlanDetails,
 }
 const compoundWarning: QueryPlanWarning = 'compound_index_prefix_not_satisfied'
+const streamedWarning: QueryPlanWarning = 'streamed_input_buffer_cap_exceeded'
+const streamedMode: QueryTypes.QueryPlanExecutionMode = 'streamed'
+const eagerMode: QueryTypes.QueryPlanExecutionMode = 'eager'
+const streamedExplainNodes: Array<QueryPlanNode> = [
+  { kind: 'intersect', mode: streamedMode, inputs: [{ kind: 'property_equality_index' }, { kind: 'property_equality_index' }] },
+  { kind: 'union', mode: eagerMode, inputs: [{ kind: 'edge_property_equality_index' }, { kind: 'edge_property_equality_index' }] },
+  { kind: 'streamed_source', input: { kind: 'property_equality_index' } },
+  { kind: 'buffered_id_sort', input: { kind: 'property_range_index' } },
+]
 const compoundPlan: QueryPlan = {
   kind: 'node_query',
-  root: compoundPlanNode,
+  root: streamedExplainNodes[0],
   estimatedCandidates: null,
-  warnings: [compoundWarning],
+  warnings: [compoundWarning, streamedWarning],
   notes: [],
   publicInputs: {
     nodeLabels: [{ name: 'Person', known: true, mode: 'all' }],
