@@ -952,7 +952,8 @@ impl ReadView {
             .graph_row_query_calls
             .fetch_add(1, Ordering::Relaxed);
         let runtime = self.normalize_graph_row_runtime_plan(query)?;
-        let physical_plan = self.plan_graph_row_physical(query, &runtime, include_plan)?;
+        let physical_plan =
+            self.plan_graph_row_physical(query, &runtime, include_plan, false)?;
         let policy_cutoffs = self.query_policy_cutoffs();
         let cursor_state = GraphRowCursorState {
             decoded: None,
@@ -973,7 +974,6 @@ impl ReadView {
         } else {
             None
         };
-        let mut followups = Vec::new();
         let initial_row_count = initial_rows.as_ref().map_or(0, Vec::len);
         let mut optional_seed_misses = Vec::new();
         let initial_rows = match initial_rows {
@@ -996,22 +996,36 @@ impl ReadView {
             None => None,
         };
         let mut intermediate_peak = initial_row_count.max(optional_seed_misses.len());
-        let mut frontier_peak = 0usize;
-        let mut paths_enumerated = 0usize;
-        let mut rows = self.graph_row_execute_runtime_plan(
+        let production = self.graph_row_execute_chunked(
             query,
             &runtime,
             &physical_plan,
-            initial_rows,
-            GraphRowRuntimeGoal::AllRows,
+            Some(GraphRowRuntimeOnceExecution {
+                reason: GraphRowRuntimeOnceReason::Stage,
+                initial_rows,
+                goal: GraphRowRuntimeGoal::AllRows,
+            }),
+            &cursor_state,
+            0,
+            true,
             effective_at_epoch,
             policy_cutoffs.as_ref(),
-            &mut followups,
-            &mut frontier_peak,
-            &mut intermediate_peak,
-            &mut paths_enumerated,
             explain_trace.as_mut(),
         )?;
+        let GraphRowProductionOutput::CollectAll(production) = production else {
+            unreachable!("graph-row stage execution must use the collect-all sink")
+        };
+        let GraphRowCollectAllProduction {
+            mut rows,
+            intermediate_peak: runtime_intermediate_peak,
+            frontier_peak: runtime_frontier_peak,
+            paths_enumerated: runtime_paths_enumerated,
+            followups: runtime_followups,
+        } = production;
+        intermediate_peak = intermediate_peak.max(runtime_intermediate_peak);
+        let frontier_peak = runtime_frontier_peak;
+        let paths_enumerated = runtime_paths_enumerated;
+        let followups = runtime_followups;
         if !optional_seed_misses.is_empty() {
             rows.extend(optional_seed_misses);
             graph_row_record_cap_peak(
@@ -1082,9 +1096,14 @@ impl ReadView {
             .graph_row_query_calls
             .fetch_add(1, Ordering::Relaxed);
         let runtime = self.normalize_graph_row_runtime_plan(query)?;
-        let physical_plan = self.plan_graph_row_physical(query, &runtime, false)?;
+        let physical_plan = self.plan_graph_row_physical(query, &runtime, false, false)?;
         let policy_cutoffs = self.query_policy_cutoffs();
-        let mut followups = Vec::new();
+        let cursor_state = GraphRowCursorState {
+            decoded: None,
+            effective_at_epoch,
+            original_skip: 0,
+            rows_emitted_after_skip: 0,
+        };
         let initial_row_count = initial_rows.as_ref().map_or(0, Vec::len);
         let initial_rows = match initial_rows {
             Some(rows) => {
@@ -1100,22 +1119,34 @@ impl ReadView {
             None => None,
         };
         let mut intermediate_peak = initial_row_count;
-        let mut frontier_peak = 0usize;
-        let mut paths_enumerated = 0usize;
-        let rows = self.graph_row_execute_runtime_plan(
+        let production = self.graph_row_execute_chunked(
             query,
             &runtime,
             &physical_plan,
-            initial_rows,
-            GraphRowRuntimeGoal::ExistsOne,
+            Some(GraphRowRuntimeOnceExecution {
+                reason: GraphRowRuntimeOnceReason::Exists,
+                initial_rows,
+                goal: GraphRowRuntimeGoal::ExistsOne,
+            }),
+            &cursor_state,
+            0,
+            true,
             effective_at_epoch,
             policy_cutoffs.as_ref(),
-            &mut followups,
-            &mut frontier_peak,
-            &mut intermediate_peak,
-            &mut paths_enumerated,
             None,
         )?;
+        let GraphRowProductionOutput::CollectAll(production) = production else {
+            unreachable!("graph-row EXISTS execution must use the collect-all sink")
+        };
+        let GraphRowCollectAllProduction {
+            rows,
+            intermediate_peak: runtime_intermediate_peak,
+            frontier_peak: _runtime_frontier_peak,
+            paths_enumerated: _runtime_paths_enumerated,
+            followups: runtime_followups,
+        } = production;
+        intermediate_peak = intermediate_peak.max(runtime_intermediate_peak);
+        let followups = runtime_followups;
         let exists = !rows.is_empty();
         let row_count = usize::from(exists);
         Ok(GraphRowStageExecution {

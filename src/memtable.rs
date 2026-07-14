@@ -3605,6 +3605,7 @@ impl Memtable {
         results
     }
 
+    #[cfg(debug_assertions)]
     pub(crate) fn incident_edges_at(
         &self,
         node_id: u64,
@@ -4620,6 +4621,11 @@ impl Memtable {
         state.live_edge_count
     }
 
+    pub fn retained_edge_slot_count(&self) -> usize {
+        let state = self.state.read().unwrap();
+        state.edges.len()
+    }
+
     pub fn nodes(&self) -> NodeIdMap<NodeRecord> {
         let state = self.state.read().unwrap();
         state
@@ -5050,6 +5056,35 @@ mod tests {
             !mt.is_empty(),
             "tombstone-only memtables still carry flushable state"
         );
+    }
+
+    #[test]
+    fn retained_edge_slot_count_tracks_ids_across_rewrites_deletes_and_resurrection() {
+        let mt = Memtable::new();
+        assert_eq!(mt.retained_edge_slot_count(), 0);
+
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)), 1);
+        assert_eq!(mt.retained_edge_slot_count(), 1);
+
+        let mut rewritten = make_edge(10, 2, 3, 6);
+        rewritten.weight = 2.0;
+        mt.apply_op(&WalOp::UpsertEdge(rewritten), 2);
+        assert_eq!(mt.retained_edge_slot_count(), 1);
+
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 10,
+                deleted_at: 3,
+            },
+            3,
+        );
+        assert_eq!(mt.retained_edge_slot_count(), 1);
+
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 3, 4, 7)), 4);
+        assert_eq!(mt.retained_edge_slot_count(), 1);
+
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(11, 4, 5, 7)), 5);
+        assert_eq!(mt.retained_edge_slot_count(), 2);
     }
 
     #[test]

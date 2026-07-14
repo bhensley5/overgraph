@@ -730,6 +730,320 @@ fn build_graph_row_streaming_scale_engine_stale_heavy() -> GraphRowStreamingScal
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GraphRowChunkedOracleRow {
+    source_id: u64,
+    edge_id: u64,
+    target_id: u64,
+    score: i64,
+}
+
+struct GraphRowChunkedScaleEngine {
+    _dir: tempfile::TempDir,
+    engine: DatabaseEngine,
+    node_ids: Vec<u64>,
+    east_anchor_ids: Vec<u64>,
+    edge_count: usize,
+    flushed_segment_count: usize,
+    active_tail_edge_count: usize,
+    hub_source_ids: Option<[u64; 2]>,
+    p90_anchor_id: u64,
+    rows: Vec<GraphRowChunkedOracleRow>,
+    residual_rows: Vec<GraphRowChunkedOracleRow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphRowChunkedScaleLayout {
+    WestRemapped,
+    HubPoisoned,
+}
+
+fn graph_row_chunked_scale_node(ordinal: usize) -> NodeInput {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "region".to_string(),
+        PropValue::String(
+            if ordinal >= 2 && ordinal % 4 == 2 {
+                "east"
+            } else {
+                "west"
+            }
+            .to_string(),
+        ),
+    );
+    props.insert(
+        "phase43_residual".to_string(),
+        PropValue::String(if ordinal % 8 == 3 { "keep" } else { "drop" }.to_string()),
+    );
+    NodeInput {
+        labels: vec!["GraphRowChunkNode".to_string()],
+        key: format!("graph-row-chunk-node-{ordinal}"),
+        props,
+        weight: 1.0,
+        dense_vector: None,
+        sparse_vector: None,
+    }
+}
+
+fn graph_row_chunked_scale_endpoints(
+    node_ids: &[u64],
+    west_source_ordinals: &[usize],
+    ordinal: usize,
+) -> (u64, u64) {
+    if ordinal >= EDGE_STREAMING_SCALE_HUB_EDGE_COUNT * 2 {
+        return edge_streaming_scale_endpoints(node_ids, ordinal);
+    }
+
+    // QPX-034 tracks the planner limitation that globally applies unrelated hub
+    // surcharge to the indexed east anchors. Keep these non-anchor ordinals
+    // low-fanout and west-only while preserving every later endpoint mapping.
+    let west_index = ordinal % west_source_ordinals.len();
+    let round = ordinal / west_source_ordinals.len();
+    let source_ordinal = west_source_ordinals[west_index];
+    let target_ordinal = if source_ordinal < 2 {
+        (source_ordinal + 21 + round) % EDGE_STREAMING_SCALE_NODE_COUNT
+    } else {
+        let source_slot = source_ordinal - 2;
+        2 + ((source_slot + 21 + round) % (EDGE_STREAMING_SCALE_NODE_COUNT - 2))
+    };
+    (node_ids[source_ordinal], node_ids[target_ordinal])
+}
+
+fn graph_row_chunked_scale_layout_endpoints(
+    layout: GraphRowChunkedScaleLayout,
+    node_ids: &[u64],
+    west_source_ordinals: &[usize],
+    ordinal: usize,
+) -> (u64, u64) {
+    match layout {
+        GraphRowChunkedScaleLayout::WestRemapped => {
+            graph_row_chunked_scale_endpoints(node_ids, west_source_ordinals, ordinal)
+        }
+        GraphRowChunkedScaleLayout::HubPoisoned => {
+            edge_streaming_scale_endpoints(node_ids, ordinal)
+        }
+    }
+}
+
+fn graph_row_chunked_scale_input(
+    layout: GraphRowChunkedScaleLayout,
+    node_ids: &[u64],
+    west_source_ordinals: &[usize],
+    ordinal: usize,
+) -> EdgeInput {
+    let (from, to) =
+        graph_row_chunked_scale_layout_endpoints(layout, node_ids, west_source_ordinals, ordinal);
+    EdgeInput {
+        from,
+        to,
+        label: "BenchEdge1".to_string(),
+        props: edge_streaming_scale_props(ordinal, None),
+        weight: edge_streaming_scale_weight(ordinal),
+        valid_from: None,
+        valid_to: None,
+    }
+}
+
+fn build_graph_row_chunked_scale_engine_variant(
+    layout: GraphRowChunkedScaleLayout,
+) -> GraphRowChunkedScaleEngine {
+    let (dir, engine) = temp_edge_streaming_scale_db();
+    engine.ensure_node_label("GraphRowChunkNode").unwrap();
+    let region = engine
+        .ensure_node_property_index(
+            "GraphRowChunkNode",
+            SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("region")]),
+        )
+        .unwrap();
+    wait_for_property_index_state(&engine, region.index_id, SecondaryIndexState::Ready);
+    ensure_edge_streaming_scale_indexes(&engine);
+
+    let node_ids = engine
+        .batch_upsert_nodes(
+            (0..EDGE_STREAMING_SCALE_NODE_COUNT)
+                .map(graph_row_chunked_scale_node)
+                .collect(),
+        )
+        .unwrap();
+    assert_eq!(node_ids.len(), EDGE_STREAMING_SCALE_NODE_COUNT);
+    assert!(node_ids.windows(2).all(|ids| ids[0] < ids[1]));
+
+    let east_ordinals = (2..EDGE_STREAMING_SCALE_NODE_COUNT)
+        .step_by(4)
+        .collect::<Vec<_>>();
+    let east_anchor_ids = east_ordinals
+        .iter()
+        .map(|&ordinal| node_ids[ordinal])
+        .collect::<Vec<_>>();
+    assert_eq!(east_anchor_ids.len(), 2_500);
+    assert!(east_anchor_ids.windows(2).all(|ids| ids[0] < ids[1]));
+    let keep_count = (0..EDGE_STREAMING_SCALE_NODE_COUNT)
+        .filter(|ordinal| ordinal % 8 == 3)
+        .count();
+    assert_eq!(keep_count, 1_250);
+    assert_eq!(EDGE_STREAMING_SCALE_NODE_COUNT - keep_count, 8_750);
+
+    let west_source_ordinals = (0..EDGE_STREAMING_SCALE_NODE_COUNT)
+        .filter(|&ordinal| ordinal < 2 || ordinal % 4 != 2)
+        .collect::<Vec<_>>();
+    assert_eq!(west_source_ordinals.len(), 7_500);
+
+    let mut edge_ids = Vec::with_capacity(EDGE_STREAMING_SCALE_TOTAL_EDGES);
+    let mut flushed_segment_count = 0usize;
+    for segment in 0..EDGE_STREAMING_SCALE_SEGMENT_COUNT {
+        let start = segment * EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT;
+        let inputs = (start..start + EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT)
+            .map(|ordinal| {
+                graph_row_chunked_scale_input(layout, &node_ids, &west_source_ordinals, ordinal)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(inputs.len(), EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT);
+        edge_ids.extend(engine.batch_upsert_edges(inputs).unwrap());
+        engine.flush().unwrap();
+        flushed_segment_count += 1;
+    }
+    assert_eq!(flushed_segment_count, EDGE_STREAMING_SCALE_SEGMENT_COUNT);
+    let tail_start = EDGE_STREAMING_SCALE_SEGMENT_COUNT * EDGE_STREAMING_SCALE_EDGES_PER_SEGMENT;
+    let tail_inputs = (tail_start..tail_start + EDGE_STREAMING_SCALE_MEMTABLE_TAIL_COUNT)
+        .map(|ordinal| {
+            graph_row_chunked_scale_input(layout, &node_ids, &west_source_ordinals, ordinal)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tail_inputs.len(), EDGE_STREAMING_SCALE_MEMTABLE_TAIL_COUNT);
+    edge_ids.extend(engine.batch_upsert_edges(tail_inputs).unwrap());
+    assert_eq!(edge_ids.len(), EDGE_STREAMING_SCALE_TOTAL_EDGES);
+    assert_eq!(
+        edge_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        EDGE_STREAMING_SCALE_TOTAL_EDGES
+    );
+
+    let mut rows = Vec::with_capacity(47_510);
+    let mut residual_rows = Vec::with_capacity(6_253);
+    let mut first_eleven_rows = 0usize;
+    let mut first_eleven_residual_rows = 0usize;
+    let mut high_score_rows = 0usize;
+    let mut prefix_source_fanout = BTreeMap::<u64, usize>::new();
+    let mut hub_outgoing_fanout = BTreeMap::<u64, usize>::new();
+    for ordinal in 0..EDGE_STREAMING_SCALE_TOTAL_EDGES {
+        let (source_ordinal, target_ordinal) = {
+            let (source_id, target_id) = graph_row_chunked_scale_layout_endpoints(
+                layout,
+                &node_ids,
+                &west_source_ordinals,
+                ordinal,
+            );
+            let source_ordinal = node_ids.binary_search(&source_id).unwrap();
+            let target_ordinal = node_ids.binary_search(&target_id).unwrap();
+            if ordinal < EDGE_STREAMING_SCALE_HUB_EDGE_COUNT * 2 {
+                if layout == GraphRowChunkedScaleLayout::WestRemapped {
+                    assert!(source_ordinal < 2 || source_ordinal % 4 != 2);
+                }
+                *prefix_source_fanout.entry(source_id).or_default() += 1;
+            }
+            if source_id == node_ids[0] || source_id == node_ids[1] {
+                *hub_outgoing_fanout.entry(source_id).or_default() += 1;
+            }
+            (source_ordinal, target_ordinal)
+        };
+        if source_ordinal < 2 || source_ordinal % 4 != 2 {
+            continue;
+        }
+        let row = GraphRowChunkedOracleRow {
+            source_id: node_ids[source_ordinal],
+            edge_id: edge_ids[ordinal],
+            target_id: node_ids[target_ordinal],
+            score: edge_streaming_scale_score(ordinal),
+        };
+        rows.push(row);
+        if source_ordinal <= 42 {
+            first_eleven_rows += 1;
+        }
+        if ordinal.is_multiple_of(4) {
+            high_score_rows += 1;
+        }
+        if target_ordinal % 8 == 3 {
+            residual_rows.push(row);
+            if source_ordinal <= 42 {
+                first_eleven_residual_rows += 1;
+            }
+        }
+    }
+    assert_eq!(rows.len(), 47_510);
+    assert_eq!(residual_rows.len(), 6_253);
+    assert_eq!(first_eleven_rows, 219);
+    assert_eq!(first_eleven_residual_rows, 28);
+    assert_eq!(high_score_rows, 25_000);
+    let hub_source_ids = match layout {
+        GraphRowChunkedScaleLayout::WestRemapped => {
+            assert_eq!(prefix_source_fanout.len(), 7_500);
+            assert_eq!(prefix_source_fanout.values().copied().max(), Some(2));
+            None
+        }
+        GraphRowChunkedScaleLayout::HubPoisoned => {
+            assert_eq!(prefix_source_fanout.len(), 2);
+            assert_eq!(prefix_source_fanout.get(&node_ids[0]), Some(&5_000));
+            assert_eq!(prefix_source_fanout.get(&node_ids[1]), Some(&5_000));
+            assert_eq!(hub_outgoing_fanout.len(), 2);
+            assert_eq!(hub_outgoing_fanout.get(&node_ids[0]), Some(&5_000));
+            assert_eq!(hub_outgoing_fanout.get(&node_ids[1]), Some(&5_000));
+            Some([node_ids[0], node_ids[1]])
+        }
+    };
+    rows.sort_unstable_by_key(|row| (row.source_id, row.target_id, row.edge_id));
+    residual_rows.sort_unstable_by_key(|row| (row.source_id, row.target_id, row.edge_id));
+
+    let p90_anchor_index = (9 * east_anchor_ids.len()).div_ceil(10) - 1;
+    assert_eq!(p90_anchor_index, 2_249);
+    assert_eq!(east_ordinals[p90_anchor_index], 8_998);
+    let p90_anchor_id = east_anchor_ids[p90_anchor_index];
+
+    GraphRowChunkedScaleEngine {
+        _dir: dir,
+        engine,
+        node_ids,
+        east_anchor_ids,
+        edge_count: edge_ids.len(),
+        flushed_segment_count,
+        active_tail_edge_count: EDGE_STREAMING_SCALE_MEMTABLE_TAIL_COUNT,
+        hub_source_ids,
+        p90_anchor_id,
+        rows,
+        residual_rows,
+    }
+}
+
+fn build_graph_row_chunked_scale_engine() -> GraphRowChunkedScaleEngine {
+    build_graph_row_chunked_scale_engine_variant(GraphRowChunkedScaleLayout::WestRemapped)
+}
+
+fn build_graph_row_hub_poisoned_scale_engine() -> GraphRowChunkedScaleEngine {
+    build_graph_row_chunked_scale_engine_variant(GraphRowChunkedScaleLayout::HubPoisoned)
+}
+
+fn fully_flush_and_reopen_graph_row_hub_poisoned_scale_engine(
+    mut fixture: GraphRowChunkedScaleEngine,
+) -> GraphRowChunkedScaleEngine {
+    fixture.engine.flush().unwrap();
+    fixture.engine.close().unwrap();
+    fixture.engine = DatabaseEngine::open(
+        fixture._dir.path(),
+        &DbOptions {
+            create_if_missing: true,
+            compact_after_n_flushes: 0,
+            edge_uniqueness: true,
+            ..DbOptions::default()
+        },
+    )
+    .unwrap();
+    fixture.flushed_segment_count += 1;
+    fixture.active_tail_edge_count = 0;
+    fixture
+}
+
 struct GraphRowFo033ScaleEngine {
     graph: GraphRowStreamingScaleEngine,
     selected_role_count: usize,
@@ -3689,6 +4003,1196 @@ fn assert_graph_row_result_count(
     result
 }
 
+fn graph_row_chunked_query(
+    limit: usize,
+    residual: bool,
+    order_by_score: bool,
+) -> overgraph::GraphRowQuery {
+    overgraph::GraphRowQuery {
+        nodes: vec![
+            GraphNodePattern {
+                alias: "source".to_string(),
+                label_filter: Some(NodeLabelFilter {
+                    labels: vec!["GraphRowChunkNode".to_string()],
+                    mode: LabelMatchMode::All,
+                }),
+                ids: Vec::new(),
+                keys: Vec::new(),
+                filter: Some(NodeFilterExpr::PropertyEquals {
+                    key: "region".to_string(),
+                    value: PropValue::String("east".to_string()),
+                }),
+            },
+            GraphNodePattern {
+                alias: "target".to_string(),
+                label_filter: None,
+                ids: Vec::new(),
+                keys: Vec::new(),
+                filter: None,
+            },
+        ],
+        pieces: vec![GraphPatternPiece::Edge(GraphEdgePattern {
+            alias: Some("edge".to_string()),
+            from_alias: "source".to_string(),
+            to_alias: "target".to_string(),
+            direction: Direction::Outgoing,
+            label_filter: vec!["BenchEdge1".to_string()],
+            filter: None,
+        })],
+        where_: residual.then(|| GraphExpr::Binary {
+            left: Box::new(GraphExpr::Property {
+                alias: "target".to_string(),
+                key: "phase43_residual".to_string(),
+            }),
+            op: GraphBinaryOp::Eq,
+            right: Box::new(GraphExpr::String("keep".to_string())),
+        }),
+        return_items: Some(vec![
+            graph_row_return_binding("source"),
+            graph_row_return_binding("edge"),
+            graph_row_return_binding("target"),
+        ]),
+        order_by: order_by_score
+            .then(|| {
+                vec![GraphOrderItem {
+                    expr: GraphExpr::Property {
+                        alias: "edge".to_string(),
+                        key: "score".to_string(),
+                    },
+                    direction: GraphOrderDirection::Desc,
+                }]
+            })
+            .unwrap_or_default(),
+        page: GraphPageRequest {
+            skip: 0,
+            limit,
+            cursor: None,
+        },
+        at_epoch: None,
+        params: BTreeMap::new(),
+        output: GraphOutputOptions::default(),
+        options: GraphQueryOptions {
+            allow_full_scan: false,
+            include_plan: false,
+            ..GraphQueryOptions::default()
+        },
+    }
+}
+
+fn graph_row_hub_explicit_ids_query(source_ids: &[u64]) -> overgraph::GraphRowQuery {
+    let mut query = graph_row_chunked_query(10, true, false);
+    query.nodes[0].ids = source_ids.to_vec();
+    query.nodes[0].filter = None;
+    query
+}
+
+fn graph_row_hub_native_query() -> overgraph::GraphRowQuery {
+    let mut query = graph_row_chunked_query(10, false, false);
+    query.options.max_intermediate_bindings = EDGE_STREAMING_SCALE_TOTAL_EDGES;
+    query.options.max_frontier = EDGE_STREAMING_SCALE_TOTAL_EDGES;
+    query
+}
+
+fn graph_row_known_ids_worst_case_query(source_ids: &[u64]) -> overgraph::GraphRowQuery {
+    let mut query = graph_row_chunked_query(10, false, false);
+    query.nodes[0].ids = source_ids.to_vec();
+    query.nodes[0].filter = None;
+    let GraphPatternPiece::Edge(edge) = &mut query.pieces[0] else {
+        panic!("known-ID worst-case query must retain its single fixed edge");
+    };
+    edge.direction = Direction::Both;
+    query
+}
+
+fn graph_row_chunked_result_rows(result: &overgraph::GraphRowResult) -> Vec<(u64, u64, u64)> {
+    result
+        .rows
+        .iter()
+        .map(|row| match row.values.as_slice() {
+            [overgraph::GraphValue::NodeId(source), overgraph::GraphValue::EdgeId(edge), overgraph::GraphValue::NodeId(target)] => {
+                (*source, *edge, *target)
+            }
+            values => panic!("expected source/edge/target ID row, got {values:?}"),
+        })
+        .collect()
+}
+
+fn graph_row_chunked_oracle_rows(rows: &[GraphRowChunkedOracleRow]) -> Vec<(u64, u64, u64)> {
+    rows.iter()
+        .map(|row| (row.source_id, row.edge_id, row.target_id))
+        .collect()
+}
+
+fn assert_graph_row_chunked_page(
+    engine: &DatabaseEngine,
+    query: &overgraph::GraphRowQuery,
+    oracle: &[(u64, u64, u64)],
+) -> overgraph::GraphRowResult {
+    let first_end = query.page.limit.min(oracle.len());
+    let expected = &oracle[..first_end];
+    let result = engine.query_graph_rows(query).unwrap();
+    assert_eq!(graph_row_chunked_result_rows(&result), expected);
+    assert_eq!(result.stats.rows_returned, expected.len());
+    if let Some(cursor) = result.next_cursor.clone() {
+        let second_end = (first_end + query.page.limit).min(oracle.len());
+        let mut next_query = query.clone();
+        next_query.page.cursor = Some(cursor);
+        let next = engine.query_graph_rows(&next_query).unwrap();
+        assert_eq!(
+            graph_row_chunked_result_rows(&next),
+            oracle[first_end..second_end]
+        );
+        assert_eq!(next.next_cursor.is_some(), second_end < oracle.len());
+    } else {
+        assert_eq!(first_end, oracle.len());
+    }
+    let mut pinned = query.clone();
+    pinned.at_epoch = Some(result.stats.effective_at_epoch);
+    let pinned_first = engine.query_graph_rows(&pinned).unwrap();
+    let pinned_repeated = engine.query_graph_rows(&pinned).unwrap();
+    assert_eq!(graph_row_chunked_result_rows(&pinned_first), expected);
+    assert_eq!(pinned_repeated.rows, pinned_first.rows);
+    assert_eq!(pinned_repeated.next_cursor, pinned_first.next_cursor);
+    result
+}
+
+fn graph_row_explain_has_node(
+    nodes: &[overgraph::GraphExplainNode],
+    kind: &str,
+    detail_fragments: &[&str],
+) -> bool {
+    nodes.iter().any(|node| {
+        (node.kind == kind
+            && detail_fragments
+                .iter()
+                .all(|fragment| node.detail.contains(fragment)))
+            || graph_row_explain_has_node(&node.children, kind, detail_fragments)
+    })
+}
+
+fn graph_row_explain_details<'a>(
+    nodes: &'a [overgraph::GraphExplainNode],
+    kind: &str,
+    details: &mut Vec<&'a str>,
+) {
+    for node in nodes {
+        if node.kind == kind {
+            details.push(node.detail.as_str());
+        }
+        graph_row_explain_details(&node.children, kind, details);
+    }
+}
+
+fn assert_graph_row_hub_native_plan(
+    engine: &DatabaseEngine,
+    query: &overgraph::GraphRowQuery,
+) -> overgraph::GraphRowExplain {
+    let explain = engine.explain_graph_rows(query).unwrap();
+    assert!(
+        graph_row_explain_has_node(
+            &explain.plan,
+            "GraphRowPhysicalPlan",
+            &["initial_driver=NodeAnchor(alias=source"]
+        ),
+        "hub-poisoned native query must choose the source node anchor: {explain:?}"
+    );
+    assert!(
+        graph_row_explain_has_node(
+            &explain.plan,
+            "GraphRowPlanAlternative",
+            &[
+                "chosen; kind=NodeAnchor",
+                "alias=source",
+                "source=PropertyEqualityIndex",
+                "cost_work=205008",
+            ]
+        ),
+        "hub-poisoned native source alternative changed: {explain:?}"
+    );
+    assert!(
+        graph_row_explain_has_node(
+            &explain.plan,
+            "GraphRowPlanAlternative",
+            &[
+                "rejected; kind=EdgeAnchor",
+                "edge=alias:edge",
+                "source=EdgeLabelIndex",
+                "decision=rejected_by=estimated_work",
+                "cost_work=600024",
+            ]
+        ),
+        "hub-poisoned native edge alternative changed: {explain:?}"
+    );
+    assert!(
+        graph_row_explain_has_node(
+            &explain.plan,
+            "NodeCandidateSource",
+            &[
+                "alias=source",
+                "context=considered physical node anchor alternative",
+                "source=PropertyEqualityIndex",
+            ]
+        ),
+        "hub-poisoned source candidate must remain the region equality index: {explain:?}"
+    );
+    explain
+}
+
+fn assert_graph_row_explicit_id_plan(
+    engine: &DatabaseEngine,
+    query: &overgraph::GraphRowQuery,
+) -> overgraph::GraphRowExplain {
+    let explain = engine.explain_graph_rows(query).unwrap();
+    assert!(
+        graph_row_explain_has_node(
+            &explain.plan,
+            "GraphRowPhysicalPlan",
+            &["initial_driver=NodeAnchor(alias=source"]
+        ),
+        "explicit-ID query must choose the source node anchor: {explain:?}"
+    );
+    assert!(
+        graph_row_explain_has_node(
+            &explain.plan,
+            "GraphRowPlanAlternative",
+            &[
+                "chosen; kind=NodeAnchor",
+                "alias=source",
+                "source=ExplicitIds",
+            ]
+        ),
+        "explicit-ID source alternative must be truthful: {explain:?}"
+    );
+    assert!(
+        graph_row_explain_has_node(
+            &explain.plan,
+            "AdjacencyExpansion",
+            &["edge=alias:edge", "source=EndpointAdjacency"]
+        ),
+        "explicit-ID plan must retain its BenchEdge1 expansion: {explain:?}"
+    );
+    explain
+}
+
+fn assert_graph_row_explicit_id_plan_cost(
+    explain: &overgraph::GraphRowExplain,
+    expected_cost_work: u64,
+) {
+    let expected = format!("cost_work={expected_cost_work}");
+    assert!(
+        graph_row_explain_has_node(
+            &explain.plan,
+            "GraphRowPlanAlternative",
+            &[
+                "chosen; kind=NodeAnchor",
+                "alias=source",
+                "source=ExplicitIds",
+                expected.as_str(),
+            ]
+        ),
+        "explicit-ID source alternative cost changed from {expected_cost_work}: {explain:?}"
+    );
+}
+
+fn assert_graph_row_known_id_worst_case_plan(
+    engine: &DatabaseEngine,
+    query: &overgraph::GraphRowQuery,
+    expected_cost_work: u64,
+) -> overgraph::GraphRowExplain {
+    let explain = assert_graph_row_explicit_id_plan(engine, query);
+    assert_graph_row_explicit_id_plan_cost(&explain, expected_cost_work);
+    assert!(
+        graph_row_explain_has_node(
+            &explain.plan,
+            "AdjacencyExpansion",
+            &["edge=alias:edge", "direction=Both"]
+        ),
+        "Direction::Both worst-case plan must retain its bidirectional expansion: {explain:?}"
+    );
+    explain
+}
+
+fn assert_graph_row_chunked_source_plan(
+    engine: &DatabaseEngine,
+    query: &overgraph::GraphRowQuery,
+) -> overgraph::GraphRowResult {
+    let mut preflight_query = query.clone();
+    preflight_query.options.include_plan = true;
+    let result = engine.query_graph_rows(&preflight_query).unwrap();
+    let explain = result
+        .plan
+        .as_ref()
+        .expect("executed graph-row preflight must include its physical plan");
+    assert!(
+        graph_row_explain_has_node(
+            &explain.plan,
+            "GraphRowPhysicalPlan",
+            &["initial_driver=NodeAnchor(alias=source"]
+        ),
+        "graph-row chunk fixture must choose the source node anchor: {explain:?}"
+    );
+    assert!(
+        graph_row_explain_has_node(
+            &explain.plan,
+            "GraphRowRequiredSegment",
+            &["initial_driver=NodeAnchor(alias=source"]
+        ),
+        "required segment must execute from the source node anchor: {explain:?}"
+    );
+    assert!(
+        graph_row_explain_has_node(
+            &explain.plan,
+            "NodeCandidateSource",
+            &[
+                "alias=source",
+                "context=physical initial node driver",
+                "source=PropertyEqualityIndex",
+            ]
+        ),
+        "executed source anchor must use the region equality index: {explain:?}"
+    );
+    result
+}
+
+fn assert_graph_row_chunked_runtime(
+    engine: &DatabaseEngine,
+    query: &overgraph::GraphRowQuery,
+    expected_eligibility: &str,
+    expected_early_exit: Option<bool>,
+    expected_first_scheduled_size: Option<usize>,
+    expected_cursor_seek: &str,
+) -> overgraph::GraphRowResult {
+    let mut explain_query = query.clone();
+    explain_query.options.include_plan = true;
+    let result = engine.query_graph_rows(&explain_query).unwrap();
+    let plan = format!(
+        "{:?}",
+        result
+            .plan
+            .as_ref()
+            .expect("chunked runtime preflight plan")
+    );
+    assert!(plan.contains("ChunkedRowProductionRuntime"), "{plan}");
+    assert!(plan.contains(expected_eligibility), "{plan}");
+    if let Some(expected_early_exit) = expected_early_exit {
+        assert!(
+            plan.contains(&format!("early_exit={expected_early_exit}")),
+            "{plan}"
+        );
+    }
+    assert!(
+        plan.contains(&format!("cursor_seek={expected_cursor_seek}")),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("source_pulls=") && !plan.contains("source_pulls=0"),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("successful_leaves=") && !plan.contains("successful_leaves=0"),
+        "{plan}"
+    );
+    if let Some(first) = expected_first_scheduled_size {
+        assert!(
+            plan.contains(&format!("scheduled_sizes={first}..")),
+            "{plan}"
+        );
+    }
+    result
+}
+
+struct GraphRowChunkedFo033Engine {
+    _dir: tempfile::TempDir,
+    engine: DatabaseEngine,
+    source_ids: Vec<u64>,
+    expected_target_ids: Vec<u64>,
+}
+
+fn build_graph_row_chunked_fo033_engine() -> GraphRowChunkedFo033Engine {
+    let (dir, engine) = temp_db();
+    let selected = [1usize, 7, 13, 19];
+    let source_ids = engine
+        .batch_upsert_nodes(
+            (0..20)
+                .map(|ordinal| NodeInput {
+                    labels: vec!["Fo033Source".to_string()],
+                    key: format!("graph-row-chunk-fo033-source-{ordinal}"),
+                    props: BTreeMap::new(),
+                    weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
+                })
+                .collect(),
+        )
+        .unwrap();
+    let target_ids = engine
+        .batch_upsert_nodes(
+            (0..20)
+                .map(|ordinal| NodeInput {
+                    labels: vec!["Fo033Target".to_string()],
+                    key: format!("graph-row-chunk-fo033-target-{ordinal}"),
+                    props: BTreeMap::new(),
+                    weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
+                })
+                .collect(),
+        )
+        .unwrap();
+    assert_eq!(source_ids.len(), 20);
+    assert_eq!(target_ids.len(), 20);
+
+    let required_edges = (0..20)
+        .map(|ordinal| {
+            let mut props = BTreeMap::new();
+            props.insert(
+                "role".to_string(),
+                PropValue::String(
+                    if selected.contains(&ordinal) {
+                        "selected"
+                    } else {
+                        "other"
+                    }
+                    .to_string(),
+                ),
+            );
+            props.insert("score".to_string(), PropValue::Int(ordinal as i64));
+            EdgeInput {
+                from: source_ids[ordinal],
+                to: target_ids[ordinal],
+                label: "FO033_REQUIRED".to_string(),
+                props,
+                weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+            }
+        })
+        .collect();
+    assert_eq!(engine.batch_upsert_edges(required_edges).unwrap().len(), 20);
+
+    let optional_ordinals = [7usize, 19];
+    let doc_ids = engine
+        .batch_upsert_nodes(
+            optional_ordinals
+                .iter()
+                .map(|ordinal| NodeInput {
+                    labels: vec!["Fo033Document".to_string()],
+                    key: format!("graph-row-chunk-fo033-document-{ordinal}"),
+                    props: BTreeMap::new(),
+                    weight: 1.0,
+                    dense_vector: None,
+                    sparse_vector: None,
+                })
+                .collect(),
+        )
+        .unwrap();
+    assert_eq!(doc_ids.len(), 2);
+    let optional_edges = optional_ordinals
+        .iter()
+        .zip(doc_ids.iter())
+        .map(|(&ordinal, &doc_id)| EdgeInput {
+            from: target_ids[ordinal],
+            to: doc_id,
+            label: "FO033_OPTIONAL".to_string(),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+        })
+        .collect();
+    assert_eq!(engine.batch_upsert_edges(optional_edges).unwrap().len(), 2);
+
+    let expected_target_ids = [19usize, 13, 7]
+        .into_iter()
+        .map(|ordinal| target_ids[ordinal])
+        .collect();
+    GraphRowChunkedFo033Engine {
+        _dir: dir,
+        engine,
+        source_ids,
+        expected_target_ids,
+    }
+}
+
+fn graph_row_chunked_fo033_query(source_ids: &[u64]) -> overgraph::GraphRowQuery {
+    let mut query = overgraph::GraphRowQuery {
+        nodes: ["source", "target", "doc"]
+            .into_iter()
+            .map(|alias| GraphNodePattern {
+                alias: alias.to_string(),
+                label_filter: None,
+                ids: Vec::new(),
+                keys: Vec::new(),
+                filter: None,
+            })
+            .collect(),
+        pieces: vec![
+            GraphPatternPiece::Edge(GraphEdgePattern {
+                alias: Some("edge".to_string()),
+                from_alias: "source".to_string(),
+                to_alias: "target".to_string(),
+                direction: Direction::Outgoing,
+                label_filter: vec!["FO033_REQUIRED".to_string()],
+                filter: None,
+            }),
+            GraphPatternPiece::Optional(overgraph::GraphOptionalGroup {
+                pieces: vec![GraphPatternPiece::Edge(GraphEdgePattern {
+                    alias: Some("opt".to_string()),
+                    from_alias: "target".to_string(),
+                    to_alias: "doc".to_string(),
+                    direction: Direction::Outgoing,
+                    label_filter: vec!["FO033_OPTIONAL".to_string()],
+                    filter: None,
+                })],
+                where_: None,
+            }),
+        ],
+        where_: Some(GraphExpr::Binary {
+            left: Box::new(GraphExpr::Property {
+                alias: "edge".to_string(),
+                key: "role".to_string(),
+            }),
+            op: GraphBinaryOp::Eq,
+            right: Box::new(GraphExpr::String("selected".to_string())),
+        }),
+        return_items: Some(vec![graph_row_return_binding("target")]),
+        order_by: vec![
+            GraphOrderItem {
+                expr: GraphExpr::Property {
+                    alias: "edge".to_string(),
+                    key: "score".to_string(),
+                },
+                direction: GraphOrderDirection::Desc,
+            },
+            GraphOrderItem {
+                expr: GraphExpr::NodeField {
+                    alias: "target".to_string(),
+                    field: GraphNodeField::Id,
+                },
+                direction: GraphOrderDirection::Asc,
+            },
+        ],
+        page: GraphPageRequest {
+            skip: 0,
+            limit: 3,
+            cursor: None,
+        },
+        at_epoch: None,
+        params: BTreeMap::new(),
+        output: GraphOutputOptions::default(),
+        options: GraphQueryOptions {
+            allow_full_scan: false,
+            max_intermediate_bindings: 8,
+            include_plan: false,
+            ..GraphQueryOptions::default()
+        },
+    };
+    query.nodes[0].ids = source_ids.to_vec();
+    query
+}
+
+fn graph_row_chunked_single_node_ids(result: &overgraph::GraphRowResult) -> Vec<u64> {
+    result
+        .rows
+        .iter()
+        .map(|row| match row.values.as_slice() {
+            [overgraph::GraphValue::NodeId(id)] => *id,
+            values => panic!("expected one node ID, got {values:?}"),
+        })
+        .collect()
+}
+
+fn graph_row_chunked_gql_single_uints(result: &overgraph::GqlExecutionResult) -> Vec<u64> {
+    result
+        .rows
+        .iter()
+        .map(|row| match row.values.as_slice() {
+            [overgraph::GqlValue::UInt(id)] => *id,
+            values => panic!("expected one GQL uint, got {values:?}"),
+        })
+        .collect()
+}
+
+fn graph_row_chunked_gql_rows(result: &overgraph::GqlExecutionResult) -> Vec<(u64, u64, u64)> {
+    result
+        .rows
+        .iter()
+        .map(|row| match row.values.as_slice() {
+            [overgraph::GqlValue::UInt(source), overgraph::GqlValue::UInt(edge), overgraph::GqlValue::UInt(target)] => {
+                (*source, *edge, *target)
+            }
+            values => panic!("expected GQL source/edge/target IDs, got {values:?}"),
+        })
+        .collect()
+}
+
+fn bench_graph_row_chunked(c: &mut Criterion) {
+    const GROUP: &str = "graph_row_chunked";
+    const UNORDERED: &str = "graph_row_unordered_limit_early_exit";
+    const RESIDUAL: &str = "graph_row_unordered_limit_where_early_exit";
+    const TOPK: &str = "graph_row_order_by_topk_scale";
+    const DEEP_CURSOR: &str = "graph_row_deep_cursor_seek";
+    const LOW_CAP: &str = "graph_row_low_cap_anchor_capability";
+    const FO033: &str = "graph_row_fo033_residual_inflight_cap";
+    const GQL_UNORDERED: &str = "gql_graph_row_unordered_limit_early_exit";
+
+    let requested = [
+        UNORDERED,
+        RESIDUAL,
+        TOPK,
+        DEEP_CURSOR,
+        LOW_CAP,
+        FO033,
+        GQL_UNORDERED,
+    ]
+    .map(|scenario| criterion_requested_benchmark(GROUP, scenario));
+    if !requested.iter().any(|requested| *requested) {
+        return;
+    }
+
+    let scale = (requested[0]
+        || requested[1]
+        || requested[2]
+        || requested[3]
+        || requested[4]
+        || requested[6])
+        .then(build_graph_row_chunked_scale_engine);
+    let fo033 = requested[5].then(build_graph_row_chunked_fo033_engine);
+
+    if let Some(fixture) = scale.as_ref() {
+        assert_eq!(fixture.node_ids.len(), 10_000);
+        assert_eq!(fixture.east_anchor_ids.len(), 2_500);
+        assert_eq!(fixture.edge_count, 200_000);
+        assert_eq!(fixture.flushed_segment_count, 3);
+        assert_eq!(fixture.active_tail_edge_count, 20_000);
+        assert_eq!(fixture.hub_source_ids, None);
+        assert_eq!(fixture.rows.len(), 47_510);
+        assert_eq!(fixture.residual_rows.len(), 6_253);
+        let plan_query = graph_row_chunked_query(10, false, false);
+        let _ = assert_graph_row_chunked_source_plan(&fixture.engine, &plan_query);
+    }
+
+    let mut group = c.benchmark_group(GROUP);
+    group.sample_size(10);
+
+    if requested[0] {
+        let fixture = scale.as_ref().unwrap();
+        let query = graph_row_chunked_query(10, false, false);
+        let oracle = graph_row_chunked_oracle_rows(&fixture.rows);
+        let result = assert_graph_row_chunked_page(&fixture.engine, &query, &oracle);
+        assert!(result.next_cursor.is_some());
+        assert_graph_row_chunked_runtime(
+            &fixture.engine,
+            &query,
+            "eligibility=eligible",
+            Some(true),
+            Some(11),
+            "none",
+        );
+        group.bench_function(UNORDERED, |b| {
+            b.iter(|| black_box(fixture.engine.query_graph_rows(black_box(&query)).unwrap()))
+        });
+    }
+
+    if requested[1] {
+        let fixture = scale.as_ref().unwrap();
+        let query = graph_row_chunked_query(10, true, false);
+        assert_graph_row_chunked_source_plan(&fixture.engine, &query);
+        let oracle = graph_row_chunked_oracle_rows(&fixture.residual_rows);
+        let result = assert_graph_row_chunked_page(&fixture.engine, &query, &oracle);
+        assert!(result.next_cursor.is_some());
+        assert_graph_row_chunked_runtime(
+            &fixture.engine,
+            &query,
+            "eligibility=eligible",
+            Some(true),
+            Some(11),
+            "none",
+        );
+        group.bench_function(RESIDUAL, |b| {
+            b.iter(|| black_box(fixture.engine.query_graph_rows(black_box(&query)).unwrap()))
+        });
+    }
+
+    if requested[2] {
+        let fixture = scale.as_ref().unwrap();
+        let query = graph_row_chunked_query(100, false, true);
+        let mut ordered = fixture.rows.clone();
+        ordered.sort_unstable_by(|left, right| {
+            right.score.cmp(&left.score).then_with(|| {
+                (left.source_id, left.target_id, left.edge_id).cmp(&(
+                    right.source_id,
+                    right.target_id,
+                    right.edge_id,
+                ))
+            })
+        });
+        let oracle = graph_row_chunked_oracle_rows(&ordered);
+        let result = assert_graph_row_chunked_page(&fixture.engine, &query, &oracle);
+        assert!(result.next_cursor.is_some());
+        assert_graph_row_chunked_runtime(
+            &fixture.engine,
+            &query,
+            "eligibility=ordered_query",
+            Some(false),
+            Some(4_096),
+            "none",
+        );
+        group.bench_function(TOPK, |b| {
+            b.iter(|| black_box(fixture.engine.query_graph_rows(black_box(&query)).unwrap()))
+        });
+    }
+
+    if requested[3] {
+        let fixture = scale.as_ref().unwrap();
+        let mut walk = graph_row_chunked_query(100, false, false);
+        let (retained_cursor, previous_page_last_tuple) = loop {
+            let page = fixture.engine.query_graph_rows(&walk).unwrap();
+            let page_rows = graph_row_chunked_result_rows(&page);
+            let last_tuple = *page_rows
+                .last()
+                .expect("cursor walk page must be non-empty");
+            let next_cursor = page.next_cursor;
+            if last_tuple.0 >= fixture.p90_anchor_id {
+                break (
+                    next_cursor.expect("p90-threshold page must retain a public cursor"),
+                    last_tuple,
+                );
+            }
+            walk.page.cursor = next_cursor;
+            assert!(
+                walk.page.cursor.is_some(),
+                "p90 anchor page must be reachable"
+            );
+        };
+        let boundary_index = fixture
+            .rows
+            .binary_search_by_key(
+                &(
+                    previous_page_last_tuple.0,
+                    previous_page_last_tuple.2,
+                    previous_page_last_tuple.1,
+                ),
+                |row| (row.source_id, row.target_id, row.edge_id),
+            )
+            .expect("retained cursor boundary must exist in the fixture oracle");
+        let expected_start = boundary_index + 1;
+        let expected_end = (expected_start + 100).min(fixture.rows.len());
+        let expected_suffix =
+            graph_row_chunked_oracle_rows(&fixture.rows[expected_start..expected_end]);
+        let mut query = graph_row_chunked_query(100, false, false);
+        query.page.cursor = Some(retained_cursor);
+        let first = fixture.engine.query_graph_rows(&query).unwrap();
+        let actual = graph_row_chunked_result_rows(&first);
+        assert_eq!(actual, expected_suffix);
+        assert_eq!(actual.last(), expected_suffix.last());
+        assert_eq!(
+            first.next_cursor.is_some(),
+            expected_end < fixture.rows.len()
+        );
+        if let Some(cursor) = first.next_cursor.clone() {
+            let continuation_end = (expected_end + 100).min(fixture.rows.len());
+            let mut continuation_query = graph_row_chunked_query(100, false, false);
+            continuation_query.page.cursor = Some(cursor);
+            let continuation = fixture
+                .engine
+                .query_graph_rows(&continuation_query)
+                .unwrap();
+            assert_eq!(
+                graph_row_chunked_result_rows(&continuation),
+                graph_row_chunked_oracle_rows(&fixture.rows[expected_end..continuation_end])
+            );
+            assert_eq!(
+                continuation.next_cursor.is_some(),
+                continuation_end < fixture.rows.len()
+            );
+        }
+        let repeated = fixture.engine.query_graph_rows(&query).unwrap();
+        assert_eq!(repeated.rows, first.rows);
+        assert_eq!(repeated.next_cursor, first.next_cursor);
+        let source_preflight = assert_graph_row_chunked_source_plan(&fixture.engine, &query);
+        let seek_preflight = assert_graph_row_chunked_runtime(
+            &fixture.engine,
+            &query,
+            "eligibility=eligible",
+            None,
+            Some(101),
+            &format!("anchor_ge:{}", previous_page_last_tuple.0),
+        );
+        let seek_plan = format!("{:?}", seek_preflight.plan.as_ref().unwrap());
+        assert!(
+            seek_plan.contains("source=AnchorPull{alias=source}"),
+            "{seek_plan}"
+        );
+        assert!(seek_plan.contains("anchor_seek=applied"), "{seek_plan}");
+        assert!(previous_page_last_tuple.0 >= fixture.p90_anchor_id);
+        assert_eq!(seek_preflight.rows, first.rows);
+        assert_eq!(seek_preflight.next_cursor, first.next_cursor);
+        assert_eq!(source_preflight.rows, first.rows);
+        assert_eq!(source_preflight.next_cursor, first.next_cursor);
+        assert_eq!(
+            source_preflight.plan.as_ref().unwrap().fingerprint,
+            seek_preflight.plan.as_ref().unwrap().fingerprint
+        );
+        group.bench_function(DEEP_CURSOR, |b| {
+            b.iter(|| black_box(fixture.engine.query_graph_rows(black_box(&query)).unwrap()))
+        });
+    }
+
+    if requested[4] {
+        let fixture = scale.as_ref().unwrap();
+        let mut query = graph_row_chunked_query(10, false, false);
+        query.options.max_intermediate_bindings = 2_048;
+        let result = fixture.engine.query_graph_rows(&query).unwrap();
+        assert_eq!(
+            graph_row_chunked_result_rows(&result),
+            graph_row_chunked_oracle_rows(&fixture.rows[..10])
+        );
+        assert!(result.stats.intermediate_bindings_peak <= 2_048);
+        assert_graph_row_chunked_runtime(
+            &fixture.engine,
+            &query,
+            "eligibility=eligible",
+            None,
+            Some(11),
+            "none",
+        );
+        group.bench_function(LOW_CAP, |b| {
+            b.iter(|| black_box(fixture.engine.query_graph_rows(black_box(&query))))
+        });
+    }
+
+    if requested[5] {
+        let fixture = fo033.as_ref().unwrap();
+        let query = graph_row_chunked_fo033_query(&fixture.source_ids);
+        let gql_query = "MATCH (source)-[edge:FO033_REQUIRED]->(target) WHERE edge.role = 'selected' OPTIONAL MATCH (target)-[opt:FO033_OPTIONAL]->(doc) RETURN id(target) AS target_id ORDER BY edge.score DESC, id(target) LIMIT 3";
+        let gql_params = GqlParams::new();
+        let gql_options = GqlExecutionOptions {
+            include_plan: true,
+            max_intermediate_bindings: 8,
+            ..GqlExecutionOptions::default()
+        };
+        let gql_oracle = fixture
+            .engine
+            .execute_gql(gql_query, &gql_params, &gql_options)
+            .unwrap();
+        assert_eq!(
+            graph_row_chunked_gql_single_uints(&gql_oracle),
+            fixture.expected_target_ids
+        );
+        assert!(gql_oracle.next_cursor.is_none());
+        let gql_read = gql_oracle
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.read.as_ref())
+            .expect("FO-033 GQL oracle must expose lowering and pushdown evidence");
+        assert_eq!(gql_read.target, overgraph::GqlLoweringTarget::GraphRowQuery);
+        assert!(
+            gql_read
+                .pushed_down
+                .iter()
+                .any(|item| item.contains("edge.role")),
+            "FO-033 GQL oracle must push edge.role: {gql_read:?}"
+        );
+        assert!(
+            gql_read.projection.iter().any(|item| {
+                item.contains("GraphRowSourceRead") && item.contains("DelegatedEdgeQuery")
+            }),
+            "FO-033 GQL oracle must expose graph-row delegated lowering: {gql_read:?}"
+        );
+        let result = fixture.engine.query_graph_rows(&query).unwrap();
+        assert_eq!(
+            graph_row_chunked_single_node_ids(&result),
+            fixture.expected_target_ids
+        );
+        assert_graph_row_chunked_runtime(
+            &fixture.engine,
+            &query,
+            "eligibility=ordered_query",
+            Some(false),
+            Some(8),
+            "none",
+        );
+        group.bench_function(FO033, |b| {
+            b.iter(|| black_box(fixture.engine.query_graph_rows(black_box(&query))))
+        });
+    }
+
+    if requested[6] {
+        let fixture = scale.as_ref().unwrap();
+        let expected = graph_row_chunked_oracle_rows(&fixture.rows[..10]);
+        let native_query = graph_row_chunked_query(10, false, false);
+        let native = fixture.engine.query_graph_rows(&native_query).unwrap();
+        assert_eq!(graph_row_chunked_result_rows(&native), expected);
+        let params = GqlParams::new();
+        let query = "MATCH (source:GraphRowChunkNode)-[edge:BenchEdge1]->(target) WHERE source.region = 'east' RETURN id(source), id(edge), id(target) LIMIT 10";
+        let explain_options = GqlExecutionOptions {
+            include_plan: true,
+            ..GqlExecutionOptions::default()
+        };
+        let preflight = fixture
+            .engine
+            .execute_gql(query, &params, &explain_options)
+            .unwrap();
+        let read = preflight
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.read.as_ref())
+            .expect("chunked GQL preflight must expose its graph-row target");
+        assert_eq!(read.target, overgraph::GqlLoweringTarget::GraphRowQuery);
+        assert!(
+            read.projection
+                .iter()
+                .any(|item| item.contains("logical_limit=Some(10)")),
+            "GQL lowering must preserve logical LIMIT 10: {read:?}"
+        );
+        assert_eq!(graph_row_chunked_gql_rows(&preflight), expected);
+        let gql_plan = format!("{:?}", preflight.plan.as_ref().unwrap());
+        assert!(
+            gql_plan.contains("initial_driver=NodeAnchor(alias=source")
+                && gql_plan.contains("source=PropertyEqualityIndex"),
+            "GQL headline must retain the locked source anchor/index: {gql_plan}"
+        );
+        assert!(gql_plan.contains("ChunkedRowProductionRuntime"));
+        assert!(gql_plan.contains("source=AnchorPull{alias=source}"));
+        assert!(gql_plan.contains("eligibility=eligible"));
+        assert!(gql_plan.contains("early_exit=true"));
+        assert!(gql_plan.contains("cursor_seek=none"));
+        assert!(gql_plan.contains("source_pulls=1"));
+        assert!(gql_plan.contains("successful_leaves=1"));
+        assert!(gql_plan.contains("scheduled_sizes=10..10"));
+        assert!(
+            preflight.next_cursor.is_none(),
+            "logical LIMIT 10 must be exhausted without a continuation cursor"
+        );
+        let repeated = fixture
+            .engine
+            .execute_gql(query, &params, &explain_options)
+            .unwrap();
+        assert_eq!(repeated.rows, preflight.rows);
+        assert_eq!(repeated.next_cursor, preflight.next_cursor);
+        assert!(repeated.next_cursor.is_none());
+        let options = GqlExecutionOptions::default();
+        group.bench_function(GQL_UNORDERED, |b| {
+            b.iter(|| {
+                black_box(
+                    fixture
+                        .engine
+                        .execute_gql(black_box(query), black_box(&params), black_box(&options))
+                        .unwrap(),
+                )
+            })
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_graph_row_phase43b(c: &mut Criterion) {
+    const HUB_GROUP: &str = "graph_row_hub_poisoned";
+    const NATIVE: &str = "native_unordered_limit10";
+    const EXPLICIT: &str = "explicit_ids_residual_limit10";
+    const WORST_GROUP: &str = "graph_row_planner_known_id_worst_case";
+    const KNOWN_1024: &str = "known_ids_1024_high_both";
+    const ABOVE_CAP_1025: &str = "above_cap_ids_1025_high_both";
+
+    let requested = [
+        criterion_requested_benchmark(HUB_GROUP, NATIVE),
+        criterion_requested_benchmark(HUB_GROUP, EXPLICIT),
+        criterion_requested_benchmark(WORST_GROUP, KNOWN_1024),
+        criterion_requested_benchmark(WORST_GROUP, ABOVE_CAP_1025),
+    ];
+    if !requested.iter().any(|requested| *requested) {
+        return;
+    }
+
+    let fixture = build_graph_row_hub_poisoned_scale_engine();
+    assert_eq!(fixture.node_ids.len(), 10_000);
+    assert_eq!(fixture.edge_count, 200_000);
+    assert_eq!(fixture.flushed_segment_count, 3);
+    assert_eq!(fixture.active_tail_edge_count, 20_000);
+    assert_eq!(fixture.east_anchor_ids.len(), 2_500);
+    assert_eq!(
+        fixture.hub_source_ids,
+        Some([fixture.node_ids[0], fixture.node_ids[1]])
+    );
+    assert_eq!(fixture.rows.len(), 47_510);
+    assert_eq!(fixture.residual_rows.len(), 6_253);
+
+    if requested[0] || requested[1] {
+        let mut group = c.benchmark_group(HUB_GROUP);
+        group.sample_size(10);
+
+        if requested[0] {
+            let query = graph_row_hub_native_query();
+            assert!(!query.options.allow_full_scan);
+            assert!(!query.options.include_plan);
+            let oracle = graph_row_chunked_oracle_rows(&fixture.rows);
+            let result = assert_graph_row_chunked_page(&fixture.engine, &query, &oracle);
+            assert!(result.next_cursor.is_some());
+            let _ = assert_graph_row_hub_native_plan(&fixture.engine, &query);
+
+            let mut default_caps_query = query.clone();
+            default_caps_query.options.max_intermediate_bindings =
+                GraphQueryOptions::default().max_intermediate_bindings;
+            default_caps_query.options.max_frontier = GraphQueryOptions::default().max_frontier;
+            let default_result =
+                assert_graph_row_chunked_page(&fixture.engine, &default_caps_query, &oracle);
+            assert!(default_result.next_cursor.is_some());
+            group.bench_function(NATIVE, |b| {
+                b.iter(|| black_box(fixture.engine.query_graph_rows(black_box(&query)).unwrap()))
+            });
+
+            let reopened = fully_flush_and_reopen_graph_row_hub_poisoned_scale_engine(
+                build_graph_row_hub_poisoned_scale_engine(),
+            );
+            assert_eq!(reopened.edge_count, 200_000);
+            assert_eq!(reopened.flushed_segment_count, 4);
+            assert_eq!(reopened.active_tail_edge_count, 0);
+            let reopened_result = assert_graph_row_chunked_page(&reopened.engine, &query, &oracle);
+            assert!(reopened_result.next_cursor.is_some());
+            let _ = assert_graph_row_hub_native_plan(&reopened.engine, &query);
+            let reopened_default =
+                assert_graph_row_chunked_page(&reopened.engine, &default_caps_query, &oracle);
+            assert!(reopened_default.next_cursor.is_some());
+        }
+
+        if requested[1] {
+            let explicit_source_ids = fixture.east_anchor_ids[..20].to_vec();
+            let expected_source_ids = (2..80)
+                .step_by(4)
+                .map(|ordinal| fixture.node_ids[ordinal])
+                .collect::<Vec<_>>();
+            assert_eq!(explicit_source_ids, expected_source_ids);
+            assert!(explicit_source_ids.windows(2).all(|ids| ids[0] < ids[1]));
+            let candidate_rows = fixture
+                .rows
+                .iter()
+                .copied()
+                .filter(|row| explicit_source_ids.binary_search(&row.source_id).is_ok())
+                .collect::<Vec<_>>();
+            let residual_rows = fixture
+                .residual_rows
+                .iter()
+                .copied()
+                .filter(|row| explicit_source_ids.binary_search(&row.source_id).is_ok())
+                .collect::<Vec<_>>();
+            assert_eq!(candidate_rows.len(), 390);
+            assert_eq!(residual_rows.len(), 50);
+            let query = graph_row_hub_explicit_ids_query(&explicit_source_ids);
+            assert_eq!(
+                query.nodes[0].label_filter.as_ref().unwrap().labels,
+                ["GraphRowChunkNode"]
+            );
+            assert_eq!(query.nodes[0].ids, explicit_source_ids);
+            assert!(query.nodes[0].filter.is_none());
+            assert!(!query.options.allow_full_scan);
+            assert!(!query.options.include_plan);
+            let oracle = graph_row_chunked_oracle_rows(&residual_rows);
+            let result = assert_graph_row_chunked_page(&fixture.engine, &query, &oracle);
+            assert!(result.next_cursor.is_some());
+            let explain = assert_graph_row_explicit_id_plan(&fixture.engine, &query);
+            assert_graph_row_explicit_id_plan_cost(&explain, 411);
+            assert!(
+                graph_row_explain_has_node(
+                    &explain.plan,
+                    "AdjacencyExpansion",
+                    &["edge=alias:edge", "direction=Outgoing"]
+                ),
+                "explicit-ID residual plan must retain its outgoing expansion: {explain:?}"
+            );
+            let mut alternatives = Vec::new();
+            graph_row_explain_details(&explain.plan, "GraphRowPlanAlternative", &mut alternatives);
+            eprintln!(
+                "CP43b.1 explicit-ID plan alternatives: {}",
+                alternatives.join(" | ")
+            );
+            group.bench_function(EXPLICIT, |b| {
+                b.iter(|| black_box(fixture.engine.query_graph_rows(black_box(&query)).unwrap()))
+            });
+        }
+
+        group.finish();
+    }
+
+    if requested[2] || requested[3] {
+        let high_1024 = fixture.node_ids[fixture.node_ids.len() - 1_024..].to_vec();
+        let high_1025 = fixture.node_ids[fixture.node_ids.len() - 1_025..].to_vec();
+        assert_eq!(high_1024.len(), 1_024);
+        assert_eq!(high_1025.len(), 1_025);
+        assert!(high_1024.windows(2).all(|ids| ids[0] < ids[1]));
+        assert!(high_1025.windows(2).all(|ids| ids[0] < ids[1]));
+        assert_eq!(high_1024, fixture.node_ids[8_976..]);
+        assert_eq!(high_1025, fixture.node_ids[8_975..]);
+
+        let known_query = graph_row_known_ids_worst_case_query(&high_1024);
+        let above_cap_query = graph_row_known_ids_worst_case_query(&high_1025);
+        let mut known_structure = known_query.clone();
+        let mut above_cap_structure = above_cap_query.clone();
+        known_structure.nodes[0].ids.clear();
+        above_cap_structure.nodes[0].ids.clear();
+        assert_eq!(known_structure, above_cap_structure);
+        assert_eq!(known_query.nodes[0].ids.len(), 1_024);
+        assert_eq!(above_cap_query.nodes[0].ids.len(), 1_025);
+        assert!(known_query.nodes[0].filter.is_none());
+        assert!(above_cap_query.nodes[0].filter.is_none());
+        assert_eq!(known_query.page, above_cap_query.page);
+        assert_eq!(known_query.options, above_cap_query.options);
+        let GraphPatternPiece::Edge(known_edge) = &known_query.pieces[0] else {
+            panic!("known-ID query must retain its fixed edge");
+        };
+        let GraphPatternPiece::Edge(above_cap_edge) = &above_cap_query.pieces[0] else {
+            panic!("above-cap query must retain its fixed edge");
+        };
+        assert_eq!(known_edge.direction, Direction::Both);
+        assert_eq!(above_cap_edge.direction, Direction::Both);
+
+        let known_explain =
+            assert_graph_row_known_id_worst_case_plan(&fixture.engine, &known_query, 39_937);
+        let above_cap_explain =
+            assert_graph_row_known_id_worst_case_plan(&fixture.engine, &above_cap_query, 401_026);
+        for (scenario, explain) in [
+            (KNOWN_1024, &known_explain),
+            (ABOVE_CAP_1025, &above_cap_explain),
+        ] {
+            let mut alternatives = Vec::new();
+            graph_row_explain_details(&explain.plan, "GraphRowPlanAlternative", &mut alternatives);
+            eprintln!(
+                "CP43b.1 {scenario} plan alternatives: {}",
+                alternatives.join(" | ")
+            );
+        }
+
+        let mut group = c.benchmark_group(WORST_GROUP);
+        group.sample_size(10);
+        if requested[2] {
+            group.bench_function(KNOWN_1024, |b| {
+                b.iter(|| {
+                    black_box(
+                        fixture
+                            .engine
+                            .explain_graph_rows(black_box(&known_query))
+                            .unwrap(),
+                    )
+                })
+            });
+        }
+        if requested[3] {
+            group.bench_function(ABOVE_CAP_1025, |b| {
+                b.iter(|| {
+                    black_box(
+                        fixture
+                            .engine
+                            .explain_graph_rows(black_box(&above_cap_query))
+                            .unwrap(),
+                    )
+                })
+            });
+        }
+        group.finish();
+    }
+}
+
 fn bench_graph_row_streamed(c: &mut Criterion) {
     const GROUP: &str = "graph_row_streamed";
     const HUB_BROAD: &str = "graph_row_hub_frontier_broad_equality";
@@ -4746,6 +6250,8 @@ criterion_group!(
     bench_edge_queries,
     bench_compound_index_queries,
     bench_graph_row_streamed,
+    bench_graph_row_chunked,
+    bench_graph_row_phase43b,
     bench_gql_queries
 );
 criterion_main!(benches);

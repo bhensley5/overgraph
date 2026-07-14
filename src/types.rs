@@ -2210,11 +2210,17 @@ pub struct GraphPageRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GraphQueryOptions {
     pub allow_full_scan: bool,
+    /// Maximum in-flight binding rows for chunked node-anchor execution and maximum
+    /// whole-call binding rows for runtime-once execution.
     pub max_intermediate_bindings: usize,
+    /// Maximum in-flight edge frontier for chunked node-anchor execution and maximum
+    /// whole-call frontier for runtime-once execution.
     pub max_frontier: usize,
     pub max_path_hops: u8,
     pub max_paths_per_start: usize,
     pub max_page_limit: usize,
+    /// Maximum retained page-selection capacity. Collect-all pipeline stages also retain
+    /// their existing whole-stage materialization check.
     pub max_order_materialization: usize,
     pub max_cursor_bytes: usize,
     pub max_query_bytes: usize,
@@ -2260,9 +2266,12 @@ pub struct GraphRowStats {
     pub rows_returned: usize,
     pub rows_after_filter: usize,
     pub rows_seen_for_page: usize,
+    /// Largest successful-leaf binding set observed. Runtime-once execution reports its
+    /// whole-call peak.
     pub intermediate_bindings_peak: usize,
-    /// Largest edge frontier observed. Delegated edge reads count verified edge-query
-    /// matches; preserved raw paths retain raw-candidate accounting.
+    /// Largest successful-leaf edge frontier observed. Delegated edge reads count
+    /// verified edge-query matches; preserved raw paths retain raw-candidate accounting.
+    /// Runtime-once execution reports its whole-call peak.
     pub frontier_peak: usize,
     pub paths_enumerated: usize,
     pub db_hits: usize,

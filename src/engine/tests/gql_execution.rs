@@ -4,6 +4,149 @@ fn gql_opts() -> GqlExecutionOptions {
     GqlExecutionOptions::default()
 }
 
+#[test]
+fn graph_row_chunk_early_exit_gql_zero_selection_and_zero_cap_are_inert() {
+    let (_dir, engine) = query_test_engine();
+    let first = insert_query_node(&engine, "ChunkZero", "chunk-zero", &[], 1.0);
+    let second = insert_query_node(&engine, "ChunkZero", "chunk-zero-second", &[], 1.0);
+    engine
+        .upsert_edge(first, second, "ChunkZeroEdge", UpsertEdgeOptions::default())
+        .unwrap();
+    let error = engine
+        .execute_gql(
+            "MATCH (n:ChunkZero) RETURN id(n)",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_intermediate_bindings: 0,
+                ..GqlExecutionOptions::default()
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid operation: graph row max_intermediate_bindings must be >= 1"
+    );
+
+    engine.reset_query_execution_counters_for_test();
+    let zero = engine
+        .execute_gql(
+            "MATCH (n:ChunkZero) RETURN id(n) LIMIT 0",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                include_plan: true,
+                ..GqlExecutionOptions::default()
+            },
+        )
+        .unwrap();
+    assert!(zero.rows.is_empty());
+    assert!(zero.next_cursor.is_none());
+    let plan = format!("{:?}", zero.plan.unwrap());
+    assert!(
+        plan.contains(
+            "source=AnchorPull{alias=n}; source_pulls=0; successful_leaves=0; \
+             scheduled_sizes=[]; leaf_size_min=0; leaf_size_max=0; source_rows=0; \
+             produced_rows=0"
+        ),
+        "{plan}"
+    );
+    assert!(
+        plan.contains(
+            "early_exit=false; cursor_seek=none; heap_capacity=0; cap_retries=0; \
+             result_cache_units=0/65536; cache_no_admit=0; optional_cache_hits=0; \
+             vlp_cross_chunk_cache_hits=0"
+        ),
+        "{plan}"
+    );
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.graph_row_query_calls, 1);
+    assert_eq!(counters.graph_row_chunks_executed, 0);
+    assert_eq!(counters.graph_row_chunk_early_exits, 0);
+    assert_eq!(counters.node_record_hydration_reads, 0);
+    assert_eq!(counters.node_selected_field_ids, 0);
+
+    engine.reset_query_execution_counters_for_test();
+    let edge_zero = engine
+        .execute_gql(
+            "MATCH ()-[r:ChunkZeroEdge]->() RETURN id(r) LIMIT 0",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                include_plan: true,
+                ..GqlExecutionOptions::default()
+            },
+        )
+        .unwrap();
+    assert!(edge_zero.rows.is_empty());
+    let edge_plan = format!("{:?}", edge_zero.plan.unwrap());
+    assert!(
+        edge_plan.contains(
+            "source=RuntimeOnce{reason=NonNodeInitialDriver}; source_pulls=0; \
+             successful_leaves=0; scheduled_sizes=[]; leaf_size_min=0; leaf_size_max=0; \
+             source_rows=0; produced_rows=0; early_exit_eligible=false; \
+             eligibility=non_node_initial_driver; early_exit=false; cursor_seek=none; \
+             heap_capacity=0; cap_retries=0; result_cache_units=0/65536; \
+             cache_no_admit=0; optional_cache_hits=0; vlp_cross_chunk_cache_hits=0"
+        ),
+        "{edge_plan}"
+    );
+    let edge_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(edge_counters.graph_row_chunks_executed, 0);
+    assert_eq!(edge_counters.graph_row_chunk_early_exits, 0);
+    assert_eq!(edge_counters.edge_record_hydration_reads, 0);
+}
+
+#[test]
+fn graph_row_chunk_early_exit_gql_logical_limit_uses_exact_target_without_cursor() {
+    let (_dir, engine) = query_test_engine();
+    for source_index in 0..20 {
+        let source = insert_query_node(
+            &engine,
+            "GqlEarlySource",
+            &format!("gql-early-source-{source_index}"),
+            &[],
+            1.0,
+        );
+        for target_index in 0..5 {
+            let target = insert_query_node(
+                &engine,
+                "GqlEarlyTarget",
+                &format!("gql-early-target-{source_index}-{target_index}"),
+                &[],
+                1.0,
+            );
+            engine
+                .upsert_edge(
+                    source,
+                    target,
+                    "GQL_EARLY_EDGE",
+                    UpsertEdgeOptions::default(),
+                )
+                .unwrap();
+        }
+    }
+    engine.reset_query_execution_counters_for_test();
+    let result = engine
+        .execute_gql(
+            "MATCH (source:GqlEarlySource)-[edge:GQL_EARLY_EDGE]->(target) \
+             RETURN id(source), id(edge), id(target) LIMIT 10",
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                include_plan: true,
+                ..GqlExecutionOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 10);
+    assert!(result.next_cursor.is_none());
+    let plan = format!("{:?}", result.plan.unwrap());
+    assert!(plan.contains("source=AnchorPull{alias=source}"), "{plan}");
+    assert!(plan.contains("eligibility=eligible"), "{plan}");
+    assert!(plan.contains("scheduled_sizes=10..10"), "{plan}");
+    assert!(plan.contains("early_exit=true; cursor_seek=none"), "{plan}");
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.graph_row_chunk_early_exits, 1);
+    assert_eq!(counters.graph_row_chunks_executed, 1);
+}
+
 fn gql_read_explain(explain: &GqlExecutionExplain) -> &GqlExplain {
     assert_eq!(explain.kind, GqlStatementKind::Query);
     assert!(explain.mutation.is_none());
@@ -6148,7 +6291,7 @@ fn gql_shortest_path_survives_flush_reopen_and_compact() {
 }
 
 #[test]
-fn gql_fixed_multi_hop_path_assignment_composes_after_fixed_matching() {
+fn graph_row_chunk_eq6_gql_fixed_path_compose_runtime_matrix() {
     let (_dir, engine) = query_test_engine();
     let a = insert_query_node(&engine, "FixedPathStart", "gql-fixed-path-a", &[], 1.0);
     let b = insert_query_node(&engine, "FixedPathMid", "gql-fixed-path-b", &[], 1.0);
@@ -6193,6 +6336,19 @@ fn gql_fixed_multi_hop_path_assignment_composes_after_fixed_matching() {
     assert_eq!(values[3], GqlValue::UInt(2));
     assert_eq!(values[4], GqlValue::UInt(cb));
 
+    for size in [1, 3, usize::MAX] {
+        let chunked = with_graph_row_test_chunk_override(size, || {
+            engine
+                .execute_gql(&source, &GqlParams::new(), &gql_opts())
+                .unwrap()
+        });
+        assert_eq!(chunked.rows, result.rows, "fixed-path forced size {size}");
+        assert_eq!(
+            chunked.next_cursor, result.next_cursor,
+            "fixed-path cursor forced size {size}"
+        );
+    }
+
     let explain = engine
         .explain_gql(
             &source,
@@ -6203,6 +6359,17 @@ fn gql_fixed_multi_hop_path_assignment_composes_after_fixed_matching() {
             },
         )
         .unwrap();
+    let executed_plan = engine
+        .execute_gql(
+            &source,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                include_plan: true,
+                ..gql_opts()
+            },
+        )
+        .unwrap();
+    assert!(format!("{:?}", executed_plan.plan).contains("FixedPathComposeRuntime"));
     let explain = gql_read_explain(&explain);
     assert!(explain
         .projection
@@ -14010,7 +14177,10 @@ fn gql_order_by_skip_offset_limit_and_scalar_order_domains() {
     assert!(limit_zero.rows.is_empty());
     assert_eq!(
         engine.query_execution_counter_snapshot_for_test(),
-        QueryExecutionCounterSnapshot::default()
+        QueryExecutionCounterSnapshot {
+            graph_row_query_calls: 1,
+            ..QueryExecutionCounterSnapshot::default()
+        }
     );
 
     let default_scan_limit_zero = engine
@@ -14025,12 +14195,13 @@ fn gql_order_by_skip_offset_limit_and_scalar_order_domains() {
         .unwrap();
     assert_eq!(default_scan_limit_zero.columns, vec!["n.name"]);
     assert!(default_scan_limit_zero.rows.is_empty());
-    assert_eq!(
-        engine.query_execution_counter_snapshot_for_test(),
-        QueryExecutionCounterSnapshot::default()
-    );
+    let zero_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(zero_counters.graph_row_query_calls, 2);
+    assert_eq!(zero_counters.graph_row_chunks_executed, 0);
+    assert_eq!(zero_counters.node_record_hydration_reads, 0);
+    assert_eq!(zero_counters.node_selected_field_ids, 0);
 
-    let default_scan_limit_zero_plan = engine
+    let default_scan_limit_zero_error = engine
         .execute_gql(
             "MATCH (n) RETURN n.name LIMIT 0",
             &GqlParams::new(),
@@ -14040,16 +14211,19 @@ fn gql_order_by_skip_offset_limit_and_scalar_order_domains() {
                 ..GqlExecutionOptions::default()
             },
         )
-        .unwrap();
-    assert!(default_scan_limit_zero_plan.rows.is_empty());
-    let plan = default_scan_limit_zero_plan.plan.unwrap();
-    let plan = gql_read_explain(&plan);
-    assert_eq!(plan.target, GqlLoweringTarget::GraphRowQuery);
-    assert!(plan.native_plan.is_none());
-    assert_eq!(
-        engine.query_execution_counter_snapshot_for_test(),
-        QueryExecutionCounterSnapshot::default()
-    );
+        .unwrap_err();
+    assert!(matches!(
+        default_scan_limit_zero_error,
+        EngineError::GqlSemantic {
+            code: GqlSemanticErrorCode::FullScanNotAllowed,
+            ..
+        }
+    ));
+    let rejected_zero_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(rejected_zero_counters.graph_row_query_calls, 2);
+    assert_eq!(rejected_zero_counters.graph_row_chunks_executed, 0);
+    assert_eq!(rejected_zero_counters.node_record_hydration_reads, 0);
+    assert_eq!(rejected_zero_counters.node_selected_field_ids, 0);
 
     let constant_order_limit_zero =
         execute_gql_ok(&engine, "MATCH (n:Person) RETURN n.name ORDER BY 1 LIMIT 0");
@@ -14228,6 +14402,7 @@ fn gql_order_by_skip_offset_limit_and_scalar_order_domains() {
             &GqlParams::from([("limit".to_string(), GqlParamValue::UInt(usize::MAX as u64))]),
             &GqlExecutionOptions {
                 max_rows: 2,
+                max_intermediate_bindings: 1,
                 ..GqlExecutionOptions::default()
             },
         )
@@ -14241,6 +14416,11 @@ fn gql_order_by_skip_offset_limit_and_scalar_order_domains() {
         .warnings
         .iter()
         .any(|warning| warning.contains("max_rows=2")));
+    assert!(safety_capped_huge_limit
+        .stats
+        .warnings
+        .iter()
+        .all(|warning| !warning.contains("max_intermediate_bindings")));
 
     assert!(a < b && b < c);
 }
@@ -14433,14 +14613,14 @@ fn gql_order_by_edge_label_and_unsupported_order_keys_are_clear() {
 #[test]
 fn gql_row_op_caps_and_stats_are_truthful() {
     let (_dir, engine) = query_test_engine();
-    insert_query_node(
+    let first = insert_query_node(
         &engine,
         "Person",
         "stats-a",
         &[("flag", PropValue::Bool(true)), ("rank", PropValue::Int(1))],
         1.0,
     );
-    insert_query_node(
+    let second = insert_query_node(
         &engine,
         "Person",
         "stats-b",
@@ -14523,13 +14703,21 @@ fn gql_row_op_caps_and_stats_are_truthful() {
                 ..GqlExecutionOptions::default()
             },
         )
-        .unwrap_err();
-    assert!(
+        .unwrap();
+    assert_eq!(
         capped_order
-            .to_string()
-            .contains("max_intermediate_bindings exceeded configured cap 1"),
-        "unexpected error: {capped_order}"
+            .rows
+            .iter()
+            .map(|row| match row.values.as_slice() {
+                [GqlValue::UInt(id)] => *id,
+                other => panic!("expected one node id, got {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        vec![first, second]
     );
+    assert_eq!(capped_order.stats.rows_matched, 2);
+    assert_eq!(capped_order.stats.rows_after_filter, 2);
+    assert_eq!(capped_order.stats.rows_returned, 2);
 }
 
 #[test]
@@ -14738,10 +14926,6 @@ fn gql_explain_reports_targets_row_ops_caps_and_does_not_execute_rows() {
     assert!(pattern
         .projection
         .iter()
-        .any(|item| item.contains("graph row plan: AdjacencyExpansion")));
-    assert!(pattern
-        .projection
-        .iter()
         .any(|item| item.contains("graph row plan: GraphRowPlanAlternative")));
     assert!(pattern
         .projection
@@ -14750,7 +14934,7 @@ fn gql_explain_reports_targets_row_ops_caps_and_does_not_execute_rows() {
     assert!(pattern
         .projection
         .iter()
-        .any(|item| item.contains("source=EndpointAdjacency")));
+        .any(|item| item.contains("graph row plan: EdgeCandidateSource")));
     assert!(pattern
         .projection
         .iter()
@@ -15182,8 +15366,10 @@ fn gql_residual_and_order_selected_field_reads_are_merged_for_node_scalars() {
     assert_eq!(gql_u64_column(&result, 0), vec![high, low]);
     let counters = engine.query_execution_counter_snapshot_for_test();
     assert_eq!(counters.node_record_hydration_reads, 0);
-    assert_eq!(counters.node_selected_field_batches, 1);
-    assert_eq!(counters.node_selected_field_ids, 3);
+    // Phase 43 deliberately hydrates residual fields before WHERE, then order fields
+    // only for survivors. Both reads remain batched per alias and leaf.
+    assert_eq!(counters.node_selected_field_batches, 2);
+    assert_eq!(counters.node_selected_field_ids, 5);
     assert_eq!(counters.node_dense_vector_projection_reads, 0);
     assert_eq!(counters.node_sparse_vector_projection_reads, 0);
     assert_eq!(counters.public_node_query_calls, 0);
@@ -15279,8 +15465,10 @@ fn gql_projection_need_classes_and_read_merge_hold_for_edge_scalars() {
     let counters = engine.query_execution_counter_snapshot_for_test();
     assert_eq!(counters.edge_record_hydration_reads, 0);
     assert_eq!(counters.edge_record_hydration_calls, 0);
-    assert_eq!(counters.edge_selected_field_batches, 1);
-    assert_eq!(counters.edge_selected_field_ids, 3);
+    // Phase 43 deliberately hydrates residual fields before WHERE, then order fields
+    // only for survivors. Both reads remain batched per alias and leaf.
+    assert_eq!(counters.edge_selected_field_batches, 2);
+    assert_eq!(counters.edge_selected_field_ids, 5);
     assert_eq!(counters.public_edge_query_calls, 0);
 }
 

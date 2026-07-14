@@ -114,6 +114,11 @@ impl DatabaseEngine {
         params: &GqlParams,
         options: &GqlExecutionOptions,
     ) -> Result<GqlExecutionResult, EngineError> {
+        if options.max_intermediate_bindings == 0 {
+            return Err(EngineError::InvalidOperation(
+                "graph row max_intermediate_bindings must be >= 1".to_string(),
+            ));
+        }
         let started_at = Instant::now();
         let parse_options = GqlParseOptions {
             max_query_bytes: options.max_query_bytes,
@@ -141,6 +146,11 @@ impl DatabaseEngine {
         params: &GqlParams,
         options: &GqlExecutionOptions,
     ) -> Result<GqlExecutionExplain, EngineError> {
+        if options.max_intermediate_bindings == 0 {
+            return Err(EngineError::InvalidOperation(
+                "graph row max_intermediate_bindings must be >= 1".to_string(),
+            ));
+        }
         let parse_options = GqlParseOptions {
             max_query_bytes: options.max_query_bytes,
             max_ast_depth: options.max_ast_depth,
@@ -191,46 +201,6 @@ impl DatabaseEngine {
             instr.prepare_ns = t.elapsed().as_nanos() as u64;
         }
         let warnings = lowered.warnings.clone();
-
-        if row_counts.limit == Some(0) {
-            let plan = if options.include_plan {
-                Some(wrap_read_gql_explain(build_gql_limit_zero_explain(
-                    &lowered,
-                    &return_exprs,
-                    &resolved_order_by,
-                    options,
-                ), options))
-            } else {
-                None
-            };
-            let elapsed_us = if options.profile {
-                started_at.elapsed().as_micros().try_into().ok()
-            } else {
-                None
-            };
-            return Ok(GqlExecutionResult {
-                kind: GqlStatementKind::Query,
-                columns: return_exprs
-                    .iter()
-                    .map(|expr| expr.output_name.clone())
-                    .collect(),
-                rows: Vec::new(),
-                next_cursor: None,
-                stats: GqlExecutionStats {
-                    rows_returned: 0,
-                    rows_matched: 0,
-                    rows_after_filter: 0,
-                    intermediate_bindings: 0,
-                    db_hits: 0,
-                    elapsed_us,
-                    warnings,
-                },
-                mutation_stats: None,
-                schema_stats: None,
-                index_stats: None,
-                plan,
-            });
-        }
 
         let snapshot_start = instr.mark();
         let (_guard, published) = self.runtime.published_snapshot()?;
@@ -285,23 +255,19 @@ impl DatabaseEngine {
             ));
         }
 
-        let effective_row_cap = options.max_rows.min(options.max_intermediate_bindings).max(1);
+        let effective_row_cap = options.max_rows.max(1);
         let truncated_by_row_cap = graph_result.next_cursor.is_some()
             && row_counts
                 .limit
                 .is_none_or(|limit| limit > effective_row_cap);
         if truncated_by_row_cap {
-            let (cap_name, cap_value) = if options.max_intermediate_bindings < options.max_rows {
-                ("max_intermediate_bindings", options.max_intermediate_bindings)
-            } else {
-                ("max_rows", options.max_rows)
-            };
             if !resolved_order_by.is_empty() {
                 warnings.push(format!(
-                    "GQL ORDER BY evaluated over capped rows at {cap_name}={cap_value}; ordered results may be incomplete"
+                    "GQL ORDER BY evaluated over capped rows at max_rows={}; ordered results may be incomplete",
+                    options.max_rows
                 ));
             } else {
-                warnings.push(format!("GQL result rows capped at {cap_name}={cap_value}"));
+                warnings.push(format!("GQL result rows capped at max_rows={}", options.max_rows));
             }
         }
 
@@ -657,7 +623,7 @@ impl DatabaseEngine {
         let normalized = normalize_graph_row_query(&graph_row_query)?;
         let outcome = published
             .view
-            .query_graph_rows_outcome(&normalized, cursor_state)?;
+            .query_graph_rows_outcome_runtime_once_stage(&normalized, cursor_state)?;
         let mut result = outcome.value;
         graph_pipeline_enforce_result_caps(query, &result)?;
         result.next_cursor = graph_pipeline_encode_cursor(
@@ -10449,7 +10415,7 @@ impl ReadView {
         trace: &mut GraphRowExplainTrace,
     ) -> Result<(), EngineError> {
         let runtime = self.normalize_graph_row_explain_runtime_plan(query, trace)?;
-        let physical_plan = self.plan_graph_row_physical(query, &runtime, true)?;
+        let physical_plan = self.plan_graph_row_physical(query, &runtime, true, true)?;
         self.populate_graph_row_explain_trace_from_runtime(
             query,
             cursor_state,
@@ -10696,7 +10662,7 @@ impl ReadView {
                         ),
                     );
                     let group_physical_plan =
-                        self.plan_graph_row_physical(query, &group.runtime, true)?;
+                        self.plan_graph_row_physical(query, &group.runtime, true, false)?;
                     trace.record_physical_plan(&group.runtime, &group_physical_plan);
                     self.record_graph_row_static_step_explain(query, &group.runtime, trace)?;
                 }
@@ -10985,6 +10951,9 @@ fn build_graph_row_explain(
     let mut trace = trace.unwrap_or_default();
     append_graph_row_projection_plan(query, &mut trace);
     append_graph_row_standard_row_ops(query, cursor_state, &mut trace);
+    if let Some(eligibility) = trace.chunk_eligibility {
+        graph_row_annotate_cursor_seek(&mut trace, eligibility);
+    }
     append_graph_row_standard_notes(query, cursor_state, runtime_stats.as_ref(), &mut trace);
     let rows_planned = query.nodes.len() + query.pieces.len();
     let mut warnings = trace.warnings.clone();
@@ -11049,6 +11018,8 @@ struct GraphRowExplainTrace {
     warnings: Vec<String>,
     bound_aliases: BTreeSet<String>,
     bound_node_ids: BTreeMap<String, Vec<u64>>,
+    chunk_eligibility: Option<GraphRowChunkEligibility>,
+    chunk_cursor_seek_anchor: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -11609,7 +11580,7 @@ fn append_graph_row_standard_row_ops(
     trace.record_row_op(
         "Order",
         format!(
-            "explicit_order={}; order_items={}; stable logical row key is always the deterministic tie-breaker",
+            "explicit_order={}; order_items={}; stable logical row key is always the deterministic tie-breaker; top_k=incremental",
             !query.bound_order_by.is_empty(),
             query.bound_order_by.len()
         ),
@@ -11741,7 +11712,7 @@ fn configure_gql_graph_row_target(
         })
         .collect::<Result<Vec<_>, EngineError>>()?;
     query.query.page.skip = row_counts.skip;
-    let effective_row_cap = options.max_rows.min(options.max_intermediate_bindings).max(1);
+    let effective_row_cap = options.max_rows.max(1);
     query.logical_limit = row_counts.limit;
     query.query.page.limit = row_counts
         .limit

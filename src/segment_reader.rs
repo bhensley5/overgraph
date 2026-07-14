@@ -697,6 +697,12 @@ enum BatchReadStrategy {
     MergeWalk,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BatchReadDecision {
+    strategy: BatchReadStrategy,
+    span_start: usize,
+}
+
 #[inline]
 fn ceil_log2_usize(n: usize) -> usize {
     if n <= 1 {
@@ -769,8 +775,35 @@ fn choose_batch_read_strategy(
     min_key: u64,
     max_key: u64,
 ) -> Result<BatchReadStrategy, EngineError> {
+    Ok(choose_batch_read_decision(
+        index_data,
+        idx_start,
+        index_count,
+        entry_size,
+        key_offset,
+        unique_keys,
+        min_key,
+        max_key,
+    )?
+    .strategy)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn choose_batch_read_decision(
+    index_data: &[u8],
+    idx_start: usize,
+    index_count: usize,
+    entry_size: usize,
+    key_offset: usize,
+    unique_keys: usize,
+    min_key: u64,
+    max_key: u64,
+) -> Result<BatchReadDecision, EngineError> {
     if unique_keys <= 2 || index_count <= 1 {
-        return Ok(BatchReadStrategy::SeekPerKey);
+        return Ok(BatchReadDecision {
+            strategy: BatchReadStrategy::SeekPerKey,
+            span_start: 0,
+        });
     }
 
     let span_start = lower_bound_u64_index(
@@ -796,9 +829,15 @@ fn choose_batch_read_strategy(
         .saturating_mul(BATCH_RANDOM_ACCESS_PENALTY);
 
     if seek_cost <= span {
-        Ok(BatchReadStrategy::SeekPerKey)
+        Ok(BatchReadDecision {
+            strategy: BatchReadStrategy::SeekPerKey,
+            span_start,
+        })
     } else {
-        Ok(BatchReadStrategy::MergeWalk)
+        Ok(BatchReadDecision {
+            strategy: BatchReadStrategy::MergeWalk,
+            span_start,
+        })
     }
 }
 
@@ -7582,7 +7621,7 @@ impl SegmentReader {
         let idx_start = 8;
         let min_key = node_ids.first().copied().unwrap_or(0);
         let max_key = node_ids.last().copied().unwrap_or(0);
-        let use_seek = choose_batch_read_strategy(
+        let decision = choose_batch_read_decision(
             idx_data,
             idx_start,
             count,
@@ -7591,8 +7630,9 @@ impl SegmentReader {
             node_ids.len(),
             min_key,
             max_key,
-        )? == BatchReadStrategy::SeekPerKey;
-        let mut idx_pos = 0usize;
+        )?;
+        let use_seek = decision.strategy == BatchReadStrategy::SeekPerKey;
+        let mut idx_pos = decision.span_start;
 
         for &target_id in node_ids {
             if use_seek {
@@ -7661,7 +7701,7 @@ impl SegmentReader {
         let idx_start = 8;
         let min_key = node_ids.first().copied().unwrap_or(0);
         let max_key = node_ids.last().copied().unwrap_or(0);
-        let use_seek = choose_batch_read_strategy(
+        let decision = choose_batch_read_decision(
             idx_data,
             idx_start,
             count,
@@ -7670,8 +7710,9 @@ impl SegmentReader {
             node_ids.len(),
             min_key,
             max_key,
-        )? == BatchReadStrategy::SeekPerKey;
-        let mut idx_pos = 0usize;
+        )?;
+        let use_seek = decision.strategy == BatchReadStrategy::SeekPerKey;
+        let mut idx_pos = decision.span_start;
 
         for &target_id in node_ids {
             if use_seek {
@@ -11232,6 +11273,48 @@ pub(crate) mod tests {
         assert_eq!(strategy, BatchReadStrategy::SeekPerKey);
     }
 
+    #[test]
+    fn endpoint_adj_posting_walk_decision_tracks_true_lower_bound_and_boundaries() {
+        let keys: Vec<u64> = (10..=1_009).collect();
+        let idx = build_u64_key_index(&keys, ADJ_INDEX_ENTRY_SIZE, 0);
+
+        let dense =
+            choose_batch_read_decision(&idx, 8, keys.len(), ADJ_INDEX_ENTRY_SIZE, 0, 4, 900, 903)
+                .unwrap();
+        assert_eq!(dense.strategy, BatchReadStrategy::MergeWalk);
+        assert_eq!(dense.span_start, 890);
+        assert_eq!(
+            dense.span_start,
+            lower_bound_u64_index(&idx, 8, keys.len(), ADJ_INDEX_ENTRY_SIZE, 0, 900).unwrap()
+        );
+
+        let tiny =
+            choose_batch_read_decision(&idx, 8, keys.len(), ADJ_INDEX_ENTRY_SIZE, 0, 2, 900, 901)
+                .unwrap();
+        assert_eq!(tiny.strategy, BatchReadStrategy::SeekPerKey);
+        let sparse =
+            choose_batch_read_decision(&idx, 8, keys.len(), ADJ_INDEX_ENTRY_SIZE, 0, 3, 10, 1_009)
+                .unwrap();
+        assert_eq!(sparse.strategy, BatchReadStrategy::SeekPerKey);
+
+        let below =
+            choose_batch_read_decision(&idx, 8, keys.len(), ADJ_INDEX_ENTRY_SIZE, 0, 4, 0, 12)
+                .unwrap();
+        assert_eq!(below.span_start, 0);
+        let above = choose_batch_read_decision(
+            &idx,
+            8,
+            keys.len(),
+            ADJ_INDEX_ENTRY_SIZE,
+            0,
+            4,
+            2_000,
+            2_003,
+        )
+        .unwrap();
+        assert_eq!(above.span_start, keys.len());
+    }
+
     // --- get_node ---
 
     #[test]
@@ -11932,6 +12015,160 @@ pub(crate) mod tests {
                 .unwrap(),
             EndpointAdjPostingStats::default()
         );
+    }
+
+    #[test]
+    fn endpoint_adj_posting_walk_collectors_start_at_high_absent_minimum() {
+        let mt = Memtable::new();
+        for id in 1..=220 {
+            mt.apply_op(
+                &WalOp::UpsertNode(make_node(id, 1, &format!("walk-{id}"))),
+                0,
+            );
+        }
+        for source in 1..=200 {
+            if source != 197 {
+                mt.apply_op(
+                    &WalOp::UpsertEdge(make_edge(1_000 + source, source, 220, 10)),
+                    0,
+                );
+            }
+        }
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(5_000, 198, 219, 20)), 0);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(6_000, 219, 198, 10)), 0);
+
+        let (_dir, reader) = write_and_open(&mt);
+        let requested = [197, 198, 199, 200];
+        let idx_data = &reader.adj_out_idx[..];
+        let count = read_u64_at(idx_data, 0).unwrap() as usize;
+        let decision = choose_batch_read_decision(
+            idx_data,
+            8,
+            count,
+            ADJ_INDEX_ENTRY_SIZE,
+            0,
+            requested.len(),
+            requested[0],
+            *requested.last().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decision.strategy, BatchReadStrategy::MergeWalk);
+        assert!(decision.span_start > 0);
+        assert_eq!(
+            decision.span_start,
+            lower_bound_u64_index(idx_data, 8, count, ADJ_INDEX_ENTRY_SIZE, 0, requested[0],)
+                .unwrap()
+        );
+        let first_off = 8 + decision.span_start * ADJ_INDEX_ENTRY_SIZE;
+        assert_eq!(read_u64_at(idx_data, first_off).unwrap(), 198);
+        assert_eq!(read_u32_at(idx_data, first_off + 8).unwrap(), 10);
+
+        assert_eq!(
+            reader
+                .endpoint_adj_posting_stats(&requested, Direction::Outgoing, None)
+                .unwrap(),
+            EndpointAdjPostingStats {
+                posting_total: 4,
+                cursor_count: 4,
+            }
+        );
+        assert_eq!(
+            reader
+                .endpoint_adj_posting_stats(&requested, Direction::Outgoing, Some(&[10]))
+                .unwrap(),
+            EndpointAdjPostingStats {
+                posting_total: 3,
+                cursor_count: 3,
+            }
+        );
+        assert_eq!(
+            reader
+                .endpoint_adj_posting_stats(&requested, Direction::Outgoing, Some(&[99]))
+                .unwrap(),
+            EndpointAdjPostingStats::default()
+        );
+        assert_eq!(
+            reader
+                .endpoint_adj_posting_stats(&requested, Direction::Both, Some(&[10]))
+                .unwrap(),
+            EndpointAdjPostingStats {
+                posting_total: 4,
+                cursor_count: 4,
+            }
+        );
+
+        let drain = |direction, labels: Option<&[u32]>| {
+            let mut cursors = reader
+                .endpoint_adj_posting_cursors(&requested, direction, labels)
+                .unwrap();
+            let mut edge_ids = Vec::new();
+            for cursor in &mut cursors {
+                while let Some(edge_id) = reader.next_adj_posting_edge_id(cursor).unwrap() {
+                    edge_ids.push(edge_id);
+                }
+            }
+            edge_ids
+        };
+        assert_eq!(
+            drain(Direction::Outgoing, None),
+            vec![1_198, 5_000, 1_199, 1_200]
+        );
+        assert_eq!(
+            drain(Direction::Outgoing, Some(&[10])),
+            vec![1_198, 1_199, 1_200]
+        );
+        assert_eq!(
+            drain(Direction::Both, Some(&[10])),
+            vec![1_198, 1_199, 1_200, 6_000]
+        );
+        assert!(reader
+            .endpoint_adj_posting_cursors(&[], Direction::Outgoing, None)
+            .unwrap()
+            .is_empty());
+        assert!(reader
+            .endpoint_adj_posting_cursors(&[500, 501, 502], Direction::Outgoing, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn endpoint_adj_posting_walk_corrupt_index_surfaces_collector_errors() {
+        let mt = Memtable::new();
+        for id in 1..=8 {
+            mt.apply_op(
+                &WalOp::UpsertNode(make_node(id, 1, &format!("corrupt-{id}"))),
+                0,
+            );
+        }
+        for source in 1..=4 {
+            mt.apply_op(
+                &WalOp::UpsertEdge(make_edge(100 + source, source, 8, 10)),
+                0,
+            );
+        }
+        let (dir, reader) = write_and_open(&mt);
+        drop(reader);
+        let seg_dir = dir.path().join("seg_0001");
+        rewrite_component_payload_for_test(
+            &seg_dir,
+            SegmentComponentKind::AdjOutIndex,
+            |payload| {
+                let count = read_u64_at(payload, 0).unwrap();
+                payload[0..8].copy_from_slice(&count.saturating_add(8).to_le_bytes());
+            },
+        );
+        let reader = SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap();
+        let err = reader
+            .endpoint_adj_posting_stats(&[2, 3, 4], Direction::Outgoing, Some(&[10]))
+            .unwrap_err();
+        assert!(matches!(err, EngineError::CorruptRecord(_)));
+        let err =
+            match reader.endpoint_adj_posting_cursors(&[2, 3, 4], Direction::Outgoing, Some(&[10]))
+            {
+                Ok(_) => panic!("corrupt adjacency index unexpectedly produced cursors"),
+                Err(err) => err,
+            };
+        assert!(matches!(err, EngineError::CorruptRecord(_)));
     }
 
     // --- Empty segment ---

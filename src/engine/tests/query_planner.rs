@@ -2835,6 +2835,7 @@ fn streamed_edge_selector_admits_endpoint_only_when_strictly_most_selective() {
             EdgeEndpointPlannerStats {
                 estimate: PlannerEstimate::upper_bound(count),
                 stream_cursor_count_upper_bound: cursor_count,
+                segment_stats_fallback: false,
             },
         )
     };
@@ -18070,6 +18071,181 @@ fn test_query_node_page_planned_preserves_planning_followups_for_core_outcomes()
         .unwrap();
     assert_eq!(page.ids, vec![keep]);
     assert_eq!(followups.len(), 1);
+
+    drop(published);
+    drop(_guard);
+    engine.close().unwrap();
+}
+
+#[test]
+fn graph_row_borrowed_plan_chains_pages_without_consuming_or_replanning() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("testdb");
+    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let mut expected = (0..4)
+        .map(|index| {
+            insert_query_node(
+                &engine,
+                "BorrowedPlan",
+                &format!("borrowed-{index}"),
+                &[],
+                1.0,
+            )
+        })
+        .collect::<Vec<_>>();
+    engine.flush().unwrap();
+    expected.extend((4..7).map(|index| {
+        insert_query_node(
+            &engine,
+            "BorrowedPlan",
+            &format!("borrowed-{index}"),
+            &[],
+            1.0,
+        )
+    }));
+    expected.sort_unstable();
+
+    let max_query = NodeQuery {
+        label_filter: Some(NodeLabelFilter {
+            labels: vec!["BorrowedPlan".to_string()],
+            mode: LabelMatchMode::All,
+        }),
+        page: PageRequest {
+            limit: Some(4),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let (_guard, published) = engine.runtime.published_snapshot().unwrap();
+    let normalized_max = published.view.normalize_node_query(&max_query).unwrap();
+    let mut planned = published
+        .view
+        .plan_normalized_node_query(&normalized_max)
+        .unwrap();
+    planned
+        .followups
+        .push(test_equality_read_followup(9_999_999));
+    let planning_followups = std::mem::take(&mut planned.followups);
+    let policy_cutoffs = published.view.query_policy_cutoffs();
+
+    let mut after = None;
+    let mut actual = Vec::new();
+    let mut actual_followups = Vec::new();
+    let mut pulls = 0usize;
+    loop {
+        let mut pull = normalized_max.clone();
+        pull.page.limit = Some(2);
+        pull.page.after = after;
+        let (page, mut followups) = published
+            .view
+            .query_node_page_planned_borrowed(
+                &pull,
+                &planned,
+                false,
+                policy_cutoffs.as_ref(),
+            )
+            .unwrap();
+        actual.extend(page.ids);
+        actual_followups.append(&mut followups);
+        after = page.next_cursor;
+        pulls += 1;
+        if pulls == 1 {
+            engine.flush().unwrap();
+        }
+        if after.is_none() {
+            break;
+        }
+    }
+    assert_eq!(actual, expected);
+    assert_eq!(planning_followups.len(), 1);
+    assert!(actual_followups.is_empty());
+    assert!(planned.followups.is_empty());
+
+    let walk_borrowed = |plan: &PlannedNodeQuery| {
+        let mut after = None;
+        let mut ids = Vec::new();
+        loop {
+            let mut pull = normalized_max.clone();
+            pull.page.limit = Some(2);
+            pull.page.after = after;
+            let (page, _) = published
+                .view
+                .query_node_page_planned_borrowed(
+                    &pull,
+                    plan,
+                    false,
+                    policy_cutoffs.as_ref(),
+                )
+                .unwrap();
+            ids.extend(page.ids);
+            after = page.next_cursor;
+            if after.is_none() {
+                break;
+            }
+        }
+        ids
+    };
+    let walk_replanned = || {
+        let mut after = None;
+        let mut ids = Vec::new();
+        loop {
+            let mut pull = normalized_max.clone();
+            pull.page.limit = Some(2);
+            pull.page.after = after;
+            let replanned = published
+                .view
+                .plan_normalized_node_query(&pull)
+                .unwrap();
+            let (page, _) = published
+                .view
+                .query_node_page_planned(
+                    &pull,
+                    replanned,
+                    false,
+                    policy_cutoffs.as_ref(),
+                )
+                .unwrap();
+            ids.extend(page.ids);
+            after = page.next_cursor;
+            if after.is_none() {
+                break;
+            }
+        }
+        ids
+    };
+    let replanned_ids = walk_replanned();
+    assert_eq!(replanned_ids, expected);
+    assert_eq!(walk_borrowed(&planned), replanned_ids);
+
+    let streamed_plan = PlannedNodeQuery {
+        driver: planned.driver.clone(),
+        execution_mode: NodeDriverExecutionMode::Streamed,
+        cap_context: planned.cap_context,
+        legal_universe_fallback: planned.legal_universe_fallback.clone(),
+        warnings: planned.warnings.clone(),
+        followups: Vec::new(),
+    };
+    assert_eq!(walk_borrowed(&streamed_plan), replanned_ids);
+
+    let fallback_source = match &planned.driver {
+        NodePhysicalPlan::Source(source) => Some(source.clone()),
+        _ => panic!("borrowed-plan fixture expected a source driver"),
+    };
+    let fallback_plan = PlannedNodeQuery {
+        driver: NodePhysicalPlan::Intersect {
+            inputs: vec![NodePhysicalPlan::Intersect {
+                inputs: vec![NodePhysicalPlan::Empty],
+                mode: NodeSetOpExecutionMode::Eager,
+            }],
+            mode: NodeSetOpExecutionMode::Streamed,
+        },
+        execution_mode: NodeDriverExecutionMode::Streamed,
+        cap_context: planned.cap_context,
+        legal_universe_fallback: fallback_source,
+        warnings: Vec::new(),
+        followups: Vec::new(),
+    };
+    assert_eq!(walk_borrowed(&fallback_plan), replanned_ids);
 
     drop(published);
     drop(_guard);

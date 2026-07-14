@@ -297,6 +297,11 @@ fn normalize_graph_row_query_with_internal_limits_and_input(
     input_schema: Option<&crate::graph_row::GraphBindingSchema>,
 ) -> Result<NormalizedGraphRowQuery, EngineError> {
     validate_graph_row_page(&query.page, &query.options)?;
+    if query.options.max_intermediate_bindings == 0 {
+        return Err(EngineError::InvalidOperation(
+            "graph row max_intermediate_bindings must be >= 1".to_string(),
+        ));
+    }
     let referenced_params = collect_graph_row_referenced_params(query)?;
 
     let mut aliases = GraphRowAliasState::default();
