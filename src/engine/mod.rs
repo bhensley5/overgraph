@@ -3481,8 +3481,20 @@ struct QueryExecutionCounters {
     edge_full_scan_pages: AtomicUsize,
     endpoint_adjacency_candidates: AtomicUsize,
     graph_row_query_calls: AtomicUsize,
+    graph_row_chunks_executed: AtomicUsize,
+    graph_row_chunk_cap_retries: AtomicUsize,
+    graph_row_chunk_early_exits: AtomicUsize,
+    graph_row_cursor_anchor_seeks: AtomicUsize,
+    graph_row_retry_input_rows_peak: AtomicUsize,
+    graph_row_successful_leaf_rows_peak: AtomicUsize,
+    graph_row_page_heap_rows_peak: AtomicUsize,
     graph_row_delegated_edge_queries: AtomicUsize,
     graph_row_delegated_verified_candidates: AtomicUsize,
+    graph_row_optional_group_cache_hits: AtomicUsize,
+    graph_row_vlp_cross_chunk_cache_hits: AtomicUsize,
+    graph_row_result_cache_units_peak: AtomicUsize,
+    graph_row_result_cache_no_admit: AtomicUsize,
+    graph_row_unique_followups_peak: AtomicUsize,
     selected_field_reads: SelectedFieldReadCounters,
     public_node_query_calls: AtomicUsize,
     public_edge_query_calls: AtomicUsize,
@@ -3518,8 +3530,20 @@ pub(crate) struct QueryExecutionCounterSnapshot {
     pub edge_full_scan_pages: usize,
     pub endpoint_adjacency_candidates: usize,
     pub graph_row_query_calls: usize,
+    pub graph_row_chunks_executed: usize,
+    pub graph_row_chunk_cap_retries: usize,
+    pub graph_row_chunk_early_exits: usize,
+    pub graph_row_cursor_anchor_seeks: usize,
+    pub graph_row_retry_input_rows_peak: usize,
+    pub graph_row_successful_leaf_rows_peak: usize,
+    pub graph_row_page_heap_rows_peak: usize,
     pub graph_row_delegated_edge_queries: usize,
     pub graph_row_delegated_verified_candidates: usize,
+    pub graph_row_optional_group_cache_hits: usize,
+    pub graph_row_vlp_cross_chunk_cache_hits: usize,
+    pub graph_row_result_cache_units_peak: usize,
+    pub graph_row_result_cache_no_admit: usize,
+    pub graph_row_unique_followups_peak: usize,
     pub node_selected_field_batches: usize,
     pub node_selected_field_ids: usize,
     pub edge_selected_field_batches: usize,
@@ -5355,6 +5379,86 @@ impl ReadView {
         self.query_execution_counters
             .graph_row_delegated_verified_candidates
             .fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_optional_group_cache_hit(&self) {
+        self.query_execution_counters
+            .graph_row_optional_group_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_vlp_cross_chunk_cache_hit(&self) {
+        self.query_execution_counters
+            .graph_row_vlp_cross_chunk_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_result_cache_counters(&self, peak: usize, no_admit: usize) {
+        self.query_execution_counters
+            .graph_row_result_cache_units_peak
+            .fetch_max(peak, Ordering::Relaxed);
+        self.query_execution_counters
+            .graph_row_result_cache_no_admit
+            .fetch_add(no_admit, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_unique_followups_peak(&self, peak: usize) {
+        self.query_execution_counters
+            .graph_row_unique_followups_peak
+            .fetch_max(peak, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_chunk_executed(&self) {
+        self.query_execution_counters
+            .graph_row_chunks_executed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_chunk_cap_retry(&self) {
+        self.query_execution_counters
+            .graph_row_chunk_cap_retries
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_chunk_early_exit(&self) {
+        self.query_execution_counters
+            .graph_row_chunk_early_exits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_cursor_anchor_seek(&self) {
+        self.query_execution_counters
+            .graph_row_cursor_anchor_seeks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_retry_input_rows_peak(&self, rows: usize) {
+        self.query_execution_counters
+            .graph_row_retry_input_rows_peak
+            .fetch_max(rows, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_successful_leaf_rows_peak(&self, rows: usize) {
+        self.query_execution_counters
+            .graph_row_successful_leaf_rows_peak
+            .fetch_max(rows, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_page_heap_rows_peak(&self, rows: usize) {
+        self.query_execution_counters
+            .graph_row_page_heap_rows_peak
+            .fetch_max(rows, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -7454,6 +7558,41 @@ impl DatabaseEngine {
                 .query_execution_counters
                 .graph_row_query_calls
                 .load(Ordering::Relaxed),
+            graph_row_chunks_executed: published
+                .view
+                .query_execution_counters
+                .graph_row_chunks_executed
+                .load(Ordering::Relaxed),
+            graph_row_chunk_cap_retries: published
+                .view
+                .query_execution_counters
+                .graph_row_chunk_cap_retries
+                .load(Ordering::Relaxed),
+            graph_row_chunk_early_exits: published
+                .view
+                .query_execution_counters
+                .graph_row_chunk_early_exits
+                .load(Ordering::Relaxed),
+            graph_row_cursor_anchor_seeks: published
+                .view
+                .query_execution_counters
+                .graph_row_cursor_anchor_seeks
+                .load(Ordering::Relaxed),
+            graph_row_retry_input_rows_peak: published
+                .view
+                .query_execution_counters
+                .graph_row_retry_input_rows_peak
+                .load(Ordering::Relaxed),
+            graph_row_successful_leaf_rows_peak: published
+                .view
+                .query_execution_counters
+                .graph_row_successful_leaf_rows_peak
+                .load(Ordering::Relaxed),
+            graph_row_page_heap_rows_peak: published
+                .view
+                .query_execution_counters
+                .graph_row_page_heap_rows_peak
+                .load(Ordering::Relaxed),
             graph_row_delegated_edge_queries: published
                 .view
                 .query_execution_counters
@@ -7463,6 +7602,31 @@ impl DatabaseEngine {
                 .view
                 .query_execution_counters
                 .graph_row_delegated_verified_candidates
+                .load(Ordering::Relaxed),
+            graph_row_optional_group_cache_hits: published
+                .view
+                .query_execution_counters
+                .graph_row_optional_group_cache_hits
+                .load(Ordering::Relaxed),
+            graph_row_vlp_cross_chunk_cache_hits: published
+                .view
+                .query_execution_counters
+                .graph_row_vlp_cross_chunk_cache_hits
+                .load(Ordering::Relaxed),
+            graph_row_result_cache_units_peak: published
+                .view
+                .query_execution_counters
+                .graph_row_result_cache_units_peak
+                .load(Ordering::Relaxed),
+            graph_row_result_cache_no_admit: published
+                .view
+                .query_execution_counters
+                .graph_row_result_cache_no_admit
+                .load(Ordering::Relaxed),
+            graph_row_unique_followups_peak: published
+                .view
+                .query_execution_counters
+                .graph_row_unique_followups_peak
                 .load(Ordering::Relaxed),
             node_selected_field_batches: published
                 .view
@@ -7648,12 +7812,72 @@ impl DatabaseEngine {
         published
             .view
             .query_execution_counters
+            .graph_row_chunks_executed
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_chunk_cap_retries
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_chunk_early_exits
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_cursor_anchor_seeks
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_retry_input_rows_peak
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_successful_leaf_rows_peak
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_page_heap_rows_peak
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
             .graph_row_delegated_edge_queries
             .store(0, Ordering::Relaxed);
         published
             .view
             .query_execution_counters
             .graph_row_delegated_verified_candidates
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_optional_group_cache_hits
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_vlp_cross_chunk_cache_hits
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_result_cache_units_peak
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_result_cache_no_admit
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_unique_followups_peak
             .store(0, Ordering::Relaxed);
         published
             .view
@@ -12818,6 +13042,7 @@ include!("query_plan.rs");
 include!("edge_stream.rs");
 include!("projection.rs");
 include!("query_exec.rs");
+include!("graph_row_production.rs");
 include!("pipeline_ir.rs");
 include!("pipeline_exec.rs");
 include!("query.rs");

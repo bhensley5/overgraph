@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-13
+
+### Added
+
+#### Bounded Graph-Row Production
+- **Chunked fixed-pattern execution.** Graph-row and GQL fixed-pattern reads now produce bounded chunks through the shared execution substrate, preserving exact rows, ordering, cursors, caps, and snapshot semantics across retries and continuation pages.
+- **Runtime-aware stage reuse.** Pipeline stages and physical `EXISTS` probes reuse the bounded producer with execution-local caching while retaining their existing public result and explain shapes.
+
+### Changed
+
+#### Graph Query Performance
+- **Safe early exit for limited reads.** Proven monotonic graph-row plans can stop after enough verified rows are available instead of consuming later chunks that cannot affect the page.
+- **Cursor pages seek to their anchor.** Eligible continuation pages begin near the decoded cursor anchor while preserving final logical row comparison and deterministic pagination.
+- **Hub-aware estimates use snapshot-safe bounds.** Distinct first-frontier fanout estimates are capped by physical edge bounds, and known-ID expansions use endpoint posting upper bounds when those bounds are provable for the pinned read view.
+
+### Fixed
+
+- **High-fanout planner overestimation.** Warm and reopened hub-shaped databases no longer let loose adjacency averages overwhelm sound physical-edge and endpoint-posting limits for eligible graph-row plans.
+- **Explicit-edge source selection.** Graph-row plans with explicit edge IDs no longer offer redundant endpoint-adjacency sources.
+- **Planner work accounting.** Hydration and endpoint posting reads now report bounded frontier and work estimates without inflating downstream planning costs.
+
 ## [0.15.0] - 2026-07-11
 
 ### Added
@@ -519,6 +540,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.16.0]: https://github.com/bhensley5/overgraph/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/bhensley5/overgraph/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/bhensley5/overgraph/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/bhensley5/overgraph/compare/v0.12.0...v0.13.0

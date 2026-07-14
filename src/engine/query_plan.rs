@@ -10,6 +10,7 @@ const GRAPH_ROW_FRONTIER_BUDGET: usize = crate::planner_stats::PLANNER_STATS_HAR
 const GRAPH_ROW_HUB_HIGH_RATIO: u64 = 8;
 const GRAPH_ROW_HUB_MEDIUM_RATIO: u64 = 4;
 const GRAPH_ROW_CONFIDENCE_DOWNGRADE_STEP: u8 = 1;
+const GRAPH_ROW_KNOWN_ID_POSTING_MAX_IDS: usize = 1024;
 const COMPOUND_INDEX_IN_EXPANSION_CAP: usize = 64;
 const STREAMED_INTERSECT_MAX_INPUTS: usize = 16;
 const STREAMED_MAX_TOTAL_CURSORS: usize = 4096;
@@ -243,18 +244,120 @@ impl GraphRowEdgeSourceCostMemo {
     }
 }
 
+struct GraphRowKnownIdPostingMemo {
+    entries: Vec<[Option<Option<u64>>; 2]>,
+}
+
+impl GraphRowKnownIdPostingMemo {
+    fn new(edge_count: usize) -> Self {
+        Self {
+            entries: (0..edge_count)
+                .map(|_| std::array::from_fn(|_| None))
+                .collect(),
+        }
+    }
+}
+
 const GRAPH_ROW_EDGE_INTERSECTION_TINY_SET: u64 = 64;
 
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct GraphRowPlanningProbeCounters {
     pub(crate) edge_source_consults: u64,
     pub(crate) edge_source_misses: u64,
+    pub(crate) known_id_posting_consults: u64,
+    pub(crate) known_id_posting_misses: u64,
     pub(crate) node_legal_universe_sources: u64,
+    #[cfg(test)]
+    pub(crate) endpoint_adjacency_offers: u64,
 }
 
 thread_local! {
     static GRAPH_ROW_PLANNING_PROBE: std::cell::RefCell<GraphRowPlanningProbeCounters> =
         std::cell::RefCell::new(GraphRowPlanningProbeCounters::default());
+}
+
+#[cfg(test)]
+thread_local! {
+    static GRAPH_ROW_TEST_LEGACY_ESTIMATOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GRAPH_ROW_TEST_PLAN_SIGNATURE_CAPTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GRAPH_ROW_TEST_PLAN_SIGNATURES: std::cell::RefCell<Vec<GraphRowTestPlanSignature>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GraphRowTestSegmentSignature {
+    pub(crate) segment_index: usize,
+    pub(crate) initial_driver: String,
+    pub(crate) edge_order: Vec<usize>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GraphRowTestPlanSignature {
+    pub(crate) initial_driver: String,
+    pub(crate) segments: Vec<GraphRowTestSegmentSignature>,
+    pub(crate) edge_order: Vec<usize>,
+    pub(crate) edge_source_choices: Vec<Option<String>>,
+}
+
+#[cfg(test)]
+fn graph_row_test_legacy_estimator_enabled() -> bool {
+    GRAPH_ROW_TEST_LEGACY_ESTIMATOR.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn with_graph_row_test_legacy_estimator<T>(run: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            GRAPH_ROW_TEST_LEGACY_ESTIMATOR.with(|enabled| enabled.set(self.0));
+        }
+    }
+
+    GRAPH_ROW_TEST_LEGACY_ESTIMATOR.with(|enabled| {
+        let reset = Reset(enabled.replace(true));
+        let result = run();
+        drop(reset);
+        result
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn graph_row_test_legacy_estimator_is_enabled() -> bool {
+    graph_row_test_legacy_estimator_enabled()
+}
+
+#[cfg(test)]
+pub(crate) fn with_graph_row_test_plan_signature_capture<T>(
+    run: impl FnOnce() -> T,
+) -> (T, Vec<GraphRowTestPlanSignature>) {
+    struct Reset {
+        enabled: bool,
+        signatures: Option<Vec<GraphRowTestPlanSignature>>,
+    }
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            GRAPH_ROW_TEST_PLAN_SIGNATURE_CAPTURE.with(|enabled| enabled.set(self.enabled));
+            GRAPH_ROW_TEST_PLAN_SIGNATURES.with(|signatures| {
+                *signatures.borrow_mut() = self.signatures.take().unwrap_or_default();
+            });
+        }
+    }
+
+    let enabled = GRAPH_ROW_TEST_PLAN_SIGNATURE_CAPTURE.with(|capture| capture.replace(true));
+    let signatures = GRAPH_ROW_TEST_PLAN_SIGNATURES
+        .with(|captured| std::mem::take(&mut *captured.borrow_mut()));
+    let reset = Reset {
+        enabled,
+        signatures: Some(signatures),
+    };
+    let result = run();
+    let captured = GRAPH_ROW_TEST_PLAN_SIGNATURES.with(|signatures| signatures.borrow().clone());
+    drop(reset);
+    (result, captured)
 }
 
 pub(crate) fn reset_graph_row_planning_probe() {
@@ -292,6 +395,55 @@ struct GraphRowExpansionChoice {
     edge_index: usize,
     source_choice: GraphRowEdgeCandidateSourceChoice,
     fanout: Option<GraphRowFanoutEstimate>,
+}
+
+#[cfg(test)]
+fn graph_row_test_driver_signature(driver: &GraphRowInitialDriver) -> String {
+    match driver {
+        GraphRowInitialDriver::Empty { .. } => "Empty".to_string(),
+        GraphRowInitialDriver::Node { node_index, alias } => {
+            format!("Node({node_index}:{alias})")
+        }
+        GraphRowInitialDriver::Edge {
+            edge_index,
+            edge_name,
+        } => format!("Edge({edge_index}:{edge_name})"),
+    }
+}
+
+#[cfg(test)]
+fn record_graph_row_test_plan_signature(plan: &GraphRowPhysicalPlan) {
+    if !GRAPH_ROW_TEST_PLAN_SIGNATURE_CAPTURE.with(std::cell::Cell::get) {
+        return;
+    }
+    let signature = GraphRowTestPlanSignature {
+        initial_driver: graph_row_test_driver_signature(&plan.initial_driver),
+        segments: plan
+            .segments
+            .iter()
+            .map(|segment| GraphRowTestSegmentSignature {
+                segment_index: segment.segment_index,
+                initial_driver: graph_row_test_driver_signature(&segment.initial_driver),
+                edge_order: segment.edge_order.clone(),
+            })
+            .collect(),
+        edge_order: plan.edge_order.clone(),
+        edge_source_choices: plan
+            .edge_source_choices
+            .iter()
+            .map(|choice| choice.map(|choice| format!("{choice:?}")))
+            .collect(),
+    };
+    GRAPH_ROW_TEST_PLAN_SIGNATURES.with(|signatures| signatures.borrow_mut().push(signature));
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GraphRowDistinctFrontierProof;
+
+#[derive(Clone, Copy, Debug)]
+struct GraphRowPhysicalEdgeBoundContext {
+    physical_edge_bound: u64,
+    retained_memtable_slots: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -462,6 +614,7 @@ enum EdgeCandidateMaterialization {
 struct EdgeEndpointPlannerStats {
     estimate: PlannerEstimate,
     stream_cursor_count_upper_bound: usize,
+    segment_stats_fallback: bool,
 }
 
 struct CandidateProbe {
@@ -726,6 +879,8 @@ struct GraphRowFanoutEstimate {
     avg_upper_fanout: u64,
     p99_fanout: u64,
     max_fanout: u64,
+    visible_total_edges_bound: Option<u64>,
+    known_id_posting_bound: Option<u64>,
     hub_risk: GraphRowHubRisk,
     confidence: EstimateConfidence,
     coverage: GraphRowFanoutCoverage,
@@ -4107,6 +4262,8 @@ impl GraphRowFanoutEstimate {
             avg_upper_fanout: 0,
             p99_fanout: 0,
             max_fanout: 0,
+            visible_total_edges_bound: Some(0),
+            known_id_posting_bound: None,
             hub_risk: GraphRowHubRisk::Low,
             confidence: EstimateConfidence::Exact,
             coverage: GraphRowFanoutCoverage::Complete,
@@ -4118,10 +4275,26 @@ impl GraphRowFanoutEstimate {
             avg_upper_fanout: 0,
             p99_fanout: 0,
             max_fanout: 0,
+            visible_total_edges_bound: None,
+            known_id_posting_bound: None,
             hub_risk: GraphRowHubRisk::Unknown,
             confidence: EstimateConfidence::Unknown,
             coverage: GraphRowFanoutCoverage::Missing,
         }
+    }
+
+    fn unknown_with_visible_bound(visible_total_edges_bound: u64) -> Self {
+        #[cfg(test)]
+        if graph_row_test_legacy_estimator_enabled() {
+            return Self::unknown();
+        }
+        let mut estimate = Self::unknown();
+        // A ReadView-backed unknown is not a known-empty rollup. Keep the
+        // existing unknown-work cost arm reachable so the physical bound can
+        // clamp it soundly at the eligible first hop.
+        estimate.avg_upper_fanout = 1;
+        estimate.visible_total_edges_bound = Some(visible_total_edges_bound);
+        estimate
     }
 
     fn from_rollup(
@@ -4129,6 +4302,7 @@ impl GraphRowFanoutEstimate {
         coverage: GraphRowFanoutCoverage,
         confidence: EstimateConfidence,
         known_source_ids: Option<&[u64]>,
+        visible_total_edges_bound: u64,
     ) -> Self {
         let avg_upper_fanout = if rollup.source_node_count == 0 {
             0
@@ -4164,6 +4338,8 @@ impl GraphRowFanoutEstimate {
             avg_upper_fanout,
             p99_fanout: rollup.p99_fanout as u64,
             max_fanout,
+            visible_total_edges_bound: Some(visible_total_edges_bound),
+            known_id_posting_bound: None,
             hub_risk,
             confidence,
             coverage,
@@ -4177,6 +4353,14 @@ impl GraphRowFanoutEstimate {
                 .saturating_add(other.avg_upper_fanout),
             p99_fanout: self.p99_fanout.saturating_add(other.p99_fanout),
             max_fanout: self.max_fanout.saturating_add(other.max_fanout),
+            visible_total_edges_bound: self
+                .visible_total_edges_bound
+                .zip(other.visible_total_edges_bound)
+                .map(|(left, right)| left.saturating_add(right)),
+            known_id_posting_bound: self
+                .known_id_posting_bound
+                .zip(other.known_id_posting_bound)
+                .map(|(left, right)| left.saturating_add(right)),
             hub_risk: higher_graph_row_hub_risk(self.hub_risk, other.hub_risk),
             confidence: weaker_confidence(self.confidence, other.confidence),
             coverage: worse_graph_row_fanout_coverage(self.coverage, other.coverage),
@@ -4207,6 +4391,34 @@ impl GraphRowFanoutEstimate {
 }
 
 impl ReadView {
+    fn graph_row_physical_edge_bound_context(&self) -> GraphRowPhysicalEdgeBoundContext {
+        let retained_memtable_slots = std::iter::once(self.memtable.as_ref())
+            .chain(
+                self.immutable_epochs
+                    .iter()
+                    .map(|epoch| epoch.memtable.as_ref()),
+            )
+            .fold(0u64, |total, memtable| {
+                total.saturating_add(
+                    u64::try_from(memtable.retained_edge_slot_count()).unwrap_or(u64::MAX),
+                )
+            });
+        let physical_edge_bound = self.segments.iter().fold(
+            retained_memtable_slots,
+            |total, segment| total.saturating_add(segment.edge_count()),
+        );
+        GraphRowPhysicalEdgeBoundContext {
+            physical_edge_bound,
+            retained_memtable_slots,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn graph_row_physical_edge_bound(&self) -> u64 {
+        self.graph_row_physical_edge_bound_context()
+            .physical_edge_bound
+    }
+
     fn public_inputs_for_node_query(
         &self,
         query: &NodeQuery,
@@ -6047,6 +6259,7 @@ impl ReadView {
             return EdgeEndpointPlannerStats {
                 estimate: PlannerEstimate::exact_cheap(0),
                 stream_cursor_count_upper_bound: 0,
+                segment_stats_fallback: false,
             };
         }
         let mut sorted_node_ids = node_ids.to_vec();
@@ -6099,6 +6312,7 @@ impl ReadView {
                         estimate: self.edge_full_scan_estimate(),
                         stream_cursor_count_upper_bound: STREAMED_MAX_TOTAL_CURSORS
                             .saturating_add(1),
+                        segment_stats_fallback: true,
                     };
                 }
             }
@@ -6107,6 +6321,30 @@ impl ReadView {
         EdgeEndpointPlannerStats {
             estimate: PlannerEstimate::upper_bound_with_confidence(count, confidence),
             stream_cursor_count_upper_bound,
+            segment_stats_fallback: false,
+        }
+    }
+
+    fn graph_row_known_id_posting_bound(
+        &self,
+        ids: &[u64],
+        direction: Direction,
+        label_filter_ids: Option<&[u32]>,
+    ) -> Option<u64> {
+        if ids.len() > GRAPH_ROW_KNOWN_ID_POSTING_MAX_IDS {
+            return None;
+        }
+        let stats = self.edge_endpoint_planner_stats(ids, direction, label_filter_ids);
+        Self::graph_row_accepted_known_id_posting_bound(stats)
+    }
+
+    fn graph_row_accepted_known_id_posting_bound(
+        stats: EdgeEndpointPlannerStats,
+    ) -> Option<u64> {
+        if stats.segment_stats_fallback {
+            None
+        } else {
+            stats.estimate.known_upper_bound()
         }
     }
 
@@ -6183,11 +6421,21 @@ impl ReadView {
         coverage: GraphRowFanoutCoverage,
         confidence: EstimateConfidence,
         known_source_ids: Option<&[u64]>,
+        edge_bound: GraphRowPhysicalEdgeBoundContext,
     ) -> Option<GraphRowFanoutEstimate> {
         let rollup = self
             .planner_stats
             .adjacency_rollups
             .get(&(direction, edge_label_id))?;
+        let visible_total_edges_bound = if rollup.coverage.has_uncovered() {
+            edge_bound.physical_edge_bound
+        } else {
+            edge_bound.physical_edge_bound.min(
+                rollup
+                    .total_edges
+                    .saturating_add(edge_bound.retained_memtable_slots),
+            )
+        };
         let coverage = if self.graph_row_has_unrolled_memtable_edges()
             || rollup.coverage.has_uncovered()
         {
@@ -6204,6 +6452,7 @@ impl ReadView {
             coverage,
             confidence,
             known_source_ids,
+            visible_total_edges_bound,
         ))
     }
 
@@ -6212,17 +6461,29 @@ impl ReadView {
         direction: PlannerStatsDirection,
         label_filter_ids: Option<&[u32]>,
         known_source_ids: Option<&[u64]>,
+        edge_bound: GraphRowPhysicalEdgeBoundContext,
     ) -> GraphRowFanoutEstimate {
         let Some(label_ids) = label_filter_ids else {
-            return self
+            let mut estimate = self
                 .graph_row_fanout_rollup_estimate(
                     direction,
                     None,
                     GraphRowFanoutCoverage::Complete,
                     EstimateConfidence::High,
                     known_source_ids,
+                    edge_bound,
                 )
-                .unwrap_or_else(GraphRowFanoutEstimate::unknown);
+                .unwrap_or_else(|| {
+                    GraphRowFanoutEstimate::unknown_with_visible_bound(
+                        edge_bound.physical_edge_bound,
+                    )
+                });
+            estimate.visible_total_edges_bound = Some(
+                estimate
+                    .visible_total_edges_bound
+                    .unwrap_or(edge_bound.physical_edge_bound),
+            );
+            return Self::graph_row_finalize_single_direction_estimate(estimate);
         };
 
         if label_ids.is_empty() {
@@ -6237,8 +6498,9 @@ impl ReadView {
                 GraphRowFanoutCoverage::Complete,
                 EstimateConfidence::High,
                 known_source_ids,
+                edge_bound,
             ) {
-                return estimate;
+                return Self::graph_row_finalize_single_direction_estimate(estimate);
             }
             if !self.graph_row_has_unrolled_memtable_edges()
                 && self
@@ -6247,17 +6509,26 @@ impl ReadView {
                     .get(&(direction, None))
                     .is_some_and(|rollup| !rollup.coverage.has_uncovered())
             {
-                return GraphRowFanoutEstimate::zero();
+                let mut estimate = GraphRowFanoutEstimate::zero();
+                estimate.visible_total_edges_bound = Some(edge_bound.physical_edge_bound);
+                return estimate;
             }
-            return self
+            let mut estimate = self
                 .graph_row_fanout_rollup_estimate(
                     direction,
                     None,
                     GraphRowFanoutCoverage::GlobalFallback,
                     EstimateConfidence::Low,
                     known_source_ids,
+                    edge_bound,
                 )
-                .unwrap_or_else(GraphRowFanoutEstimate::unknown);
+                .unwrap_or_else(|| {
+                    GraphRowFanoutEstimate::unknown_with_visible_bound(
+                        edge_bound.physical_edge_bound,
+                    )
+                });
+            estimate.visible_total_edges_bound = Some(edge_bound.physical_edge_bound);
+            return Self::graph_row_finalize_single_direction_estimate(estimate);
         }
 
         let mut combined: Option<GraphRowFanoutEstimate> = None;
@@ -6268,16 +6539,24 @@ impl ReadView {
                 GraphRowFanoutCoverage::Complete,
                 EstimateConfidence::High,
                 known_source_ids,
+                edge_bound,
             ) else {
-                return self
+                let mut estimate = self
                     .graph_row_fanout_rollup_estimate(
                         direction,
                         None,
                         GraphRowFanoutCoverage::GlobalFallback,
                         EstimateConfidence::Low,
                         known_source_ids,
+                        edge_bound,
                     )
-                    .unwrap_or_else(GraphRowFanoutEstimate::unknown);
+                    .unwrap_or_else(|| {
+                        GraphRowFanoutEstimate::unknown_with_visible_bound(
+                            edge_bound.physical_edge_bound,
+                        )
+                    });
+                estimate.visible_total_edges_bound = Some(edge_bound.physical_edge_bound);
+                return Self::graph_row_finalize_single_direction_estimate(estimate);
             };
             combined = Some(match combined {
                 Some(current) => current.combine_sum(estimate),
@@ -6285,16 +6564,53 @@ impl ReadView {
             });
         }
 
-        combined.unwrap_or_else(GraphRowFanoutEstimate::unknown)
+        let mut estimate = combined.unwrap_or_else(|| {
+            GraphRowFanoutEstimate::unknown_with_visible_bound(edge_bound.physical_edge_bound)
+        });
+        estimate.visible_total_edges_bound = Some(
+            estimate
+                .visible_total_edges_bound
+                .unwrap_or(edge_bound.physical_edge_bound)
+                .min(edge_bound.physical_edge_bound),
+        );
+        Self::graph_row_finalize_single_direction_estimate(estimate)
     }
 
+    #[cfg(test)]
+    fn graph_row_finalize_single_direction_estimate(
+        mut estimate: GraphRowFanoutEstimate,
+    ) -> GraphRowFanoutEstimate {
+        if graph_row_test_legacy_estimator_enabled()
+            && estimate.coverage == GraphRowFanoutCoverage::Missing
+            && estimate.avg_upper_fanout == 0
+            && estimate.p99_fanout == 0
+            && estimate.max_fanout == 0
+        {
+            estimate.visible_total_edges_bound = None;
+            estimate.known_id_posting_bound = None;
+        }
+        estimate
+    }
+
+    #[cfg(not(test))]
+    fn graph_row_finalize_single_direction_estimate(
+        estimate: GraphRowFanoutEstimate,
+    ) -> GraphRowFanoutEstimate {
+        estimate
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn graph_row_edge_fanout_estimate(
         &self,
+        edge_index: usize,
+        source_is_from_alias: bool,
         direction: Direction,
         label_filter_ids: Option<&[u32]>,
         known_source_ids: Option<&[u64]>,
         query: &NormalizedGraphRowQuery,
         edge: &GraphRowRuntimeEdge,
+        edge_bound: GraphRowPhysicalEdgeBoundContext,
+        memo: &mut GraphRowKnownIdPostingMemo,
     ) -> GraphRowFanoutEstimate {
         let mut combined: Option<GraphRowFanoutEstimate> = None;
         for planner_direction in Self::graph_row_planner_directions(direction) {
@@ -6302,6 +6618,7 @@ impl ReadView {
                 *planner_direction,
                 label_filter_ids,
                 known_source_ids,
+                edge_bound,
             );
             combined = Some(match combined {
                 Some(current) => current.combine_sum(estimate),
@@ -6321,6 +6638,34 @@ impl ReadView {
         }
         if downgrade_steps > 0 {
             estimate.confidence = downgrade_confidence(estimate.confidence, downgrade_steps);
+        }
+        #[cfg(test)]
+        if graph_row_test_legacy_estimator_enabled() {
+            return estimate;
+        }
+        if !label_filter_ids.is_some_and(|ids| ids.is_empty()) {
+            if let Some(ids) = known_source_ids.filter(|ids| !ids.is_empty()) {
+                let orientation = usize::from(!source_is_from_alias);
+                let is_miss = memo.entries[edge_index][orientation].is_none();
+                GRAPH_ROW_PLANNING_PROBE.with(|c| {
+                    let mut counters = c.borrow_mut();
+                    counters.known_id_posting_consults += 1;
+                    if is_miss {
+                        counters.known_id_posting_misses += 1;
+                    }
+                });
+                if is_miss {
+                    memo.entries[edge_index][orientation] = Some(
+                        self.graph_row_known_id_posting_bound(
+                            ids,
+                            direction,
+                            label_filter_ids,
+                        ),
+                    );
+                }
+                estimate.known_id_posting_bound = memo.entries[edge_index][orientation]
+                    .expect("known-ID endpoint posting memo entry must be initialized");
+            }
         }
         estimate
     }
@@ -6385,6 +6730,42 @@ impl ReadView {
             .div_ceil(universe_count)
             .max(1)
             .min(raw_expansion)
+    }
+
+    fn graph_row_current_expansion_estimate(
+        fanout: &GraphRowFanoutEstimate,
+        frontier: u64,
+        distinct_frontier_proof: Option<GraphRowDistinctFrontierProof>,
+        target_selectivity: Option<(u64, u64)>,
+        target_is_bound: bool,
+        requires_hydration: bool,
+    ) -> (u64, u64) {
+        let per_row_fanout = fanout.known_id_posting_bound.map_or_else(
+            || fanout.cost_fanout(),
+            |bound| fanout.cost_fanout().min(bound),
+        );
+        let mut candidate_rows = frontier.saturating_mul(per_row_fanout);
+        if distinct_frontier_proof.is_some() {
+            if let Some(known_id_posting_bound) = fanout.known_id_posting_bound {
+                candidate_rows = candidate_rows.min(known_id_posting_bound);
+            }
+            if let Some(visible_total_edges_bound) = fanout.visible_total_edges_bound {
+                candidate_rows = candidate_rows.min(visible_total_edges_bound);
+            }
+        }
+        let output_rows =
+            Self::apply_graph_row_target_selectivity(candidate_rows, target_selectivity);
+        let estimated_expansion = if requires_hydration {
+            output_rows.saturating_add(candidate_rows)
+        } else {
+            output_rows
+        };
+        let next_frontier = if target_is_bound {
+            frontier
+        } else {
+            output_rows.min(GRAPH_ROW_FRONTIER_BUDGET as u64 + 1)
+        };
+        (estimated_expansion, next_frontier)
     }
 
     fn graph_row_edge_source_plan_cost(
@@ -6528,7 +6909,9 @@ impl ReadView {
         query: &NormalizedGraphRowQuery,
         runtime: &GraphRowRuntimePlan,
         build_explain: bool,
+        distinct_frontier_context: bool,
     ) -> Result<GraphRowPhysicalPlan, EngineError> {
+        let edge_bound = self.graph_row_physical_edge_bound_context();
         let known_node_ids = runtime
             .nodes
             .iter()
@@ -6566,6 +6949,8 @@ impl ReadView {
             .map(|edge| self.graph_row_edge_source_plan_cost(query, edge, build_explain))
             .collect::<Result<Vec<_>, _>>()?;
         let mut edge_source_cost_memo = GraphRowEdgeSourceCostMemo::new(runtime.edges.len());
+        let mut known_id_posting_memo =
+            GraphRowKnownIdPostingMemo::new(runtime.edges.len());
 
         if runtime.edges.is_empty() {
             let initial_driver = if runtime.nodes.len() == 1 {
@@ -6578,14 +6963,17 @@ impl ReadView {
                     reason: "no required fixed edge segment".to_string(),
                 }
             };
-            return Ok(GraphRowPhysicalPlan {
+            let plan = GraphRowPhysicalPlan {
                 initial_driver,
                 edge_order: Vec::new(),
                 segments: Vec::new(),
                 edge_source_choices: Vec::new(),
                 alternatives: Vec::new(),
                 notes: self.graph_row_physical_plan_notes(query),
-            });
+            };
+            #[cfg(test)]
+            record_graph_row_test_plan_signature(&plan);
+            return Ok(plan);
         }
 
         let fallback_segment;
@@ -6615,9 +7003,12 @@ impl ReadView {
                 segment_index,
                 &edge_source_costs,
                 &mut edge_source_cost_memo,
+                &mut known_id_posting_memo,
                 &node_anchor_plans,
                 &known_node_ids,
                 &target_selectivities,
+                edge_bound,
+                distinct_frontier_context,
                 build_explain,
             )?;
             if segment_index == 0 {
@@ -6633,7 +7024,7 @@ impl ReadView {
             segments.push(planned.segment);
         }
 
-        Ok(GraphRowPhysicalPlan {
+        let plan = GraphRowPhysicalPlan {
             initial_driver,
             edge_order,
             segments,
@@ -6644,7 +7035,10 @@ impl ReadView {
             } else {
                 Vec::new()
             },
-        })
+        };
+        #[cfg(test)]
+        record_graph_row_test_plan_signature(&plan);
+        Ok(plan)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6656,9 +7050,12 @@ impl ReadView {
         segment_index: usize,
         edge_source_costs: &[GraphRowEdgeSourcePlanCost],
         edge_source_cost_memo: &mut GraphRowEdgeSourceCostMemo,
+        known_id_posting_memo: &mut GraphRowKnownIdPostingMemo,
         node_anchor_plans: &[Option<Result<GraphRowNodeAnchorPlan, EngineError>>],
         known_node_ids: &[Option<Vec<u64>>],
         target_selectivities: &[Option<(u64, u64)>],
+        edge_bound: GraphRowPhysicalEdgeBoundContext,
+        distinct_frontier_context: bool,
         build_explain: bool,
     ) -> Result<GraphRowPhysicalSegmentPlan, EngineError> {
         let mut alternatives = Vec::new();
@@ -6706,8 +7103,12 @@ impl ReadView {
                         initial_frontier,
                         edge_source_costs,
                         edge_source_cost_memo,
+                        known_id_posting_memo,
                         known_node_ids,
                         target_selectivities,
+                        edge_bound,
+                        (distinct_frontier_context && segment_index == 0)
+                            .then_some(GraphRowDistinctFrontierProof),
                         format!("node:{}:{node_index}", node.alias),
                         build_explain,
                     )?;
@@ -6802,8 +7203,11 @@ impl ReadView {
                 initial_frontier,
                 edge_source_costs,
                 edge_source_cost_memo,
+                known_id_posting_memo,
                 known_node_ids,
                 target_selectivities,
+                edge_bound,
+                None,
                 format!("edge:{}:{edge_index}", edge.explain_name()),
                 build_explain,
             )?;
@@ -6918,8 +7322,11 @@ impl ReadView {
         initial_frontier: u64,
         edge_source_costs: &[GraphRowEdgeSourcePlanCost],
         edge_source_cost_memo: &mut GraphRowEdgeSourceCostMemo,
+        known_id_posting_memo: &mut GraphRowKnownIdPostingMemo,
         known_node_ids: &[Option<Vec<u64>>],
         target_selectivities: &[Option<(u64, u64)>],
+        edge_bound: GraphRowPhysicalEdgeBoundContext,
+        mut distinct_frontier_proof: Option<GraphRowDistinctFrontierProof>,
         canonical_key: String,
         build_explain: bool,
     ) -> Result<GraphRowFrontierPlan, EngineError> {
@@ -7003,43 +7410,87 @@ impl ReadView {
                         edge.from_alias.as_str(),
                     )
                 };
-                let fanout = self.graph_row_edge_fanout_estimate(
-                    direction,
-                    edge.label_filter_ids.as_deref(),
-                    known_node_ids[source_index].as_deref(),
-                    query,
-                    edge,
-                );
-                let raw_expansion = frontier.saturating_mul(fanout.cost_fanout());
-                let target_selectivity = if bound.contains(target_alias) {
-                    None
-                } else {
-                    target_selectivities[target_index]
-                };
-                let mut estimated_expansion =
-                    Self::apply_graph_row_target_selectivity(raw_expansion, target_selectivity);
-                if edge_filter_requires_hydration(&edge.filter) {
-                    estimated_expansion = estimated_expansion.saturating_add(raw_expansion);
+                let offer_endpoint_adjacency = edge.candidate_edge_ids.is_empty();
+                #[cfg(test)]
+                let offer_endpoint_adjacency =
+                    offer_endpoint_adjacency || graph_row_test_legacy_estimator_enabled();
+                if offer_endpoint_adjacency {
+                    #[cfg(test)]
+                    GRAPH_ROW_PLANNING_PROBE.with(|c| {
+                        c.borrow_mut().endpoint_adjacency_offers += 1;
+                    });
+                    let fanout = self.graph_row_edge_fanout_estimate(
+                        edge_index,
+                        from_bound,
+                        direction,
+                        edge.label_filter_ids.as_deref(),
+                        known_node_ids[source_index].as_deref(),
+                        query,
+                        edge,
+                        edge_bound,
+                        known_id_posting_memo,
+                    );
+                    let target_selectivity = if bound.contains(target_alias) {
+                        None
+                    } else {
+                        target_selectivities[target_index]
+                    };
+                    let target_is_bound = bound.contains(target_alias);
+                    let requires_hydration = edge_filter_requires_hydration(&edge.filter);
+                    #[cfg(test)]
+                    let legacy_estimator = graph_row_test_legacy_estimator_enabled();
+                    #[cfg(test)]
+                    let (estimated_expansion, next_frontier) = if legacy_estimator {
+                        let raw_expansion = frontier.saturating_mul(fanout.cost_fanout());
+                        let mut estimated_expansion = Self::apply_graph_row_target_selectivity(
+                            raw_expansion,
+                            target_selectivity,
+                        );
+                        if requires_hydration {
+                            estimated_expansion =
+                                estimated_expansion.saturating_add(raw_expansion);
+                        }
+                        let next_frontier = if target_is_bound {
+                            frontier
+                        } else {
+                            estimated_expansion.min(GRAPH_ROW_FRONTIER_BUDGET as u64 + 1)
+                        };
+                        (estimated_expansion, next_frontier)
+                    } else {
+                        Self::graph_row_current_expansion_estimate(
+                            &fanout,
+                            frontier,
+                            distinct_frontier_proof,
+                            target_selectivity,
+                            target_is_bound,
+                            requires_hydration,
+                        )
+                    };
+                    #[cfg(not(test))]
+                    let (estimated_expansion, next_frontier) =
+                        Self::graph_row_current_expansion_estimate(
+                            &fanout,
+                            frontier,
+                            distinct_frontier_proof,
+                            target_selectivity,
+                            target_is_bound,
+                            requires_hydration,
+                        );
+                    choices.push(GraphRowExpansionChoice {
+                        bound_rank,
+                        complete: fanout.complete(),
+                        estimated_expansion,
+                        next_frontier,
+                        confidence_rank: fanout.confidence.rank(),
+                        hub_risk_rank: fanout.hub_risk.rank(),
+                        coverage_rank: fanout.coverage.rank(),
+                        source_rank: 2,
+                        tie_kind_rank: 0,
+                        edge_index,
+                        source_choice: GraphRowEdgeCandidateSourceChoice::EndpointAdjacency,
+                        fanout: Some(fanout),
+                    });
                 }
-                let next_frontier = if bound.contains(target_alias) {
-                    frontier
-                } else {
-                    estimated_expansion.min(GRAPH_ROW_FRONTIER_BUDGET as u64 + 1)
-                };
-                choices.push(GraphRowExpansionChoice {
-                    bound_rank,
-                    complete: fanout.complete(),
-                    estimated_expansion,
-                    next_frontier,
-                    confidence_rank: fanout.confidence.rank(),
-                    hub_risk_rank: fanout.hub_risk.rank(),
-                    coverage_rank: fanout.coverage.rank(),
-                    source_rank: 2,
-                    tie_kind_rank: 0,
-                    edge_index,
-                    source_choice: GraphRowEdgeCandidateSourceChoice::EndpointAdjacency,
-                    fanout: Some(fanout),
-                });
                 let bound_edge_source_cost = self.graph_row_bound_edge_source_plan_cost(
                     query,
                     edge,
@@ -7113,6 +7564,7 @@ impl ReadView {
             bound.insert(edge.from_alias.clone());
             bound.insert(edge.to_alias.clone());
             order.push(choice.edge_index);
+            distinct_frontier_proof.take();
             source_choices.push((choice.edge_index, choice.source_choice));
             fanout_complete &= choice.complete;
             total_work = total_work.saturating_add(choice.estimated_expansion);
@@ -7139,6 +7591,7 @@ impl ReadView {
                 if !visited_edges[edge_index] {
                     total_work = total_work.saturating_add(GRAPH_ROW_FANOUT_UNKNOWN_WORK);
                     order.push(edge_index);
+                    distinct_frontier_proof.take();
                     source_choices.push((
                         edge_index,
                         graph_row_deterministic_fallback_edge_source_choice(
@@ -11142,6 +11595,85 @@ impl ReadView {
 mod query_plan_unit_tests {
     use super::*;
 
+    #[test]
+    fn graph_row_legacy_estimator_scope_is_nested_panic_safe_and_thread_local() {
+        assert!(!graph_row_test_legacy_estimator_is_enabled());
+        with_graph_row_test_legacy_estimator(|| {
+            assert!(graph_row_test_legacy_estimator_is_enabled());
+            with_graph_row_test_legacy_estimator(|| {
+                assert!(graph_row_test_legacy_estimator_is_enabled());
+            });
+            assert!(graph_row_test_legacy_estimator_is_enabled());
+
+            let isolated = std::thread::spawn(graph_row_test_legacy_estimator_is_enabled)
+                .join()
+                .unwrap();
+            assert!(!isolated, "the scoped estimator mode must not leak across threads");
+        });
+        assert!(!graph_row_test_legacy_estimator_is_enabled());
+
+        let panicked = std::panic::catch_unwind(|| {
+            with_graph_row_test_legacy_estimator(|| {
+                assert!(graph_row_test_legacy_estimator_is_enabled());
+                panic!("scope reset oracle");
+            });
+        });
+        assert!(panicked.is_err());
+        assert!(!graph_row_test_legacy_estimator_is_enabled());
+    }
+
+    #[test]
+    fn graph_row_plan_signature_capture_is_inactive_nested_and_panic_safe() {
+        fn plan(alias: &str) -> GraphRowPhysicalPlan {
+            GraphRowPhysicalPlan {
+                initial_driver: GraphRowInitialDriver::Node {
+                    node_index: 0,
+                    alias: alias.to_string(),
+                },
+                edge_order: Vec::new(),
+                segments: Vec::new(),
+                edge_source_choices: Vec::new(),
+                alternatives: Vec::new(),
+                notes: Vec::new(),
+            }
+        }
+
+        assert!(!GRAPH_ROW_TEST_PLAN_SIGNATURE_CAPTURE.with(std::cell::Cell::get));
+        GRAPH_ROW_TEST_PLAN_SIGNATURES.with(|signatures| {
+            assert!(signatures.borrow().is_empty());
+        });
+        record_graph_row_test_plan_signature(&plan("outside-before"));
+
+        let ((), outer) = with_graph_row_test_plan_signature_capture(|| {
+            record_graph_row_test_plan_signature(&plan("outer-before"));
+
+            let ((), nested) = with_graph_row_test_plan_signature_capture(|| {
+                record_graph_row_test_plan_signature(&plan("nested"));
+            });
+            assert_eq!(nested.len(), 1);
+            assert_eq!(nested[0].initial_driver, "Node(0:nested)");
+
+            let panicked = std::panic::catch_unwind(|| {
+                with_graph_row_test_plan_signature_capture(|| {
+                    record_graph_row_test_plan_signature(&plan("panicking-nested"));
+                    panic!("signature capture reset oracle");
+                });
+            });
+            assert!(panicked.is_err());
+            assert!(GRAPH_ROW_TEST_PLAN_SIGNATURE_CAPTURE.with(std::cell::Cell::get));
+
+            record_graph_row_test_plan_signature(&plan("outer-after"));
+        });
+        assert_eq!(outer.len(), 2);
+        assert_eq!(outer[0].initial_driver, "Node(0:outer-before)");
+        assert_eq!(outer[1].initial_driver, "Node(0:outer-after)");
+
+        assert!(!GRAPH_ROW_TEST_PLAN_SIGNATURE_CAPTURE.with(std::cell::Cell::get));
+        record_graph_row_test_plan_signature(&plan("outside-after"));
+        let ((), captured_after_scope) = with_graph_row_test_plan_signature_capture(|| {});
+        assert!(captured_after_scope.is_empty());
+    }
+
     fn plan_cost(
         estimated_work: u64,
         estimated_candidates: Option<u64>,
@@ -11229,6 +11761,7 @@ mod query_plan_unit_tests {
                 EdgeEndpointPlannerStats {
                     estimate: PlannerEstimate::upper_bound(3),
                     stream_cursor_count_upper_bound: 3,
+                    segment_stats_fallback: false,
                 },
             ),
             PlannedEdgeCandidateSource::fallback_full_scan(PlannerEstimate::unknown()),
@@ -11253,6 +11786,7 @@ mod query_plan_unit_tests {
                 EdgeEndpointPlannerStats {
                     estimate: PlannerEstimate::upper_bound(3),
                     stream_cursor_count_upper_bound: 3,
+                    segment_stats_fallback: false,
                 },
             )
         };
@@ -11290,6 +11824,7 @@ mod query_plan_unit_tests {
                 EdgeEndpointPlannerStats {
                     estimate: PlannerEstimate::upper_bound(3),
                     stream_cursor_count_upper_bound: 6,
+                    segment_stats_fallback: false,
                 },
             );
             assert_eq!(
@@ -11920,5 +12455,89 @@ mod query_plan_unit_tests {
         );
         assert_eq!(estimate, rollup.total_postings);
         assert!(!exact);
+    }
+
+    #[test]
+    fn graph_row_edge_bound_combine_sum_saturates_and_preserves_unknownness() {
+        let mut left = GraphRowFanoutEstimate::zero();
+        left.avg_upper_fanout = u64::MAX;
+        left.p99_fanout = u64::MAX;
+        left.max_fanout = u64::MAX;
+        left.visible_total_edges_bound = Some(u64::MAX - 1);
+        left.known_id_posting_bound = Some(u64::MAX - 1);
+        let mut right = GraphRowFanoutEstimate::zero();
+        right.avg_upper_fanout = 2;
+        right.p99_fanout = 2;
+        right.max_fanout = 2;
+        right.visible_total_edges_bound = Some(10);
+        right.known_id_posting_bound = Some(10);
+
+        let combined = left.combine_sum(right);
+        assert_eq!(combined.avg_upper_fanout, u64::MAX);
+        assert_eq!(combined.p99_fanout, u64::MAX);
+        assert_eq!(combined.max_fanout, u64::MAX);
+        assert_eq!(combined.visible_total_edges_bound, Some(u64::MAX));
+        assert_eq!(combined.known_id_posting_bound, Some(u64::MAX));
+
+        assert_eq!(
+            combined
+                .combine_sum(GraphRowFanoutEstimate::unknown())
+                .visible_total_edges_bound,
+            None
+        );
+        assert_eq!(
+            GraphRowFanoutEstimate::zero().visible_total_edges_bound,
+            Some(0)
+        );
+        assert_eq!(
+            GraphRowFanoutEstimate::unknown().visible_total_edges_bound,
+            None
+        );
+    }
+
+    #[test]
+    fn graph_row_known_id_posting_constructors_and_combine_preserve_unknownness() {
+        assert_eq!(GraphRowFanoutEstimate::zero().known_id_posting_bound, None);
+        assert_eq!(GraphRowFanoutEstimate::unknown().known_id_posting_bound, None);
+        assert_eq!(
+            GraphRowFanoutEstimate::unknown_with_visible_bound(9).known_id_posting_bound,
+            None
+        );
+
+        let mut left = GraphRowFanoutEstimate::zero();
+        left.known_id_posting_bound = Some(u64::MAX - 1);
+        let mut right = GraphRowFanoutEstimate::zero();
+        right.known_id_posting_bound = Some(10);
+        assert_eq!(
+            left.clone().combine_sum(right).known_id_posting_bound,
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            left.combine_sum(GraphRowFanoutEstimate::unknown())
+                .known_id_posting_bound,
+            None
+        );
+    }
+
+    #[test]
+    fn graph_row_known_id_posting_segment_fallback_provenance_declines_bound() {
+        let accepted = EdgeEndpointPlannerStats {
+            estimate: PlannerEstimate::upper_bound(99),
+            stream_cursor_count_upper_bound: 3,
+            segment_stats_fallback: false,
+        };
+        assert_eq!(
+            ReadView::graph_row_accepted_known_id_posting_bound(accepted),
+            Some(99)
+        );
+        let fallback = EdgeEndpointPlannerStats {
+            estimate: PlannerEstimate::upper_bound(99),
+            stream_cursor_count_upper_bound: STREAMED_MAX_TOTAL_CURSORS + 1,
+            segment_stats_fallback: true,
+        };
+        assert_eq!(
+            ReadView::graph_row_accepted_known_id_posting_bound(fallback),
+            None
+        );
     }
 }

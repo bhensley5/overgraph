@@ -1252,6 +1252,7 @@ struct GraphRowRuntimeEdge {
 #[derive(Clone)]
 struct GraphRowRuntimeVariableLength {
     piece_index: usize,
+    piece_path: Box<[usize]>,
     path_alias: Option<String>,
     edge_alias: Option<String>,
     path_slot: Option<crate::graph_row::GraphBindingSlotRef>,
@@ -1302,6 +1303,7 @@ enum GraphRowRuntimeStep {
 
 struct GraphRowRuntimeOptionalGroup {
     piece_index: usize,
+    piece_path: Box<[usize]>,
     pieces_len: usize,
     runtime: Box<GraphRowRuntimePlan>,
     introduced_slots: Vec<crate::graph_row::GraphBindingSlotRef>,
@@ -1463,6 +1465,7 @@ struct GraphRowEdgeCandidateBuckets {
 }
 
 fn graph_row_cap_error(name: &str, cap: usize) -> EngineError {
+    graph_row_note_cap_trip(name);
     EngineError::InvalidOperation(format!("graph row {name} exceeded configured cap {cap}"))
 }
 
@@ -1471,6 +1474,7 @@ fn graph_row_vlp_cap_error(
     cap: usize,
     path: &GraphRowRuntimeVariableLength,
 ) -> EngineError {
+    graph_row_note_cap_trip(name);
     EngineError::InvalidOperation(format!(
         "graph row {name} exceeded configured cap {cap}; path={}; piece_index={}",
         graph_row_vlp_context(path),
@@ -5201,20 +5205,35 @@ impl ReadView {
     fn query_node_page_planned(
         &self,
         query: &NormalizedNodeQuery,
-        planned: PlannedNodeQuery,
+        mut planned: PlannedNodeQuery,
         hydrate: bool,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
     ) -> Result<(VerifiedNodePage, Vec<SecondaryIndexReadFollowup>), EngineError> {
-        let PlannedNodeQuery {
-            driver,
-            execution_mode,
-            cap_context,
-            legal_universe_fallback,
-            warnings: _,
-            mut followups,
-        } = planned;
+        let mut followups = std::mem::take(&mut planned.followups);
+        let (page, mut actual_followups) = self.query_node_page_planned_borrowed(
+            query,
+            &planned,
+            hydrate,
+            policy_cutoffs,
+        )?;
+        followups.append(&mut actual_followups);
+        Ok((page, followups))
+    }
 
-        match &driver {
+    fn query_node_page_planned_borrowed(
+        &self,
+        query: &NormalizedNodeQuery,
+        planned: &PlannedNodeQuery,
+        hydrate: bool,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+    ) -> Result<(VerifiedNodePage, Vec<SecondaryIndexReadFollowup>), EngineError> {
+        let driver = &planned.driver;
+        let execution_mode = planned.execution_mode;
+        let cap_context = planned.cap_context;
+        let legal_universe_fallback = &planned.legal_universe_fallback;
+        let mut followups = Vec::new();
+
+        match driver {
             NodePhysicalPlan::Empty => Ok((
                 VerifiedNodePage {
                     ids: Vec::new(),
@@ -6622,6 +6641,7 @@ impl ReadView {
                     let where_present = where_expr.is_some();
                     steps.push(GraphRowRuntimeStep::Optional(GraphRowRuntimeOptionalGroup {
                         piece_index,
+                        piece_path: group_scope.into_boxed_slice(),
                         pieces_len: group.pieces.len(),
                         runtime: Box::new(group_runtime),
                         introduced_slots: introduced_slots.clone(),
@@ -6657,8 +6677,15 @@ impl ReadView {
                         &mut steps,
                         bound_slots,
                     )?;
-                    let runtime =
-                        self.normalize_graph_row_runtime_vlp(piece_index, vlp, query, next_hidden_id)?;
+                    let mut piece_path = scope.to_vec();
+                    piece_path.push(piece_index);
+                    let runtime = self.normalize_graph_row_runtime_vlp(
+                        piece_index,
+                        piece_path.into_boxed_slice(),
+                        vlp,
+                        query,
+                        next_hidden_id,
+                    )?;
                     for warning in &runtime.warnings {
                         push_query_warning(&mut warnings, *warning);
                     }
@@ -6870,6 +6897,7 @@ impl ReadView {
     fn normalize_graph_row_runtime_vlp(
         &self,
         piece_index: usize,
+        piece_path: Box<[usize]>,
         path: &GraphVariableLengthPattern,
         query: &NormalizedGraphRowQuery,
         next_hidden_id: &mut usize,
@@ -6950,6 +6978,7 @@ impl ReadView {
 
         Ok(GraphRowRuntimeVariableLength {
             piece_index,
+            piece_path,
             path_alias: path.path_alias.clone(),
             edge_alias: path.edge_alias.clone(),
             path_slot,
@@ -6974,6 +7003,27 @@ impl ReadView {
         query: &NormalizedGraphRowQuery,
         cursor_state: GraphRowCursorState,
     ) -> Result<QueryExecutionOutcome<GraphRowResult>, EngineError> {
+        self.query_graph_rows_outcome_with_source_policy(query, cursor_state, None)
+    }
+
+    fn query_graph_rows_outcome_runtime_once_stage(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        cursor_state: GraphRowCursorState,
+    ) -> Result<QueryExecutionOutcome<GraphRowResult>, EngineError> {
+        self.query_graph_rows_outcome_with_source_policy(
+            query,
+            cursor_state,
+            Some(GraphRowRuntimeOnceReason::Stage),
+        )
+    }
+
+    fn query_graph_rows_outcome_with_source_policy(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        cursor_state: GraphRowCursorState,
+        runtime_once_reason: Option<GraphRowRuntimeOnceReason>,
+    ) -> Result<QueryExecutionOutcome<GraphRowResult>, EngineError> {
         let mut profile_timers = GraphRowProfileTimers::new(query.options.profile);
         #[cfg(test)]
         self.query_execution_counters
@@ -6995,8 +7045,12 @@ impl ReadView {
 
         let planning_started_at = profile_timers.planning_started();
         let runtime = self.normalize_graph_row_runtime_plan(query)?;
-        let physical_plan =
-            self.plan_graph_row_physical(query, &runtime, query.options.include_plan)?;
+        let physical_plan = self.plan_graph_row_physical(
+            query,
+            &runtime,
+            query.options.include_plan,
+            true,
+        )?;
         profile_timers.finish_planning(planning_started_at);
         let policy_cutoffs = self.query_policy_cutoffs();
         let mut explain_trace = if query.options.include_plan {
@@ -7012,7 +7066,10 @@ impl ReadView {
         } else {
             None
         };
-        if graph_row_node_only_default_order_fast_path(query, &runtime) {
+        if selection_capacity != 0
+            && runtime_once_reason.is_none()
+            && graph_row_node_only_default_order_fast_path(query, &runtime)
+        {
             if let Some(outcome) = self.query_graph_rows_node_only_default_order_outcome(
                 query,
                 &runtime,
@@ -7028,94 +7085,37 @@ impl ReadView {
                 return Ok(outcome);
             }
         }
-        let mut followups = Vec::new();
-        let mut intermediate_peak = 0;
-        let mut frontier_peak = 0;
-        let mut paths_enumerated = 0;
-        let mut rows = self.graph_row_execute_runtime_plan(
+        let production = self.graph_row_execute_chunked(
             query,
             &runtime,
             &physical_plan,
-            None,
-            GraphRowRuntimeGoal::AllRows,
+            runtime_once_reason.map(|reason| GraphRowRuntimeOnceExecution {
+                reason,
+                initial_rows: None,
+                goal: GraphRowRuntimeGoal::AllRows,
+            }),
+            &cursor_state,
+            selection_capacity,
+            false,
             effective_at_epoch,
             policy_cutoffs.as_ref(),
-            &mut followups,
-            &mut frontier_peak,
-            &mut intermediate_peak,
-            &mut paths_enumerated,
             explain_trace.as_mut(),
         )?;
-
-        let residual_needs = query.projection_needs.residual.clone();
-        if rows.len() > query.options.max_order_materialization
-            && graph_row_entity_needs_require_selected_field_reads(&residual_needs)
-        {
-            return Err(graph_row_cap_error(
-                "max_order_materialization",
-                query.options.max_order_materialization,
-            ));
-        }
-        let mut pre_page_needs = residual_needs.clone();
-        let order_loaded_before_filter = rows.len() <= query.options.max_order_materialization;
-        if order_loaded_before_filter {
-            pre_page_needs.merge_from(&query.projection_needs.order, ProjectionNeedClass::Order)?;
-        }
-        self.hydrate_graph_rows_for_needs(&mut rows, &query.binding_schema, &pre_page_needs)?;
-        let mut filtered = Vec::with_capacity(rows.len().min(query.options.max_order_materialization));
-        for row in rows {
-            if let Some(where_expr) = query.bound_where.as_ref() {
-                let context = crate::graph_row::BoundGraphEvalContext { row: &row };
-                if !crate::graph_row::eval_bound_graph_predicate(where_expr, &context)? {
-                    continue;
-                }
-            }
-            if filtered.len() >= query.options.max_order_materialization {
-                return Err(graph_row_cap_error(
-                    "max_order_materialization",
-                    query.options.max_order_materialization,
-                ));
-            }
-            filtered.push(row);
-        }
-        let rows_after_filter = filtered.len();
-        if !order_loaded_before_filter {
-            let order_needs =
-                graph_row_remaining_output_needs(&query.projection_needs.order, &pre_page_needs);
-            self.hydrate_graph_rows_for_needs(&mut filtered, &query.binding_schema, &order_needs)?;
-            pre_page_needs.merge_from(&query.projection_needs.order, ProjectionNeedClass::Order)?;
-        }
-
-        let mut selected = BinaryHeap::new();
-        let mut rows_seen_for_page = 0usize;
+        let GraphRowProductionOutput::Page(production) = production else {
+            unreachable!("graph-row page execution must use the page sink")
+        };
+        let GraphRowPageProduction {
+            selected,
+            pre_page_needs,
+            rows_after_filter,
+            rows_seen_for_page,
+            intermediate_peak,
+            frontier_peak,
+            paths_enumerated,
+            planning_ns_delta,
+            followups,
+        } = production;
         let order_directions = graph_row_order_directions(&query.bound_order_by);
-        for row in filtered {
-            let logical_key = row.logical_sort_key(&query.binding_schema)?;
-            let sort_key = graph_row_explicit_sort_key(query, &row)?;
-            if let Some(cursor) = cursor_state.decoded.as_ref() {
-                let ordering = compare_graph_final_keys_by_directions(
-                    &sort_key,
-                    &logical_key,
-                    &cursor.last_sort_key,
-                    &cursor.last_logical_row_key,
-                    &order_directions,
-                );
-                if ordering != std::cmp::Ordering::Greater {
-                    continue;
-                }
-            }
-            rows_seen_for_page = rows_seen_for_page.saturating_add(1);
-            graph_row_insert_bounded_candidate(
-                &mut selected,
-                GraphRowPageCandidate {
-                    sort_key,
-                    logical_key,
-                    row,
-                },
-                selection_capacity,
-                &order_directions,
-            );
-        }
         let mut selected = selected
             .into_iter()
             .map(|candidate| candidate.candidate)
@@ -7194,6 +7194,12 @@ impl ReadView {
         warnings.sort();
         warnings.dedup();
         let rows_returned = result_rows.len();
+        let planning_ns = profile_timers
+            .planning_ns
+            .map(|value| value.saturating_add(planning_ns_delta));
+        let execution_ns = profile_timers
+            .execution_ns()
+            .map(|value| value.saturating_sub(planning_ns_delta));
         let runtime_stats = GraphRowExplainRuntimeStats {
             rows_returned,
             rows_after_filter,
@@ -7225,8 +7231,8 @@ impl ReadView {
                 paths_enumerated,
                 db_hits: 0,
                 elapsed_us: profile_timers.elapsed_us(),
-                planning_ns: profile_timers.planning_ns,
-                execution_ns: profile_timers.execution_ns(),
+                planning_ns,
+                execution_ns,
                 effective_at_epoch,
                 warnings,
             },
@@ -7407,6 +7413,7 @@ impl ReadView {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn graph_row_execute_runtime_plan(
         &self,
         query: &NormalizedGraphRowQuery,
@@ -7420,7 +7427,103 @@ impl ReadView {
         frontier_peak: &mut usize,
         intermediate_peak: &mut usize,
         paths_enumerated: &mut usize,
+        explain_trace: Option<&mut GraphRowExplainTrace>,
+    ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+        let mut caches =
+            GraphRowExecutionCaches::compatibility(query.options.max_intermediate_bindings);
+        let mut attempt = caches.begin_attempt();
+        let mut unique_followups = GraphRowUniqueFollowups::new(std::mem::take(followups));
+        let result = self.graph_row_execute_runtime_plan_with_caches(
+            query,
+            runtime,
+            physical_plan,
+            initial_rows,
+            goal,
+            effective_at_epoch,
+            policy_cutoffs,
+            &mut unique_followups,
+            frontier_peak,
+            intermediate_peak,
+            paths_enumerated,
+            explain_trace,
+            &mut caches,
+            &mut attempt,
+        );
+        if result.is_ok() {
+            caches.commit_attempt(&mut attempt);
+        } else {
+            caches.rollback_attempt(&mut attempt);
+        }
+        unique_followups.drain_into(followups);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_execute_runtime_plan_with_caches(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+        physical_plan: &GraphRowPhysicalPlan,
+        initial_rows: Option<Vec<crate::graph_row::GraphBindingRow>>,
+        goal: GraphRowRuntimeGoal,
+        effective_at_epoch: i64,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        unique_followups: &mut GraphRowUniqueFollowups,
+        frontier_peak: &mut usize,
+        intermediate_peak: &mut usize,
+        paths_enumerated: &mut usize,
+        explain_trace: Option<&mut GraphRowExplainTrace>,
+        caches: &mut GraphRowExecutionCaches,
+        attempt: &mut GraphRowCacheAttempt,
+    ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+        let unique_prefix_len = unique_followups.followups.len();
+        let mut leaf = GraphRowLeafTransientState::default();
+        let result = self.graph_row_execute_runtime_plan_inner(
+            query,
+            runtime,
+            physical_plan,
+            initial_rows,
+            goal,
+            effective_at_epoch,
+            policy_cutoffs,
+            &mut unique_followups.followups,
+            frontier_peak,
+            intermediate_peak,
+            paths_enumerated,
+            explain_trace,
+            caches,
+            attempt,
+            &mut leaf,
+        );
+        unique_followups.dedup_appended(unique_prefix_len);
+        #[cfg(test)]
+        {
+            let no_admit_delta = caches.no_admit.saturating_sub(caches.reported_no_admit);
+            self.note_graph_row_result_cache_counters(caches.peak_units, no_admit_delta);
+            caches.reported_no_admit = caches.no_admit;
+            self.note_graph_row_unique_followups_peak(unique_followups.peak);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_execute_runtime_plan_inner(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+        physical_plan: &GraphRowPhysicalPlan,
+        initial_rows: Option<Vec<crate::graph_row::GraphBindingRow>>,
+        goal: GraphRowRuntimeGoal,
+        effective_at_epoch: i64,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+        frontier_peak: &mut usize,
+        intermediate_peak: &mut usize,
+        paths_enumerated: &mut usize,
         mut explain_trace: Option<&mut GraphRowExplainTrace>,
+        caches: &mut GraphRowExecutionCaches,
+        attempt: &mut GraphRowCacheAttempt,
+        leaf: &mut GraphRowLeafTransientState,
     ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
         if runtime.steps.is_empty() {
             let fallback_node_driver;
@@ -7521,6 +7624,9 @@ impl ReadView {
                         intermediate_peak,
                         paths_enumerated,
                         explain_trace.as_deref_mut(),
+                        caches,
+                        attempt,
+                        leaf,
                     )?
                 }
                 GraphRowRuntimeStep::VariableLength(path) => {
@@ -7539,6 +7645,9 @@ impl ReadView {
                         paths_enumerated,
                         step_goal,
                         explain_trace.as_deref_mut(),
+                        caches,
+                        attempt,
+                        leaf,
                     )?
                 }
             };
@@ -7871,6 +7980,9 @@ impl ReadView {
         intermediate_peak: &mut usize,
         paths_enumerated: &mut usize,
         mut explain_trace: Option<&mut GraphRowExplainTrace>,
+        caches: &mut GraphRowExecutionCaches,
+        attempt: &mut GraphRowCacheAttempt,
+        leaf: &mut GraphRowLeafTransientState,
     ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
         if left_rows.is_empty() {
             if let Some(trace) = explain_trace.as_deref_mut() {
@@ -7885,8 +7997,23 @@ impl ReadView {
             return Ok(left_rows);
         }
 
-        let group_physical_plan =
-            self.plan_graph_row_physical(query, &group.runtime, query.options.include_plan)?;
+        let group_physical_plan = if let Some(plan) = caches
+            .optional_physical_plans
+            .get(group.piece_path.as_ref())
+        {
+            ProductionRc::clone(plan)
+        } else {
+            let plan = ProductionRc::new(self.plan_graph_row_physical(
+                query,
+                &group.runtime,
+                query.options.include_plan,
+                false,
+            )?);
+            caches
+                .optional_physical_plans
+                .insert(group.piece_path.clone(), ProductionRc::clone(&plan));
+            plan
+        };
         if group.dependency_slots.is_empty() {
             return self.graph_row_execute_uncorrelated_optional_group(
                 query,
@@ -7900,6 +8027,9 @@ impl ReadView {
                 intermediate_peak,
                 paths_enumerated,
                 explain_trace.as_deref_mut(),
+                caches,
+                attempt,
+                leaf,
             );
         }
 
@@ -7915,6 +8045,9 @@ impl ReadView {
             intermediate_peak,
             paths_enumerated,
             explain_trace,
+            caches,
+            attempt,
+            leaf,
         )
     }
 
@@ -7932,23 +8065,129 @@ impl ReadView {
         intermediate_peak: &mut usize,
         paths_enumerated: &mut usize,
         mut explain_trace: Option<&mut GraphRowExplainTrace>,
+        caches: &mut GraphRowExecutionCaches,
+        attempt: &mut GraphRowCacheAttempt,
+        leaf: &mut GraphRowLeafTransientState,
     ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
         let left_count = left_rows.len();
-        let group_rows = self.graph_row_execute_runtime_plan(
-            query,
-            &group.runtime,
-            group_physical_plan,
-            Some(vec![query.binding_schema.empty_row()]),
-            GraphRowRuntimeGoal::AllRows,
-            effective_at_epoch,
-            policy_cutoffs,
-            followups,
-            frontier_peak,
-            intermediate_peak,
-            paths_enumerated,
-            explain_trace.as_deref_mut(),
-        )?;
-        let group_rows = self.graph_row_apply_optional_where(query, group, group_rows)?;
+        if caches.bypasses_execution_wide_results() {
+            let rows = self.graph_row_execute_runtime_plan_inner(
+                query,
+                &group.runtime,
+                group_physical_plan,
+                Some(vec![query.binding_schema.empty_row()]),
+                GraphRowRuntimeGoal::AllRows,
+                effective_at_epoch,
+                policy_cutoffs,
+                followups,
+                frontier_peak,
+                intermediate_peak,
+                paths_enumerated,
+                explain_trace.as_deref_mut(),
+                caches,
+                attempt,
+                leaf,
+            )?;
+            let group_rows = self.graph_row_apply_optional_where(query, group, rows)?;
+            let mut output = Vec::new();
+            if group_rows.is_empty() {
+                for row in left_rows {
+                    graph_row_push_optional_joined_row(
+                        query,
+                        &mut output,
+                        self.graph_row_null_extend_optional_row(query, group, row)?,
+                    )?;
+                }
+            } else {
+                for left in left_rows {
+                    for group_row in &group_rows {
+                        let mut next = left.clone();
+                        next.copy_slots_from(group_row, &group.introduced_slots)?;
+                        graph_row_push_optional_joined_row(query, &mut output, next)?;
+                    }
+                }
+            }
+            let hit_rows = if group_rows.is_empty() {
+                0
+            } else {
+                left_count.saturating_mul(group_rows.len())
+            };
+            let miss_rows = if group_rows.is_empty() { left_count } else { 0 };
+            if let Some(trace) = explain_trace {
+                trace.record_plan(
+                    "OptionalApplyRuntime",
+                    format!(
+                        "piece_index={}; correlated=false; left_rows={}; reusable_subplan_rows={}; hit_rows={}; miss_rows={}; output_rows={}; left_outer=true; full_scan_per_left_row=false; where_present={}; introduced_slots={}; dependency_slots={}; left_slots={}",
+                        group.piece_index,
+                        left_count,
+                        group_rows.len(),
+                        hit_rows,
+                        miss_rows,
+                        output.len(),
+                        group.where_present,
+                        graph_row_slot_list_detail(query, &group.introduced_slots),
+                        graph_row_slot_list_detail(query, &group.dependency_slots),
+                        graph_row_slot_list_detail(query, &group.left_slots)
+                    ),
+                );
+            }
+            return Ok(output);
+        }
+        let group_rows = if let Some(rows) = leaf
+            .uncorrelated_optional_results
+            .get(group.piece_path.as_ref())
+        {
+            ProductionArc::clone(rows)
+        } else if let Some(rows) = caches
+            .uncorrelated_optional_results
+            .get(group.piece_path.as_ref())
+        {
+            caches.optional_hits = caches.optional_hits.saturating_add(1);
+            #[cfg(test)]
+            self.note_graph_row_optional_group_cache_hit();
+            let rows = ProductionArc::clone(rows);
+            leaf.uncorrelated_optional_results
+                .insert(group.piece_path.clone(), ProductionArc::clone(&rows));
+            rows
+        } else {
+            let rows = self.graph_row_execute_runtime_plan_inner(
+                query,
+                &group.runtime,
+                group_physical_plan,
+                Some(vec![query.binding_schema.empty_row()]),
+                GraphRowRuntimeGoal::AllRows,
+                effective_at_epoch,
+                policy_cutoffs,
+                followups,
+                frontier_peak,
+                intermediate_peak,
+                paths_enumerated,
+                explain_trace.as_deref_mut(),
+                caches,
+                attempt,
+                leaf,
+            )?;
+            let rows = ProductionArc::new(self.graph_row_apply_optional_where(query, group, rows)?);
+            if caches.admit_uncorrelated_optional(
+                group.piece_path.clone(),
+                ProductionArc::clone(&rows),
+                attempt,
+            ) {
+                let retained = caches
+                    .uncorrelated_optional_results
+                    .get(group.piece_path.as_ref())
+                    .expect("admitted optional result must be retained");
+                leaf.uncorrelated_optional_results.insert(
+                    group.piece_path.clone(),
+                    ProductionArc::clone(retained),
+                );
+                ProductionArc::clone(retained)
+            } else {
+                leaf.uncorrelated_optional_results
+                    .insert(group.piece_path.clone(), ProductionArc::clone(&rows));
+                rows
+            }
+        };
         let mut output = Vec::new();
         if group_rows.is_empty() {
             for row in left_rows {
@@ -7960,7 +8199,7 @@ impl ReadView {
             }
         } else {
             for left in left_rows {
-                for group_row in &group_rows {
+                for group_row in group_rows.iter() {
                     let mut next = left.clone();
                     next.copy_slots_from(group_row, &group.introduced_slots)?;
                     graph_row_push_optional_joined_row(query, &mut output, next)?;
@@ -8008,8 +8247,29 @@ impl ReadView {
         intermediate_peak: &mut usize,
         paths_enumerated: &mut usize,
         mut explain_trace: Option<&mut GraphRowExplainTrace>,
+        caches: &mut GraphRowExecutionCaches,
+        attempt: &mut GraphRowCacheAttempt,
+        leaf: &mut GraphRowLeafTransientState,
     ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
         let left_count = left_rows.len();
+        if caches.bypasses_execution_wide_results() {
+            return self.graph_row_execute_correlated_optional_group_uncached(
+                query,
+                group,
+                group_physical_plan,
+                left_rows,
+                effective_at_epoch,
+                policy_cutoffs,
+                followups,
+                frontier_peak,
+                intermediate_peak,
+                paths_enumerated,
+                explain_trace,
+                caches,
+                attempt,
+                leaf,
+            );
+        }
         let mut dependency_null_misses = Vec::new();
         let mut left_groups = Vec::<GraphRowOptionalLeftGroup>::new();
         let mut left_group_by_key: BTreeMap<Vec<crate::graph_row::GraphSortAtom>, usize> =
@@ -8035,14 +8295,37 @@ impl ReadView {
             }
         }
 
-        let representatives = left_groups
-            .iter()
-            .map(|group| group.representative.clone())
-            .collect::<Vec<_>>();
+        let mut resolved_by_key: BTreeMap<
+            Vec<crate::graph_row::GraphSortAtom>,
+            GraphRowCachedRows,
+        > = BTreeMap::new();
+        let mut unresolved_keys = Vec::new();
+        let mut representatives = Vec::new();
+        for left_group in &left_groups {
+            let cache_key = GraphRowCorrelatedOptionalCacheKey {
+                piece_path: group.piece_path.clone(),
+                dependency_key: left_group.key.clone(),
+            };
+            if let Some(rows) = leaf.correlated_optional_results.get(&cache_key) {
+                resolved_by_key.insert(left_group.key.clone(), ProductionArc::clone(rows));
+            } else if let Some(rows) = caches.correlated_optional_results.get(&cache_key) {
+                caches.optional_hits = caches.optional_hits.saturating_add(1);
+                #[cfg(test)]
+                self.note_graph_row_optional_group_cache_hit();
+                let rows = ProductionArc::clone(rows);
+                leaf.correlated_optional_results
+                    .insert(cache_key, ProductionArc::clone(&rows));
+                resolved_by_key.insert(left_group.key.clone(), rows);
+            } else {
+                unresolved_keys.push((left_group.key.clone(), cache_key));
+                representatives.push(left_group.representative.clone());
+            }
+        }
+
         let mut group_rows = if representatives.is_empty() {
             Vec::new()
         } else {
-            self.graph_row_execute_runtime_plan(
+            self.graph_row_execute_runtime_plan_inner(
                 query,
                 &group.runtime,
                 group_physical_plan,
@@ -8055,26 +8338,49 @@ impl ReadView {
                 intermediate_peak,
                 paths_enumerated,
                 explain_trace.as_deref_mut(),
+                caches,
+                attempt,
+                leaf,
             )?
         };
         group_rows = self.graph_row_apply_optional_where(query, group, group_rows)?;
 
-        let mut hits_by_key: BTreeMap<Vec<crate::graph_row::GraphSortAtom>, Vec<crate::graph_row::GraphBindingRow>> =
+        let mut computed_by_key: BTreeMap<Vec<crate::graph_row::GraphSortAtom>, Vec<crate::graph_row::GraphBindingRow>> =
             BTreeMap::new();
         for row in group_rows {
             let key = row.logical_sort_key_for_slots(&query.binding_schema, &group.dependency_slots)?;
-            hits_by_key.entry(key).or_default().push(row);
+            computed_by_key.entry(key).or_default().push(row);
+        }
+        for (dependency_key, cache_key) in unresolved_keys {
+            let rows = ProductionArc::new(computed_by_key.remove(&dependency_key).unwrap_or_default());
+            let retained = if caches.admit_correlated_optional(
+                cache_key.clone(),
+                ProductionArc::clone(&rows),
+                attempt,
+            ) {
+                ProductionArc::clone(
+                    caches
+                        .correlated_optional_results
+                        .get(&cache_key)
+                        .expect("admitted correlated optional result must be retained"),
+                )
+            } else {
+                rows
+            };
+            leaf.correlated_optional_results
+                .insert(cache_key, ProductionArc::clone(&retained));
+            resolved_by_key.insert(dependency_key, retained);
         }
 
         let mut output = Vec::new();
         let mut hit_groups = 0usize;
         let mut missed_groups = 0usize;
         for left_group in left_groups {
-            match hits_by_key.get(&left_group.key) {
+            match resolved_by_key.get(&left_group.key) {
                 Some(hits) if !hits.is_empty() => {
                     hit_groups = hit_groups.saturating_add(1);
                     for left in left_group.rows {
-                        for hit in hits {
+                        for hit in hits.iter() {
                             let mut next = left.clone();
                             next.copy_slots_from(hit, &group.introduced_slots)?;
                             graph_row_push_optional_joined_row(query, &mut output, next)?;
@@ -8123,6 +8429,137 @@ impl ReadView {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn graph_row_execute_correlated_optional_group_uncached(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        group: &GraphRowRuntimeOptionalGroup,
+        group_physical_plan: &GraphRowPhysicalPlan,
+        left_rows: Vec<crate::graph_row::GraphBindingRow>,
+        effective_at_epoch: i64,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        followups: &mut Vec<SecondaryIndexReadFollowup>,
+        frontier_peak: &mut usize,
+        intermediate_peak: &mut usize,
+        paths_enumerated: &mut usize,
+        mut explain_trace: Option<&mut GraphRowExplainTrace>,
+        caches: &mut GraphRowExecutionCaches,
+        attempt: &mut GraphRowCacheAttempt,
+        leaf: &mut GraphRowLeafTransientState,
+    ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+        let left_count = left_rows.len();
+        let mut dependency_null_misses = Vec::new();
+        let mut left_groups = Vec::<GraphRowOptionalLeftGroup>::new();
+        let mut left_group_by_key: BTreeMap<Vec<crate::graph_row::GraphSortAtom>, usize> =
+            BTreeMap::new();
+        for row in left_rows {
+            if graph_row_any_slot_null(&row, &group.dependency_slots)? {
+                dependency_null_misses.push(row);
+                continue;
+            }
+            let key = row.logical_sort_key_for_slots(&query.binding_schema, &group.dependency_slots)?;
+            match left_group_by_key.get(&key).copied() {
+                Some(index) => left_groups[index].rows.push(row),
+                None => {
+                    let index = left_groups.len();
+                    left_group_by_key.insert(key.clone(), index);
+                    left_groups.push(GraphRowOptionalLeftGroup {
+                        key,
+                        representative: row.clone(),
+                        rows: vec![row],
+                    });
+                }
+            }
+        }
+        let representatives = left_groups
+            .iter()
+            .map(|group| group.representative.clone())
+            .collect::<Vec<_>>();
+        let mut group_rows = if representatives.is_empty() {
+            Vec::new()
+        } else {
+            self.graph_row_execute_runtime_plan_inner(
+                query,
+                &group.runtime,
+                group_physical_plan,
+                Some(representatives),
+                GraphRowRuntimeGoal::AllRows,
+                effective_at_epoch,
+                policy_cutoffs,
+                followups,
+                frontier_peak,
+                intermediate_peak,
+                paths_enumerated,
+                explain_trace.as_deref_mut(),
+                caches,
+                attempt,
+                leaf,
+            )?
+        };
+        group_rows = self.graph_row_apply_optional_where(query, group, group_rows)?;
+        let mut hits_by_key: BTreeMap<
+            Vec<crate::graph_row::GraphSortAtom>,
+            Vec<crate::graph_row::GraphBindingRow>,
+        > = BTreeMap::new();
+        for row in group_rows {
+            let key = row.logical_sort_key_for_slots(&query.binding_schema, &group.dependency_slots)?;
+            hits_by_key.entry(key).or_default().push(row);
+        }
+        let mut output = Vec::new();
+        let mut hit_groups = 0usize;
+        let mut missed_groups = 0usize;
+        for left_group in left_groups {
+            match hits_by_key.get(&left_group.key) {
+                Some(hits) if !hits.is_empty() => {
+                    hit_groups = hit_groups.saturating_add(1);
+                    for left in left_group.rows {
+                        for hit in hits {
+                            let mut next = left.clone();
+                            next.copy_slots_from(hit, &group.introduced_slots)?;
+                            graph_row_push_optional_joined_row(query, &mut output, next)?;
+                        }
+                    }
+                }
+                _ => {
+                    missed_groups = missed_groups.saturating_add(1);
+                    for left in left_group.rows {
+                        graph_row_push_optional_joined_row(
+                            query,
+                            &mut output,
+                            self.graph_row_null_extend_optional_row(query, group, left)?,
+                        )?;
+                    }
+                }
+            }
+        }
+        let dependency_null_miss_rows = dependency_null_misses.len();
+        for row in dependency_null_misses {
+            missed_groups = missed_groups.saturating_add(1);
+            graph_row_push_optional_joined_row(
+                query,
+                &mut output,
+                self.graph_row_null_extend_optional_row(query, group, row)?,
+            )?;
+        }
+        if let Some(trace) = explain_trace {
+            trace.record_plan(
+                "OptionalApplyRuntime",
+                format!(
+                    "piece_index={}; correlated=true; left_rows={left_count}; distinct_dependency_bindings={}; dependency_null_misses={}; hit_groups={hit_groups}; missed_groups={missed_groups}; output_rows={}; left_outer=true; batched_by_dependency_bindings=true; where_present={}; introduced_slots={}; dependency_slots={}; left_slots={}",
+                    group.piece_index,
+                    left_group_by_key.len(),
+                    dependency_null_miss_rows,
+                    output.len(),
+                    group.where_present,
+                    graph_row_slot_list_detail(query, &group.introduced_slots),
+                    graph_row_slot_list_detail(query, &group.dependency_slots),
+                    graph_row_slot_list_detail(query, &group.left_slots)
+                ),
+            );
+        }
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn graph_row_execute_variable_length(
         &self,
         query: &NormalizedGraphRowQuery,
@@ -8136,6 +8573,9 @@ impl ReadView {
         paths_enumerated: &mut usize,
         goal: GraphRowRuntimeGoal,
         mut explain_trace: Option<&mut GraphRowExplainTrace>,
+        caches: &mut GraphRowExecutionCaches,
+        attempt: &mut GraphRowCacheAttempt,
+        leaf: &mut GraphRowLeafTransientState,
     ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
         if left_rows.is_empty() {
             if let Some(trace) = explain_trace.as_deref_mut() {
@@ -8192,6 +8632,9 @@ impl ReadView {
                 paths_enumerated,
                 goal,
                 explain_trace.as_deref_mut(),
+                caches,
+                attempt,
+                leaf,
             );
         }
 
@@ -8199,8 +8642,7 @@ impl ReadView {
         let to_node = graph_row_runtime_node(runtime, &path.to_alias)?;
         let mut output = Vec::new();
         let mut starts_considered = 0usize;
-        let mut search_cache: BTreeMap<GraphRowVlpSearchKey, GraphRowVlpSearchResult> =
-            BTreeMap::new();
+        let mut observed_search_keys = BTreeSet::new();
         let mut search_cache_hits = 0usize;
         let mut delegated_step_stats =
             explain_trace.is_some().then(GraphRowVlpDelegatedStepStats::default);
@@ -8210,7 +8652,27 @@ impl ReadView {
                 bound_from: row.node_id_for_slot_if_bound(path.from_slot)?,
                 bound_to: row.node_id_for_slot_if_bound(path.to_slot)?,
             };
-            if let std::collections::btree_map::Entry::Vacant(e) = search_cache.entry(key) {
+            observed_search_keys.insert(key);
+            let cache_key = GraphRowVlpResultCacheKey {
+                piece_path: path.piece_path.clone(),
+                search_key: key,
+            };
+            let search_result = if let Some(result) = leaf.vlp_results.get(&cache_key) {
+                search_cache_hits = search_cache_hits.saturating_add(1);
+                ProductionArc::clone(result)
+            } else if let Some(result) = caches
+                .can_read_global_results()
+                .then(|| caches.vlp_results.get(&cache_key))
+                .flatten()
+            {
+                caches.vlp_hits = caches.vlp_hits.saturating_add(1);
+                #[cfg(test)]
+                self.note_graph_row_vlp_cross_chunk_cache_hit();
+                let result = ProductionArc::clone(result);
+                leaf.vlp_results
+                    .insert(cache_key.clone(), ProductionArc::clone(&result));
+                result
+            } else {
                 let mut per_start_counts: NodeIdMap<usize> = NodeIdMap::default();
                 let seeds = self.graph_row_vlp_seeds(
                     query,
@@ -8242,13 +8704,24 @@ impl ReadView {
                     paths.extend(seed_paths);
                 }
                 *paths_enumerated = paths_enumerated.saturating_add(paths.len());
-                e.insert(GraphRowVlpSearchResult { seed_count, paths });
-            } else {
-                search_cache_hits = search_cache_hits.saturating_add(1);
-            }
-
-            let Some(search_result) = search_cache.get(&key) else {
-                continue;
+                let result = ProductionArc::new(GraphRowVlpSearchResult { seed_count, paths });
+                let retained = if caches.admit_vlp(
+                    cache_key.clone(),
+                    ProductionArc::clone(&result),
+                    attempt,
+                ) {
+                    ProductionArc::clone(
+                        caches
+                            .vlp_results
+                            .get(&cache_key)
+                            .expect("admitted VLP result must be retained"),
+                    )
+                } else {
+                    result
+                };
+                leaf.vlp_results
+                    .insert(cache_key, ProductionArc::clone(&retained));
+                retained
             };
             starts_considered = starts_considered.saturating_add(search_result.seed_count);
             let mut per_start_counts: NodeIdMap<usize> = NodeIdMap::default();
@@ -8294,7 +8767,7 @@ impl ReadView {
                     graph_row_vlp_context(path),
                     left_count,
                     starts_considered,
-                    search_cache.len(),
+                    observed_search_keys.len(),
                     search_cache_hits,
                     output.len(),
                     path.min_hops,
@@ -8323,6 +8796,9 @@ impl ReadView {
         paths_enumerated: &mut usize,
         goal: GraphRowRuntimeGoal,
         mut explain_trace: Option<&mut GraphRowExplainTrace>,
+        caches: &mut GraphRowExecutionCaches,
+        attempt: &mut GraphRowCacheAttempt,
+        leaf: &mut GraphRowLeafTransientState,
     ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
         let temp_edge = GraphRowRuntimeEdge {
             alias: path.edge_alias.clone(),
@@ -8350,31 +8826,59 @@ impl ReadView {
         } else {
             None
         };
-        let candidate_batch = self.graph_row_fixed_edge_candidates(
-            query,
-            &temp_edge,
-            None,
-            &rows,
-            effective_at_epoch,
-            policy_cutoffs,
-            followups,
-            frontier_peak,
-            edge_explain_trace,
-            Some(path),
-        )?;
-        if candidate_batch.edges.is_empty() {
-            if let Some(trace) = explain_trace.as_deref_mut() {
-                trace.record_plan(
-                    "VariableLengthPathRuntime",
-                    format!(
-                        "piece_index={}; path={}; one_hop_fixed_equivalent=true; output_rows=0",
-                        path.piece_index,
-                        graph_row_vlp_context(path)
-                    ),
-                );
+        let mut row_keys = Vec::with_capacity(rows.len());
+        let mut missing_keys = Vec::new();
+        let mut missing_rows = Vec::new();
+        let mut seen_missing = BTreeSet::new();
+        let mut cross_invocation_keys = BTreeSet::new();
+        for row in &rows {
+            let search_key = GraphRowVlpSearchKey {
+                bound_from: row.node_id_for_slot_if_bound(path.from_slot)?,
+                bound_to: row.node_id_for_slot_if_bound(path.to_slot)?,
+            };
+            let cache_key = GraphRowVlpResultCacheKey {
+                piece_path: path.piece_path.clone(),
+                search_key,
+            };
+            row_keys.push(cache_key.clone());
+            if leaf.vlp_results.contains_key(&cache_key) {
+                continue;
             }
-            return Ok(Vec::new());
+            if caches.can_read_global_results() {
+                if let Some(result) = caches.vlp_results.get(&cache_key) {
+                    caches.vlp_hits = caches.vlp_hits.saturating_add(1);
+                    #[cfg(test)]
+                    self.note_graph_row_vlp_cross_chunk_cache_hit();
+                    leaf.vlp_results
+                        .insert(cache_key.clone(), ProductionArc::clone(result));
+                    cross_invocation_keys.insert(cache_key);
+                    continue;
+                }
+            }
+            if seen_missing.insert(cache_key.clone()) {
+                missing_keys.push(cache_key);
+                missing_rows.push(row.clone());
+            }
         }
+        let candidate_batch = if missing_rows.is_empty() {
+            GraphRowFixedEdgeCandidates {
+                edges: Vec::new(),
+                endpoints_verified: false,
+            }
+        } else {
+            self.graph_row_fixed_edge_candidates(
+                query,
+                &temp_edge,
+                None,
+                &missing_rows,
+                effective_at_epoch,
+                policy_cutoffs,
+                followups,
+                frontier_peak,
+                edge_explain_trace,
+                Some(path),
+            )?
+        };
 
         let from_node = graph_row_runtime_node(runtime, &path.from_alias)?;
         let to_node = graph_row_runtime_node(runtime, &path.to_alias)?;
@@ -8384,13 +8888,19 @@ impl ReadView {
             from_candidates.push(candidate.logical_from);
             to_candidates.push(candidate.logical_to);
         }
-        let verified_from = self.graph_row_verified_or_proven_node_ids(
-            from_node,
-            from_candidates,
-            policy_cutoffs,
-            candidate_batch.endpoints_verified,
-        )?;
-        let verified_to = if from_node.alias == to_node.alias {
+        let verified_from = if from_candidates.is_empty() {
+            NodeIdSet::default()
+        } else {
+            self.graph_row_verified_or_proven_node_ids(
+                from_node,
+                from_candidates,
+                policy_cutoffs,
+                candidate_batch.endpoints_verified,
+            )?
+        };
+        let verified_to = if to_candidates.is_empty() {
+            NodeIdSet::default()
+        } else if from_node.alias == to_node.alias {
             verified_from.clone()
         } else {
             self.graph_row_verified_or_proven_node_ids(
@@ -8403,11 +8913,10 @@ impl ReadView {
 
         let candidates = candidate_batch.edges;
         let buckets = GraphRowEdgeCandidateBuckets::new(&candidates);
-        let mut output = Vec::new();
-        for row in rows {
+        for cache_key in &missing_keys {
             let mut per_start_counts: NodeIdMap<usize> = NodeIdMap::default();
-            let bound_from = row.node_id_for_slot_if_bound(path.from_slot)?;
-            let bound_to = row.node_id_for_slot_if_bound(path.to_slot)?;
+            let bound_from = cache_key.search_key.bound_from;
+            let bound_to = cache_key.search_key.bound_to;
             let all_indices;
             let indices = match buckets.indices_for(bound_from, bound_to) {
                 Some(indices) => indices,
@@ -8415,8 +8924,9 @@ impl ReadView {
                     all_indices = (0..candidates.len()).collect::<Vec<_>>();
                     all_indices.as_slice()
                 }
-                None => continue,
+                None => &[],
             };
+            let mut paths = Vec::new();
             for &candidate_index in indices {
                 let candidate = &candidates[candidate_index];
                 if bound_from.is_some_and(|node_id| node_id != candidate.logical_from)
@@ -8439,20 +8949,80 @@ impl ReadView {
                     ));
                 }
                 *count += 1;
-                let graph_path = GraphPath {
+                paths.push(GraphPath {
                     nodes: vec![candidate.logical_from, candidate.logical_to],
                     edges: vec![candidate.meta.id],
-                };
-                self.graph_row_push_vlp_path_row(query, path, &row, graph_path, &mut output)?;
+                });
+                if goal.is_exists_one() {
+                    break;
+                }
+            }
+            let result = ProductionArc::new(GraphRowVlpSearchResult {
+                seed_count: usize::from(!paths.is_empty()),
+                paths,
+            });
+            let retained = if !goal.is_exists_one()
+                && caches.admit_vlp(
+                    cache_key.clone(),
+                    ProductionArc::clone(&result),
+                    attempt,
+                )
+            {
+                ProductionArc::clone(
+                    caches
+                        .vlp_results
+                        .get(cache_key)
+                        .expect("admitted one-hop VLP result must be retained"),
+                )
+            } else {
+                result
+            };
+            leaf.vlp_results
+                .insert(cache_key.clone(), ProductionArc::clone(&retained));
+            if goal.is_exists_one() && !retained.paths.is_empty() {
+                break;
+            }
+        }
+
+        let mut output = Vec::new();
+        for (row, cache_key) in rows.into_iter().zip(row_keys) {
+            let Some(result) = leaf.vlp_results.get(&cache_key) else {
+                continue;
+            };
+            let before = output.len();
+            for graph_path in &result.paths {
+                self.graph_row_push_vlp_path_row(
+                    query,
+                    path,
+                    &row,
+                    graph_path.clone(),
+                    &mut output,
+                )?;
                 if goal.reached(output.len()) {
                     break;
                 }
+            }
+            if !cross_invocation_keys.contains(&cache_key) {
+                *paths_enumerated = paths_enumerated
+                    .saturating_add(output.len().saturating_sub(before));
             }
             if goal.reached(output.len()) {
                 break;
             }
         }
-        *paths_enumerated = paths_enumerated.saturating_add(output.len());
+        if candidates.is_empty() && output.is_empty() {
+            if let Some(trace) = explain_trace.as_deref_mut() {
+                trace.record_plan(
+                    "VariableLengthPathRuntime",
+                    format!(
+                        "piece_index={}; path={}; one_hop_fixed_equivalent=true; output_rows=0",
+                        path.piece_index,
+                        graph_row_vlp_context(path)
+                    ),
+                );
+            }
+            return Ok(output);
+        }
         if let Some(trace) = explain_trace {
             trace.record_plan(
                 "VariableLengthPathRuntime",
@@ -9892,6 +10462,7 @@ impl ReadView {
             EdgeEndpointPlannerStats {
                 estimate,
                 stream_cursor_count_upper_bound: 0,
+                segment_stats_fallback: false,
             },
         );
         source.plan_cost()

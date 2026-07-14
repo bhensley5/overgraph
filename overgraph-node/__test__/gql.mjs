@@ -568,6 +568,40 @@ describe('GQL connector API', () => {
     assert.equal(asyncExplain.read.target, 'graph_row_query');
   });
 
+  it('exposes chunked GQL early exit with deterministic rows and plan', () => {
+    const expected = [];
+    for (let sourceOrdinal = 0; sourceOrdinal < 20; sourceOrdinal += 1) {
+      const sourceId = db.upsertNode(
+        'GqlEarlySource',
+        `node-gql-early-source-${sourceOrdinal}`
+      );
+      for (let targetOrdinal = 0; targetOrdinal < 5; targetOrdinal += 1) {
+        const targetId = db.upsertNode(
+          'GqlEarlyTarget',
+          `node-gql-early-target-${sourceOrdinal}-${targetOrdinal}`
+        );
+        const edgeId = db.upsertEdge(sourceId, targetId, 'GQL_EARLY_EDGE');
+        if (expected.length < 10) {
+          expected.push({ source_id: sourceId, edge_id: edgeId, target_id: targetId });
+        }
+      }
+    }
+    const query = `MATCH (source:GqlEarlySource)-[edge:GQL_EARLY_EDGE]->(target)
+                   RETURN id(source) AS source_id, id(edge) AS edge_id,
+                          id(target) AS target_id LIMIT 10`;
+    const first = db.executeGql(query, null, { includePlan: true });
+    assert.deepEqual(first.rows, expected);
+    assert.equal(first.nextCursor, null);
+    assert.equal(first.plan.read.target, 'graph_row_query');
+    const projection = first.plan.read.projection.join('\n');
+    assert.match(projection, /ChunkedRowProductionRuntime/);
+    assert.match(projection, /early_exit=true/);
+
+    const repeat = db.executeGql(query, null, { includePlan: true });
+    assert.deepEqual(repeat.rows, expected);
+    assert.equal(repeat.nextCursor, null);
+  });
+
   it('executes Phase 34 WITH, rich expressions, DISTINCT, aggregation, and compact rows', () => {
     const rich = db.executeGql(
       `MATCH (n:Person)

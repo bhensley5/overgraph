@@ -632,6 +632,46 @@ def test_gql_explain_sync(db):
     assert explain["columns"] == ["n.name"]
 
 
+def test_gql_chunked_early_exit_rows_order_and_plan(db):
+    expected = []
+    for source_ordinal in range(20):
+        source_id = db.upsert_node(
+            "GqlEarlySource",
+            f"python-gql-early-source-{source_ordinal}",
+        )
+        for target_ordinal in range(5):
+            target_id = db.upsert_node(
+                "GqlEarlyTarget",
+                f"python-gql-early-target-{source_ordinal}-{target_ordinal}",
+            )
+            edge_id = db.upsert_edge(source_id, target_id, "GQL_EARLY_EDGE")
+            if len(expected) < 10:
+                expected.append(
+                    {
+                        "source_id": source_id,
+                        "edge_id": edge_id,
+                        "target_id": target_id,
+                    }
+                )
+
+    query = """
+        MATCH (source:GqlEarlySource)-[edge:GQL_EARLY_EDGE]->(target)
+        RETURN id(source) AS source_id, id(edge) AS edge_id,
+               id(target) AS target_id LIMIT 10
+    """
+    first = db.execute_gql(query, include_plan=True)
+    assert first["rows"] == expected
+    assert first["next_cursor"] is None
+    assert first["plan"]["read"]["target"] == "graph_row_query"
+    projection = "\n".join(first["plan"]["read"]["projection"])
+    assert "ChunkedRowProductionRuntime" in projection
+    assert "early_exit=true" in projection
+
+    repeat = db.execute_gql(query, include_plan=True)
+    assert repeat["rows"] == expected
+    assert repeat["next_cursor"] is None
+
+
 @pytest.mark.asyncio
 async def test_gql_explain_async(async_db):
     await seed_async(async_db)
