@@ -952,8 +952,13 @@ impl ReadView {
             .graph_row_query_calls
             .fetch_add(1, Ordering::Relaxed);
         let runtime = self.normalize_graph_row_runtime_plan(query)?;
-        let physical_plan =
-            self.plan_graph_row_physical(query, &runtime, include_plan, false)?;
+        let physical_plan = self.plan_graph_row_physical_with_ordered_context(
+            query,
+            &runtime,
+            include_plan,
+            false,
+            GraphRowOrderedProductionContext::disabled(),
+        )?;
         let policy_cutoffs = self.query_policy_cutoffs();
         let cursor_state = GraphRowCursorState {
             decoded: None,
@@ -1096,7 +1101,13 @@ impl ReadView {
             .graph_row_query_calls
             .fetch_add(1, Ordering::Relaxed);
         let runtime = self.normalize_graph_row_runtime_plan(query)?;
-        let physical_plan = self.plan_graph_row_physical(query, &runtime, false, false)?;
+        let physical_plan = self.plan_graph_row_physical_with_ordered_context(
+            query,
+            &runtime,
+            false,
+            false,
+            GraphRowOrderedProductionContext::disabled(),
+        )?;
         let policy_cutoffs = self.query_policy_cutoffs();
         let cursor_state = GraphRowCursorState {
             decoded: None,

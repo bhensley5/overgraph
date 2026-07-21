@@ -3340,6 +3340,7 @@ fn resolve_manifest_prune_policy(
     })
 }
 
+#[derive(Clone)]
 struct PrecomputedPruneCutoffs {
     /// (age_cutoff, max_weight, label_id) per policy.
     policies: Vec<(Option<i64>, Option<f32>, Option<u32>)>,
@@ -3476,11 +3477,14 @@ struct QueryExecutionCounters {
     edge_record_hydration_calls: AtomicUsize,
     edge_verifier_metadata_lookup_calls: AtomicUsize,
     edge_verifier_metadata_lookup_ids: AtomicUsize,
+    adjacency_newest_opinion_resolution_calls: AtomicUsize,
+    adjacency_newest_opinion_resolution_ids: AtomicUsize,
     equality_materialization_record_reads: AtomicUsize,
     final_verifier_record_reads: AtomicUsize,
     edge_full_scan_pages: AtomicUsize,
     endpoint_adjacency_candidates: AtomicUsize,
     graph_row_query_calls: AtomicUsize,
+    graph_row_edge_pull_executions: AtomicUsize,
     graph_row_chunks_executed: AtomicUsize,
     graph_row_chunk_cap_retries: AtomicUsize,
     graph_row_chunk_early_exits: AtomicUsize,
@@ -3495,6 +3499,13 @@ struct QueryExecutionCounters {
     graph_row_result_cache_units_peak: AtomicUsize,
     graph_row_result_cache_no_admit: AtomicUsize,
     graph_row_unique_followups_peak: AtomicUsize,
+    graph_row_node_verification_resolutions: AtomicUsize,
+    graph_row_node_verification_cache_hits: AtomicUsize,
+    graph_row_node_verification_cache_units_peak: AtomicUsize,
+    graph_row_node_verification_set_builds: AtomicUsize,
+    graph_row_all_candidate_endpoints_proven: AtomicUsize,
+    graph_row_fixed_edge_bucket_builds: AtomicUsize,
+    graph_row_fixed_edge_workspace_growths: AtomicUsize,
     selected_field_reads: SelectedFieldReadCounters,
     public_node_query_calls: AtomicUsize,
     public_edge_query_calls: AtomicUsize,
@@ -3525,11 +3536,14 @@ pub(crate) struct QueryExecutionCounterSnapshot {
     pub edge_record_hydration_calls: usize,
     pub edge_verifier_metadata_lookup_calls: usize,
     pub edge_verifier_metadata_lookup_ids: usize,
+    pub adjacency_newest_opinion_resolution_calls: usize,
+    pub adjacency_newest_opinion_resolution_ids: usize,
     pub equality_materialization_record_reads: usize,
     pub final_verifier_record_reads: usize,
     pub edge_full_scan_pages: usize,
     pub endpoint_adjacency_candidates: usize,
     pub graph_row_query_calls: usize,
+    pub graph_row_edge_pull_executions: usize,
     pub graph_row_chunks_executed: usize,
     pub graph_row_chunk_cap_retries: usize,
     pub graph_row_chunk_early_exits: usize,
@@ -3544,6 +3558,13 @@ pub(crate) struct QueryExecutionCounterSnapshot {
     pub graph_row_result_cache_units_peak: usize,
     pub graph_row_result_cache_no_admit: usize,
     pub graph_row_unique_followups_peak: usize,
+    pub graph_row_node_verification_resolutions: usize,
+    pub graph_row_node_verification_cache_hits: usize,
+    pub graph_row_node_verification_cache_units_peak: usize,
+    pub graph_row_node_verification_set_builds: usize,
+    pub graph_row_all_candidate_endpoints_proven: usize,
+    pub graph_row_fixed_edge_bucket_builds: usize,
+    pub graph_row_fixed_edge_workspace_growths: usize,
     pub node_selected_field_batches: usize,
     pub node_selected_field_ids: usize,
     pub edge_selected_field_batches: usize,
@@ -3568,6 +3589,129 @@ pub(crate) struct QueryExecutionCounterSnapshot {
     pub streamed_edge_leaf_demotions: usize,
     pub streamed_edge_cursor_seeks: usize,
     pub streamed_edge_candidates_emitted: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PreparedEdgeSourceTestSnapshot {
+    pub branch_plans: usize,
+    pub preparations: usize,
+    pub native_cursor_builds: usize,
+    pub streamed_cursor_builds: usize,
+    pub eager_materializations: usize,
+    pub buffered_sorts: usize,
+    pub fallback_selections: usize,
+    pub retained_id_units_peak: usize,
+    pub verification_endpoint_cache_units_peak: usize,
+    pub verification_endpoint_cache_retained_peak: usize,
+    pub verification_endpoint_cache_transient_peak: usize,
+    pub verification_endpoint_visibility_resolutions: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREPARED_EDGE_SOURCE_TEST_COUNTERS: std::cell::Cell<PreparedEdgeSourceTestSnapshot> =
+        const { std::cell::Cell::new(PreparedEdgeSourceTestSnapshot {
+            branch_plans: 0,
+            preparations: 0,
+            native_cursor_builds: 0,
+            streamed_cursor_builds: 0,
+            eager_materializations: 0,
+            buffered_sorts: 0,
+            fallback_selections: 0,
+            retained_id_units_peak: 0,
+            verification_endpoint_cache_units_peak: 0,
+            verification_endpoint_cache_retained_peak: 0,
+            verification_endpoint_cache_transient_peak: 0,
+            verification_endpoint_visibility_resolutions: 0,
+        }) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_prepared_edge_source_test_snapshot() {
+    PREPARED_EDGE_SOURCE_TEST_COUNTERS.with(|counters| counters.set(Default::default()));
+}
+
+#[cfg(test)]
+pub(crate) fn prepared_edge_source_test_snapshot() -> PreparedEdgeSourceTestSnapshot {
+    PREPARED_EDGE_SOURCE_TEST_COUNTERS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn update_prepared_edge_source_test_snapshot(
+    update: impl FnOnce(&mut PreparedEdgeSourceTestSnapshot),
+) {
+    PREPARED_EDGE_SOURCE_TEST_COUNTERS.with(|counters| {
+        let mut snapshot = counters.get();
+        update(&mut snapshot);
+        counters.set(snapshot);
+    });
+}
+
+#[cfg(test)]
+fn note_prepared_edge_branch_plan() {
+    update_prepared_edge_source_test_snapshot(|snapshot| snapshot.branch_plans += 1);
+}
+
+#[cfg(test)]
+fn note_prepared_edge_preparation() {
+    update_prepared_edge_source_test_snapshot(|snapshot| snapshot.preparations += 1);
+}
+
+#[cfg(test)]
+fn note_prepared_edge_native_cursor_build() {
+    update_prepared_edge_source_test_snapshot(|snapshot| snapshot.native_cursor_builds += 1);
+}
+
+#[cfg(test)]
+fn note_prepared_edge_streamed_cursor_build() {
+    update_prepared_edge_source_test_snapshot(|snapshot| snapshot.streamed_cursor_builds += 1);
+}
+
+#[cfg(test)]
+fn note_prepared_edge_eager_materialization() {
+    update_prepared_edge_source_test_snapshot(|snapshot| snapshot.eager_materializations += 1);
+}
+
+#[cfg(test)]
+fn note_prepared_edge_buffered_sort() {
+    update_prepared_edge_source_test_snapshot(|snapshot| snapshot.buffered_sorts += 1);
+}
+
+#[cfg(test)]
+fn note_prepared_edge_fallback_selection() {
+    update_prepared_edge_source_test_snapshot(|snapshot| snapshot.fallback_selections += 1);
+}
+
+#[cfg(test)]
+fn note_prepared_edge_retained_id_units_peak(units: usize) {
+    update_prepared_edge_source_test_snapshot(|snapshot| {
+        snapshot.retained_id_units_peak = snapshot.retained_id_units_peak.max(units);
+    });
+}
+
+#[cfg(test)]
+fn note_prepared_edge_endpoint_cache_units_peak(retained: usize, transient: usize) {
+    update_prepared_edge_source_test_snapshot(|snapshot| {
+        let units = retained.saturating_add(transient);
+        snapshot.verification_endpoint_cache_units_peak =
+            snapshot.verification_endpoint_cache_units_peak.max(units);
+        snapshot.verification_endpoint_cache_retained_peak = snapshot
+            .verification_endpoint_cache_retained_peak
+            .max(retained);
+        snapshot.verification_endpoint_cache_transient_peak = snapshot
+            .verification_endpoint_cache_transient_peak
+            .max(transient);
+    });
+}
+
+#[cfg(test)]
+fn note_prepared_edge_endpoint_visibility_resolutions(resolutions: usize) {
+    update_prepared_edge_source_test_snapshot(|snapshot| {
+        snapshot.verification_endpoint_visibility_resolutions = snapshot
+            .verification_endpoint_visibility_resolutions
+            .saturating_add(resolutions);
+    });
 }
 
 /// Published read-visible snapshot for CP1 point/dedup reads.
@@ -5347,6 +5491,16 @@ impl ReadView {
     }
 
     #[cfg(test)]
+    fn note_adjacency_newest_opinion_resolution(&self, count: usize) {
+        self.query_execution_counters
+            .adjacency_newest_opinion_resolution_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.query_execution_counters
+            .adjacency_newest_opinion_resolution_ids
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
     fn note_equality_materialization_record_reads(&self, count: usize) {
         self.query_execution_counters
             .equality_materialization_record_reads
@@ -5413,9 +5567,65 @@ impl ReadView {
     }
 
     #[cfg(test)]
+    fn note_graph_row_node_verification_resolutions(&self, count: usize) {
+        self.query_execution_counters
+            .graph_row_node_verification_resolutions
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_node_verification_cache_hit(&self) {
+        self.query_execution_counters
+            .graph_row_node_verification_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_node_verification_cache_units_peak(&self, peak: usize) {
+        self.query_execution_counters
+            .graph_row_node_verification_cache_units_peak
+            .fetch_max(peak, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_node_verification_set_build(&self) {
+        self.query_execution_counters
+            .graph_row_node_verification_set_builds
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_all_candidate_endpoints_proven(&self) {
+        self.query_execution_counters
+            .graph_row_all_candidate_endpoints_proven
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_fixed_edge_bucket_build(&self) {
+        self.query_execution_counters
+            .graph_row_fixed_edge_bucket_builds
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_fixed_edge_workspace_growth(&self) {
+        self.query_execution_counters
+            .graph_row_fixed_edge_workspace_growths
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
     fn note_graph_row_chunk_executed(&self) {
         self.query_execution_counters
             .graph_row_chunks_executed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_graph_row_edge_pull_execution(&self) {
+        self.query_execution_counters
+            .graph_row_edge_pull_executions
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -7306,6 +7516,31 @@ impl DatabaseEngine {
             .unwrap_or(0)
     }
 
+    pub(crate) fn phase44b_write_amplification_snapshot_for_test(
+        &self,
+    ) -> Phase44bWriteAmplificationSnapshot {
+        self.with_core_ref(|core| {
+            let counters = &core.phase44b_write_amplification;
+            Ok(Phase44bWriteAmplificationSnapshot {
+                memtable_rotations: counters.memtable_rotations,
+                wal_generations_created: counters.wal_generations_created,
+                flush_segments_installed: counters.flush_segments_installed,
+                flush_segment_bytes: counters.flush_segment_bytes,
+                auto_compaction_jobs_started: counters.auto_compaction_jobs_started,
+                auto_compaction_jobs_finished: counters.auto_compaction_jobs_finished,
+            })
+        })
+        .expect("snapshot Phase 44b write amplification counters")
+    }
+
+    pub(crate) fn reset_phase44b_write_amplification_for_test(&self) {
+        self.with_core_mut(|core| {
+            core.phase44b_write_amplification = Phase44bWriteAmplificationCounters::default();
+            Ok(())
+        })
+        .expect("reset Phase 44b write amplification counters");
+    }
+
     pub(crate) fn start_bg_compact(&self) -> Result<(), EngineError> {
         self.with_core_mut(|core| core.start_bg_compact())
     }
@@ -7533,6 +7768,16 @@ impl DatabaseEngine {
                 .query_execution_counters
                 .edge_verifier_metadata_lookup_ids
                 .load(Ordering::Relaxed),
+            adjacency_newest_opinion_resolution_calls: published
+                .view
+                .query_execution_counters
+                .adjacency_newest_opinion_resolution_calls
+                .load(Ordering::Relaxed),
+            adjacency_newest_opinion_resolution_ids: published
+                .view
+                .query_execution_counters
+                .adjacency_newest_opinion_resolution_ids
+                .load(Ordering::Relaxed),
             equality_materialization_record_reads: published
                 .view
                 .query_execution_counters
@@ -7557,6 +7802,11 @@ impl DatabaseEngine {
                 .view
                 .query_execution_counters
                 .graph_row_query_calls
+                .load(Ordering::Relaxed),
+            graph_row_edge_pull_executions: published
+                .view
+                .query_execution_counters
+                .graph_row_edge_pull_executions
                 .load(Ordering::Relaxed),
             graph_row_chunks_executed: published
                 .view
@@ -7627,6 +7877,41 @@ impl DatabaseEngine {
                 .view
                 .query_execution_counters
                 .graph_row_unique_followups_peak
+                .load(Ordering::Relaxed),
+            graph_row_node_verification_resolutions: published
+                .view
+                .query_execution_counters
+                .graph_row_node_verification_resolutions
+                .load(Ordering::Relaxed),
+            graph_row_node_verification_cache_hits: published
+                .view
+                .query_execution_counters
+                .graph_row_node_verification_cache_hits
+                .load(Ordering::Relaxed),
+            graph_row_node_verification_cache_units_peak: published
+                .view
+                .query_execution_counters
+                .graph_row_node_verification_cache_units_peak
+                .load(Ordering::Relaxed),
+            graph_row_node_verification_set_builds: published
+                .view
+                .query_execution_counters
+                .graph_row_node_verification_set_builds
+                .load(Ordering::Relaxed),
+            graph_row_all_candidate_endpoints_proven: published
+                .view
+                .query_execution_counters
+                .graph_row_all_candidate_endpoints_proven
+                .load(Ordering::Relaxed),
+            graph_row_fixed_edge_bucket_builds: published
+                .view
+                .query_execution_counters
+                .graph_row_fixed_edge_bucket_builds
+                .load(Ordering::Relaxed),
+            graph_row_fixed_edge_workspace_growths: published
+                .view
+                .query_execution_counters
+                .graph_row_fixed_edge_workspace_growths
                 .load(Ordering::Relaxed),
             node_selected_field_batches: published
                 .view
@@ -7787,6 +8072,16 @@ impl DatabaseEngine {
         published
             .view
             .query_execution_counters
+            .adjacency_newest_opinion_resolution_calls
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .adjacency_newest_opinion_resolution_ids
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
             .equality_materialization_record_reads
             .store(0, Ordering::Relaxed);
         published
@@ -7808,6 +8103,11 @@ impl DatabaseEngine {
             .view
             .query_execution_counters
             .graph_row_query_calls
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_edge_pull_executions
             .store(0, Ordering::Relaxed);
         published
             .view
@@ -7878,6 +8178,41 @@ impl DatabaseEngine {
             .view
             .query_execution_counters
             .graph_row_unique_followups_peak
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_node_verification_resolutions
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_node_verification_cache_hits
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_node_verification_cache_units_peak
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_node_verification_set_builds
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_all_candidate_endpoints_proven
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_fixed_edge_bucket_builds
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .graph_row_fixed_edge_workspace_growths
             .store(0, Ordering::Relaxed);
         published
             .view
@@ -8283,6 +8618,8 @@ struct EngineCore {
     schema_validation_overlay_builds: Arc<AtomicUsize>,
     #[cfg(test)]
     schema_validation_incident_scan_chunks: Arc<AtomicUsize>,
+    #[cfg(test)]
+    phase44b_write_amplification: Phase44bWriteAmplificationCounters,
     /// Monotonic shared view of the latest durable engine_seq.
     engine_seq_seen: Arc<AtomicU64>,
     /// Shared runtime node-label/edge-label catalog. Manifest writers merge this
@@ -8393,6 +8730,8 @@ struct BgCompactHandle {
     cancel: Arc<AtomicBool>,
     /// Durable completion signal used by lifecycle polling before join.
     completed: Arc<AtomicBool>,
+    #[cfg(test)]
+    automatically_scheduled: bool,
 }
 
 struct BgCompactCompletionSignal {
@@ -8457,6 +8796,73 @@ struct SecondaryIndexBgHandle {
     job_tx: std::sync::mpsc::Sender<SecondaryIndexJob>,
     handle: Option<JoinHandle<()>>,
     cancel: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct Phase44bWriteAmplificationCounters {
+    memtable_rotations: u64,
+    wal_generations_created: u64,
+    flush_segments_installed: u64,
+    flush_segment_bytes: u64,
+    auto_compaction_jobs_started: u64,
+    auto_compaction_jobs_finished: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Phase44bWriteAmplificationSnapshot {
+    pub memtable_rotations: u64,
+    pub wal_generations_created: u64,
+    pub flush_segments_installed: u64,
+    pub flush_segment_bytes: u64,
+    pub auto_compaction_jobs_started: u64,
+    pub auto_compaction_jobs_finished: u64,
+}
+
+#[cfg(test)]
+fn phase44b_checked_add(value: &mut u64, delta: u64, name: &str) {
+    *value = value
+        .checked_add(delta)
+        .unwrap_or_else(|| panic!("Phase 44b {name} counter overflow"));
+}
+
+#[cfg(test)]
+fn phase44b_regular_file_bytes(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|error| panic!("read Phase 44b flush segment {dir:?}: {error}"));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|error| {
+                panic!("read Phase 44b flush segment entry in {dir:?}: {error}")
+            });
+            let file_type = entry.file_type().unwrap_or_else(|error| {
+                panic!(
+                    "read Phase 44b flush segment file type {:?}: {error}",
+                    entry.path()
+                )
+            });
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                let len = entry
+                    .metadata()
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "read Phase 44b flush segment metadata {:?}: {error}",
+                            entry.path()
+                        )
+                    })
+                    .len();
+                total = total
+                    .checked_add(len)
+                    .expect("Phase 44b flush segment byte total overflow");
+            }
+        }
+    }
+    total
 }
 
 #[cfg(test)]
@@ -8942,6 +9348,8 @@ impl EngineCore {
             schema_validation_overlay_builds: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             schema_validation_incident_scan_chunks: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            phase44b_write_amplification: Phase44bWriteAmplificationCounters::default(),
             engine_seq_seen,
             label_catalog,
             runtime_schema_catalog,
@@ -9547,6 +9955,13 @@ impl EngineCore {
         let mut manifest = self.load_current_manifest_for_synced_write()?;
         let result = mutate(&mut manifest)?;
         self.merge_synced_runtime_manifest_state(&mut manifest);
+        #[cfg(test)]
+        if self.runtime_manifest_write_force_error {
+            self.runtime_manifest_write_force_error = false;
+            return Err(EngineError::ManifestError(
+                "test forced runtime manifest write failure".to_string(),
+            ));
+        }
         write_manifest(&self.db_dir, &manifest)?;
         self.manifest = manifest;
         Ok(result)
@@ -9993,6 +10408,20 @@ impl EngineCore {
         );
         self.immutable_bytes_total += frozen_size;
 
+        #[cfg(test)]
+        {
+            phase44b_checked_add(
+                &mut self.phase44b_write_amplification.memtable_rotations,
+                1,
+                "memtable_rotations",
+            );
+            phase44b_checked_add(
+                &mut self.phase44b_write_amplification.wal_generations_created,
+                1,
+                "wal_generations_created",
+            );
+        }
+
         Ok(())
     }
 
@@ -10435,6 +10864,22 @@ impl EngineCore {
                     self.flush_pipeline_error_reported = false;
                 }
 
+                #[cfg(test)]
+                {
+                    let installed_bytes =
+                        phase44b_regular_file_bytes(&segment_dir(&self.db_dir, seg_info.id));
+                    phase44b_checked_add(
+                        &mut self.phase44b_write_amplification.flush_segments_installed,
+                        1,
+                        "flush_segments_installed",
+                    );
+                    phase44b_checked_add(
+                        &mut self.phase44b_write_amplification.flush_segment_bytes,
+                        installed_bytes,
+                        "flush_segment_bytes",
+                    );
+                }
+
                 if !self.compacting {
                     self.flush_count_since_last_compact =
                         self.flush_count_since_last_compact.saturating_add(1);
@@ -10557,7 +11002,22 @@ impl EngineCore {
         {
             return Ok(());
         }
-        self.start_bg_compact()
+        self.start_bg_compact()?;
+        #[cfg(test)]
+        {
+            self.bg_compact
+                .as_mut()
+                .expect("automatic compaction must install a handle")
+                .automatically_scheduled = true;
+            phase44b_checked_add(
+                &mut self
+                    .phase44b_write_amplification
+                    .auto_compaction_jobs_started,
+                1,
+                "auto_compaction_jobs_started",
+            );
+        }
+        Ok(())
     }
 
     /// Spawn a background thread to compact all current segments.
@@ -10622,6 +11082,8 @@ impl EngineCore {
             handle,
             cancel,
             completed,
+            #[cfg(test)]
+            automatically_scheduled: false,
         });
 
         Ok(())
@@ -10651,16 +11113,30 @@ impl EngineCore {
     /// If no bg compact is running, this is a no-op.
     fn cancel_bg_compact(&mut self) {
         if let Some(bg) = self.bg_compact.take() {
+            #[cfg(test)]
+            let automatically_scheduled = bg.automatically_scheduled;
             bg.cancel.store(true, Ordering::Relaxed);
             // Join the thread. It will see the cancel flag and exit early.
             // Discard the result (it's either CompactionCancelled or partial).
             let _ = bg.handle.join();
+            #[cfg(test)]
+            if automatically_scheduled {
+                phase44b_checked_add(
+                    &mut self
+                        .phase44b_write_amplification
+                        .auto_compaction_jobs_finished,
+                    1,
+                    "auto_compaction_jobs_finished",
+                );
+            }
         }
     }
 
     /// Join a background compaction handle and apply its result.
     fn join_bg_compact(&mut self, bg: BgCompactHandle) -> Option<CompactionStats> {
-        match bg.handle.join() {
+        #[cfg(test)]
+        let automatically_scheduled = bg.automatically_scheduled;
+        let stats = match bg.handle.join() {
             Ok(Ok(result)) => self.apply_bg_compact_result(result),
             Ok(Err(e)) => {
                 eprintln!("Background compaction failed: {}", e);
@@ -10670,7 +11146,18 @@ impl EngineCore {
                 eprintln!("Background compaction thread panicked");
                 None
             }
+        };
+        #[cfg(test)]
+        if automatically_scheduled {
+            phase44b_checked_add(
+                &mut self
+                    .phase44b_write_amplification
+                    .auto_compaction_jobs_finished,
+                1,
+                "auto_compaction_jobs_finished",
+            );
         }
+        stats
     }
 
     /// Apply a completed background compaction result: update manifest, swap
@@ -11098,12 +11585,22 @@ impl EngineCore {
         F: FnMut(&CompactionProgress) -> bool,
     {
         // --- Phase 1: Collect tombstones ---
-        let mut deleted_nodes: NodeIdSet = NodeIdSet::default();
-        let mut deleted_edges: NodeIdSet = NodeIdSet::default();
+        let mut deleted_nodes: NodeIdMap<usize> = NodeIdMap::default();
+        let mut deleted_edges: NodeIdMap<usize> = NodeIdMap::default();
         if has_tombstones {
             for (i, seg) in self.segments.iter().enumerate() {
-                deleted_nodes.extend(seg.deleted_node_ids());
-                deleted_edges.extend(seg.deleted_edge_ids());
+                for &id in seg.deleted_node_tombstones().keys() {
+                    deleted_nodes
+                        .entry(id)
+                        .and_modify(|newest_seg_idx| *newest_seg_idx = (*newest_seg_idx).min(i))
+                        .or_insert(i);
+                }
+                for &id in seg.deleted_edge_tombstones().keys() {
+                    deleted_edges
+                        .entry(id)
+                        .and_modify(|newest_seg_idx| *newest_seg_idx = (*newest_seg_idx).min(i))
+                        .or_insert(i);
+                }
 
                 let cont = callback(&CompactionProgress {
                     phase: CompactionPhase::CollectingTombstones,
@@ -12498,8 +12995,8 @@ fn matches_any_prune_policy_meta(
 fn v3_plan_winners(
     segments: &[Arc<SegmentReader>],
     prune_policies: &[ResolvedPrunePolicy],
-    deleted_nodes: &NodeIdSet,
-    deleted_edges: &NodeIdSet,
+    deleted_nodes: &NodeIdMap<usize>,
+    deleted_edges: &NodeIdMap<usize>,
 ) -> Result<V3Plan, EngineError> {
     let now = now_millis();
     let has_policies = !prune_policies.is_empty();
@@ -12521,7 +13018,10 @@ fn v3_plan_winners(
             }
             seen_nodes.insert(meta.node_id);
 
-            if deleted_nodes.contains(&meta.node_id) {
+            if deleted_nodes
+                .get(&meta.node_id)
+                .is_some_and(|deleted_seg_idx| *deleted_seg_idx <= seg_idx)
+            {
                 continue; // Tombstoned
             }
 
@@ -12586,12 +13086,10 @@ fn v3_plan_winners(
                 continue;
             }
 
-            if deleted_edges.contains(&edge_id) {
-                continue;
-            }
-
-            // Skip edges whose endpoints are tombstoned
-            if deleted_nodes.contains(&from) || deleted_nodes.contains(&to) {
+            if deleted_edges
+                .get(&edge_id)
+                .is_some_and(|deleted_seg_idx| *deleted_seg_idx <= seg_idx)
+            {
                 continue;
             }
 
@@ -12989,12 +13487,22 @@ fn bg_standard_merge(
     cancel: &AtomicBool,
 ) -> Result<(SegmentInfo, u64, u64, SecondaryIndexMaintenanceReport), EngineError> {
     // Collect tombstones
-    let mut deleted_nodes: NodeIdSet = NodeIdSet::default();
-    let mut deleted_edges: NodeIdSet = NodeIdSet::default();
+    let mut deleted_nodes: NodeIdMap<usize> = NodeIdMap::default();
+    let mut deleted_edges: NodeIdMap<usize> = NodeIdMap::default();
     if has_tombstones {
-        for seg in segments {
-            deleted_nodes.extend(seg.deleted_node_ids());
-            deleted_edges.extend(seg.deleted_edge_ids());
+        for (seg_idx, seg) in segments.iter().enumerate() {
+            for &id in seg.deleted_node_tombstones().keys() {
+                deleted_nodes
+                    .entry(id)
+                    .and_modify(|newest_seg_idx| *newest_seg_idx = (*newest_seg_idx).min(seg_idx))
+                    .or_insert(seg_idx);
+            }
+            for &id in seg.deleted_edge_tombstones().keys() {
+                deleted_edges
+                    .entry(id)
+                    .and_modify(|newest_seg_idx| *newest_seg_idx = (*newest_seg_idx).min(seg_idx))
+                    .or_insert(seg_idx);
+            }
         }
     }
 
@@ -13040,6 +13548,7 @@ include!("stream_core.rs");
 include!("node_stream.rs");
 include!("query_plan.rs");
 include!("edge_stream.rs");
+include!("adjacency_stream.rs");
 include!("projection.rs");
 include!("query_exec.rs");
 include!("graph_row_production.rs");
@@ -13650,6 +14159,9 @@ mod tests {
     include!("tests/read.rs");
     include!("tests/graph_ops.rs");
     include!("tests/graph_rows.rs");
+    include!("tests/prepared_edge_pull.rs");
+    include!("tests/adjacency_stream.rs");
+    include!("tests/prepared_edge_outcomes.rs");
     include!("tests/query_planner.rs");
     include!("tests/projection.rs");
     include!("tests/gql_execution.rs");

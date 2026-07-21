@@ -2210,11 +2210,11 @@ pub struct GraphPageRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GraphQueryOptions {
     pub allow_full_scan: bool,
-    /// Maximum in-flight binding rows for chunked node-anchor execution and maximum
-    /// whole-call binding rows for runtime-once execution.
+    /// Maximum in-flight binding rows for AnchorPull and EdgePull execution and
+    /// maximum whole-call binding rows for RuntimeOnce execution.
     pub max_intermediate_bindings: usize,
-    /// Maximum in-flight edge frontier for chunked node-anchor execution and maximum
-    /// whole-call frontier for runtime-once execution.
+    /// Maximum in-flight edge frontier for AnchorPull and EdgePull execution and
+    /// maximum whole-call frontier for RuntimeOnce execution.
     pub max_frontier: usize,
     pub max_path_hops: u8,
     pub max_paths_per_start: usize,

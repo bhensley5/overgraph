@@ -188,7 +188,7 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
 **Rust** - add to `Cargo.toml`:
 ```toml
 [dependencies]
-overgraph = "0.16"
+overgraph = "0.17"
 ```
 
 **Node.js**:

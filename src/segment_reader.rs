@@ -11,6 +11,7 @@ use crate::edge_metadata::{
     EDGE_WEIGHT_INDEX_ENTRY_SIZE, EDGE_WEIGHT_INDEX_LOGICAL_NAME,
 };
 use crate::error::EngineError;
+use crate::memtable::AdjEntry;
 #[cfg(test)]
 use crate::planner_stats::SegmentPlannerStatsV1;
 use crate::planner_stats::{
@@ -78,7 +79,7 @@ enum MappedData {
     Empty,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SegmentAdjacencyFile {
     Out,
     In,
@@ -89,6 +90,47 @@ pub(crate) struct SegmentAdjPostingCursor {
     cur_off: usize,
     remaining: usize,
     prev_edge_id: u64,
+}
+
+struct DecodedRawAdjPosting {
+    edge_id: u64,
+    neighbor_id: u64,
+    weight: f32,
+    valid_from: i64,
+    valid_to: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SegmentAdjacencyGroupHead {
+    pub(crate) owner_id: u64,
+    pub(crate) label_id: u32,
+    pub(crate) posting_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SegmentAdjacencyGroupStep {
+    SeekProbe { owner_id: u64 },
+    FilteredGroup { owner_id: u64, label_id: u32 },
+    Group(SegmentAdjacencyGroupHead),
+    Exhausted,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SegmentAdjacencySeekState {
+    owner_id: u64,
+    lo: usize,
+    hi: usize,
+}
+
+pub(crate) struct SegmentAdjacencyGroupCursor {
+    reader: Arc<SegmentReader>,
+    direction: Direction,
+    normalized_labels: Option<Box<[u32]>>,
+    group_count: usize,
+    index_position: usize,
+    posting_cursor: Option<SegmentAdjPostingCursor>,
+    posting_label_id: Option<u32>,
+    inclusive_seek: Option<SegmentAdjacencySeekState>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -348,6 +390,38 @@ fn checked_range_end(start: usize, len: usize, context: &str) -> Result<usize, E
     start
         .checked_add(len)
         .ok_or_else(|| EngineError::CorruptRecord(format!("{context} range overflow")))
+}
+
+fn checked_adjacency_group_count(data: &[u8]) -> Result<usize, EngineError> {
+    let count = usize_from_u64(read_u64_at(data, 0)?, "adjacency group count")?;
+    let table_len = count.checked_mul(ADJ_INDEX_ENTRY_SIZE).ok_or_else(|| {
+        EngineError::CorruptRecord("adjacency index table length overflow".into())
+    })?;
+    let table_end = 8usize
+        .checked_add(table_len)
+        .ok_or_else(|| EngineError::CorruptRecord("adjacency index table end overflow".into()))?;
+    if table_end > data.len() {
+        return Err(EngineError::CorruptRecord(format!(
+            "adjacency index table end {table_end} exceeds data length {}",
+            data.len()
+        )));
+    }
+    Ok(count)
+}
+
+fn checked_adjacency_index_entry_offset(index: usize) -> Result<usize, EngineError> {
+    let relative = index.checked_mul(ADJ_INDEX_ENTRY_SIZE).ok_or_else(|| {
+        EngineError::CorruptRecord("adjacency index entry offset overflow".into())
+    })?;
+    8usize
+        .checked_add(relative)
+        .ok_or_else(|| EngineError::CorruptRecord("adjacency index entry offset overflow".into()))
+}
+
+fn checked_advance_offset(offset: usize, len: usize, context: &str) -> Result<usize, EngineError> {
+    offset
+        .checked_add(len)
+        .ok_or_else(|| EngineError::CorruptRecord(format!("{context} offset overflow")))
 }
 
 fn parse_node_meta_layout(data: &[u8]) -> Result<Option<NodeMetaLayout>, EngineError> {
@@ -656,6 +730,47 @@ fn checked_adj_edge_id_delta(prev_edge_id: u64, delta: u64) -> Result<u64, Engin
     prev_edge_id
         .checked_add(delta)
         .ok_or_else(|| EngineError::CorruptRecord("adjacency edge id delta overflow".into()))
+}
+
+fn decode_next_raw_adj_entry(
+    data: &[u8],
+    cursor: &mut SegmentAdjPostingCursor,
+) -> Result<Option<DecodedRawAdjPosting>, EngineError> {
+    if cursor.remaining == 0 {
+        return Ok(None);
+    }
+
+    let mut next_offset = cursor.cur_off;
+    let (delta, len) = read_varint_at(data, next_offset)?;
+    next_offset = checked_advance_offset(next_offset, len, "adjacency edge delta")?;
+    let edge_id = checked_adj_edge_id_delta(cursor.prev_edge_id, delta)?;
+
+    let (neighbor_id, len) = read_varint_at(data, next_offset)?;
+    next_offset = checked_advance_offset(next_offset, len, "adjacency neighbor id")?;
+
+    let weight = read_f32_at(data, next_offset)?;
+    next_offset = checked_advance_offset(next_offset, 4, "adjacency weight")?;
+
+    let (valid_from_encoded, len) = read_varint_at(data, next_offset)?;
+    next_offset = checked_advance_offset(next_offset, len, "adjacency valid-from")?;
+    let (valid_to_encoded, len) = read_varint_at(data, next_offset)?;
+    next_offset = checked_advance_offset(next_offset, len, "adjacency valid-to")?;
+    let valid_to = if valid_to_encoded == 0 {
+        i64::MAX
+    } else {
+        (valid_to_encoded - 1) as i64
+    };
+
+    cursor.cur_off = next_offset;
+    cursor.remaining -= 1;
+    cursor.prev_edge_id = edge_id;
+    Ok(Some(DecodedRawAdjPosting {
+        edge_id,
+        neighbor_id,
+        weight,
+        valid_from: valid_from_encoded as i64,
+        valid_to,
+    }))
 }
 
 /// Safe byte slice extraction with bounds checking.
@@ -1278,6 +1393,146 @@ pub(crate) struct SecondaryEqPostingChunk {
     pub(crate) ids: Vec<u64>,
     pub(crate) next_offset: usize,
     pub(crate) exhausted: bool,
+}
+
+impl SegmentAdjacencyGroupCursor {
+    #[cfg(test)]
+    pub(crate) fn direction(&self) -> Direction {
+        self.direction
+    }
+
+    #[cfg(test)]
+    pub(crate) fn group_count(&self) -> usize {
+        self.group_count
+    }
+
+    pub(crate) fn next_group_step(&mut self) -> Result<SegmentAdjacencyGroupStep, EngineError> {
+        if self
+            .posting_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.remaining > 0)
+        {
+            panic!("segment adjacency group postings must be drained before advancing");
+        }
+        self.posting_cursor = None;
+        self.posting_label_id = None;
+
+        if let Some(mut seek) = self.inclusive_seek {
+            if seek.lo < seek.hi {
+                let mid = seek.lo + (seek.hi - seek.lo) / 2;
+                let offset = checked_adjacency_index_entry_offset(mid)?;
+                let owner_id = read_u64_at(self.index_data(), offset)?;
+                if owner_id < seek.owner_id {
+                    seek.lo = mid.checked_add(1).ok_or_else(|| {
+                        EngineError::CorruptRecord("adjacency seek index position overflow".into())
+                    })?;
+                } else {
+                    seek.hi = mid;
+                }
+                if seek.lo == seek.hi {
+                    self.index_position = seek.lo;
+                    self.inclusive_seek = None;
+                } else {
+                    self.inclusive_seek = Some(seek);
+                }
+                return Ok(SegmentAdjacencyGroupStep::SeekProbe { owner_id });
+            }
+            self.index_position = seek.lo;
+            self.inclusive_seek = None;
+        }
+
+        if self.index_position >= self.group_count {
+            return Ok(SegmentAdjacencyGroupStep::Exhausted);
+        }
+
+        let entry_offset = checked_adjacency_index_entry_offset(self.index_position)?;
+        let owner_id = read_u64_at(self.index_data(), entry_offset)?;
+        let label_offset = checked_advance_offset(entry_offset, 8, "adjacency label")?;
+        let label_id = read_u32_at(self.index_data(), label_offset)?;
+        self.index_position = self.index_position.checked_add(1).ok_or_else(|| {
+            EngineError::CorruptRecord("adjacency index position overflow".into())
+        })?;
+
+        if self
+            .normalized_labels
+            .as_deref()
+            .is_some_and(|labels| labels.binary_search(&label_id).is_err())
+        {
+            return Ok(SegmentAdjacencyGroupStep::FilteredGroup { owner_id, label_id });
+        }
+
+        let posting_offset_field =
+            checked_advance_offset(entry_offset, 12, "adjacency posting offset field")?;
+        let posting_offset = usize_from_u64(
+            read_u64_at(self.index_data(), posting_offset_field)?,
+            "adjacency posting offset",
+        )?;
+        let posting_count_field =
+            checked_advance_offset(entry_offset, 20, "adjacency posting count field")?;
+        let posting_count_raw = read_u32_at(self.index_data(), posting_count_field)?;
+        let posting_count = usize::try_from(posting_count_raw).map_err(|_| {
+            EngineError::CorruptRecord(format!(
+                "adjacency posting count does not fit in usize: {posting_count_raw}"
+            ))
+        })?;
+        let file = match self.direction {
+            Direction::Outgoing => SegmentAdjacencyFile::Out,
+            Direction::Incoming => SegmentAdjacencyFile::In,
+            Direction::Both => {
+                panic!("segment adjacency group cursor requires a physical direction")
+            }
+        };
+        self.posting_cursor = Some(SegmentAdjPostingCursor {
+            file,
+            cur_off: posting_offset,
+            remaining: posting_count,
+            prev_edge_id: 0,
+        });
+        self.posting_label_id = Some(label_id);
+        Ok(SegmentAdjacencyGroupStep::Group(
+            SegmentAdjacencyGroupHead {
+                owner_id,
+                label_id,
+                posting_count,
+            },
+        ))
+    }
+
+    pub(crate) fn next_raw_posting(&mut self) -> Result<Option<AdjEntry>, EngineError> {
+        let Some(cursor) = self.posting_cursor.as_mut() else {
+            return Ok(None);
+        };
+        let label_id = self.posting_label_id.unwrap_or_else(|| {
+            panic!("segment adjacency posting cursor is missing its group label")
+        });
+        let data = match cursor.file {
+            SegmentAdjacencyFile::Out => &self.reader.adj_out_dat[..],
+            SegmentAdjacencyFile::In => &self.reader.adj_in_dat[..],
+        };
+        let posting = decode_next_raw_adj_entry(data, cursor)?;
+        if posting.is_none() {
+            self.posting_cursor = None;
+            self.posting_label_id = None;
+        }
+        Ok(posting.map(|posting| AdjEntry {
+            edge_id: posting.edge_id,
+            label_id,
+            neighbor_id: posting.neighbor_id,
+            weight: posting.weight,
+            valid_from: posting.valid_from,
+            valid_to: posting.valid_to,
+        }))
+    }
+
+    fn index_data(&self) -> &[u8] {
+        match self.direction {
+            Direction::Outgoing => &self.reader.adj_out_idx[..],
+            Direction::Incoming => &self.reader.adj_in_idx[..],
+            Direction::Both => {
+                panic!("segment adjacency group cursor requires a physical direction")
+            }
+        }
+    }
 }
 
 impl SegmentReader {
@@ -7525,6 +7780,56 @@ impl SegmentReader {
         }
     }
 
+    pub(crate) fn adjacency_group_count(&self, direction: Direction) -> Result<usize, EngineError> {
+        let index_data = match direction {
+            Direction::Outgoing => &self.adj_out_idx[..],
+            Direction::Incoming => &self.adj_in_idx[..],
+            Direction::Both => {
+                panic!("segment adjacency group count requires a physical direction")
+            }
+        };
+        checked_adjacency_group_count(index_data)
+    }
+
+    pub(crate) fn adjacency_group_cursor(
+        self: &Arc<Self>,
+        direction: Direction,
+        normalized_labels: Option<&[u32]>,
+        inclusive_seek_owner: Option<u64>,
+    ) -> Result<SegmentAdjacencyGroupCursor, EngineError> {
+        if normalized_labels
+            .is_some_and(|labels| labels.windows(2).any(|pair| pair.first() >= pair.get(1)))
+        {
+            return Err(EngineError::InvalidOperation(
+                "segment adjacency labels must be sorted ascending and unique".into(),
+            ));
+        }
+        let group_count = self.adjacency_group_count(direction)?;
+        let labels = normalized_labels
+            .map(<[u32]>::to_vec)
+            .map(Vec::into_boxed_slice);
+        let known_empty = labels.as_deref().is_some_and(<[u32]>::is_empty);
+        let inclusive_seek = if known_empty {
+            None
+        } else {
+            inclusive_seek_owner.map(|owner_id| SegmentAdjacencySeekState {
+                owner_id,
+                lo: 0,
+                hi: group_count,
+            })
+        };
+        Ok(SegmentAdjacencyGroupCursor {
+            reader: self.clone(),
+            direction,
+            normalized_labels: labels,
+            group_count,
+            index_position: if known_empty { group_count } else { 0 },
+            posting_cursor: None,
+            posting_label_id: None,
+            inclusive_seek,
+        })
+    }
+
     pub(crate) fn endpoint_adj_posting_cursors(
         &self,
         node_ids: &[u64],
@@ -7763,32 +8068,14 @@ impl SegmentReader {
             SegmentAdjacencyFile::In => &self.adj_in_dat[..],
         };
 
-        while cursor.remaining > 0 {
-            cursor.remaining -= 1;
-
-            let (delta, n) = read_varint_at(dat_data, cursor.cur_off)?;
-            cursor.cur_off += n;
-            let edge_id = checked_adj_edge_id_delta(cursor.prev_edge_id, delta)?;
-            cursor.prev_edge_id = edge_id;
-
-            let (neighbor_id, n) = read_varint_at(dat_data, cursor.cur_off)?;
-            cursor.cur_off += n;
-
-            let _ = read_f32_at(dat_data, cursor.cur_off)?;
-            cursor.cur_off += 4;
-
-            let (_, n) = read_varint_at(dat_data, cursor.cur_off)?;
-            cursor.cur_off += n;
-            let (_, n) = read_varint_at(dat_data, cursor.cur_off)?;
-            cursor.cur_off += n;
-
-            if self.deleted_edges.contains_key(&edge_id) {
+        while let Some(entry) = decode_next_raw_adj_entry(dat_data, cursor)? {
+            if self.deleted_edges.contains_key(&entry.edge_id) {
                 continue;
             }
-            if self.deleted_nodes.contains_key(&neighbor_id) {
+            if self.deleted_nodes.contains_key(&entry.neighbor_id) {
                 continue;
             }
-            return Ok(Some(edge_id));
+            return Ok(Some(entry.edge_id));
         }
 
         Ok(None)
@@ -11947,6 +12234,374 @@ pub(crate) mod tests {
             matches!(&err, EngineError::CorruptRecord(message) if message.contains("delta overflow")),
             "expected cursor delta overflow corruption, got {err}"
         );
+    }
+
+    struct DrainedSegmentAdjacencyGroups {
+        groups: Vec<(u64, u32, usize)>,
+        postings: Vec<AdjEntry>,
+        probes: Vec<u64>,
+        filtered: Vec<(u64, u32)>,
+    }
+
+    fn drain_segment_adjacency_groups(
+        cursor: &mut SegmentAdjacencyGroupCursor,
+    ) -> Result<DrainedSegmentAdjacencyGroups, EngineError> {
+        let mut groups = Vec::new();
+        let mut postings = Vec::new();
+        let mut probes = Vec::new();
+        let mut filtered = Vec::new();
+        loop {
+            match cursor.next_group_step()? {
+                SegmentAdjacencyGroupStep::SeekProbe { owner_id } => probes.push(owner_id),
+                SegmentAdjacencyGroupStep::FilteredGroup { owner_id, label_id } => {
+                    filtered.push((owner_id, label_id));
+                }
+                SegmentAdjacencyGroupStep::Group(group) => {
+                    groups.push((group.owner_id, group.label_id, group.posting_count));
+                    while let Some(posting) = cursor.next_raw_posting()? {
+                        postings.push(posting);
+                    }
+                }
+                SegmentAdjacencyGroupStep::Exhausted => break,
+            }
+        }
+        Ok(DrainedSegmentAdjacencyGroups {
+            groups,
+            postings,
+            probes,
+            filtered,
+        })
+    }
+
+    #[test]
+    fn adjacency_group_cursor_streams_checked_groups_labels_directions_and_extremes() {
+        let empty_mt = Memtable::new();
+        let (_empty_dir, empty_reader) = write_and_open(&empty_mt);
+        let empty_reader = Arc::new(empty_reader);
+        assert_eq!(
+            empty_reader
+                .adjacency_group_count(Direction::Outgoing)
+                .unwrap(),
+            0
+        );
+        let mut empty_cursor = empty_reader
+            .adjacency_group_cursor(Direction::Outgoing, None, Some(0))
+            .unwrap();
+        assert_eq!(
+            empty_cursor.next_group_step().unwrap(),
+            SegmentAdjacencyGroupStep::Exhausted
+        );
+
+        let mt = Memtable::new();
+        let mut edge_zero = make_edge(0, 0, 9, 0);
+        edge_zero.weight = 1.25;
+        edge_zero.valid_from = 10;
+        edge_zero.valid_to = 20;
+        for edge in [
+            edge_zero,
+            make_edge(2, 0, 9, 0),
+            make_edge(4, 0, 8, u32::MAX),
+            make_edge(7, 5, 0, 10),
+            make_edge(9, 10, 5, 20),
+            make_edge(u64::MAX, u64::MAX, 1, u32::MAX),
+        ] {
+            mt.apply_op(&WalOp::UpsertEdge(edge), 1);
+        }
+
+        let (_dir, reader) = write_and_open(&mt);
+        let reader = Arc::new(reader);
+        assert_eq!(
+            reader.adjacency_group_count(Direction::Outgoing).unwrap(),
+            5
+        );
+        assert_eq!(
+            reader.adjacency_group_count(Direction::Incoming).unwrap(),
+            5
+        );
+
+        let mut outgoing = reader
+            .adjacency_group_cursor(Direction::Outgoing, None, None)
+            .unwrap();
+        assert_eq!(outgoing.direction(), Direction::Outgoing);
+        assert_eq!(outgoing.group_count(), 5);
+        let drained = drain_segment_adjacency_groups(&mut outgoing).unwrap();
+        assert_eq!(
+            drained.groups,
+            vec![
+                (0, 0, 2),
+                (0, u32::MAX, 1),
+                (5, 10, 1),
+                (10, 20, 1),
+                (u64::MAX, u32::MAX, 1),
+            ]
+        );
+        assert_eq!(
+            drained
+                .postings
+                .iter()
+                .map(|entry| (entry.edge_id, entry.label_id, entry.neighbor_id))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 0, 9),
+                (2, 0, 9),
+                (4, u32::MAX, 8),
+                (7, 10, 0),
+                (9, 20, 5),
+                (u64::MAX, u32::MAX, 1),
+            ]
+        );
+        assert_eq!(drained.postings[0].weight, 1.25);
+        assert_eq!(
+            (drained.postings[0].valid_from, drained.postings[0].valid_to,),
+            (10, 20)
+        );
+        assert!(drained.probes.is_empty());
+        assert!(drained.filtered.is_empty());
+
+        let mut max_seek = reader
+            .adjacency_group_cursor(Direction::Outgoing, None, Some(u64::MAX))
+            .unwrap();
+        loop {
+            match max_seek.next_group_step().unwrap() {
+                SegmentAdjacencyGroupStep::SeekProbe { .. } => {}
+                SegmentAdjacencyGroupStep::Group(group) => {
+                    assert_eq!(group.owner_id, u64::MAX);
+                    assert_eq!(
+                        max_seek.next_raw_posting().unwrap().unwrap().edge_id,
+                        u64::MAX
+                    );
+                    break;
+                }
+                step => panic!("maximum-owner seek returned unexpected step {step:?}"),
+            }
+        }
+
+        let mut incoming = reader
+            .adjacency_group_cursor(Direction::Incoming, Some(&[10, u32::MAX]), None)
+            .unwrap();
+        let drained = drain_segment_adjacency_groups(&mut incoming).unwrap();
+        assert_eq!(
+            drained.groups,
+            vec![(0, 10, 1), (1, u32::MAX, 1), (8, u32::MAX, 1)]
+        );
+        assert_eq!(
+            drained
+                .postings
+                .iter()
+                .map(|entry| entry.edge_id)
+                .collect::<Vec<_>>(),
+            vec![7, u64::MAX, 4]
+        );
+        assert!(drained.probes.is_empty());
+        assert_eq!(drained.filtered, vec![(5, 20), (9, 0)]);
+
+        let mut known_empty = reader
+            .adjacency_group_cursor(Direction::Outgoing, Some(&[]), Some(u64::MAX))
+            .unwrap();
+        assert_eq!(
+            known_empty.next_group_step().unwrap(),
+            SegmentAdjacencyGroupStep::Exhausted
+        );
+        assert!(known_empty.next_raw_posting().unwrap().is_none());
+    }
+
+    #[test]
+    fn adjacency_group_cursor_inclusive_seek_is_resumable_and_counts_each_probe() {
+        let mt = Memtable::new();
+        for (edge_id, owner_id) in [(10, 0), (11, 0), (12, 5), (13, 10), (14, 20)] {
+            mt.apply_op(
+                &WalOp::UpsertEdge(make_edge(edge_id, owner_id, 99, edge_id as u32)),
+                1,
+            );
+        }
+        let (_dir, reader) = write_and_open(&mt);
+        let reader = Arc::new(reader);
+
+        let assert_seek = |target, expected_owner: Option<u64>, expected_probes: Vec<u64>| {
+            let mut cursor = reader
+                .adjacency_group_cursor(Direction::Outgoing, None, Some(target))
+                .unwrap();
+            let mut probes = Vec::new();
+            loop {
+                match cursor.next_group_step().unwrap() {
+                    SegmentAdjacencyGroupStep::SeekProbe { owner_id } => probes.push(owner_id),
+                    SegmentAdjacencyGroupStep::Group(group) => {
+                        assert_eq!(Some(group.owner_id), expected_owner);
+                        break;
+                    }
+                    SegmentAdjacencyGroupStep::Exhausted => {
+                        assert_eq!(expected_owner, None);
+                        break;
+                    }
+                    SegmentAdjacencyGroupStep::FilteredGroup { .. } => {
+                        panic!("unfiltered seek returned a filtered group")
+                    }
+                }
+            }
+            assert_eq!(probes, expected_probes);
+        };
+
+        assert_seek(0, Some(0), vec![5, 0, 0]);
+        assert_seek(5, Some(5), vec![5, 0]);
+        assert_seek(6, Some(10), vec![5, 20, 10]);
+        assert_seek(21, None, vec![5, 20]);
+        assert_seek(u64::MAX, None, vec![5, 20]);
+    }
+
+    #[test]
+    fn adjacency_group_header_validation_rejects_truncation_and_overflow() {
+        let err = checked_adjacency_group_count(&[]).unwrap_err();
+        assert!(matches!(err, EngineError::CorruptRecord(_)));
+
+        let mut truncated = Vec::new();
+        truncated.extend_from_slice(&2u64.to_le_bytes());
+        truncated.resize(8 + ADJ_INDEX_ENTRY_SIZE, 0);
+        let err = checked_adjacency_group_count(&truncated).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::CorruptRecord(message) if message.contains("index table"))
+        );
+
+        let overflow = u64::MAX.to_le_bytes();
+        let err = checked_adjacency_group_count(&overflow).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::CorruptRecord(message) if message.contains("adjacency"))
+        );
+
+        let mut valid = Vec::new();
+        valid.extend_from_slice(&1u64.to_le_bytes());
+        valid.resize(8 + ADJ_INDEX_ENTRY_SIZE, 0);
+        assert_eq!(checked_adjacency_group_count(&valid).unwrap(), 1);
+    }
+
+    #[test]
+    fn adjacency_group_cursor_surfaces_header_and_posting_corruption_lazily() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 7, 10)), 1);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(20, 2, 7, 20)), 1);
+        let (dir, reader) = write_and_open(&mt);
+        drop(reader);
+        let seg_dir = dir.path().join("seg_0001");
+        let postings_len =
+            component_payload_bytes_for_test(&seg_dir, SegmentComponentKind::AdjOutPostings).len();
+        rewrite_component_payload_for_test(
+            &seg_dir,
+            SegmentComponentKind::AdjOutIndex,
+            |payload| {
+                let second_entry = 8 + ADJ_INDEX_ENTRY_SIZE;
+                payload[second_entry + 12..second_entry + 20]
+                    .copy_from_slice(&(postings_len as u64 + 1).to_le_bytes());
+            },
+        );
+        let reader = Arc::new(SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap());
+
+        let mut cursor = reader
+            .adjacency_group_cursor(Direction::Outgoing, None, None)
+            .unwrap();
+        let first = cursor.next_group_step().unwrap();
+        assert!(matches!(
+            first,
+            SegmentAdjacencyGroupStep::Group(SegmentAdjacencyGroupHead {
+                owner_id: 1,
+                label_id: 10,
+                ..
+            })
+        ));
+        assert_eq!(cursor.next_raw_posting().unwrap().unwrap().edge_id, 10);
+        assert!(cursor.next_raw_posting().unwrap().is_none());
+        let second = cursor.next_group_step().unwrap();
+        assert!(matches!(
+            second,
+            SegmentAdjacencyGroupStep::Group(SegmentAdjacencyGroupHead {
+                owner_id: 2,
+                label_id: 20,
+                ..
+            })
+        ));
+        let err = cursor.next_raw_posting().unwrap_err();
+        assert!(matches!(err, EngineError::CorruptRecord(_)));
+
+        let mut filtered = reader
+            .adjacency_group_cursor(Direction::Outgoing, Some(&[10]), None)
+            .unwrap();
+        assert!(matches!(
+            filtered.next_group_step().unwrap(),
+            SegmentAdjacencyGroupStep::Group(_)
+        ));
+        assert_eq!(filtered.next_raw_posting().unwrap().unwrap().edge_id, 10);
+        assert!(filtered.next_raw_posting().unwrap().is_none());
+        assert_eq!(
+            filtered.next_group_step().unwrap(),
+            SegmentAdjacencyGroupStep::FilteredGroup {
+                owner_id: 2,
+                label_id: 20
+            }
+        );
+        assert_eq!(
+            filtered.next_group_step().unwrap(),
+            SegmentAdjacencyGroupStep::Exhausted
+        );
+
+        drop(filtered);
+        drop(cursor);
+        drop(reader);
+        rewrite_component_payload_for_test(
+            &seg_dir,
+            SegmentComponentKind::AdjOutIndex,
+            |payload| payload[0..8].copy_from_slice(&3u64.to_le_bytes()),
+        );
+        let reader = Arc::new(SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap());
+        let err = match reader.adjacency_group_cursor(Direction::Outgoing, None, None) {
+            Ok(_) => panic!("truncated adjacency index unexpectedly prepared a cursor"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(&err, EngineError::CorruptRecord(message) if message.contains("index table"))
+        );
+    }
+
+    #[test]
+    fn adjacency_group_cursor_inflated_posting_count_fails_after_valid_prefix() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 10)), 1);
+        let (dir, reader) = write_and_open(&mt);
+        drop(reader);
+        let seg_dir = dir.path().join("seg_0001");
+        rewrite_component_payload_for_test(
+            &seg_dir,
+            SegmentComponentKind::AdjOutIndex,
+            |payload| payload[28..32].copy_from_slice(&2u32.to_le_bytes()),
+        );
+        let reader = Arc::new(SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap());
+        let mut cursor = reader
+            .adjacency_group_cursor(Direction::Outgoing, None, None)
+            .unwrap();
+        assert!(matches!(
+            cursor.next_group_step().unwrap(),
+            SegmentAdjacencyGroupStep::Group(SegmentAdjacencyGroupHead {
+                posting_count: 2,
+                ..
+            })
+        ));
+        assert_eq!(cursor.next_raw_posting().unwrap().unwrap().edge_id, 10);
+        let err = cursor.next_raw_posting().unwrap_err();
+        assert!(matches!(err, EngineError::CorruptRecord(_)));
+    }
+
+    #[test]
+    fn adjacency_group_cursor_rejects_non_normalized_labels() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 1);
+        let (_dir, reader) = write_and_open(&mt);
+        let reader = Arc::new(reader);
+        for labels in [&[20, 10][..], &[10, 10][..]] {
+            let err = match reader.adjacency_group_cursor(Direction::Outgoing, Some(labels), None) {
+                Ok(_) => panic!("non-normalized labels unexpectedly prepared a cursor"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(&err, EngineError::InvalidOperation(message) if message.contains("sorted ascending and unique"))
+            );
+        }
     }
 
     #[test]

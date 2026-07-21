@@ -7427,6 +7427,98 @@ mod tests {
         }
     }
 
+    fn read_test_varint(data: &[u8], offset: &mut usize) -> u64 {
+        let mut value = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let byte = *data
+                .get(*offset)
+                .expect("test adjacency posting varint must be in bounds");
+            *offset += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+            assert!(shift < 64, "test adjacency posting varint must fit in u64");
+        }
+    }
+
+    fn read_adjacency_group_shape(
+        seg_dir: &Path,
+        direction: Direction,
+    ) -> Vec<((u64, u32), Vec<u64>)> {
+        const TEST_ADJ_INDEX_ENTRY_SIZE: usize = 24;
+        let (index_kind, postings_kind) = match direction {
+            Direction::Outgoing => (
+                SegmentComponentKind::AdjOutIndex,
+                SegmentComponentKind::AdjOutPostings,
+            ),
+            Direction::Incoming => (
+                SegmentComponentKind::AdjInIndex,
+                SegmentComponentKind::AdjInPostings,
+            ),
+            Direction::Both => panic!("test adjacency shape requires a physical direction"),
+        };
+        let index = read_manifest_component_payload(seg_dir, index_kind);
+        let postings = read_manifest_component_payload(seg_dir, postings_kind);
+        let group_count = u64::from_le_bytes(index[0..8].try_into().unwrap()) as usize;
+        assert_eq!(index.len(), 8 + group_count * TEST_ADJ_INDEX_ENTRY_SIZE);
+
+        let mut groups = Vec::with_capacity(group_count);
+        for group_index in 0..group_count {
+            let entry_offset = 8 + group_index * TEST_ADJ_INDEX_ENTRY_SIZE;
+            let owner_id =
+                u64::from_le_bytes(index[entry_offset..entry_offset + 8].try_into().unwrap());
+            let label_id = u32::from_le_bytes(
+                index[entry_offset + 8..entry_offset + 12]
+                    .try_into()
+                    .unwrap(),
+            );
+            let mut posting_offset = u64::from_le_bytes(
+                index[entry_offset + 12..entry_offset + 20]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let posting_count = u32::from_le_bytes(
+                index[entry_offset + 20..entry_offset + 24]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let mut edge_ids = Vec::with_capacity(posting_count);
+            let mut previous_edge_id = 0u64;
+            for _ in 0..posting_count {
+                previous_edge_id += read_test_varint(&postings, &mut posting_offset);
+                edge_ids.push(previous_edge_id);
+                let _neighbor_id = read_test_varint(&postings, &mut posting_offset);
+                posting_offset = posting_offset
+                    .checked_add(4)
+                    .expect("test adjacency weight offset must not overflow");
+                assert!(posting_offset <= postings.len());
+                let _valid_from = read_test_varint(&postings, &mut posting_offset);
+                let _valid_to = read_test_varint(&postings, &mut posting_offset);
+            }
+            groups.push(((owner_id, label_id), edge_ids));
+        }
+        groups
+    }
+
+    fn labeled_adjacency_source_group_count(reader: &SegmentReader, direction: Direction) -> u64 {
+        let stats_direction = match direction {
+            Direction::Outgoing => crate::planner_stats::PlannerStatsDirection::Outgoing,
+            Direction::Incoming => crate::planner_stats::PlannerStatsDirection::Incoming,
+            Direction::Both => panic!("test adjacency stats require a physical direction"),
+        };
+        reader
+            .planner_stats()
+            .expect("planner stats should load")
+            .adjacency_stats
+            .iter()
+            .filter(|row| row.direction == stats_direction && row.edge_label_id.is_some())
+            .map(|row| row.source_node_count)
+            .sum()
+    }
+
     fn write_packed_segment_from_ops(
         ops: Vec<WalOp>,
         dense_config: Option<&DenseVectorConfig>,
@@ -8091,6 +8183,103 @@ mod tests {
             read_manifest_component_payload(&seg_dir, SegmentComponentKind::AdjOutPostings),
             direct_dat
         );
+    }
+
+    #[test]
+    fn adjacency_flush_and_compaction_paths_preserve_identical_order_and_group_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let flush_dir = dir.path().join("seg_0001");
+        let compacted_dir = dir.path().join("seg_0002");
+        let memtable = Memtable::new();
+
+        // Deliberately neither owner-, label-, nor edge-ID ordered. Both writer paths
+        // must canonicalize this same live edge set without relying on input order.
+        for (write_seq, edge) in [
+            make_edge(90, 7, 3, 2),
+            make_edge(2, 1, 9, 1),
+            make_edge(40, 7, 5, 2),
+            make_edge(3, 1, 3, 3),
+            make_edge(10, 7, 3, 1),
+            make_edge(4, 8, 3, 2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            memtable.apply_op(&WalOp::UpsertEdge(edge), (write_seq + 1) as u64);
+        }
+        memtable.apply_op(&WalOp::UpsertEdge(make_edge(100, 99, 98, 99)), 7);
+        memtable.apply_op(
+            &WalOp::DeleteEdge {
+                id: 100,
+                deleted_at: 8,
+            },
+            8,
+        );
+        assert_eq!(
+            memtable.retained_ordered_adj_outer_group_count(Direction::Outgoing),
+            6,
+            "zero-current group history remains in the memtable until rotation"
+        );
+
+        write_segment(&flush_dir, 1, &memtable, None).unwrap();
+        let flush_reader =
+            Arc::new(SegmentReader::open_unpinned_for_test(&flush_dir, 1, None).unwrap());
+        let compacted_reader =
+            compact_copy_segment_for_test(flush_reader.clone(), &compacted_dir, 2, &[]);
+
+        for kind in [
+            SegmentComponentKind::AdjOutIndex,
+            SegmentComponentKind::AdjOutPostings,
+            SegmentComponentKind::AdjInIndex,
+            SegmentComponentKind::AdjInPostings,
+        ] {
+            assert_eq!(
+                read_manifest_component_payload(&flush_dir, kind.clone()),
+                read_manifest_component_payload(&compacted_dir, kind),
+                "flush and metadata-compaction adjacency payloads must be byte-identical"
+            );
+        }
+
+        let expected_outgoing = vec![
+            ((1, 1), vec![2]),
+            ((1, 3), vec![3]),
+            ((7, 1), vec![10]),
+            ((7, 2), vec![40, 90]),
+            ((8, 2), vec![4]),
+        ];
+        let expected_incoming = vec![
+            ((3, 1), vec![10]),
+            ((3, 2), vec![4, 90]),
+            ((3, 3), vec![3]),
+            ((5, 2), vec![40]),
+            ((9, 1), vec![2]),
+        ];
+
+        for (direction, expected) in [
+            (Direction::Outgoing, expected_outgoing),
+            (Direction::Incoming, expected_incoming),
+        ] {
+            let flush_shape = read_adjacency_group_shape(&flush_dir, direction);
+            let compacted_shape = read_adjacency_group_shape(&compacted_dir, direction);
+            assert_eq!(flush_shape, expected);
+            assert_eq!(compacted_shape, expected);
+            assert!(flush_shape
+                .windows(2)
+                .all(|groups| groups[0].0 < groups[1].0));
+            assert!(flush_shape
+                .iter()
+                .all(|(_, edge_ids)| edge_ids.windows(2).all(|ids| ids[0] < ids[1])));
+
+            let physical_group_count = flush_shape.len() as u64;
+            assert_eq!(
+                labeled_adjacency_source_group_count(&flush_reader, direction),
+                physical_group_count
+            );
+            assert_eq!(
+                labeled_adjacency_source_group_count(&compacted_reader, direction),
+                physical_group_count
+            );
+        }
     }
 
     // --- Packed key index payload ---

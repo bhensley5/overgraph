@@ -66,6 +66,13 @@ pub(crate) struct EdgeMetadataCandidate {
     pub(crate) valid_to: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum EdgeMetadataVisibilityState {
+    Live(EdgeMetadataCandidate),
+    Deleted,
+    Missing,
+}
+
 impl EdgeMetadataCandidate {
     pub(crate) fn from_edge(edge: &EdgeRecord) -> Self {
         Self {

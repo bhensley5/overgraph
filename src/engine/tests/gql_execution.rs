@@ -79,16 +79,17 @@ fn graph_row_chunk_early_exit_gql_zero_selection_and_zero_cap_are_inert() {
     let edge_plan = format!("{:?}", edge_zero.plan.unwrap());
     assert!(
         edge_plan.contains(
-            "source=RuntimeOnce{reason=NonNodeInitialDriver}; source_pulls=0; \
+            "source=EdgePull{edge=alias:r}; source_pulls=0; \
              successful_leaves=0; scheduled_sizes=[]; leaf_size_min=0; leaf_size_max=0; \
              source_rows=0; produced_rows=0; early_exit_eligible=false; \
-             eligibility=non_node_initial_driver; early_exit=false; cursor_seek=none; \
+             eligibility=edge_id_order_not_logical_prefix; early_exit=false; cursor_seek=none; \
              heap_capacity=0; cap_retries=0; result_cache_units=0/65536; \
              cache_no_admit=0; optional_cache_hits=0; vlp_cross_chunk_cache_hits=0"
         ),
         "{edge_plan}"
     );
     let edge_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(edge_counters.graph_row_edge_pull_executions, 0);
     assert_eq!(edge_counters.graph_row_chunks_executed, 0);
     assert_eq!(edge_counters.graph_row_chunk_early_exits, 0);
     assert_eq!(edge_counters.edge_record_hydration_reads, 0);
@@ -145,6 +146,112 @@ fn graph_row_chunk_early_exit_gql_logical_limit_uses_exact_target_without_cursor
     let counters = engine.query_execution_counter_snapshot_for_test();
     assert_eq!(counters.graph_row_chunk_early_exits, 1);
     assert_eq!(counters.graph_row_chunks_executed, 1);
+}
+
+#[test]
+fn graph_row_edge_pull_gql_logical_limit_pages_without_early_exit_or_seek() {
+    let (_dir, engine) = query_test_engine();
+    for index in 0..6 {
+        let source = insert_query_node(
+            &engine,
+            "GqlEdgePullLimit",
+            &format!("gql-edge-pull-limit-source-{index}"),
+            &[],
+            1.0,
+        );
+        let target = insert_query_node(
+            &engine,
+            "GqlEdgePullLimit",
+            &format!("gql-edge-pull-limit-target-{index}"),
+            &[],
+            1.0,
+        );
+        engine
+            .upsert_edge(
+                source,
+                target,
+                "GQL_EDGE_PULL_LIMIT",
+                UpsertEdgeOptions::default(),
+            )
+            .unwrap();
+    }
+    let source = "MATCH ()-[edge:GQL_EDGE_PULL_LIMIT]->() \
+                  RETURN id(edge) ORDER BY id(edge) LIMIT 5";
+    engine.reset_query_execution_counters_for_test();
+    let first = engine
+        .execute_gql(
+            source,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_rows: 2,
+                include_plan: true,
+                ..GqlExecutionOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(first.rows.len(), 2);
+    let first_cursor = first.next_cursor.clone().unwrap();
+    let first_plan = format!("{:?}", first.plan.unwrap());
+    assert!(first_plan.contains("source=EdgePull{edge=alias:edge}"), "{first_plan}");
+    assert!(first_plan.contains("logical_limit=Some(5)"), "{first_plan}");
+    assert!(first_plan.contains("anchor_seek=ineligible"), "{first_plan}");
+    assert!(first_plan.contains("early_exit=false; cursor_seek=none"), "{first_plan}");
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.graph_row_edge_pull_executions, 1);
+    assert_eq!(counters.graph_row_chunk_early_exits, 0);
+
+    let second = engine
+        .execute_gql(
+            source,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                cursor: Some(first_cursor),
+                max_rows: 2,
+                ..GqlExecutionOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(second.rows.len(), 2);
+    let third = engine
+        .execute_gql(
+            source,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                cursor: second.next_cursor,
+                max_rows: 2,
+                ..GqlExecutionOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(third.rows.len(), 1);
+    assert!(third.next_cursor.is_none());
+}
+
+#[test]
+fn graph_row_edge_pull_gql_anonymous_hidden_edge_keeps_node_slot_zero() {
+    for source in [
+        "MATCH (left)-[edge:GQL_SLOT_EDGE]->(right) RETURN id(edge)",
+        "MATCH ()-[:GQL_SLOT_EDGE]->() RETURN 1",
+    ] {
+        let lowered = lowered_gql_for_projection_test(source);
+        let crate::gql::lower::GqlNativeTarget::GraphRows { query: target } =
+            lowered.native_target
+        else {
+            panic!("fixed-edge GQL must lower to graph rows: {source}")
+        };
+        let normalized = normalize_graph_row_query_with_gql_fixed_paths(
+            &target.query,
+            &target.edge_id_constraints,
+            target.logical_limit,
+            &target.fixed_paths,
+        )
+        .unwrap();
+        assert_eq!(
+            normalized.binding_schema.slots()[0].kind,
+            crate::graph_row::GraphBindingSlotKind::Node,
+            "logical slot zero must stay a node for {source}"
+        );
+    }
 }
 
 fn gql_read_explain(explain: &GqlExecutionExplain) -> &GqlExplain {
@@ -10808,10 +10915,11 @@ fn gql_streamed_edge_result_parity_reuses_delegated_graph_row_execution() {
         .iter()
         .any(|item| item.contains("r.region")));
     let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.graph_row_edge_pull_executions, 1);
     assert_eq!(counters.graph_row_delegated_edge_queries, 1);
     assert_eq!(counters.graph_row_delegated_verified_candidates, 2_700);
-    assert_eq!(counters.streamed_edge_intersect_drivers, 1);
-    assert!(counters.streamed_edge_cursor_seeks > 0);
+    assert_eq!(counters.streamed_edge_intersect_drivers, 0);
+    assert_eq!(counters.streamed_edge_cursor_seeks, 0);
 }
 
 #[test]

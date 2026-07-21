@@ -11,6 +11,8 @@ use crate::secondary_index_key::{
     CompoundRangeBounds, CompoundSidecarTargetKind, CompoundTupleContext,
 };
 use crate::types::*;
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Bound, ControlFlow};
 #[cfg(test)]
@@ -19,6 +21,21 @@ use std::sync::RwLock;
 
 #[cfg(test)]
 static ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static VERSIONED_SLOT_LOOKUP_COMPARISONS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_versioned_slot_lookup_comparisons_for_test() {
+    VERSIONED_SLOT_LOOKUP_COMPARISONS_FOR_TEST.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn versioned_slot_lookup_comparisons_for_test() -> usize {
+    VERSIONED_SLOT_LOOKUP_COMPARISONS_FOR_TEST.with(Cell::get)
+}
 
 #[cfg(test)]
 pub(crate) fn reset_endpoint_cursor_entries_visited_for_test() {
@@ -81,6 +98,10 @@ impl<T: Clone> VersionedSlot<T> {
     }
 
     fn replace(&mut self, write_seq: u64, value: T) {
+        assert!(
+            write_seq >= self.head.write_seq,
+            "versioned slot write sequence must be monotonic"
+        );
         if self.head.write_seq == write_seq {
             self.head.value = value;
             return;
@@ -99,11 +120,22 @@ impl<T: Clone> VersionedSlot<T> {
         if self.head.write_seq <= snapshot_seq {
             return Some(&self.head.value);
         }
-        self.history
-            .as_ref()?
-            .iter()
-            .rev()
-            .find_map(|version| (version.write_seq <= snapshot_seq).then_some(&version.value))
+        let history = self.history.as_ref()?;
+        let mut low = 0usize;
+        let mut high = history.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            #[cfg(test)]
+            VERSIONED_SLOT_LOOKUP_COMPARISONS_FOR_TEST.with(|count| count.set(count.get() + 1));
+            if history[mid].write_seq <= snapshot_seq {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        low.checked_sub(1)
+            .and_then(|index| history.get(index))
+            .map(|version| &version.value)
     }
 }
 
@@ -121,6 +153,28 @@ type SecondaryEqState = HashMap<u64, SecondaryEqMemberState>;
 type SecondaryRangeState = HashMap<u64, BTreeMap<(NumericRangeSortKey, u64), MembershipSlot<()>>>;
 type CompoundSecondaryIndexState = HashMap<u64, BTreeMap<(Vec<u8>, u64), MembershipSlot<()>>>;
 type CompoundAction = (u64, Vec<u8>, u64, bool);
+
+#[derive(Debug, Clone)]
+struct OrderedAdjacencyGroupState {
+    current_count: u64,
+    membership: MembershipSlot<()>,
+}
+
+#[derive(Debug)]
+pub(crate) struct MemtableAdjacencyOwnerRefill {
+    pub(crate) owner_head: Option<u64>,
+    pub(crate) last_group_key_examined: Option<(u64, u32)>,
+    pub(crate) examined: usize,
+    pub(crate) exhausted: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct MemtableAdjacencyPostingRefill {
+    pub(crate) entries: Vec<AdjEntry>,
+    pub(crate) last_edge_id_examined: Option<u64>,
+    pub(crate) examined: usize,
+    pub(crate) exhausted: bool,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MemtableEndpointCountEstimate {
@@ -174,6 +228,10 @@ fn estimate_membership_slot(slot: &MembershipSlot<()>) -> usize {
 
 fn estimate_adj_slot(slot: &MembershipSlot<AdjEntry>) -> usize {
     Memtable::estimate_slot(slot, |_| 48)
+}
+
+fn estimate_ordered_adj_group_state(state: &OrderedAdjacencyGroupState) -> usize {
+    8 + 4 + 8 + estimate_membership_slot(&state.membership)
 }
 
 fn estimate_secondary_decl_entry(entry: &SecondaryIndexManifestEntry) -> usize {
@@ -250,6 +308,10 @@ struct MemtableState {
     ordered_label_edge_index: BTreeMap<(u32, u64), MembershipSlot<()>>,
     ordered_adj_out: NodeIdMap<BTreeMap<u64, MembershipSlot<AdjEntry>>>,
     ordered_adj_in: NodeIdMap<BTreeMap<u64, MembershipSlot<AdjEntry>>>,
+    ordered_adj_out_groups: BTreeMap<(u64, u32), OrderedAdjacencyGroupState>,
+    ordered_adj_in_groups: BTreeMap<(u64, u32), OrderedAdjacencyGroupState>,
+    retained_adj_out_posting_slots: u64,
+    retained_adj_in_posting_slots: u64,
     label_edge_index: HashMap<u32, NodeIdMap<MembershipSlot<()>>>,
     time_node_index: BTreeMap<(u32, i64, u64), MembershipSlot<()>>,
     secondary_index_declarations: HashMap<u64, SecondaryIndexManifestEntry>,
@@ -703,19 +765,94 @@ impl MemtableState {
         member_id: u64,
         value: Option<AdjEntry>,
         write_seq: u64,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, bool) {
         let members = map.entry(owner_id).or_default();
         if let Some(slot) = members.get_mut(&member_id) {
             let before = estimate_adj_slot(slot);
             slot.replace(write_seq, value);
             let after = estimate_adj_slot(slot);
-            (before, after)
+            (before, after, false)
         } else {
             let slot = VersionedSlot::new(write_seq, value);
             let after = estimate_adj_slot(&slot);
             members.insert(member_id, slot);
-            (0, after)
+            (0, after, true)
         }
+    }
+
+    fn change_ordered_adj_group(
+        groups: &mut BTreeMap<(u64, u32), OrderedAdjacencyGroupState>,
+        key: (u64, u32),
+        increment: bool,
+        write_seq: u64,
+    ) -> (usize, usize) {
+        match groups.get_mut(&key) {
+            Some(group) => {
+                let before = estimate_ordered_adj_group_state(group);
+                if increment {
+                    let was_zero = group.current_count == 0;
+                    group.current_count = group
+                        .current_count
+                        .checked_add(1)
+                        .expect("ordered adjacency group count overflow");
+                    if was_zero {
+                        group.membership.replace(write_seq, Some(()));
+                    }
+                } else {
+                    group.current_count = group
+                        .current_count
+                        .checked_sub(1)
+                        .expect("ordered adjacency group count underflow");
+                    if group.current_count == 0 {
+                        group.membership.replace(write_seq, None);
+                    }
+                }
+                let after = estimate_ordered_adj_group_state(group);
+                (before, after)
+            }
+            None if increment => {
+                let group = OrderedAdjacencyGroupState {
+                    current_count: 1,
+                    membership: VersionedSlot::new(write_seq, Some(())),
+                };
+                let after = estimate_ordered_adj_group_state(&group);
+                groups.insert(key, group);
+                (0, after)
+            }
+            None => panic!("ordered adjacency group count underflow"),
+        }
+    }
+
+    fn change_ordered_adj_out_group(
+        &mut self,
+        owner_id: u64,
+        label_id: u32,
+        increment: bool,
+        write_seq: u64,
+    ) {
+        let (before, after) = Self::change_ordered_adj_group(
+            &mut self.ordered_adj_out_groups,
+            (owner_id, label_id),
+            increment,
+            write_seq,
+        );
+        apply_size_delta(&mut self.estimated_bytes, before, after);
+    }
+
+    fn change_ordered_adj_in_group(
+        &mut self,
+        owner_id: u64,
+        label_id: u32,
+        increment: bool,
+        write_seq: u64,
+    ) {
+        let (before, after) = Self::change_ordered_adj_group(
+            &mut self.ordered_adj_in_groups,
+            (owner_id, label_id),
+            increment,
+            write_seq,
+        );
+        apply_size_delta(&mut self.estimated_bytes, before, after);
     }
 
     fn set_label_membership_slot(
@@ -994,7 +1131,7 @@ impl MemtableState {
             write_seq,
         );
         apply_size_delta(&mut self.estimated_bytes, before, after);
-        let (before, after) = Self::set_ordered_adj_slot(
+        let (before, after, inserted) = Self::set_ordered_adj_slot(
             &mut self.ordered_adj_out,
             owner_id,
             member_id,
@@ -1002,6 +1139,12 @@ impl MemtableState {
             write_seq,
         );
         apply_size_delta(&mut self.estimated_bytes, before, after);
+        if inserted {
+            self.retained_adj_out_posting_slots = self
+                .retained_adj_out_posting_slots
+                .checked_add(1)
+                .expect("retained outgoing adjacency posting count overflow");
+        }
     }
 
     fn set_adj_in_slot(
@@ -1019,7 +1162,7 @@ impl MemtableState {
             write_seq,
         );
         apply_size_delta(&mut self.estimated_bytes, before, after);
-        let (before, after) = Self::set_ordered_adj_slot(
+        let (before, after, inserted) = Self::set_ordered_adj_slot(
             &mut self.ordered_adj_in,
             owner_id,
             member_id,
@@ -1027,6 +1170,41 @@ impl MemtableState {
             write_seq,
         );
         apply_size_delta(&mut self.estimated_bytes, before, after);
+        if inserted {
+            self.retained_adj_in_posting_slots = self
+                .retained_adj_in_posting_slots
+                .checked_add(1)
+                .expect("retained incoming adjacency posting count overflow");
+        }
+    }
+
+    fn sync_ordered_adj_groups_for_edge_transition(
+        &mut self,
+        old_edge: Option<&EdgeRecord>,
+        new_edge: Option<&EdgeRecord>,
+        write_seq: u64,
+    ) {
+        let old_out = old_edge.map(|edge| (edge.from, edge.label_id));
+        let new_out = new_edge.map(|edge| (edge.from, edge.label_id));
+        if old_out != new_out {
+            if let Some((owner_id, label_id)) = old_out {
+                self.change_ordered_adj_out_group(owner_id, label_id, false, write_seq);
+            }
+            if let Some((owner_id, label_id)) = new_out {
+                self.change_ordered_adj_out_group(owner_id, label_id, true, write_seq);
+            }
+        }
+
+        let old_in = old_edge.map(|edge| (edge.to, edge.label_id));
+        let new_in = new_edge.map(|edge| (edge.to, edge.label_id));
+        if old_in != new_in {
+            if let Some((owner_id, label_id)) = old_in {
+                self.change_ordered_adj_in_group(owner_id, label_id, false, write_seq);
+            }
+            if let Some((owner_id, label_id)) = new_in {
+                self.change_ordered_adj_in_group(owner_id, label_id, true, write_seq);
+            }
+        }
     }
 
     fn set_node_tombstone_slot(&mut self, member_id: u64, present: bool, write_seq: u64) {
@@ -1157,6 +1335,16 @@ impl MemtableState {
                 .values()
                 .map(|entries| entries.values().map(estimate_adj_slot).sum::<usize>())
                 .sum::<usize>();
+        let ordered_adj_group_size: usize = self
+            .ordered_adj_out_groups
+            .values()
+            .map(estimate_ordered_adj_group_state)
+            .sum::<usize>()
+            + self
+                .ordered_adj_in_groups
+                .values()
+                .map(estimate_ordered_adj_group_state)
+                .sum::<usize>();
         let label_idx_size: usize = self
             .label_edge_index
             .values()
@@ -1274,6 +1462,7 @@ impl MemtableState {
             + adj_in_size
             + ordered_edge_size
             + ordered_adj_size
+            + ordered_adj_group_size
             + label_idx_size
             + time_idx_size
             + secondary_decl_size
@@ -2005,6 +2194,11 @@ impl Memtable {
                 let old_edge = state.current_edge(edge.id).cloned();
                 let was_live = old_edge.is_some();
                 let was_deleted = state.edge_deleted_at(edge.id, u64::MAX);
+                state.sync_ordered_adj_groups_for_edge_transition(
+                    old_edge.as_ref(),
+                    Some(edge),
+                    last_write_seq,
+                );
                 if let Some(old) = old_edge.as_ref() {
                     if (old.from != edge.from || old.to != edge.to || old.label_id != edge.label_id)
                         && state.current_edge_triple_id(old.from, old.to, old.label_id)
@@ -2112,6 +2306,11 @@ impl Memtable {
             }
             WalOp::DeleteEdge { id, deleted_at } => {
                 if let Some(edge) = state.current_edge(*id).cloned() {
+                    state.sync_ordered_adj_groups_for_edge_transition(
+                        Some(&edge),
+                        None,
+                        last_write_seq,
+                    );
                     if state.current_edge_triple_id(edge.from, edge.to, edge.label_id) == Some(*id)
                     {
                         state.set_edge_triple(
@@ -2836,15 +3035,52 @@ impl Memtable {
         ))
     }
 
-    pub(crate) fn get_edge_metadata_at(
+    pub(crate) fn batch_get_edge_metadata_at(
         &self,
-        id: u64,
+        lookups: &[(usize, u64)],
         snapshot_seq: u64,
-    ) -> Option<EdgeMetadataCandidate> {
+        results: &mut [crate::edge_metadata::EdgeMetadataVisibilityState],
+    ) -> Vec<(usize, u64)> {
+        use crate::edge_metadata::EdgeMetadataVisibilityState;
+
+        if lookups.is_empty() {
+            return Vec::new();
+        }
+
         let state = self.state.read().unwrap();
-        state
-            .edge_at(id, snapshot_seq)
-            .map(EdgeMetadataCandidate::from_edge)
+        let mut cache =
+            NodeIdMap::with_capacity_and_hasher(lookups.len(), NodeIdBuildHasher::default());
+        let mut remaining = Vec::with_capacity(lookups.len());
+
+        for &(orig_idx, id) in lookups {
+            let visibility = match cache.get(&id).copied() {
+                Some(visibility) => visibility,
+                None => {
+                    let visibility = match state
+                        .edges
+                        .get(&id)
+                        .and_then(|slot| record_at(slot, snapshot_seq))
+                    {
+                        Some(RecordState::Live(edge)) => EdgeMetadataVisibilityState::Live(
+                            EdgeMetadataCandidate::from_edge(edge),
+                        ),
+                        Some(RecordState::Tombstone(_)) => EdgeMetadataVisibilityState::Deleted,
+                        None if state.edge_deleted_at(id, snapshot_seq) => {
+                            EdgeMetadataVisibilityState::Deleted
+                        }
+                        None => EdgeMetadataVisibilityState::Missing,
+                    };
+                    cache.insert(id, visibility);
+                    visibility
+                }
+            };
+            results[orig_idx] = visibility;
+            if visibility == EdgeMetadataVisibilityState::Missing {
+                remaining.push((orig_idx, id));
+            }
+        }
+
+        remaining
     }
 
     pub(crate) fn batch_get_node_visibility_meta_at(
@@ -4626,6 +4862,170 @@ impl Memtable {
         state.edges.len()
     }
 
+    pub(crate) fn retained_edge_record_keys_is_empty(&self) -> bool {
+        let state = self.state.read().unwrap();
+        state.edges.is_empty()
+    }
+
+    pub(crate) fn retained_ordered_adj_outer_group_count(&self, direction: Direction) -> usize {
+        let state = self.state.read().unwrap();
+        match direction {
+            Direction::Outgoing => state.ordered_adj_out_groups.len(),
+            Direction::Incoming => state.ordered_adj_in_groups.len(),
+            Direction::Both => {
+                panic!("ordered adjacency retained count requires a physical direction")
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn retained_ordered_adj_posting_slot_count(&self, direction: Direction) -> u64 {
+        let state = self.state.read().unwrap();
+        match direction {
+            Direction::Outgoing => state.retained_adj_out_posting_slots,
+            Direction::Incoming => state.retained_adj_in_posting_slots,
+            Direction::Both => {
+                panic!("ordered adjacency retained count requires a physical direction")
+            }
+        }
+    }
+
+    pub(crate) fn refill_ordered_adj_owner_at(
+        &self,
+        direction: Direction,
+        normalized_labels: Option<&[u32]>,
+        snapshot_seq: u64,
+        group_bound: Bound<(u64, u32)>,
+        max_group_entries_examined: usize,
+    ) -> MemtableAdjacencyOwnerRefill {
+        assert!(
+            max_group_entries_examined > 0,
+            "ordered adjacency owner refill maximum must be positive"
+        );
+        if normalized_labels.is_some_and(<[u32]>::is_empty) {
+            return MemtableAdjacencyOwnerRefill {
+                owner_head: None,
+                last_group_key_examined: None,
+                examined: 0,
+                exhausted: true,
+            };
+        }
+
+        let state = self.state.read().unwrap();
+        let groups = match direction {
+            Direction::Outgoing => &state.ordered_adj_out_groups,
+            Direction::Incoming => &state.ordered_adj_in_groups,
+            Direction::Both => {
+                panic!("ordered adjacency owner refill requires a physical direction")
+            }
+        };
+        let mut range = groups.range((group_bound, Bound::Unbounded));
+        let mut last_group_key_examined = None;
+        let mut examined = 0usize;
+        while examined < max_group_entries_examined {
+            let Some((&key, group)) = range.next() else {
+                return MemtableAdjacencyOwnerRefill {
+                    owner_head: None,
+                    last_group_key_examined,
+                    examined,
+                    exhausted: true,
+                };
+            };
+            examined += 1;
+            last_group_key_examined = Some(key);
+            let label_matches =
+                normalized_labels.is_none_or(|labels| labels.binary_search(&key.1).is_ok());
+            if label_matches && slot_option_visible(&group.membership, snapshot_seq) {
+                return MemtableAdjacencyOwnerRefill {
+                    owner_head: Some(key.0),
+                    last_group_key_examined,
+                    examined,
+                    exhausted: false,
+                };
+            }
+        }
+
+        MemtableAdjacencyOwnerRefill {
+            owner_head: None,
+            last_group_key_examined,
+            examined,
+            exhausted: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn refill_ordered_adj_postings_at(
+        &self,
+        direction: Direction,
+        owner_id: u64,
+        normalized_labels: Option<&[u32]>,
+        snapshot_seq: u64,
+        edge_bound: Bound<u64>,
+        max_posting_slots_examined: usize,
+        mut scratch: Vec<AdjEntry>,
+    ) -> MemtableAdjacencyPostingRefill {
+        assert!(
+            max_posting_slots_examined > 0,
+            "ordered adjacency posting refill maximum must be positive"
+        );
+        scratch.clear();
+        if normalized_labels.is_some_and(<[u32]>::is_empty) {
+            return MemtableAdjacencyPostingRefill {
+                entries: scratch,
+                last_edge_id_examined: None,
+                examined: 0,
+                exhausted: true,
+            };
+        }
+        let state = self.state.read().unwrap();
+        let source = match direction {
+            Direction::Outgoing => &state.ordered_adj_out,
+            Direction::Incoming => &state.ordered_adj_in,
+            Direction::Both => {
+                panic!("ordered adjacency posting refill requires a physical direction")
+            }
+        };
+        let Some(entries) = source.get(&owner_id) else {
+            return MemtableAdjacencyPostingRefill {
+                entries: scratch,
+                last_edge_id_examined: None,
+                examined: 0,
+                exhausted: true,
+            };
+        };
+        let mut range = entries.range((edge_bound, Bound::Unbounded));
+        let mut last_edge_id_examined = None;
+        let mut examined = 0usize;
+        while examined < max_posting_slots_examined {
+            let Some((&edge_id, slot)) = range.next() else {
+                return MemtableAdjacencyPostingRefill {
+                    entries: scratch,
+                    last_edge_id_examined,
+                    examined,
+                    exhausted: true,
+                };
+            };
+            examined += 1;
+            last_edge_id_examined = Some(edge_id);
+            let Some(entry) = slot_option_at(slot, snapshot_seq) else {
+                continue;
+            };
+            if normalized_labels
+                .is_some_and(|labels| labels.binary_search(&entry.label_id).is_err())
+            {
+                continue;
+            }
+            scratch.push(entry.clone());
+        }
+
+        MemtableAdjacencyPostingRefill {
+            entries: scratch,
+            last_edge_id_examined,
+            examined,
+            exhausted: false,
+        }
+    }
+
     pub fn nodes(&self) -> NodeIdMap<NodeRecord> {
         let state = self.state.read().unwrap();
         state
@@ -4779,7 +5179,7 @@ impl Memtable {
     }
 
     #[cfg(test)]
-    fn estimated_size_full_for_test(&self) -> usize {
+    pub(crate) fn estimated_size_full_for_test(&self) -> usize {
         let state = self.state.read().unwrap();
         state.recompute_estimated_size()
     }
@@ -6777,6 +7177,527 @@ mod tests {
         assert_eq!(slot.at(1), Some(&10));
         assert_eq!(slot.at(2), Some(&30));
         assert_eq!(slot.history.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn versioned_slot_binary_search_preserves_all_snapshot_boundaries() {
+        let mut slot = VersionedSlot::new(10, 100u64);
+        assert_eq!(slot.at(0), None);
+        assert_eq!(slot.at(9), None);
+        assert_eq!(slot.at(10), Some(&100));
+        assert_eq!(slot.at(u64::MAX), Some(&100));
+
+        slot.replace(20, 200);
+        slot.replace(30, 300);
+        slot.replace(40, 400);
+        assert_eq!(slot.at(9), None);
+        assert_eq!(slot.at(10), Some(&100));
+        assert_eq!(slot.at(19), Some(&100));
+        assert_eq!(slot.at(20), Some(&200));
+        assert_eq!(slot.at(29), Some(&200));
+        assert_eq!(slot.at(30), Some(&300));
+        assert_eq!(slot.at(39), Some(&300));
+        assert_eq!(slot.at(40), Some(&400));
+        assert_eq!(slot.at(41), Some(&400));
+    }
+
+    #[test]
+    fn versioned_slot_old_snapshot_lookup_is_logarithmic() {
+        let mut slot = VersionedSlot::new(0, 0u64);
+        for write_seq in 1..=4096 {
+            slot.replace(write_seq, write_seq);
+        }
+        reset_versioned_slot_lookup_comparisons_for_test();
+        assert_eq!(slot.at(2047), Some(&2047));
+        assert!(
+            versioned_slot_lookup_comparisons_for_test() <= 13,
+            "upper-bound lookup over 4,096 historical versions must be logarithmic"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "versioned slot write sequence must be monotonic")]
+    fn versioned_slot_rejects_lower_write_sequence_in_every_build() {
+        let mut slot = VersionedSlot::new(10, 1u64);
+        slot.replace(9, 2);
+    }
+
+    fn ordered_group_snapshot(
+        mt: &Memtable,
+        direction: Direction,
+        key: (u64, u32),
+        snapshot_seq: u64,
+    ) -> (u64, bool, usize, u64) {
+        let state = mt.state.read().unwrap();
+        let groups = match direction {
+            Direction::Outgoing => &state.ordered_adj_out_groups,
+            Direction::Incoming => &state.ordered_adj_in_groups,
+            Direction::Both => unreachable!(),
+        };
+        let group = groups.get(&key).expect("ordered group must be retained");
+        (
+            group.current_count,
+            slot_option_visible(&group.membership, snapshot_seq),
+            group.membership.history.as_ref().map_or(0, Vec::len),
+            group.membership.head.write_seq,
+        )
+    }
+
+    #[test]
+    fn ordered_adjacency_groups_track_moves_relabels_deletes_and_resurrection() {
+        let mt = Memtable::new();
+        assert_eq!(mt.estimated_size(), 0);
+        assert!(mt.retained_edge_record_keys_is_empty());
+
+        let edge = make_edge(10, 1, 2, 5);
+        mt.apply_op(&WalOp::UpsertEdge(edge.clone()), 1);
+        assert!(!ordered_group_snapshot(&mt, Direction::Outgoing, (1, 5), 0).1);
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Outgoing, (1, 5), 1),
+            (1, true, 0, 1)
+        );
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Incoming, (2, 5), 1),
+            (1, true, 0, 1)
+        );
+        assert_eq!(
+            mt.retained_ordered_adj_outer_group_count(Direction::Outgoing),
+            1
+        );
+        assert_eq!(
+            mt.retained_ordered_adj_posting_slot_count(Direction::Outgoing),
+            1
+        );
+        assert!(!mt.retained_edge_record_keys_is_empty());
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+
+        let mut metadata_only = edge.clone();
+        metadata_only.weight = 9.0;
+        mt.apply_op(&WalOp::UpsertEdge(metadata_only), 2);
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Outgoing, (1, 5), 2),
+            (1, true, 0, 1)
+        );
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Incoming, (2, 5), 2),
+            (1, true, 0, 1)
+        );
+
+        let moved_to = make_edge(10, 1, 3, 5);
+        mt.apply_op(&WalOp::UpsertEdge(moved_to), 3);
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Outgoing, (1, 5), 3),
+            (1, true, 0, 1)
+        );
+        assert!(ordered_group_snapshot(&mt, Direction::Incoming, (2, 5), 2).1);
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Incoming, (2, 5), 3),
+            (0, false, 1, 3)
+        );
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Incoming, (3, 5), 3),
+            (1, true, 0, 3)
+        );
+
+        let relabeled = make_edge(10, 1, 3, 6);
+        mt.apply_op(&WalOp::UpsertEdge(relabeled), 4);
+        assert!(ordered_group_snapshot(&mt, Direction::Outgoing, (1, 5), 3).1);
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Outgoing, (1, 5), 4),
+            (0, false, 1, 4)
+        );
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Outgoing, (1, 6), 4),
+            (1, true, 0, 4)
+        );
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Incoming, (3, 5), 4),
+            (0, false, 1, 4)
+        );
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Incoming, (3, 6), 4),
+            (1, true, 0, 4)
+        );
+
+        let moved_and_relabeled = make_edge(10, 4, 5, 7);
+        mt.apply_op(&WalOp::UpsertEdge(moved_and_relabeled.clone()), 5);
+        assert!(!ordered_group_snapshot(&mt, Direction::Outgoing, (1, 6), 5).1);
+        assert!(!ordered_group_snapshot(&mt, Direction::Incoming, (3, 6), 5).1);
+        assert!(ordered_group_snapshot(&mt, Direction::Outgoing, (4, 7), 5).1);
+        assert!(ordered_group_snapshot(&mt, Direction::Incoming, (5, 7), 5).1);
+
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 10,
+                deleted_at: 6,
+            },
+            6,
+        );
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Outgoing, (4, 7), 6),
+            (0, false, 1, 6)
+        );
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Incoming, (5, 7), 6),
+            (0, false, 1, 6)
+        );
+        let sizes_after_delete = (
+            mt.retained_ordered_adj_outer_group_count(Direction::Outgoing),
+            mt.retained_ordered_adj_outer_group_count(Direction::Incoming),
+            mt.retained_ordered_adj_posting_slot_count(Direction::Outgoing),
+            mt.retained_ordered_adj_posting_slot_count(Direction::Incoming),
+        );
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 10,
+                deleted_at: 7,
+            },
+            7,
+        );
+        assert_eq!(
+            sizes_after_delete,
+            (
+                mt.retained_ordered_adj_outer_group_count(Direction::Outgoing),
+                mt.retained_ordered_adj_outer_group_count(Direction::Incoming),
+                mt.retained_ordered_adj_posting_slot_count(Direction::Outgoing),
+                mt.retained_ordered_adj_posting_slot_count(Direction::Incoming),
+            )
+        );
+
+        mt.apply_op(&WalOp::UpsertEdge(moved_and_relabeled), 8);
+        assert!(!ordered_group_snapshot(&mt, Direction::Outgoing, (4, 7), 6).1);
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Outgoing, (4, 7), 8),
+            (1, true, 2, 8)
+        );
+        assert_eq!(
+            mt.retained_ordered_adj_posting_slot_count(Direction::Outgoing),
+            2
+        );
+        assert_eq!(
+            mt.retained_ordered_adj_posting_slot_count(Direction::Incoming),
+            3
+        );
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+    }
+
+    #[test]
+    fn ordered_adjacency_same_sequence_crossings_collapse_to_final_membership() {
+        let mt = Memtable::new();
+        let edge = make_edge(1, 10, 20, 30);
+        mt.apply_op(&WalOp::UpsertEdge(edge.clone()), 5);
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 1,
+                deleted_at: 5,
+            },
+            5,
+        );
+        mt.apply_op(&WalOp::UpsertEdge(edge), 5);
+        assert!(!ordered_group_snapshot(&mt, Direction::Outgoing, (10, 30), 4).1);
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Outgoing, (10, 30), 5),
+            (1, true, 0, 5)
+        );
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+    }
+
+    #[test]
+    fn ordered_adjacency_churn_retains_physical_keys_and_versions_only_zero_crossings() {
+        let mt = Memtable::new();
+        for id in 0..1024u64 {
+            mt.apply_op(
+                &WalOp::UpsertEdge(make_edge(id, id, id + 10_000, 7)),
+                id * 2 + 1,
+            );
+            mt.apply_op(
+                &WalOp::DeleteEdge {
+                    id,
+                    deleted_at: (id * 2 + 2) as i64,
+                },
+                id * 2 + 2,
+            );
+        }
+        assert_eq!(
+            mt.retained_ordered_adj_outer_group_count(Direction::Outgoing),
+            1024
+        );
+        assert_eq!(
+            mt.retained_ordered_adj_posting_slot_count(Direction::Outgoing),
+            1024
+        );
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+
+        let sentinel = make_edge(10_000, 50_000, 60_000, 9);
+        mt.apply_op(&WalOp::UpsertEdge(sentinel), 10_000);
+        for offset in 1..=512u64 {
+            let id = 10_000 + offset;
+            mt.apply_op(
+                &WalOp::UpsertEdge(make_edge(id, 50_000, 70_000 + offset, 9)),
+                10_000 + offset * 2 - 1,
+            );
+            mt.apply_op(
+                &WalOp::DeleteEdge {
+                    id,
+                    deleted_at: (10_000 + offset * 2) as i64,
+                },
+                10_000 + offset * 2,
+            );
+        }
+        let group = ordered_group_snapshot(&mt, Direction::Outgoing, (50_000, 9), u64::MAX);
+        assert_eq!(group, (1, true, 0, 10_000));
+        let refill = mt.refill_ordered_adj_postings_at(
+            Direction::Outgoing,
+            50_000,
+            Some(&[9]),
+            u64::MAX,
+            Bound::Unbounded,
+            4096,
+            Vec::new(),
+        );
+        assert_eq!(refill.examined, 513);
+        assert_eq!(refill.entries.len(), 1);
+        assert!(refill.exhausted);
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+    }
+
+    #[test]
+    fn ordered_adjacency_hot_group_history_tracks_only_zero_crossings() {
+        let mt = Memtable::new();
+        let edge = make_edge(1, 1, 2, 3);
+        mt.apply_op(&WalOp::UpsertEdge(edge.clone()), 1);
+        for cycle in 0..64u64 {
+            let delete_seq = cycle * 2 + 2;
+            mt.apply_op(
+                &WalOp::DeleteEdge {
+                    id: 1,
+                    deleted_at: delete_seq as i64,
+                },
+                delete_seq,
+            );
+            mt.apply_op(&WalOp::UpsertEdge(edge.clone()), delete_seq + 1);
+        }
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Outgoing, (1, 3), u64::MAX),
+            (1, true, 128, 129)
+        );
+        reset_versioned_slot_lookup_comparisons_for_test();
+        assert_eq!(
+            ordered_group_snapshot(&mt, Direction::Outgoing, (1, 3), 64),
+            (1, false, 128, 129)
+        );
+        assert!(
+            versioned_slot_lookup_comparisons_for_test() <= 8,
+            "old-snapshot lookup over 128 zero-crossing versions must be logarithmic"
+        );
+        assert_eq!(
+            mt.retained_ordered_adj_posting_slot_count(Direction::Outgoing),
+            1
+        );
+        assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
+    }
+
+    #[test]
+    #[should_panic(expected = "ordered adjacency group count underflow")]
+    fn ordered_adjacency_group_count_rejects_underflow() {
+        MemtableState::change_ordered_adj_group(&mut BTreeMap::new(), (1, 2), false, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "ordered adjacency group count overflow")]
+    fn ordered_adjacency_group_count_rejects_overflow() {
+        let mut groups = BTreeMap::from([(
+            (1, 2),
+            OrderedAdjacencyGroupState {
+                current_count: u64::MAX,
+                membership: VersionedSlot::new(1, Some(())),
+            },
+        )]);
+        MemtableState::change_ordered_adj_group(&mut groups, (1, 2), true, 2);
+    }
+
+    #[test]
+    fn ordered_adjacency_refills_are_bounded_owned_and_resume_exclusively() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(0, 0, 9, 0)), 1);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 0, 8, u32::MAX)), 2);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 4, 7, 7)), 3);
+        mt.apply_op(
+            &WalOp::UpsertEdge(make_edge(u64::MAX, u64::MAX, 6, u32::MAX)),
+            4,
+        );
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 1,
+                deleted_at: 5,
+            },
+            5,
+        );
+
+        let empty =
+            mt.refill_ordered_adj_owner_at(Direction::Outgoing, Some(&[]), 5, Bound::Unbounded, 1);
+        assert_eq!(
+            (empty.owner_head, empty.examined, empty.exhausted),
+            (None, 0, true)
+        );
+
+        let first =
+            mt.refill_ordered_adj_owner_at(Direction::Outgoing, Some(&[7]), 5, Bound::Unbounded, 1);
+        assert_eq!(first.owner_head, None);
+        assert_eq!(first.last_group_key_examined, Some((0, 0)));
+        assert_eq!(first.examined, 1);
+        assert!(!first.exhausted);
+        let second = mt.refill_ordered_adj_owner_at(
+            Direction::Outgoing,
+            Some(&[7]),
+            5,
+            Bound::Excluded(first.last_group_key_examined.unwrap()),
+            4096,
+        );
+        assert_eq!(second.owner_head, Some(4));
+        assert_eq!(second.examined, 2);
+        let after_owner_zero = mt.refill_ordered_adj_owner_at(
+            Direction::Outgoing,
+            Some(&[0, 7, u32::MAX]),
+            5,
+            Bound::Excluded((0, u32::MAX)),
+            4096,
+        );
+        assert_eq!(after_owner_zero.owner_head, Some(4));
+
+        let scratch = Vec::with_capacity(8);
+        let postings = mt.refill_ordered_adj_postings_at(
+            Direction::Outgoing,
+            0,
+            None,
+            5,
+            Bound::Unbounded,
+            1,
+            scratch,
+        );
+        assert_eq!(postings.examined, 1);
+        assert_eq!(postings.last_edge_id_examined, Some(0));
+        assert_eq!(
+            postings
+                .entries
+                .iter()
+                .map(|entry| entry.edge_id)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert!(postings.entries.capacity() >= 8);
+        assert!(!postings.exhausted);
+        let postings = mt.refill_ordered_adj_postings_at(
+            Direction::Outgoing,
+            0,
+            None,
+            5,
+            Bound::Excluded(postings.last_edge_id_examined.unwrap()),
+            4096,
+            postings.entries,
+        );
+        assert_eq!(postings.examined, 1, "deleted physical slot still counts");
+        assert!(postings.entries.is_empty());
+        assert!(postings.exhausted);
+
+        let nonmatching = mt.refill_ordered_adj_postings_at(
+            Direction::Outgoing,
+            0,
+            Some(&[7]),
+            4,
+            Bound::Unbounded,
+            4096,
+            Vec::new(),
+        );
+        assert_eq!(nonmatching.examined, 2);
+        assert!(nonmatching.entries.is_empty());
+        let version_invisible = mt.refill_ordered_adj_postings_at(
+            Direction::Outgoing,
+            0,
+            None,
+            0,
+            Bound::Unbounded,
+            4096,
+            Vec::new(),
+        );
+        assert_eq!(version_invisible.examined, 2);
+        assert!(version_invisible.entries.is_empty());
+        let known_empty_postings = mt.refill_ordered_adj_postings_at(
+            Direction::Outgoing,
+            0,
+            Some(&[]),
+            5,
+            Bound::Unbounded,
+            4096,
+            Vec::with_capacity(4),
+        );
+        assert_eq!(
+            (
+                known_empty_postings.examined,
+                known_empty_postings.exhausted,
+                known_empty_postings.entries.capacity(),
+            ),
+            (0, true, 4)
+        );
+
+        let max_owner = mt.refill_ordered_adj_owner_at(
+            Direction::Outgoing,
+            Some(&[u32::MAX]),
+            5,
+            Bound::Included((u64::MAX, u32::MIN)),
+            4096,
+        );
+        assert_eq!(max_owner.owner_head, Some(u64::MAX));
+        let owned = mt.refill_ordered_adj_postings_at(
+            Direction::Outgoing,
+            u64::MAX,
+            Some(&[u32::MAX]),
+            5,
+            Bound::Unbounded,
+            4096,
+            Vec::new(),
+        );
+        assert_eq!(owned.entries[0].edge_id, u64::MAX);
+        let incoming = mt.refill_ordered_adj_owner_at(
+            Direction::Incoming,
+            Some(&[u32::MAX]),
+            5,
+            Bound::Included((6, u32::MIN)),
+            4096,
+        );
+        assert_eq!(incoming.owner_head, Some(6));
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(99, 100, 101, 9)), 6);
+        assert_eq!(
+            owned.entries[0].edge_id,
+            u64::MAX,
+            "refill result owns its entries"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ordered adjacency owner refill maximum must be positive")]
+    fn ordered_adjacency_owner_refill_rejects_zero_maximum() {
+        Memtable::new().refill_ordered_adj_owner_at(
+            Direction::Outgoing,
+            None,
+            0,
+            Bound::Unbounded,
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ordered adjacency posting refill maximum must be positive")]
+    fn ordered_adjacency_posting_refill_rejects_zero_maximum() {
+        Memtable::new().refill_ordered_adj_postings_at(
+            Direction::Outgoing,
+            0,
+            None,
+            0,
+            Bound::Unbounded,
+            0,
+            Vec::new(),
+        );
     }
 
     #[test]
