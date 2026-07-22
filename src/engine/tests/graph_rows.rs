@@ -99,10 +99,42 @@ fn graph_row_test_engine() -> (TempDir, DatabaseEngine) {
     (dir, engine)
 }
 
-fn assert_graph_row_single_read_followup_enqueued(
-    engine: &DatabaseEngine,
-    action: impl FnOnce(),
-) {
+fn execute_graph_row_with_anchored_edge_override(
+    view: &ReadView,
+    normalized: &NormalizedGraphRowQuery,
+    runtime: &GraphRowRuntimePlan,
+    physical: &GraphRowPhysicalPlan,
+    source_override: &GraphRowAnchoredEdgeSourceOverride<'_>,
+) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
+    let mut caches = GraphRowExecutionCaches::new(normalized.options.max_intermediate_bindings);
+    let mut attempt = caches.begin_attempt();
+    let mut followups = GraphRowUniqueFollowups::new(Vec::new());
+    let result = view.graph_row_execute_runtime_plan_with_caches(
+        normalized,
+        runtime,
+        physical,
+        Some(source_override),
+        None,
+        GraphRowRuntimeGoal::AllRows,
+        normalized.at_epoch.unwrap_or(i64::MAX / 2),
+        view.query_policy_cutoffs().as_ref(),
+        &mut followups,
+        &mut 0,
+        &mut 0,
+        &mut 0,
+        None,
+        &mut caches,
+        &mut attempt,
+    );
+    if result.is_ok() {
+        caches.commit_attempt(&mut attempt);
+    } else {
+        caches.rollback_attempt(&mut attempt);
+    }
+    result
+}
+
+fn assert_graph_row_single_read_followup_enqueued(engine: &DatabaseEngine, action: impl FnOnce()) {
     let (followup_ready_rx, followup_release_tx) = engine.set_runtime_publish_pause();
     action();
     followup_ready_rx
@@ -6492,6 +6524,7 @@ fn graph_row_runtime_cache_reuses_one_and_multi_hop_vlp_across_direct_core_calls
                 &runtime,
                 &physical,
                 None,
+                None,
                 GraphRowRuntimeGoal::AllRows,
                 i64::MAX / 2,
                 policy_cutoffs.as_ref(),
@@ -6514,6 +6547,7 @@ fn graph_row_runtime_cache_reuses_one_and_multi_hop_vlp_across_direct_core_calls
                 &normalized,
                 &runtime,
                 &physical,
+                None,
                 None,
                 GraphRowRuntimeGoal::AllRows,
                 i64::MAX / 2,
@@ -6548,6 +6582,7 @@ fn graph_row_runtime_cache_reuses_one_and_multi_hop_vlp_across_direct_core_calls
                     &normalized,
                     &runtime,
                     &physical,
+                    None,
                     None,
                     GraphRowRuntimeGoal::AllRows,
                     i64::MAX / 2,
@@ -8503,23 +8538,25 @@ fn graph_row_runtime_cache_reuses_uncorrelated_optional_across_direct_core_calls
         let mut intermediate_peak = 0;
         let mut paths_enumerated = 0;
         let mut trace = GraphRowExplainTrace::default();
-        let rows = view.graph_row_execute_runtime_plan_with_caches(
-            &normalized,
-            &runtime,
-            &physical,
-            None,
-            GraphRowRuntimeGoal::AllRows,
-            i64::MAX / 2,
-            policy_cutoffs.as_ref(),
-            &mut followups,
-            &mut frontier_peak,
-            &mut intermediate_peak,
-            &mut paths_enumerated,
-            Some(&mut trace),
-            &mut caches,
-            &mut first_attempt,
-        )
-        .unwrap();
+        let rows = view
+            .graph_row_execute_runtime_plan_with_caches(
+                &normalized,
+                &runtime,
+                &physical,
+                None,
+                None,
+                GraphRowRuntimeGoal::AllRows,
+                i64::MAX / 2,
+                policy_cutoffs.as_ref(),
+                &mut followups,
+                &mut frontier_peak,
+                &mut intermediate_peak,
+                &mut paths_enumerated,
+                Some(&mut trace),
+                &mut caches,
+                &mut first_attempt,
+            )
+            .unwrap();
         (rows, frontier_peak, intermediate_peak, paths_enumerated, trace)
     };
     caches.commit_attempt(&mut first_attempt);
@@ -8532,6 +8569,7 @@ fn graph_row_runtime_cache_reuses_uncorrelated_optional_across_direct_core_calls
             &normalized,
             &runtime,
             &physical,
+            None,
             None,
             GraphRowRuntimeGoal::AllRows,
             i64::MAX / 2,
@@ -9825,6 +9863,7 @@ fn graph_row_runtime_cache_executes_nested_same_local_paths_without_collision() 
                 &runtime,
                 &physical,
                 None,
+                None,
                 GraphRowRuntimeGoal::AllRows,
                 i64::MAX / 2,
                 policy_cutoffs.as_ref(),
@@ -9909,6 +9948,7 @@ fn graph_row_runtime_cache_correlated_negative_no_admit_and_rollback_are_directl
                 &runtime,
                 &physical,
                 None,
+                None,
                 GraphRowRuntimeGoal::AllRows,
                 i64::MAX / 2,
                 policy_cutoffs.as_ref(),
@@ -9933,6 +9973,7 @@ fn graph_row_runtime_cache_correlated_negative_no_admit_and_rollback_are_directl
                 &normalized,
                 &runtime,
                 &physical,
+                None,
                 None,
                 GraphRowRuntimeGoal::AllRows,
                 i64::MAX / 2,
@@ -9963,6 +10004,7 @@ fn graph_row_runtime_cache_correlated_negative_no_admit_and_rollback_are_directl
                 &runtime,
                 &physical,
                 None,
+                None,
                 GraphRowRuntimeGoal::AllRows,
                 i64::MAX / 2,
                 policy_cutoffs.as_ref(),
@@ -9990,6 +10032,7 @@ fn graph_row_runtime_cache_correlated_negative_no_admit_and_rollback_are_directl
                     &normalized,
                     &runtime,
                     &physical,
+                    None,
                     None,
                     GraphRowRuntimeGoal::AllRows,
                     i64::MAX / 2,
@@ -10804,6 +10847,7 @@ fn graph_row_parallel_edges_preserve_multiplicity() {
     query.nodes[0].ids = vec![from];
     query.nodes[1].ids = vec![to];
     query.return_items = Some(vec![graph_return_binding("r", GraphReturnProjection::IdOnly)]);
+    query.options.include_plan = true;
 
     assert_eq!(
         graph_row_single_u64_column(engine.query_graph_rows(&query).unwrap()),
@@ -12259,12 +12303,13 @@ fn graph_row_unbound_delegates_filtered_unfiltered_and_multi_label_branches() {
     assert_eq!(counters.graph_row_delegated_edge_queries, 2);
     assert_eq!(counters.graph_row_delegated_verified_candidates, 3);
     let explain = unfiltered.plan.as_ref().unwrap();
-    assert_graph_row_explain_contains(explain, "materialized_source=DelegatedEdgeQuery");
-    assert_graph_row_explain_contains(explain, "label_branches=2");
-    assert_graph_row_explain_contains(explain, "planned_modes=");
-    assert_graph_row_explain_contains(explain, "planned_warnings=[");
-    assert_graph_row_explain_contains(explain, "verified_candidates=3");
-    assert_graph_row_explain_contains(explain, "drivers=EdgeLabelIndex|EdgeLabelIndex");
+    assert_graph_row_explain_contains(explain, "materialized_source=EdgePullDelegatedMetadata");
+    assert_graph_row_explain_contains(
+        explain,
+        "context=executed prepared graph-row edge anchor source",
+    );
+    assert_graph_row_explain_contains(explain, "prepared_source=NativeCursor");
+    assert_graph_row_explain_contains(explain, "source_pulls=2; successful_leaves=2");
     assert_graph_row_explain_not_contains(explain, "EdgeValidityIndex");
     assert_eq!(
         engine
@@ -12303,9 +12348,19 @@ fn graph_row_unbound_valid_at_injection_does_not_legalize_anchorless_read() {
         GraphReturnProjection::IdOnly,
     )]);
 
+    engine.reset_query_execution_counters_for_test();
     let without_explicit_epoch = engine.query_graph_rows(&query).unwrap_err().to_string();
+    let without_epoch_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(without_epoch_counters.graph_row_edge_pull_executions, 0);
+    assert_eq!(without_epoch_counters.graph_row_delegated_edge_queries, 0);
+    assert_eq!(without_epoch_counters.graph_row_chunks_executed, 0);
     query.at_epoch = Some(123);
+    engine.reset_query_execution_counters_for_test();
     let with_explicit_epoch = engine.query_graph_rows(&query).unwrap_err().to_string();
+    let with_epoch_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(with_epoch_counters.graph_row_edge_pull_executions, 0);
+    assert_eq!(with_epoch_counters.graph_row_delegated_edge_queries, 0);
+    assert_eq!(with_epoch_counters.graph_row_chunks_executed, 0);
 
     assert_eq!(without_explicit_epoch, with_explicit_epoch);
     assert_eq!(
@@ -12464,7 +12519,7 @@ fn graph_row_delegated_stale_candidates_do_not_consume_frontier_cap() {
 }
 
 #[test]
-fn graph_row_delegated_verified_candidates_above_cap_return_truthful_error() {
+fn graph_row_edge_pull_verified_candidates_above_cap_succeed_in_bounded_leaves() {
     let (_dir, engine) = graph_row_test_engine();
     let source = insert_graph_row_node(&engine, "DelegatedCap", "cap-source", &[]);
     for index in 0..3 {
@@ -12492,13 +12547,20 @@ fn graph_row_delegated_verified_candidates_above_cap_return_truthful_error() {
         GraphReturnProjection::IdOnly,
     )]);
 
-    let message = engine.query_graph_rows(&query).unwrap_err().to_string();
-    assert_eq!(
-        message,
-        "invalid operation: graph row max_frontier exceeded configured cap 2"
-    );
-    assert!(!message.contains("source=EdgeCandidateSource"));
-    assert!(!message.contains("planned_source="));
+    engine.reset_query_execution_counters_for_test();
+    let result = engine.query_graph_rows(&query).unwrap();
+    assert_eq!(result.rows.len(), 3);
+    assert!(result.stats.frontier_peak <= 2);
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.graph_row_edge_pull_executions, 1);
+    assert_eq!(counters.graph_row_delegated_edge_queries, 2);
+    assert_eq!(counters.graph_row_delegated_verified_candidates, 3);
+    assert_eq!(counters.graph_row_chunks_executed, 2);
+    assert_eq!(counters.graph_row_node_verification_resolutions, 0);
+    assert_eq!(counters.graph_row_node_verification_set_builds, 0);
+    assert_eq!(counters.graph_row_fixed_edge_bucket_builds, 0);
+    assert_eq!(counters.graph_row_all_candidate_endpoints_proven, 4);
+    assert_eq!(counters.graph_row_fixed_edge_workspace_growths, 1);
 
     query.nodes[0].ids = vec![source];
     if let GraphPatternPiece::Edge(edge) = &mut query.pieces[0] {
@@ -12517,6 +12579,125 @@ fn graph_row_delegated_verified_candidates_above_cap_return_truthful_error() {
             .graph_row_delegated_edge_queries,
         1
     );
+}
+
+#[test]
+fn graph_row_edge_pull_constrained_node_cache_reuses_positive_and_negative_results() {
+    let (dir, engine) = graph_row_test_engine();
+    let db_path = dir.path().join("db");
+    let source = insert_graph_row_node(
+        &engine,
+        "EdgePullCacheSource",
+        "cache-source",
+        &[("kind", PropValue::String("good".to_string()))],
+    );
+    let target = insert_graph_row_node(
+        &engine,
+        "EdgePullCacheOther",
+        "cache-target",
+        &[("kind", PropValue::String("other".to_string()))],
+    );
+    insert_graph_row_edge(&engine, source, target, "EDGE_PULL_CACHE_A", &[]);
+    insert_graph_row_edge(&engine, source, target, "EDGE_PULL_CACHE_B", &[]);
+    let policy_hidden = engine
+        .upsert_node(
+            "EdgePullCacheOther",
+            "cache-policy-hidden",
+            UpsertNodeOptions {
+                weight: 0.1,
+                props: graph_row_props(&[(
+                    "kind",
+                    PropValue::String("wanted".to_string()),
+                )]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    insert_graph_row_edge(&engine, source, policy_hidden, "EDGE_PULL_CACHE_A", &[]);
+    insert_graph_row_edge(&engine, source, policy_hidden, "EDGE_PULL_CACHE_B", &[]);
+    engine
+        .set_prune_policy(
+            "edge-pull-cache-hidden",
+            PrunePolicy {
+                max_age_ms: None,
+                max_weight: Some(0.5),
+                label: Some("EdgePullCacheOther".to_string()),
+            },
+        )
+        .unwrap();
+
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![GraphPatternPiece::Edge(GraphEdgePattern {
+            alias: Some("edge".to_string()),
+            from_alias: "source".to_string(),
+            to_alias: "target".to_string(),
+            direction: Direction::Outgoing,
+            label_filter: vec![
+                "EDGE_PULL_CACHE_A".to_string(),
+                "EDGE_PULL_CACHE_B".to_string(),
+            ],
+            filter: None,
+        })],
+    );
+    query.nodes[0].filter = Some(NodeFilterExpr::PropertyEquals {
+        key: "kind".to_string(),
+        value: PropValue::String("good".to_string()),
+    });
+    query.nodes[1].filter = Some(NodeFilterExpr::PropertyEquals {
+        key: "kind".to_string(),
+        value: PropValue::String("wanted".to_string()),
+    });
+    query.options.allow_full_scan = false;
+    query.options.max_frontier = 1;
+    query.options.include_plan = true;
+    query.page.limit = 1;
+    query.at_epoch = Some(now_millis());
+
+    let assert_cache = |engine: &DatabaseEngine| {
+        let mut oracle_query = query.clone();
+        oracle_query.options.max_frontier = 16;
+        oracle_query.options.max_intermediate_bindings = 16;
+        oracle_query.options.include_plan = false;
+        let oracle = graph_row_chunk_runtime_once_result(engine, &oracle_query);
+        engine.reset_query_execution_counters_for_test();
+        let result = engine.query_graph_rows(&query).unwrap();
+        graph_row_chunk_assert_page_parity(
+            &result,
+            &oracle,
+            "constrained cache policy warm/reopen RuntimeOnce oracle",
+        );
+        assert!(result.rows.is_empty());
+        let counters = engine.query_execution_counter_snapshot_for_test();
+        assert_eq!(counters.graph_row_edge_pull_executions, 1);
+        assert_eq!(counters.graph_row_node_verification_resolutions, 2);
+        assert_eq!(counters.graph_row_node_verification_cache_hits, 2);
+        assert_eq!(counters.graph_row_node_verification_cache_units_peak, 2);
+        assert_eq!(counters.graph_row_node_verification_set_builds, 4);
+        assert_eq!(counters.graph_row_all_candidate_endpoints_proven, 0);
+        assert_eq!(counters.graph_row_fixed_edge_bucket_builds, 0);
+    };
+
+    engine.reset_query_execution_counters_for_test();
+    let verification_error = with_graph_row_test_node_verification_failure(|| {
+        engine.query_graph_rows(&query).unwrap_err()
+    });
+    assert_eq!(
+        verification_error.to_string(),
+        "invalid operation: injected graph-row node verification failure"
+    );
+    let failed = engine.query_execution_counter_snapshot_for_test();
+    assert!(failed.graph_row_node_verification_resolutions > 0);
+    assert_eq!(
+        failed.graph_row_node_verification_cache_units_peak, 0,
+        "a failed miss batch must admit no positive or negative cache entries"
+    );
+
+    assert_cache(&engine);
+    engine.flush().unwrap();
+    drop(engine);
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    assert_cache(&reopened);
 }
 
 #[test]
@@ -12859,6 +13040,747 @@ fn graph_row_verified_metadata_terminal_matches_full_verifier_across_source_stat
     );
 }
 
+fn prepared_edge_metadata_pull_find_source(
+    plan: &EdgePhysicalPlan,
+    kind: EdgeQueryCandidateSourceKind,
+) -> Option<PlannedEdgeCandidateSource> {
+    match plan {
+        EdgePhysicalPlan::Source(source) if source.kind == kind => Some(source.clone()),
+        EdgePhysicalPlan::BufferedIdSort(input) => {
+            prepared_edge_metadata_pull_find_source(input, kind)
+        }
+        EdgePhysicalPlan::Intersect { inputs, .. } | EdgePhysicalPlan::Union { inputs, .. } => {
+            inputs
+                .iter()
+                .find_map(|input| prepared_edge_metadata_pull_find_source(input, kind))
+        }
+        EdgePhysicalPlan::Empty | EdgePhysicalPlan::Source(_) => None,
+    }
+}
+
+#[test]
+fn prepared_edge_metadata_pull_native_label_continues_once_across_flush() {
+    let (dir, engine) = query_test_engine();
+    let db_path = dir.path().join("db");
+    let source_node = insert_query_node(&engine, "Person", "prepared-source", &[], 1.0);
+    let targets = (0..7)
+        .map(|index| {
+            insert_query_node(
+                &engine,
+                "Person",
+                &format!("prepared-target-{index}"),
+                &[],
+                1.0,
+            )
+        })
+        .collect::<Vec<_>>();
+    let label = "PREPARED_EDGE_LABEL";
+    let mut expected = Vec::new();
+    for target in &targets[..3] {
+        expected.push(
+            engine
+                .upsert_edge(source_node, *target, label, UpsertEdgeOptions::default())
+                .unwrap(),
+        );
+    }
+    engine.flush().unwrap();
+    for target in &targets[3..6] {
+        expected.push(
+            engine
+                .upsert_edge(source_node, *target, label, UpsertEdgeOptions::default())
+                .unwrap(),
+        );
+    }
+
+    let query = EdgeQuery {
+        label: Some(label.to_string()),
+        page: PageRequest {
+            limit: Some(4),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let view = engine.published_state().view.clone();
+    let planning_query = view.normalize_edge_query(&query).unwrap();
+    let execution_query = planning_query.clone();
+    reset_prepared_edge_source_test_snapshot();
+    let (mut prepared, preparation_followups) = view
+        .plan_and_prepare_edge_metadata_pull_source_for_test(
+            &planning_query,
+            &execution_query,
+            None,
+        )
+        .unwrap();
+    assert!(preparation_followups.is_empty());
+    assert_eq!(prepared.planning_limit(), 4);
+    assert_eq!(prepared.prepared_mode(), PreparedEdgeSourceMode::NativeCursor);
+    assert_eq!(prepared.fallback(), PreparedEdgeFallback::None);
+    assert_eq!(prepared.retained_id_units(), 0);
+
+    let zero_error = prepared.pull(0).unwrap_err().to_string();
+    assert_eq!(
+        zero_error,
+        "invalid operation: prepared edge metadata pull limit must be in 1..=4, got 0"
+    );
+    let above_error = prepared.pull(5).unwrap_err().to_string();
+    assert_eq!(
+        above_error,
+        "invalid operation: prepared edge metadata pull limit must be in 1..=4, got 5"
+    );
+
+    let first = prepared.pull(1).unwrap();
+    assert_eq!(first.metadata.len(), 1);
+    assert!(first.has_more);
+    assert!(first.followups.is_empty());
+    let mut actual = first.metadata.into_iter().map(|meta| meta.id).collect::<Vec<_>>();
+
+    let post_prepare = engine
+        .upsert_edge(
+            source_node,
+            targets[6],
+            label,
+            UpsertEdgeOptions::default(),
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    loop {
+        let pull = prepared.pull(1).unwrap();
+        actual.extend(pull.metadata.into_iter().map(|meta| meta.id));
+        if !pull.has_more {
+            break;
+        }
+    }
+    assert_eq!(actual, expected);
+    assert!(!actual.contains(&post_prepare));
+
+    let snapshot = prepared_edge_source_test_snapshot();
+    assert_eq!(snapshot.branch_plans, 1);
+    assert_eq!(snapshot.preparations, 1);
+    assert_eq!(snapshot.native_cursor_builds, 2);
+    assert_eq!(snapshot.streamed_cursor_builds, 0);
+    assert_eq!(snapshot.eager_materializations, 0);
+    assert_eq!(snapshot.buffered_sorts, 0);
+    assert_eq!(snapshot.fallback_selections, 0);
+    assert_eq!(snapshot.retained_id_units_peak, 0);
+    assert!(snapshot.verification_endpoint_cache_units_peak
+        <= PREPARED_EDGE_ENDPOINT_VISIBILITY_CAP + 2 * QUERY_VERIFY_CHUNK);
+
+    drop(prepared);
+    drop(view);
+    engine.close().unwrap();
+    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened_view = reopened.published_state().view.clone();
+    let reopened_query = reopened_view.normalize_edge_query(&query).unwrap();
+    let (mut reopened_prepared, followups) = reopened_view
+        .plan_and_prepare_edge_metadata_pull_source_for_test(
+            &reopened_query,
+            &reopened_query,
+            None,
+        )
+        .unwrap();
+    assert!(followups.is_empty());
+    let mut reopened_ids = Vec::new();
+    loop {
+        let pull = reopened_prepared.pull(1).unwrap();
+        reopened_ids.extend(pull.metadata.into_iter().map(|meta| meta.id));
+        if !pull.has_more {
+            break;
+        }
+    }
+    let mut reopened_expected = expected;
+    reopened_expected.push(post_prepare);
+    assert_eq!(reopened_ids, reopened_expected);
+}
+
+#[test]
+fn prepared_edge_metadata_pull_empty_and_full_scan_modes_match_stateless_ids() {
+    let (_dir, engine) = query_test_engine();
+    let source_node = insert_query_node(&engine, "Person", "prepared-full-source", &[], 1.0);
+    let targets = (0..5)
+        .map(|index| {
+            insert_query_node(
+                &engine,
+                "Person",
+                &format!("prepared-full-target-{index}"),
+                &[],
+                1.0,
+            )
+        })
+        .collect::<Vec<_>>();
+    let expected = targets
+        .iter()
+        .map(|target| {
+            engine
+                .upsert_edge(
+                    source_node,
+                    *target,
+                    "PREPARED_FULL_SCAN",
+                    UpsertEdgeOptions::default(),
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    engine.flush().unwrap();
+    let view = engine.published_state().view.clone();
+
+    let full_query = EdgeQuery {
+        allow_full_scan: true,
+        page: PageRequest {
+            limit: Some(3),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let normalized = view.normalize_edge_query(&full_query).unwrap();
+    reset_prepared_edge_source_test_snapshot();
+    let (mut prepared, followups) = view
+        .plan_and_prepare_edge_metadata_pull_source_for_test(&normalized, &normalized, None)
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(prepared.prepared_mode(), PreparedEdgeSourceMode::NativeCursor);
+    let mut actual = Vec::new();
+    loop {
+        let pull = prepared.pull(2).unwrap();
+        actual.extend(pull.metadata.into_iter().map(|meta| meta.id));
+        if !pull.has_more {
+            break;
+        }
+    }
+    assert_eq!(actual, expected);
+
+    let planned_full_scan = view.plan_normalized_edge_query(&normalized).unwrap();
+    let fallback_source = match &planned_full_scan.driver {
+        EdgePhysicalPlan::Source(source) => source.clone(),
+        _ => panic!("expected full-scan source"),
+    };
+    let forced_fallback = PlannedEdgeQuery {
+        driver: EdgePhysicalPlan::Source(fallback_source.clone()),
+        execution_mode: EdgeDriverExecutionMode::Streamed,
+        cap_context: planned_full_scan.cap_context,
+        legal_universe_fallback: Some(fallback_source),
+        warnings: Vec::new(),
+        followups: Vec::new(),
+    };
+    reset_prepared_edge_source_test_snapshot();
+    let (mut fallback_prepared, followups) = view
+        .prepare_edge_metadata_pull_source(
+            &normalized,
+            &normalized,
+            forced_fallback,
+            None,
+        )
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(fallback_prepared.prepared_mode(), PreparedEdgeSourceMode::NativeCursor);
+    assert_eq!(
+        fallback_prepared.fallback(),
+        PreparedEdgeFallback::PreparedLegalUniverse
+    );
+    let first = fallback_prepared.pull(1).unwrap();
+    assert_eq!(first.metadata[0].id, expected[0]);
+    assert_eq!(prepared_edge_source_test_snapshot().fallback_selections, 1);
+
+    let empty = normalized.clone();
+    let empty_plan = PlannedEdgeQuery {
+        driver: EdgePhysicalPlan::Empty,
+        execution_mode: EdgeDriverExecutionMode::Eager,
+        cap_context: EdgeQueryCapContext::default(),
+        legal_universe_fallback: None,
+        warnings: Vec::new(),
+        followups: Vec::new(),
+    };
+    let (mut prepared_empty, followups) = view
+        .prepare_edge_metadata_pull_source(&empty, &empty, empty_plan, None)
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(prepared_empty.prepared_mode(), PreparedEdgeSourceMode::Empty);
+    let pull = prepared_empty.pull(1).unwrap();
+    assert!(pull.metadata.is_empty());
+    assert!(!pull.has_more);
+}
+
+#[test]
+fn prepared_edge_metadata_pull_rejects_unreachable_anchored_sources() {
+    let (_dir, engine) = query_test_engine();
+    let from = insert_query_node(&engine, "Person", "prepared-negative-from", &[], 1.0);
+    let to = insert_query_node(&engine, "Person", "prepared-negative-to", &[], 1.0);
+    let edge = engine
+        .upsert_edge(from, to, "PREPARED_NEGATIVE", UpsertEdgeOptions::default())
+        .unwrap();
+    let view = engine.published_state().view.clone();
+    let cases = [
+        EdgeQuery {
+            ids: vec![edge],
+            page: PageRequest {
+                limit: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        EdgeQuery {
+            from_ids: vec![from],
+            page: PageRequest {
+                limit: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        EdgeQuery {
+            to_ids: vec![to],
+            page: PageRequest {
+                limit: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        EdgeQuery {
+            endpoint_ids: vec![from],
+            page: PageRequest {
+                limit: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        EdgeQuery {
+            label: Some("PREPARED_NEGATIVE".to_string()),
+            from_ids: vec![from],
+            to_ids: vec![to],
+            page: PageRequest {
+                limit: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ];
+    for query in cases {
+        let normalized = view.normalize_edge_query(&query).unwrap();
+        let planned = view.plan_normalized_edge_query(&normalized).unwrap();
+        let error = view
+            .prepare_edge_metadata_pull_source(&normalized, &normalized, planned, None)
+            .err()
+            .expect("anchored source must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "invalid operation: prepared graph-row edge source received unreachable anchored input source"
+        );
+    }
+}
+
+#[test]
+fn prepared_edge_metadata_pull_streamed_union_builds_once_across_many_pulls() {
+    let (_dir, engine) = query_test_engine();
+    let label = "PREPARED_STREAMED_UNION";
+    ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
+    ensure_ready_edge_property_index(&engine, label, "region", SecondaryIndexKind::Equality);
+    ensure_ready_edge_property_index(&engine, label, "score", SecondaryIndexKind::Range);
+    let (_nodes, edge_ids) = seed_streamed_edge_union_fixture(&engine, label, 5_000);
+    engine.flush().unwrap();
+    let expected = edge_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, edge_id)| {
+            (ordinal % 3 == 0 || ordinal.is_multiple_of(2)).then_some(*edge_id)
+        })
+        .collect::<Vec<_>>();
+    let query = EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(EdgeFilterExpr::Or(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(12),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let view = engine.published_state().view.clone();
+    let normalized = view.normalize_edge_query(&query).unwrap();
+    reset_prepared_edge_source_test_snapshot();
+    let (mut prepared, followups) = view
+        .plan_and_prepare_edge_metadata_pull_source_for_test(&normalized, &normalized, None)
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(prepared.prepared_mode(), PreparedEdgeSourceMode::StreamedUnion);
+    assert_eq!(prepared.retained_id_units(), 0);
+    let mut actual = Vec::new();
+    let mut pulls = 0usize;
+    loop {
+        let pull = prepared.pull(7).unwrap();
+        pulls += 1;
+        actual.extend(pull.metadata.into_iter().map(|meta| meta.id));
+        if !pull.has_more {
+            break;
+        }
+    }
+    assert!(pulls >= 3);
+    assert_eq!(actual, expected);
+    let snapshot = prepared_edge_source_test_snapshot();
+    assert_eq!(snapshot.branch_plans, 1);
+    assert_eq!(snapshot.preparations, 1);
+    assert_eq!(snapshot.streamed_cursor_builds, 2);
+    assert_eq!(snapshot.buffered_sorts, 0);
+    assert_eq!(snapshot.fallback_selections, 0);
+    assert!(snapshot.verification_endpoint_cache_units_peak
+        <= PREPARED_EDGE_ENDPOINT_VISIBILITY_CAP + 2 * QUERY_VERIFY_CHUNK);
+
+    let intersect_query = EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(12),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let intersect_expected = edge_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, edge_id)| {
+            (ordinal % 3 == 0 && ordinal.is_multiple_of(2)).then_some(*edge_id)
+        })
+        .collect::<Vec<_>>();
+    let intersect = view.normalize_edge_query(&intersect_query).unwrap();
+    reset_prepared_edge_source_test_snapshot();
+    let (mut prepared_intersect, followups) = view
+        .plan_and_prepare_edge_metadata_pull_source_for_test(&intersect, &intersect, None)
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(
+        prepared_intersect.prepared_mode(),
+        PreparedEdgeSourceMode::StreamedIntersect
+    );
+    let mut actual = Vec::new();
+    loop {
+        let pull = prepared_intersect.pull(5).unwrap();
+        actual.extend(pull.metadata.into_iter().map(|meta| meta.id));
+        if !pull.has_more {
+            break;
+        }
+    }
+    assert_eq!(actual, intersect_expected);
+    let snapshot = prepared_edge_source_test_snapshot();
+    assert_eq!(snapshot.branch_plans, 1);
+    assert_eq!(snapshot.preparations, 1);
+    assert_eq!(snapshot.streamed_cursor_builds, 2);
+
+    let single_query = EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(EdgeFilterExpr::PropertyEquals {
+            key: "status".to_string(),
+            value: PropValue::String("hot".to_string()),
+        }),
+        page: PageRequest {
+            limit: Some(12),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let single_expected = edge_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, edge_id)| (ordinal % 3 == 0).then_some(*edge_id))
+        .collect::<Vec<_>>();
+    let single = view.normalize_edge_query(&single_query).unwrap();
+    reset_prepared_edge_source_test_snapshot();
+    note_prepared_edge_branch_plan();
+    let mut single_plan = view.plan_normalized_edge_query(&single).unwrap();
+    single_plan.execution_mode = EdgeDriverExecutionMode::Streamed;
+    single_plan.driver = EdgePhysicalPlan::Source(
+        prepared_edge_metadata_pull_find_source(
+            &single_plan.driver,
+            EdgeQueryCandidateSourceKind::EdgePropertyEqualityIndex,
+        )
+        .expect("single query should contain the equality source"),
+    );
+    let (mut prepared_single, followups) = view
+        .prepare_edge_metadata_pull_source(&single, &single, single_plan, None)
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(
+        prepared_single.prepared_mode(),
+        PreparedEdgeSourceMode::StreamedSingle
+    );
+    let mut actual = Vec::new();
+    loop {
+        let pull = prepared_single.pull(3).unwrap();
+        actual.extend(pull.metadata.into_iter().map(|meta| meta.id));
+        if !pull.has_more {
+            break;
+        }
+    }
+    assert_eq!(actual, single_expected);
+    assert_eq!(prepared_edge_source_test_snapshot().streamed_cursor_builds, 1);
+
+    let buffered_query = EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(EdgeFilterExpr::And(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyRange {
+                key: "score".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(0))),
+                upper: Some(PropertyRangeBound::Excluded(PropValue::Int(2_500))),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(12),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let buffered_expected = edge_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, edge_id)| {
+            (ordinal < 2_500 && ordinal % 3 == 0).then_some(*edge_id)
+        })
+        .collect::<Vec<_>>();
+    let buffered = view.normalize_edge_query(&buffered_query).unwrap();
+    reset_prepared_edge_source_test_snapshot();
+    note_prepared_edge_branch_plan();
+    let mut buffered_plan = view.plan_normalized_edge_query(&buffered).unwrap();
+    buffered_plan.execution_mode = EdgeDriverExecutionMode::Streamed;
+    let equality_source = prepared_edge_metadata_pull_find_source(
+        &buffered_plan.driver,
+        EdgeQueryCandidateSourceKind::EdgePropertyEqualityIndex,
+    )
+    .expect("buffered query should contain the equality source");
+    let range_source = prepared_edge_metadata_pull_find_source(
+        &buffered_plan.driver,
+        EdgeQueryCandidateSourceKind::EdgePropertyRangeIndex,
+    )
+    .expect("buffered query should contain the range source");
+    buffered_plan.driver = EdgePhysicalPlan::Intersect {
+        inputs: vec![
+            EdgePhysicalPlan::Source(equality_source),
+            EdgePhysicalPlan::BufferedIdSort(Box::new(EdgePhysicalPlan::Source(range_source))),
+        ],
+        mode: EdgeSetOpExecutionMode::Streamed,
+    };
+    let (mut prepared_buffered, followups) = view
+        .prepare_edge_metadata_pull_source(&buffered, &buffered, buffered_plan, None)
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(
+        prepared_buffered.prepared_mode(),
+        PreparedEdgeSourceMode::StreamedIntersect
+    );
+    let mut actual = Vec::new();
+    loop {
+        let pull = prepared_buffered.pull(6).unwrap();
+        actual.extend(pull.metadata.into_iter().map(|meta| meta.id));
+        if !pull.has_more {
+            break;
+        }
+    }
+    assert_eq!(actual, buffered_expected);
+    let snapshot = prepared_edge_source_test_snapshot();
+    assert_eq!(snapshot.buffered_sorts, 1);
+    assert_eq!(snapshot.streamed_cursor_builds, 2);
+    assert!(snapshot.retained_id_units_peak <= PREPARED_EDGE_RETAINED_ID_CAP);
+}
+
+#[test]
+fn prepared_edge_metadata_pull_eager_union_materializes_once() {
+    let (_dir, engine) = query_test_engine();
+    let label = "PREPARED_EAGER_UNION";
+    ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
+    ensure_ready_edge_property_index(&engine, label, "region", SecondaryIndexKind::Equality);
+    let (_nodes, edge_ids) = seed_streamed_edge_union_fixture(&engine, label, 3_000);
+    engine.flush().unwrap();
+    let expected = edge_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, edge_id)| {
+            (ordinal % 3 == 0 || ordinal.is_multiple_of(2)).then_some(*edge_id)
+        })
+        .collect::<Vec<_>>();
+    let query = EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(EdgeFilterExpr::Or(vec![
+            EdgeFilterExpr::PropertyEquals {
+                key: "status".to_string(),
+                value: PropValue::String("hot".to_string()),
+            },
+            EdgeFilterExpr::PropertyEquals {
+                key: "region".to_string(),
+                value: PropValue::String("east".to_string()),
+            },
+        ])),
+        page: PageRequest {
+            limit: Some(12),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let view = engine.published_state().view.clone();
+    let normalized = view.normalize_edge_query(&query).unwrap();
+    reset_prepared_edge_source_test_snapshot();
+    let (mut prepared, followups) = view
+        .plan_and_prepare_edge_metadata_pull_source_for_test(&normalized, &normalized, None)
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(prepared.prepared_mode(), PreparedEdgeSourceMode::RetainedIds);
+    assert_eq!(prepared.retained_id_units(), expected.len());
+    let mut actual = Vec::new();
+    loop {
+        let pull = prepared.pull(7).unwrap();
+        actual.extend(pull.metadata.into_iter().map(|meta| meta.id));
+        if !pull.has_more {
+            break;
+        }
+    }
+    assert_eq!(actual, expected);
+    let snapshot = prepared_edge_source_test_snapshot();
+    assert_eq!(snapshot.branch_plans, 1);
+    assert_eq!(snapshot.preparations, 1);
+    assert_eq!(snapshot.eager_materializations, 3);
+    assert_eq!(snapshot.streamed_cursor_builds, 0);
+    assert_eq!(snapshot.fallback_selections, 0);
+    assert!(snapshot.retained_id_units_peak <= PREPARED_EDGE_RETAINED_ID_CAP);
+}
+
+#[test]
+fn prepared_edge_metadata_pull_endpoint_cache_is_persistent_and_bounded_for_200k_candidates() {
+    const CANDIDATE_COUNT: usize = 200_000;
+    const FIRST_DISTINCT_ENDPOINT_ID: u64 = 1_000_000;
+
+    let (_dir, engine) = query_test_engine();
+    let label = "PREPARED_ENDPOINT_CACHE_BOUND";
+    let label_id = engine.ensure_edge_label(label).unwrap();
+    let matching_from = insert_query_node(
+        &engine,
+        "Person",
+        "prepared-endpoint-cache-match-from",
+        &[],
+        1.0,
+    );
+    let matching_to = insert_query_node(
+        &engine,
+        "Person",
+        "prepared-endpoint-cache-match-to",
+        &[],
+        1.0,
+    );
+    let first_edge_id = engine.next_edge_id().unwrap();
+    let matching_edge_id = first_edge_id + CANDIDATE_COUNT as u64 - 1;
+
+    // Build the large fixture directly in the test memtable so this regression does
+    // not perform 200,000 individual public WAL writes. Every candidate uses two
+    // endpoint IDs that are distinct across the entire fixture. The final edge uses
+    // the only live endpoint pair and is the only residual-filter match, forcing one
+    // pull to scan the complete candidate universe through real ReadView semantics.
+    engine
+        .with_core_mut(|core| {
+            let mut write_seq = core.engine_seq;
+            for ordinal in 0..CANDIDATE_COUNT {
+                let edge_id = first_edge_id + ordinal as u64;
+                let is_match = ordinal + 1 == CANDIDATE_COUNT;
+                let (from, to) = if is_match {
+                    (matching_from, matching_to)
+                } else {
+                    let from = FIRST_DISTINCT_ENDPOINT_ID + ordinal as u64 * 2;
+                    (from, from + 1)
+                };
+                let mut props = BTreeMap::new();
+                if is_match {
+                    props.insert("needle".to_string(), PropValue::Bool(true));
+                }
+                write_seq += 1;
+                core.active_memtable().apply_op(
+                    &WalOp::UpsertEdge(EdgeRecord {
+                        id: edge_id,
+                        from,
+                        to,
+                        label_id,
+                        props,
+                        created_at: 1,
+                        updated_at: 1,
+                        weight: 1.0,
+                        valid_from: 0,
+                        valid_to: i64::MAX,
+                        last_write_seq: 0,
+                    }),
+                    write_seq,
+                );
+            }
+            core.engine_seq = write_seq;
+            core.next_edge_id = matching_edge_id + 1;
+            core.update_next_edge_id_seen();
+            Ok(())
+        })
+        .unwrap();
+
+    let query = EdgeQuery {
+        label: Some(label.to_string()),
+        filter: Some(EdgeFilterExpr::PropertyEquals {
+            key: "needle".to_string(),
+            value: PropValue::Bool(true),
+        }),
+        page: PageRequest {
+            limit: Some(1),
+            after: None,
+        },
+        ..Default::default()
+    };
+    let view = engine.published_state().view.clone();
+    let normalized = view.normalize_edge_query(&query).unwrap();
+    reset_prepared_edge_source_test_snapshot();
+    let (mut prepared, followups) = view
+        .plan_and_prepare_edge_metadata_pull_source_for_test(&normalized, &normalized, None)
+        .unwrap();
+    assert!(followups.is_empty());
+    assert_eq!(prepared.prepared_mode(), PreparedEdgeSourceMode::NativeCursor);
+
+    let pull = prepared.pull(1).unwrap();
+    assert_eq!(
+        pull.metadata.iter().map(|meta| meta.id).collect::<Vec<_>>(),
+        vec![matching_edge_id]
+    );
+    assert!(!pull.has_more);
+    assert!(pull.followups.is_empty());
+
+    let snapshot = prepared_edge_source_test_snapshot();
+    assert_eq!(snapshot.branch_plans, 1);
+    assert_eq!(snapshot.preparations, 1);
+    assert_eq!(snapshot.native_cursor_builds, 1);
+    assert_eq!(
+        snapshot.verification_endpoint_cache_units_peak,
+        PREPARED_EDGE_ENDPOINT_VISIBILITY_CAP + 2 * QUERY_VERIFY_CHUNK
+    );
+    assert_eq!(
+        snapshot.verification_endpoint_cache_retained_peak,
+        PREPARED_EDGE_ENDPOINT_VISIBILITY_CAP
+    );
+    assert_eq!(
+        snapshot.verification_endpoint_cache_transient_peak,
+        2 * QUERY_VERIFY_CHUNK
+    );
+    assert_eq!(
+        snapshot.verification_endpoint_visibility_resolutions,
+        2 * CANDIDATE_COUNT
+    );
+}
+
 #[test]
 fn graph_row_delegated_rows_explain_and_cursor_are_deterministic_after_reopen() {
     let dir = TempDir::new().unwrap();
@@ -12965,12 +13887,18 @@ fn graph_row_delegated_rows_explain_and_cursor_are_deterministic_after_reopen() 
         reopened
             .query_execution_counter_snapshot_for_test()
             .graph_row_delegated_edge_queries,
-        1
+        0
     );
+    let reopened_plan = reopened_first.plan.as_ref().unwrap();
+    assert_graph_row_explain_contains(
+        reopened_plan,
+        "source=AdjacencyPull{edge=alias:edge}",
+    );
+    assert_graph_row_explain_contains(reopened_plan, "choice=AdjacencyPullChunk");
 }
 
 #[test]
-fn graph_row_unbound_running_union_detects_cross_label_overflow() {
+fn graph_row_edge_pull_cross_label_totals_succeed_with_bounded_frontiers() {
     let (_dir, engine) = graph_row_test_engine();
     let source = insert_graph_row_node(&engine, "DelegatedUnionCap", "union-cap-source", &[]);
     for (label, offset) in [
@@ -13006,17 +13934,18 @@ fn graph_row_unbound_running_union_detects_cross_label_overflow() {
     query.options.max_frontier = 3;
 
     engine.reset_query_execution_counters_for_test();
-    assert_eq!(
-        engine.query_graph_rows(&query).unwrap_err().to_string(),
-        "invalid operation: graph row max_frontier exceeded configured cap 3"
-    );
+    let result = engine.query_graph_rows(&query).unwrap();
+    assert_eq!(result.rows.len(), 4);
+    assert!(result.stats.frontier_peak <= 3);
     let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.graph_row_edge_pull_executions, 1);
     assert_eq!(counters.graph_row_delegated_edge_queries, 2);
     assert_eq!(counters.graph_row_delegated_verified_candidates, 4);
+    assert_eq!(counters.graph_row_chunks_executed, 2);
 }
 
 #[test]
-fn graph_row_unbound_cap_remains_conservative_before_endpoint_pattern_verification() {
+fn graph_row_edge_pull_endpoint_filter_keeps_candidate_frontier_inflight() {
     let (_dir, engine) = graph_row_test_engine();
     let source = insert_graph_row_node(
         &engine,
@@ -13059,10 +13988,420 @@ fn graph_row_unbound_cap_remains_conservative_before_endpoint_pattern_verificati
     query.options.allow_full_scan = false;
     query.options.max_frontier = 2;
 
-    assert_eq!(
-        engine.query_graph_rows(&query).unwrap_err().to_string(),
-        "invalid operation: graph row max_frontier exceeded configured cap 2"
+    let result = engine.query_graph_rows(&query).unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.stats.frontier_peak, 2);
+    assert_eq!(result.stats.intermediate_bindings_peak, 1);
+}
+
+#[test]
+fn anchored_edge_source_override_delegated_and_raw_ids_bypass_complete_source_tree() {
+    let (_dir, engine) = graph_row_test_engine();
+    let source_a = insert_graph_row_node(&engine, "Override", "override-source-a", &[]);
+    let target_a = insert_graph_row_node(&engine, "Override", "override-target-a", &[]);
+    let source_b = insert_graph_row_node(&engine, "Override", "override-source-b", &[]);
+    let target_b = insert_graph_row_node(&engine, "Override", "override-target-b", &[]);
+    let edge_a = insert_graph_row_edge(&engine, source_a, target_a, "ANCHORED_OVERRIDE", &[]);
+    let edge_b = insert_graph_row_edge(&engine, source_b, target_b, "ANCHORED_OVERRIDE", &[]);
+    engine.flush().unwrap();
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![graph_edge_with_label(
+            Some("edge"),
+            "source",
+            "target",
+            "ANCHORED_OVERRIDE",
+        )],
     );
+    query.options.allow_full_scan = false;
+    let mut normalized = normalize_graph_row_query(&query).unwrap();
+    normalized
+        .edge_id_constraints
+        .insert("edge".to_string(), vec![edge_a, edge_b]);
+    let view = engine.published_state().view.clone();
+    let runtime = view.normalize_graph_row_runtime_plan(&normalized).unwrap();
+    let physical = view
+        .plan_graph_row_physical(&normalized, &runtime, false, true)
+        .unwrap();
+    let edge_slot = runtime.edges[0].edge_slot.unwrap();
+
+    let delegated_metadata = [EdgeMetadataForQuery::from(
+        &internal_edge_record(&engine, edge_a).unwrap().unwrap(),
+    )];
+    let delegated_override = GraphRowAnchoredEdgeSourceOverride {
+        edge_index: 0,
+        read: GraphRowAnchoredEdgeSourceRead::DelegatedMetadata(&delegated_metadata),
+        consumed: std::cell::Cell::new(false),
+    };
+    engine.reset_query_execution_counters_for_test();
+    let delegated_rows = execute_graph_row_with_anchored_edge_override(
+        &view,
+        &normalized,
+        &runtime,
+        &physical,
+        &delegated_override,
+    )
+    .unwrap();
+    assert!(delegated_override.consumed.get());
+    assert_eq!(delegated_rows.len(), 1);
+    assert_eq!(
+        delegated_rows[0]
+            .edge_id_for_slot_if_bound(edge_slot)
+            .unwrap(),
+        Some(edge_a)
+    );
+    let delegated_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(delegated_counters.graph_row_delegated_edge_queries, 0);
+    assert_eq!(delegated_counters.edge_verifier_metadata_lookup_calls, 0);
+
+    let raw_slice = [edge_b];
+    let raw_override = GraphRowAnchoredEdgeSourceOverride {
+        edge_index: 0,
+        read: GraphRowAnchoredEdgeSourceRead::RawIds(&raw_slice),
+        consumed: std::cell::Cell::new(false),
+    };
+    engine.reset_query_execution_counters_for_test();
+    let raw_rows = execute_graph_row_with_anchored_edge_override(
+        &view,
+        &normalized,
+        &runtime,
+        &physical,
+        &raw_override,
+    )
+    .unwrap();
+    assert!(raw_override.consumed.get());
+    assert_eq!(raw_rows.len(), 1);
+    assert_eq!(
+        raw_rows[0].edge_id_for_slot_if_bound(edge_slot).unwrap(),
+        Some(edge_b)
+    );
+    let raw_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(raw_counters.graph_row_delegated_edge_queries, 0);
+    assert_eq!(
+        graph_row_source_choice_label(GraphRowEdgeCandidateSourceChoice::EdgePullChunk),
+        "EdgePullChunk"
+    );
+}
+
+#[test]
+fn anchored_edge_source_override_consumption_error_missing_and_retry_freshness_are_exact() {
+    let (_dir, engine) = graph_row_test_engine();
+    let source = insert_graph_row_node(&engine, "OverrideState", "override-state-source", &[]);
+    let target = insert_graph_row_node(&engine, "OverrideState", "override-state-target", &[]);
+    let edge_id = insert_graph_row_edge(&engine, source, target, "ANCHORED_OVERRIDE_STATE", &[]);
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![graph_edge_with_label(
+            Some("edge"),
+            "source",
+            "target",
+            "ANCHORED_OVERRIDE_STATE",
+        )],
+    );
+    query.options.allow_full_scan = false;
+    let mut normalized = normalize_graph_row_query(&query).unwrap();
+    normalized.options.max_frontier = 0;
+    let view = engine.published_state().view.clone();
+    let mut runtime = view.normalize_graph_row_runtime_plan(&normalized).unwrap();
+    let physical = view
+        .plan_graph_row_physical(&normalized, &runtime, false, true)
+        .unwrap();
+    let ids = [edge_id];
+
+    let error_override = GraphRowAnchoredEdgeSourceOverride {
+        edge_index: 0,
+        read: GraphRowAnchoredEdgeSourceRead::RawIds(&ids),
+        consumed: std::cell::Cell::new(false),
+    };
+    runtime.edges[0].filter = NormalizedEdgeFilter::AlwaysFalse;
+    assert_eq!(
+        execute_graph_row_with_anchored_edge_override(
+            &view,
+            &normalized,
+            &runtime,
+            &physical,
+            &error_override,
+        )
+        .unwrap_err()
+        .to_string(),
+        "invalid operation: graph row max_frontier exceeded configured cap 0"
+    );
+    assert!(error_override.consumed.get());
+
+    normalized.options.max_frontier = 16;
+    runtime.edges[0].filter = NormalizedEdgeFilter::AlwaysTrue;
+    let mismatched = GraphRowAnchoredEdgeSourceOverride {
+        edge_index: 99,
+        read: GraphRowAnchoredEdgeSourceRead::RawIds(&ids),
+        consumed: std::cell::Cell::new(false),
+    };
+    let ordinary_rows = execute_graph_row_with_anchored_edge_override(
+        &view,
+        &normalized,
+        &runtime,
+        &physical,
+        &mismatched,
+    )
+    .unwrap();
+    assert_eq!(ordinary_rows.len(), 1);
+    assert!(!mismatched.consumed.get());
+    #[cfg(debug_assertions)]
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        debug_assert!(
+            mismatched.consumed.get(),
+            "future EdgePull caller requires post-attempt consumption"
+        );
+    }))
+    .is_err());
+
+    for _ in 0..2 {
+        let fresh = GraphRowAnchoredEdgeSourceOverride {
+            edge_index: 0,
+            read: GraphRowAnchoredEdgeSourceRead::RawIds(&ids),
+            consumed: std::cell::Cell::new(false),
+        };
+        let rows = execute_graph_row_with_anchored_edge_override(
+            &view,
+            &normalized,
+            &runtime,
+            &physical,
+            &fresh,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(fresh.consumed.get());
+    }
+}
+
+#[test]
+fn anchored_edge_source_override_later_edge_optional_and_vlp_collisions_are_contained() {
+    let (_dir, engine) = graph_row_test_engine();
+    let source = insert_graph_row_node(&engine, "OverrideContain", "contain-source", &[]);
+    let middle = insert_graph_row_node(&engine, "OverrideContain", "contain-middle", &[]);
+    let target = insert_graph_row_node(&engine, "OverrideContain", "contain-target", &[]);
+    let first = insert_graph_row_edge(&engine, source, middle, "ANCHORED_CONTAIN_FIRST", &[]);
+    let second = insert_graph_row_edge(&engine, middle, target, "ANCHORED_CONTAIN_SECOND", &[]);
+
+    let mut chain = graph_query(
+        &["source", "middle", "target"],
+        vec![
+            graph_edge_with_label(Some("first"), "source", "middle", "ANCHORED_CONTAIN_FIRST"),
+            graph_edge_with_label(
+                Some("second"),
+                "middle",
+                "target",
+                "ANCHORED_CONTAIN_SECOND",
+            ),
+        ],
+    );
+    chain.options.allow_full_scan = false;
+    let normalized = normalize_graph_row_query(&chain).unwrap();
+    let view = engine.published_state().view.clone();
+    let runtime = view.normalize_graph_row_runtime_plan(&normalized).unwrap();
+    let physical = view
+        .plan_graph_row_physical(&normalized, &runtime, false, true)
+        .unwrap();
+    let anchor_index = physical.segments[0].edge_order[0];
+    assert_eq!(physical.segments[0].edge_order.len(), 2);
+    let anchor_id = [first, second][anchor_index];
+    let anchor_metadata = [EdgeMetadataForQuery::from(
+        &internal_edge_record(&engine, anchor_id).unwrap().unwrap(),
+    )];
+    let source_override = GraphRowAnchoredEdgeSourceOverride {
+        edge_index: anchor_index,
+        read: GraphRowAnchoredEdgeSourceRead::DelegatedMetadata(&anchor_metadata),
+        consumed: std::cell::Cell::new(false),
+    };
+    let rows = execute_graph_row_with_anchored_edge_override(
+        &view,
+        &normalized,
+        &runtime,
+        &physical,
+        &source_override,
+    )
+    .unwrap();
+    assert!(source_override.consumed.get());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]
+            .edge_id_for_slot_if_bound(runtime.edges[0].edge_slot.unwrap())
+            .unwrap(),
+        Some(first)
+    );
+    assert_eq!(
+        rows[0]
+            .edge_id_for_slot_if_bound(runtime.edges[1].edge_slot.unwrap())
+            .unwrap(),
+        Some(second)
+    );
+
+    let mut optional = graph_query(
+        &["source", "middle", "target"],
+        vec![
+            graph_edge_with_label(
+                Some("required"),
+                "source",
+                "middle",
+                "ANCHORED_CONTAIN_FIRST",
+            ),
+            graph_optional(
+                vec![graph_edge_with_label(
+                    Some("optional"),
+                    "middle",
+                    "target",
+                    "ANCHORED_CONTAIN_SECOND",
+                )],
+                None,
+            ),
+        ],
+    );
+    optional.options.allow_full_scan = false;
+    let optional_normalized = normalize_graph_row_query(&optional).unwrap();
+    let optional_runtime = view
+        .normalize_graph_row_runtime_plan(&optional_normalized)
+        .unwrap();
+    let optional_physical = view
+        .plan_graph_row_physical(&optional_normalized, &optional_runtime, false, true)
+        .unwrap();
+    let required_metadata = [EdgeMetadataForQuery::from(
+        &internal_edge_record(&engine, first).unwrap().unwrap(),
+    )];
+    let optional_override = GraphRowAnchoredEdgeSourceOverride {
+        edge_index: 0,
+        read: GraphRowAnchoredEdgeSourceRead::DelegatedMetadata(&required_metadata),
+        consumed: std::cell::Cell::new(false),
+    };
+    let optional_rows = execute_graph_row_with_anchored_edge_override(
+        &view,
+        &optional_normalized,
+        &optional_runtime,
+        &optional_physical,
+        &optional_override,
+    )
+    .unwrap();
+    assert!(optional_override.consumed.get());
+    assert_eq!(optional_rows.len(), 1);
+    let optional_slot = optional_normalized
+        .binding_schema
+        .slot_for_alias("optional")
+        .unwrap();
+    assert_eq!(
+        optional_rows[0]
+            .edge_id_for_slot_if_bound(optional_slot)
+            .unwrap(),
+        Some(second)
+    );
+
+    let mut vlp = graph_vlp(
+        Some("path"),
+        Some("vlp_edge"),
+        "middle",
+        "target",
+        1,
+        1,
+    );
+    let GraphPatternPiece::VariableLength(path) = &mut vlp else {
+        unreachable!()
+    };
+    path.label_filter = vec!["ANCHORED_CONTAIN_SECOND".to_string()];
+    let mut required_then_vlp = graph_query(
+        &["source", "middle", "target"],
+        vec![
+            graph_edge_with_label(
+                Some("required"),
+                "source",
+                "middle",
+                "ANCHORED_CONTAIN_FIRST",
+            ),
+            vlp,
+        ],
+    );
+    required_then_vlp.options.allow_full_scan = false;
+    let vlp_normalized = normalize_graph_row_query(&required_then_vlp).unwrap();
+    let vlp_runtime = view
+        .normalize_graph_row_runtime_plan(&vlp_normalized)
+        .unwrap();
+    let vlp_physical = view
+        .plan_graph_row_physical(&vlp_normalized, &vlp_runtime, false, true)
+        .unwrap();
+    assert!(matches!(
+        vlp_runtime.steps.as_slice(),
+        [GraphRowRuntimeStep::RequiredSegment(0), GraphRowRuntimeStep::VariableLength(_)]
+    ));
+    let vlp_override = GraphRowAnchoredEdgeSourceOverride {
+        edge_index: 0,
+        read: GraphRowAnchoredEdgeSourceRead::DelegatedMetadata(&required_metadata),
+        consumed: std::cell::Cell::new(false),
+    };
+    let vlp_rows = execute_graph_row_with_anchored_edge_override(
+        &view,
+        &vlp_normalized,
+        &vlp_runtime,
+        &vlp_physical,
+        &vlp_override,
+    )
+    .unwrap();
+    assert!(vlp_override.consumed.get());
+    assert_eq!(vlp_rows.len(), 1);
+    let vlp_edge_slot = vlp_normalized
+        .binding_schema
+        .slot_for_alias("vlp_edge")
+        .unwrap();
+    assert_eq!(
+        vlp_rows[0]
+            .edge_id_for_slot_if_bound(vlp_edge_slot)
+            .unwrap(),
+        Some(second)
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn anchored_edge_source_override_duplicate_consumption_panics() {
+    let (_dir, engine) = graph_row_test_engine();
+    let source = insert_graph_row_node(&engine, "OverrideDup", "override-dup-source", &[]);
+    let target = insert_graph_row_node(&engine, "OverrideDup", "override-dup-target", &[]);
+    let edge_id = insert_graph_row_edge(&engine, source, target, "ANCHORED_OVERRIDE_DUP", &[]);
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![graph_edge_with_label(
+            Some("edge"),
+            "source",
+            "target",
+            "ANCHORED_OVERRIDE_DUP",
+        )],
+    );
+    query.options.allow_full_scan = false;
+    let normalized = normalize_graph_row_query(&query).unwrap();
+    let view = engine.published_state().view.clone();
+    let runtime = view.normalize_graph_row_runtime_plan(&normalized).unwrap();
+    let physical = view
+        .plan_graph_row_physical(&normalized, &runtime, false, true)
+        .unwrap();
+    let ids = [edge_id];
+    let source_override = GraphRowAnchoredEdgeSourceOverride {
+        edge_index: 0,
+        read: GraphRowAnchoredEdgeSourceRead::RawIds(&ids),
+        consumed: std::cell::Cell::new(false),
+    };
+    execute_graph_row_with_anchored_edge_override(
+        &view,
+        &normalized,
+        &runtime,
+        &physical,
+        &source_override,
+    )
+    .unwrap();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = execute_graph_row_with_anchored_edge_override(
+            &view,
+            &normalized,
+            &runtime,
+            &physical,
+            &source_override,
+        );
+    }))
+    .is_err());
 }
 
 #[test]
@@ -13123,10 +14462,12 @@ fn graph_row_delegated_mixed_bound_unbound_union_composes_retained_metadata() {
     engine.reset_query_execution_counters_for_test();
     let mut followups = Vec::new();
     let mut frontier_peak = 0;
+    let mut oriented_scratch = Vec::new();
     let candidates = view
         .graph_row_fixed_edge_candidates(
             &normalized,
             edge,
+            None,
             None,
             &[bound_row, unbound_row],
             i64::MAX / 2,
@@ -13135,6 +14476,7 @@ fn graph_row_delegated_mixed_bound_unbound_union_composes_retained_metadata() {
             &mut frontier_peak,
             None,
             None,
+            &mut oriented_scratch,
         )
         .unwrap();
     assert!(followups.is_empty());
@@ -13210,10 +14552,12 @@ fn graph_row_mixed_unfiltered_bound_and_delegated_unbound_union_uses_full_verifi
     engine.reset_query_execution_counters_for_test();
     let mut followups = Vec::new();
     let mut frontier_peak = 0;
+    let mut oriented_scratch = Vec::new();
     let candidates = view
         .graph_row_fixed_edge_candidates(
             &normalized,
             edge,
+            None,
             None,
             &[bound_row, unbound_row],
             i64::MAX / 2,
@@ -13222,6 +14566,7 @@ fn graph_row_mixed_unfiltered_bound_and_delegated_unbound_union_uses_full_verifi
             &mut frontier_peak,
             None,
             None,
+            &mut oriented_scratch,
         )
         .unwrap();
     assert!(followups.is_empty());
@@ -13275,11 +14620,104 @@ fn graph_row_delegated_warning_truthfulness_stays_in_sorted_explain_detail() {
     assert_eq!(graph_row_single_u64_column(result.clone()), vec![expected]);
     assert!(result.stats.warnings.is_empty());
     let explain = result.plan.as_ref().unwrap();
-    assert_graph_row_explain_contains(explain, "planned_modes=eager");
-    assert_graph_row_explain_contains(
-        explain,
-        "planned_warnings=[edge_property_post_filter,missing_ready_index,verify_only_filter]",
+    assert_graph_row_explain_contains(explain, "prepared_source=NativeCursor");
+    assert_graph_row_explain_contains(explain, "warnings=[\"MissingReadyIndex\", \"EdgePropertyPostFilter\", \"VerifyOnlyFilter\"]");
+    assert_graph_row_explain_contains(explain, "materialized_source=EdgePullDelegatedMetadata");
+}
+
+#[test]
+fn edge_pull_routing_optional_and_vlp_first_matrix_stays_ineligible() {
+    let (_dir, engine) = graph_row_test_engine();
+    let source = insert_graph_row_node(&engine, "RouteMatrix", "route-source", &[]);
+    let target = insert_graph_row_node(&engine, "RouteMatrix", "route-target", &[]);
+    let prefix = insert_graph_row_node(&engine, "RouteMatrix", "route-prefix", &[]);
+    let optional_from = insert_graph_row_node(&engine, "RouteMatrix", "route-optional-from", &[]);
+    let optional_to = insert_graph_row_node(&engine, "RouteMatrix", "route-optional-to", &[]);
+    insert_graph_row_edge(&engine, source, target, "ROUTE_REQUIRED", &[]);
+    insert_graph_row_edge(&engine, prefix, source, "ROUTE_VLP", &[]);
+    insert_graph_row_edge(&engine, optional_from, optional_to, "ROUTE_OPTIONAL", &[]);
+    let view = engine.published_state().view.clone();
+
+    let mut optional_first = graph_query(
+        &["optional_from", "optional_to", "source", "target"],
+        vec![
+            graph_optional(
+                vec![graph_edge_with_label(
+                    None,
+                    "optional_from",
+                    "optional_to",
+                    "ROUTE_OPTIONAL",
+                )],
+                None,
+            ),
+            graph_edge_with_label(Some("edge"), "source", "target", "ROUTE_REQUIRED"),
+        ],
     );
+    optional_first.options.allow_full_scan = false;
+    let optional_normalized = normalize_graph_row_query(&optional_first).unwrap();
+    let optional_runtime = view
+        .normalize_graph_row_runtime_plan(&optional_normalized)
+        .unwrap();
+    let optional_physical = view
+        .plan_graph_row_physical(&optional_normalized, &optional_runtime, false, true)
+        .unwrap();
+    assert!(matches!(
+        optional_runtime.steps.first(),
+        Some(GraphRowRuntimeStep::Optional(_))
+    ));
+    assert!(matches!(
+        optional_physical.initial_driver,
+        GraphRowInitialDriver::Edge { .. }
+    ));
+    assert!(!graph_row_edge_pull_route_is_eligible(
+        &optional_normalized,
+        &optional_runtime,
+        &optional_physical,
+    ));
+
+    for shared_anchor in [false, true] {
+        let (vlp_from, vlp_to) = if shared_anchor {
+            ("prefix", "source")
+        } else {
+            ("prefix", "vlp_target")
+        };
+        let mut vlp = graph_vlp(None, None, vlp_from, vlp_to, 1, 1);
+        let GraphPatternPiece::VariableLength(path) = &mut vlp else {
+            unreachable!()
+        };
+        path.label_filter = vec!["ROUTE_VLP".to_string()];
+        let nodes = if shared_anchor {
+            vec!["prefix", "source", "target"]
+        } else {
+            vec!["prefix", "vlp_target", "source", "target"]
+        };
+        let mut query = graph_query(
+            &nodes,
+            vec![
+                vlp,
+                graph_edge_with_label(Some("edge"), "source", "target", "ROUTE_REQUIRED"),
+            ],
+        );
+        query.options.allow_full_scan = false;
+        let normalized = normalize_graph_row_query(&query).unwrap();
+        let runtime = view.normalize_graph_row_runtime_plan(&normalized).unwrap();
+        let physical = view
+            .plan_graph_row_physical(&normalized, &runtime, false, true)
+            .unwrap();
+        assert!(matches!(
+            runtime.steps.first(),
+            Some(GraphRowRuntimeStep::VariableLength(_))
+        ));
+        assert!(matches!(
+            physical.initial_driver,
+            GraphRowInitialDriver::Edge { .. }
+        ));
+        assert!(!graph_row_edge_pull_route_is_eligible(
+            &normalized,
+            &runtime,
+            &physical,
+        ));
+    }
 }
 
 #[test]
@@ -13366,7 +14804,7 @@ fn graph_row_fo033_native_residual_succeeds_with_inflight_caps() {
         .iter()
         .any(|item| item.contains("edge.role")));
     assert!(gql_read.projection.iter().any(|item| {
-        item.contains("GraphRowSourceRead") && item.contains("DelegatedEdgeQuery")
+        item.contains("GraphRowSourceRead") && item.contains("EdgePullDelegatedMetadata")
     }));
 
     let mut native = graph_query(
@@ -13403,46 +14841,86 @@ fn graph_row_fo033_native_residual_succeeds_with_inflight_caps() {
         },
     ];
     native.page.limit = 3;
-    native.options.include_plan = true;
-    native.options.max_intermediate_bindings = 64;
-    engine.reset_query_execution_counters_for_test();
-    let runtime_once = engine.query_graph_rows(&native).unwrap();
-    let runtime_once_counters = engine.query_execution_counter_snapshot_for_test();
-    let runtime_once_plan = format!("{:?}", runtime_once.plan.unwrap());
-    assert!(
-        runtime_once_plan.contains("source=RuntimeOnce{reason=NonNodeInitialDriver}"),
-        "{runtime_once_plan}"
-    );
-    assert!(
-        runtime_once_plan.contains(
-            "result_cache_units=0/64; cache_no_admit=0; optional_cache_hits=0; \
-             vlp_cross_chunk_cache_hits=0"
-        ),
-        "RuntimeOnce must truthfully report the CP43.2 compatibility/no-admission policy: \
-         {runtime_once_plan}"
-    );
-    assert_eq!(
-        runtime_once_counters.graph_row_result_cache_units_peak, 0,
-        "Edge-driven RuntimeOnce must not admit execution-wide result-cache entries"
-    );
-    assert_eq!(
-        runtime_once_counters.graph_row_result_cache_no_admit, 0,
-        "policy-disabled RuntimeOnce admission is not budget pressure"
-    );
-    assert_eq!(
-        runtime_once_counters.graph_row_optional_group_cache_hits, 0,
-        "RuntimeOnce must not observe execution-wide optional cache hits"
-    );
-    assert_eq!(
-        runtime_once_counters.graph_row_vlp_cross_chunk_cache_hits, 0,
-        "RuntimeOnce must not observe execution-wide VLP cache hits"
-    );
-
-    native.nodes[0].ids = sources;
     native.return_items = Some(vec![graph_return_binding(
         "target",
         GraphReturnProjection::IdOnly,
     )]);
+    native.options.include_plan = true;
+    native.options.max_intermediate_bindings = 8;
+    let fo033_normalized = normalize_graph_row_query(&native).unwrap();
+    let fo033_view = engine.published_state().view.clone();
+    let fo033_runtime = fo033_view
+        .normalize_graph_row_runtime_plan(&fo033_normalized)
+        .unwrap();
+    let fo033_physical = fo033_view
+        .plan_graph_row_physical(&fo033_normalized, &fo033_runtime, false, true)
+        .unwrap();
+    assert!(graph_row_edge_pull_route_is_eligible(
+        &fo033_normalized,
+        &fo033_runtime,
+        &fo033_physical,
+    ));
+    engine.reset_query_execution_counters_for_test();
+    let edge_pull = engine.query_graph_rows(&native).unwrap();
+    assert_eq!(
+        graph_row_single_u64_column(edge_pull.clone()),
+        vec![targets[19], targets[13], targets[7]]
+    );
+    let edge_pull_counters = engine.query_execution_counter_snapshot_for_test();
+    let edge_pull_plan = format!("{:?}", edge_pull.plan.unwrap());
+    assert!(
+        edge_pull_plan.contains("source=EdgePull{edge=alias:edge}"),
+        "{edge_pull_plan}"
+    );
+    assert!(
+        edge_pull_plan.contains("eligibility=edge_id_order_not_logical_prefix"),
+        "{edge_pull_plan}"
+    );
+    assert!(
+        edge_pull_plan.contains(
+            "source_pulls=3; successful_leaves=3; scheduled_sizes=8..8"
+        ),
+        "the cap-8 FO-033 closure must use bounded leaves: {edge_pull_plan}"
+    );
+    assert_eq!(
+        edge_pull_counters.graph_row_edge_pull_executions, 1,
+        "the unconstrained native FO-033 query must execute through EdgePull"
+    );
+    assert!(edge_pull_counters.graph_row_result_cache_units_peak > 0);
+    assert_eq!(edge_pull_counters.graph_row_optional_group_cache_hits, 0);
+    assert_eq!(edge_pull_counters.graph_row_vlp_cross_chunk_cache_hits, 0);
+    assert_eq!(edge_pull_counters.graph_row_chunk_early_exits, 0);
+    assert_eq!(edge_pull_counters.graph_row_cursor_anchor_seeks, 0);
+
+    let mut single_edge_pull_query = native.clone();
+    single_edge_pull_query.options.max_intermediate_bindings = 64;
+    engine.reset_query_execution_counters_for_test();
+    let single_edge_pull = engine.query_graph_rows(&single_edge_pull_query).unwrap();
+    assert_eq!(
+        graph_row_single_u64_column(single_edge_pull.clone()),
+        vec![targets[19], targets[13], targets[7]]
+    );
+    let single_edge_pull_counters = engine.query_execution_counter_snapshot_for_test();
+    let single_edge_pull_plan = format!("{:?}", single_edge_pull.plan.unwrap());
+    assert!(
+        single_edge_pull_plan.contains(
+            "successful_leaves=1; scheduled_sizes=64..64; leaf_size_min=20; \
+             leaf_size_max=20; source_rows=20; produced_rows=20"
+        ),
+        "{single_edge_pull_plan}"
+    );
+    assert!(
+        single_edge_pull_plan.contains(
+            "result_cache_units=0/64; cache_no_admit=0; optional_cache_hits=0; \
+             vlp_cross_chunk_cache_hits=0"
+        ),
+        "a terminal single EdgePull leaf must use Bypass: {single_edge_pull_plan}"
+    );
+    assert_eq!(single_edge_pull_counters.graph_row_result_cache_units_peak, 0);
+    assert_eq!(single_edge_pull_counters.graph_row_result_cache_no_admit, 0);
+
+    native.nodes[0].ids = sources;
+    native.options.max_intermediate_bindings = 64;
     engine.reset_query_execution_counters_for_test();
     let single_leaf = engine.query_graph_rows(&native).unwrap();
     let single_leaf_counters = engine.query_execution_counter_snapshot_for_test();
@@ -14392,6 +15870,7 @@ fn graph_row_stale_edge_property_index_candidates_are_verified_away() {
     let explain = reopened.explain_graph_rows(&query).unwrap();
     assert_graph_row_explain_contains(&explain, "EdgePropertyEqualityIndex");
     assert_graph_row_explain_contains(&explain, "stale index candidates");
+    assert_graph_row_explain_contains(&explain, "candidate_universe_not_equivalent");
 
     assert_eq!(
         graph_row_single_u64_column(reopened.query_graph_rows(&query).unwrap()),
@@ -17710,6 +19189,9 @@ fn graph_row_legacy_single_edge_signature(
 ) -> Vec<GraphRowTestPlanSignature> {
     vec![GraphRowTestPlanSignature {
         initial_driver: initial_driver.to_string(),
+        initial_edge_production: initial_driver
+            .starts_with("Edge(")
+            .then(|| "EdgePull".to_string()),
         segments: vec![GraphRowTestSegmentSignature {
             segment_index: 0,
             initial_driver: initial_driver.to_string(),
@@ -19246,9 +20728,13 @@ fn graph_row_planner_edge_property_equality_materializes_edge_source() {
     assert_eq!(graph_row_single_u64_column(result.clone()), vec![hit.unwrap()]);
     let explain = result.plan.as_ref().unwrap();
     assert_graph_row_explain_contains(explain, "GraphRowSourceRead");
-    assert_graph_row_explain_contains(explain, "choice=DelegatedEdgeQuery");
+    assert_graph_row_explain_contains(explain, "choice=EdgePullChunk");
     assert_graph_row_explain_contains(explain, "EdgePropertyEqualityIndex");
-    assert_graph_row_explain_contains(explain, "materialized_source=DelegatedEdgeQuery{");
+    assert_graph_row_explain_contains(explain, "GraphRowPreparedEdgeSource");
+    assert_graph_row_explain_contains(
+        explain,
+        "materialized_source=EdgePullDelegatedMetadata{",
+    );
     assert_graph_row_explain_contains(explain, "verified_candidates=");
 }
 
@@ -19367,8 +20853,1663 @@ fn graph_row_planner_edge_property_range_materializes_edge_source() {
     let result = engine.query_graph_rows(&query).unwrap();
     assert_eq!(graph_row_single_u64_column(result.clone()), vec![hit.unwrap()]);
     let explain = result.plan.as_ref().unwrap();
-    assert_graph_row_explain_contains(explain, "choice=DelegatedEdgeQuery");
+    assert_graph_row_explain_contains(explain, "choice=EdgePullChunk");
     assert_graph_row_explain_contains(explain, "EdgePropertyRangeIndex");
+}
+
+#[test]
+fn graph_row_adjacency_pull_first_cursor_and_plan_flips_preserve_pages() {
+    let (_dir, engine) = graph_row_test_engine();
+    for index in 0..1_000 {
+        let source = insert_graph_row_node(
+            &engine,
+            "GRAPH_ROW_ADJ_SOURCE",
+            &format!("adj-source-{index:04}"),
+            &[],
+        );
+        let target = insert_graph_row_node(
+            &engine,
+            "GRAPH_ROW_ADJ_TARGET",
+            &format!("adj-target-{index:04}"),
+            &[],
+        );
+        insert_graph_row_edge(
+            &engine,
+            source,
+            target,
+            "GRAPH_ROW_ADJ_REL",
+            &[],
+        );
+    }
+
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![graph_edge_with_label(
+            Some("edge"),
+            "source",
+            "target",
+            "GRAPH_ROW_ADJ_REL",
+        )],
+    );
+    query.options.allow_full_scan = false;
+    query.options.include_plan = true;
+    query.options.max_frontier = 1_024;
+    query.options.max_intermediate_bindings = 1_024;
+    query.page.limit = 10;
+
+    let (active_first, active_signatures) =
+        with_graph_row_test_plan_signature_capture(|| engine.query_graph_rows(&query).unwrap());
+    assert!(active_signatures.iter().any(|signature| {
+        signature.initial_edge_production.as_deref() == Some("EdgePull")
+    }));
+    let active_cursor = active_first.next_cursor.clone().unwrap();
+    let mut active_second_query = query.clone();
+    active_second_query.at_epoch = Some(active_first.stats.effective_at_epoch);
+    active_second_query.page.cursor = Some(active_cursor.clone());
+    let active_second = engine.query_graph_rows(&active_second_query).unwrap();
+    assert_graph_row_explain_contains(
+        active_first.plan.as_ref().unwrap(),
+        "source=EdgePull{edge=alias:edge}",
+    );
+    assert_graph_row_explain_contains(
+        active_first.plan.as_ref().unwrap(),
+        "mutable_active_memtable",
+    );
+
+    query.at_epoch = Some(active_first.stats.effective_at_epoch);
+    engine.flush().unwrap();
+    let (flushed_first, flushed_signatures) =
+        with_graph_row_test_plan_signature_capture(|| engine.query_graph_rows(&query).unwrap());
+    assert!(flushed_signatures.iter().any(|signature| {
+        signature.initial_edge_production.as_deref() == Some("AdjacencyPull")
+    }));
+    assert_eq!(flushed_first.rows, active_first.rows);
+    assert_eq!(flushed_first.next_cursor, active_first.next_cursor);
+    let flushed_plan = flushed_first.plan.as_ref().unwrap();
+    for fragment in [
+        "kind=AdjacencyPull",
+        "source=AdjacencyPull{edge=alias:edge}",
+        "choice=AdjacencyPullChunk",
+        "source_order=logical_from_group_asc",
+        "proof_boundary=completed_owner_group",
+        "early_exit=true",
+    ] {
+        assert_graph_row_explain_contains(flushed_plan, fragment);
+    }
+
+    for (limit, skip) in [(1, 0), (10, 0), (10, 3), (64, 0)] {
+        let mut shaped = query.clone();
+        shaped.page.limit = limit;
+        shaped.page.skip = skip;
+        let exhaustive = with_graph_row_test_early_exit_disabled(|| {
+            engine.query_graph_rows(&shaped).unwrap()
+        });
+        let actual = engine.query_graph_rows(&shaped).unwrap();
+        graph_row_chunk_early_exit_assert_identity(&actual, &exhaustive);
+        assert_graph_row_explain_contains(
+            actual.plan.as_ref().unwrap(),
+            "source=AdjacencyPull{edge=alias:edge}",
+        );
+    }
+
+    let mut walk_query = query.clone();
+    walk_query.page.limit = 7;
+    let mut walked = Vec::new();
+    loop {
+        let exhaustive = with_graph_row_test_early_exit_disabled(|| {
+            engine.query_graph_rows(&walk_query).unwrap()
+        });
+        let actual = engine.query_graph_rows(&walk_query).unwrap();
+        graph_row_chunk_early_exit_assert_identity(&actual, &exhaustive);
+        walked.extend(actual.rows.clone());
+        match actual.next_cursor.clone() {
+            Some(cursor) => walk_query.page.cursor = Some(cursor),
+            None => {
+                assert_graph_row_explain_contains(
+                    actual.plan.as_ref().unwrap(),
+                    "early_exit=false",
+                );
+                break;
+            }
+        }
+    }
+    assert_eq!(walked.len(), 1_000);
+
+    engine.reset_query_execution_counters_for_test();
+    let (retried, attempt_sizes) = with_graph_row_test_forced_adjacency_retry(2, || {
+        engine.query_graph_rows(&query).unwrap()
+    });
+    assert_eq!(retried.rows, flushed_first.rows);
+    assert_eq!(retried.next_cursor, flushed_first.next_cursor);
+    assert!(attempt_sizes.len() >= 3, "{attempt_sizes:?}");
+    assert!(attempt_sizes[0] > 1, "{attempt_sizes:?}");
+    assert_eq!(attempt_sizes[1], attempt_sizes[0] / 2, "{attempt_sizes:?}");
+    assert_eq!(
+        attempt_sizes[2],
+        attempt_sizes[0] - attempt_sizes[1],
+        "{attempt_sizes:?}"
+    );
+    let retried_plan = format!("{:?}", retried.plan.as_ref().unwrap());
+    assert!(retried_plan.contains("cap_retries=1"), "{retried_plan}");
+    assert!(
+        retried_plan.contains(&format!("successful_leaves={}", attempt_sizes.len() - 1)),
+        "{retried_plan}"
+    );
+    assert_eq!(
+        graph_row_chunk_cursor_seek_runtime_metric(&retried_plan, "source_rows"),
+        attempt_sizes[1..].iter().sum::<usize>(),
+        "failed original attempts must not duplicate committed source counters"
+    );
+    assert_eq!(
+        engine
+            .query_execution_counter_snapshot_for_test()
+            .graph_row_chunk_early_exits,
+        1
+    );
+
+    engine.reset_query_execution_counters_for_test();
+    let sink_error = with_graph_row_test_sink_failure(|| engine.query_graph_rows(&query));
+    assert!(sink_error.is_err());
+    assert_eq!(
+        engine
+            .query_execution_counter_snapshot_for_test()
+            .graph_row_chunk_early_exits,
+        0,
+        "a failed sink cannot commit an adjacency stop boundary"
+    );
+
+    let mut hydrated_query = query.clone();
+    hydrated_query.nodes[1] = graph_node_with_label("target", "GRAPH_ROW_ADJ_TARGET");
+    engine.reset_query_execution_counters_for_test();
+    let hydration_error = with_graph_row_test_node_verification_failure(|| {
+        engine.query_graph_rows(&hydrated_query)
+    });
+    assert!(hydration_error.is_err());
+    assert_eq!(
+        engine
+            .query_execution_counter_snapshot_for_test()
+            .graph_row_chunk_early_exits,
+        0,
+        "failed node hydration cannot commit an adjacency stop boundary"
+    );
+
+    let gql = "MATCH (source)-[edge:GRAPH_ROW_ADJ_REL]->(target) \
+               RETURN id(source), id(edge), id(target) LIMIT 5";
+    let gql_first = engine
+        .execute_gql(
+            gql,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                max_rows: 2,
+                include_plan: true,
+                ..GqlExecutionOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_first.rows.len(), 2);
+    let gql_first_plan = format!("{:?}", gql_first.plan.as_ref().unwrap());
+    assert!(
+        gql_first_plan.contains("source=AdjacencyPull{edge=alias:edge}"),
+        "{gql_first_plan}"
+    );
+    assert!(gql_first_plan.contains("logical_limit=Some(5)"), "{gql_first_plan}");
+    let gql_second = engine
+        .execute_gql(
+            gql,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                cursor: gql_first.next_cursor,
+                max_rows: 2,
+                ..GqlExecutionOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_second.rows.len(), 2);
+    let gql_third = engine
+        .execute_gql(
+            gql,
+            &GqlParams::new(),
+            &GqlExecutionOptions {
+                cursor: gql_second.next_cursor,
+                max_rows: 2,
+                ..GqlExecutionOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(gql_third.rows.len(), 1);
+    assert!(gql_third.next_cursor.is_none());
+
+    let mut adjacency_cursor_query = query.clone();
+    adjacency_cursor_query.at_epoch = Some(active_first.stats.effective_at_epoch);
+    adjacency_cursor_query.page.cursor = Some(active_cursor);
+    let flushed_second = engine.query_graph_rows(&adjacency_cursor_query).unwrap();
+    assert_eq!(flushed_second.rows, active_second.rows);
+    assert_eq!(flushed_second.next_cursor, active_second.next_cursor);
+    let second_plan = flushed_second.plan.as_ref().unwrap();
+    assert_graph_row_explain_contains(second_plan, "source=AdjacencyPull{edge=alias:edge}");
+    assert_graph_row_explain_contains(second_plan, "cursor_seek=anchor_ge:");
+    assert_graph_row_explain_contains(second_plan, "cursor_seek_units=");
+
+    let fallback = with_graph_row_test_adjacency_prepare_failure(|| {
+        engine.query_graph_rows(&adjacency_cursor_query).unwrap()
+    });
+    assert_eq!(fallback.rows, flushed_second.rows);
+    assert_eq!(fallback.next_cursor, flushed_second.next_cursor);
+    let fallback_plan = fallback.plan.as_ref().unwrap();
+    assert_graph_row_explain_contains(fallback_plan, "source=EdgePull{edge=alias:edge}");
+    assert_graph_row_explain_contains(fallback_plan, "fallback=adjacency_prepare_error");
+    assert_graph_row_explain_contains(fallback_plan, "choice=EdgePullChunk");
+    assert_graph_row_explain_not_contains(fallback_plan, "source_order=logical_from_group_asc");
+
+    let extra_source = insert_graph_row_node(
+        &engine,
+        "GRAPH_ROW_ADJ_SOURCE",
+        "adj-source-extra",
+        &[],
+    );
+    let extra_target = insert_graph_row_node(
+        &engine,
+        "GRAPH_ROW_ADJ_TARGET",
+        "adj-target-extra",
+        &[],
+    );
+    insert_graph_row_edge(
+        &engine,
+        extra_source,
+        extra_target,
+        "GRAPH_ROW_ADJ_REL",
+        &[],
+    );
+    let edge_pull_second = engine.query_graph_rows(&adjacency_cursor_query).unwrap();
+    assert_eq!(edge_pull_second.rows, flushed_second.rows);
+    assert_eq!(edge_pull_second.next_cursor, flushed_second.next_cursor);
+    assert_graph_row_explain_contains(
+        edge_pull_second.plan.as_ref().unwrap(),
+        "source=EdgePull{edge=alias:edge}",
+    );
+}
+
+#[test]
+fn graph_row_adjacency_pull_pinned_cursor_walk_crosses_every_physical_state_and_source() {
+    let (dir, engine) = graph_row_test_engine();
+    let mut edge_ids = Vec::new();
+    for index in 0..128u64 {
+        let source = insert_graph_row_node(
+            &engine,
+            "AdjFlipSource",
+            &format!("adj-flip-source-{index:03}"),
+            &[],
+        );
+        let target = insert_graph_row_node(
+            &engine,
+            "AdjFlipTarget",
+            &format!("adj-flip-target-{index:03}"),
+            &[],
+        );
+        edge_ids.push(insert_graph_row_edge(
+            &engine,
+            source,
+            target,
+            "ADJ_FLIP_EDGE",
+            &[],
+        ));
+    }
+
+    let mut query = graph_row_adjacency_selected_edge_query(
+        &["ADJ_FLIP_EDGE"],
+        Direction::Outgoing,
+        5,
+    );
+    let warm = engine.query_graph_rows(&query).unwrap();
+    query.at_epoch = Some(warm.stats.effective_at_epoch);
+    let active = engine.query_graph_rows(&query).unwrap();
+    let active_oracle = graph_row_chunk_runtime_once_result(&engine, &query);
+    graph_row_chunk_assert_page_parity(&active, &active_oracle, "active/RuntimeOnce");
+    assert_graph_row_explain_contains(active.plan.as_ref().unwrap(), "source=EdgePull{");
+    assert_graph_row_explain_contains(
+        active.plan.as_ref().unwrap(),
+        "mutable_active_memtable",
+    );
+    let fingerprint = active.plan.as_ref().unwrap().fingerprint.clone();
+    let effective_epoch = active.stats.effective_at_epoch;
+    let mut walked = graph_row_adjacency_selected_edges(&active)
+        .iter()
+        .map(|edge| edge.id.unwrap())
+        .collect::<Vec<_>>();
+    query.page.cursor = active.next_cursor.clone();
+
+    engine.freeze_memtable().unwrap();
+    let (_, immutable_adjacency, immutable_edge, _) =
+        graph_row_adjacency_forced_differential(&engine, &query);
+    assert_eq!(
+        immutable_adjacency.plan.as_ref().unwrap().fingerprint,
+        fingerprint
+    );
+    assert_eq!(immutable_adjacency.stats.effective_at_epoch, effective_epoch);
+    assert_eq!(immutable_adjacency.next_cursor, immutable_edge.next_cursor);
+    walked.extend(
+        graph_row_adjacency_selected_edges(&immutable_adjacency)
+            .iter()
+            .map(|edge| edge.id.unwrap()),
+    );
+    query.page.cursor = immutable_adjacency.next_cursor.clone();
+
+    engine.flush().unwrap();
+    let (_, flushed_adjacency, flushed_edge, _) =
+        graph_row_adjacency_forced_differential(&engine, &query);
+    assert_eq!(flushed_edge.plan.as_ref().unwrap().fingerprint, fingerprint);
+    assert_eq!(flushed_edge.stats.effective_at_epoch, effective_epoch);
+    assert_eq!(flushed_edge.next_cursor, flushed_adjacency.next_cursor);
+    walked.extend(
+        graph_row_adjacency_selected_edges(&flushed_edge)
+            .iter()
+            .map(|edge| edge.id.unwrap()),
+    );
+    query.page.cursor = flushed_edge.next_cursor.clone();
+
+    let late_source = insert_graph_row_node(&engine, "AdjFlipLate", "adj-flip-late-source", &[]);
+    let late_target = insert_graph_row_node(&engine, "AdjFlipLate", "adj-flip-late-target", &[]);
+    insert_graph_row_edge(
+        &engine,
+        late_source,
+        late_target,
+        "ADJ_FLIP_EDGE",
+        &[],
+    );
+    engine.flush().unwrap();
+    let (_, layered_adjacency, layered_edge, _) =
+        graph_row_adjacency_forced_differential(&engine, &query);
+    assert_eq!(
+        layered_adjacency.plan.as_ref().unwrap().fingerprint,
+        fingerprint
+    );
+    assert_eq!(layered_adjacency.stats.effective_at_epoch, effective_epoch);
+    assert_eq!(layered_adjacency.next_cursor, layered_edge.next_cursor);
+    walked.extend(
+        graph_row_adjacency_selected_edges(&layered_adjacency)
+            .iter()
+            .map(|edge| edge.id.unwrap()),
+    );
+    query.page.cursor = layered_adjacency.next_cursor.clone();
+
+    engine.compact().unwrap();
+    let (_, compacted_adjacency, compacted_edge, _) =
+        graph_row_adjacency_forced_differential(&engine, &query);
+    assert_eq!(compacted_edge.plan.as_ref().unwrap().fingerprint, fingerprint);
+    assert_eq!(compacted_edge.stats.effective_at_epoch, effective_epoch);
+    assert_eq!(compacted_edge.next_cursor, compacted_adjacency.next_cursor);
+    walked.extend(
+        graph_row_adjacency_selected_edges(&compacted_edge)
+            .iter()
+            .map(|edge| edge.id.unwrap()),
+    );
+    query.page.cursor = compacted_edge.next_cursor.clone();
+
+    drop(engine);
+    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    let (_, reopened_adjacency, reopened_edge, _) =
+        graph_row_adjacency_forced_differential(&reopened, &query);
+    assert_eq!(
+        reopened_adjacency.plan.as_ref().unwrap().fingerprint,
+        fingerprint
+    );
+    assert_eq!(reopened_adjacency.stats.effective_at_epoch, effective_epoch);
+    assert_eq!(reopened_adjacency.next_cursor, reopened_edge.next_cursor);
+    walked.extend(
+        graph_row_adjacency_selected_edges(&reopened_adjacency)
+            .iter()
+            .map(|edge| edge.id.unwrap()),
+    );
+
+    assert_eq!(walked, edge_ids[..walked.len()]);
+}
+
+#[test]
+fn graph_row_adjacency_pull_partial_owner_cannot_reuse_stale_boundary() {
+    let (_dir, engine) = graph_row_test_engine();
+    let mut giant_owner = None;
+    let mut giant_owner_edges = Vec::new();
+    for owner_index in 0..800 {
+        let source = insert_graph_row_node(
+            &engine,
+            "GRAPH_ROW_ADJ_BOUNDARY_SOURCE",
+            &format!("adj-boundary-source-{owner_index:04}"),
+            &[],
+        );
+        let fanout = if owner_index == 1 { 20 } else { 1 };
+        if owner_index == 1 {
+            giant_owner = Some(source);
+        }
+        for target_index in 0..fanout {
+            let target = insert_graph_row_node(
+                &engine,
+                "GRAPH_ROW_ADJ_BOUNDARY_TARGET",
+                &format!("adj-boundary-target-{owner_index:04}-{target_index:02}"),
+                &[],
+            );
+            let edge_id = insert_graph_row_edge(
+                &engine,
+                source,
+                target,
+                "GRAPH_ROW_ADJ_BOUNDARY_REL",
+                &[],
+            );
+            if owner_index == 1 {
+                giant_owner_edges.push(edge_id);
+            }
+        }
+    }
+    engine.flush().unwrap();
+
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![graph_edge_with_label(
+            Some("edge"),
+            "source",
+            "target",
+            "GRAPH_ROW_ADJ_BOUNDARY_REL",
+        )],
+    );
+    query.options.allow_full_scan = false;
+    query.options.include_plan = true;
+    query.options.max_frontier = 1_024;
+    query.options.max_intermediate_bindings = 1_024;
+    query.page.limit = 3;
+
+    let initial = with_graph_row_test_early_exit_disabled(|| {
+        engine.query_graph_rows(&query).unwrap()
+    });
+    query.at_epoch = Some(initial.stats.effective_at_epoch);
+    let exhaustive = with_graph_row_test_early_exit_disabled(|| {
+        engine.query_graph_rows(&query).unwrap()
+    });
+    let (actual, pull_trace) = with_graph_row_test_adjacency_pull_trace(|| {
+        engine.query_graph_rows(&query).unwrap()
+    });
+    graph_row_chunk_early_exit_assert_identity(&actual, &exhaustive);
+    assert_eq!(pull_trace.len(), 3, "{pull_trace:?}");
+    assert_eq!(
+        pull_trace[0],
+        GraphRowTestAdjacencyPullTrace {
+            oriented_metadata: 2,
+            physical_scan_units: 4,
+            raw_postings_scanned: 2,
+            pending_completed_through_owner: None,
+            pending_last_completed_owner: Some(1),
+            has_more: true,
+            partial_owner_pull: true,
+        }
+    );
+    assert_eq!(
+        pull_trace[1],
+        GraphRowTestAdjacencyPullTrace {
+            oriented_metadata: 8,
+            physical_scan_units: 8,
+            raw_postings_scanned: 8,
+            pending_completed_through_owner: None,
+            pending_last_completed_owner: None,
+            has_more: true,
+            partial_owner_pull: true,
+        }
+    );
+    assert_eq!(
+        pull_trace[2].pending_completed_through_owner,
+        giant_owner
+    );
+    assert_eq!(pull_trace[2].pending_last_completed_owner, giant_owner);
+    assert!(pull_trace[2].has_more);
+    assert!(!pull_trace[2].partial_owner_pull);
+    let plan = format!("{:?}", actual.plan.as_ref().unwrap());
+    assert!(plan.contains("source=AdjacencyPull{edge=alias:edge}"), "{plan}");
+    assert!(plan.contains("early_exit=true"), "{plan}");
+    assert!(
+        graph_row_chunk_cursor_seek_runtime_metric(&plan, "source_pulls") > 1,
+        "the partial giant owner must force a later original pull: {plan}"
+    );
+    assert!(
+        graph_row_chunk_cursor_seek_runtime_metric(&plan, "partial_owner_pulls") > 0,
+        "{plan}"
+    );
+    assert!(
+        plan.contains(&format!(
+            "last_completed_owner={}",
+            giant_owner.expect("giant owner")
+        )),
+        "the later pull must commit its own giant-owner boundary: {plan}"
+    );
+
+    for edge_id in [
+        giant_owner_edges[0],
+        giant_owner_edges[giant_owner_edges.len() / 2],
+        *giant_owner_edges.last().unwrap(),
+    ] {
+        let (retried, attempt_sizes) = with_graph_row_test_forced_adjacency_retry_edge(
+            edge_id,
+            || engine.query_graph_rows(&query).unwrap(),
+        );
+        graph_row_chunk_early_exit_assert_identity(&retried, &actual);
+        assert!(attempt_sizes.first().is_some_and(|size| *size > 1));
+        assert!(attempt_sizes.contains(&1), "{attempt_sizes:?}");
+        let retried_plan = format!("{:?}", retried.plan.as_ref().unwrap());
+        assert!(
+            graph_row_chunk_cursor_seek_runtime_metric(&retried_plan, "cap_retries") > 0,
+            "{retried_plan}"
+        );
+        assert_eq!(
+            graph_row_chunk_cursor_seek_runtime_metric(&retried_plan, "source_rows"),
+            graph_row_chunk_cursor_seek_runtime_metric(&plan, "source_rows"),
+            "retry failures must not duplicate committed original-pull counters"
+        );
+    }
+
+    for limit in [1, 2, 10, 21] {
+        let mut first_query = query.clone();
+        first_query.page.limit = limit;
+        let first = engine.query_graph_rows(&first_query).unwrap();
+        let mut cursor_query = first_query;
+        cursor_query.page.cursor = first.next_cursor;
+        let oracle = with_graph_row_test_cursor_seek_disabled(|| {
+            engine.query_graph_rows(&cursor_query).unwrap()
+        });
+        let cursor_page = engine.query_graph_rows(&cursor_query).unwrap();
+        graph_row_chunk_early_exit_assert_identity(&cursor_page, &oracle);
+        let cursor_plan = format!("{:?}", cursor_page.plan.as_ref().unwrap());
+        assert!(
+            cursor_plan.contains("source=AdjacencyPull{edge=alias:edge}"),
+            "limit={limit}: {cursor_plan}"
+        );
+        assert!(
+            cursor_plan.contains("cursor_seek=anchor_ge:"),
+            "limit={limit}: {cursor_plan}"
+        );
+    }
+}
+
+fn graph_row_adjacency_forced_differential(
+    engine: &DatabaseEngine,
+    query: &GraphRowQuery,
+) -> (GraphRowResult, GraphRowResult, GraphRowResult, GraphRowResult) {
+    let first = engine.query_graph_rows(query).unwrap();
+    let mut pinned = query.clone();
+    pinned.at_epoch = Some(first.stats.effective_at_epoch);
+    pinned.options.include_plan = true;
+
+    let automatic = engine.query_graph_rows(&pinned).unwrap();
+    let adjacency = with_graph_row_test_forced_edge_production(
+        GraphRowEdgeAnchorProduction::AdjacencyPull,
+        || engine.query_graph_rows(&pinned).unwrap(),
+    );
+    let edge = with_graph_row_test_forced_edge_production(
+        GraphRowEdgeAnchorProduction::EdgePull,
+        || engine.query_graph_rows(&pinned).unwrap(),
+    );
+    let runtime_once = graph_row_chunk_runtime_once_result(engine, &pinned);
+
+    graph_row_chunk_assert_page_parity(&automatic, &runtime_once, "automatic/RuntimeOnce");
+    graph_row_chunk_assert_page_parity(&adjacency, &runtime_once, "AdjacencyPull/RuntimeOnce");
+    graph_row_chunk_assert_page_parity(&edge, &runtime_once, "EdgePull/RuntimeOnce");
+    assert_graph_row_explain_contains(
+        adjacency.plan.as_ref().unwrap(),
+        "source=AdjacencyPull{",
+    );
+    assert_graph_row_explain_contains(edge.plan.as_ref().unwrap(), "source=EdgePull{");
+
+    (automatic, adjacency, edge, runtime_once)
+}
+
+fn graph_row_adjacency_selected_edges(result: &GraphRowResult) -> Vec<GraphEdgeValue> {
+    result
+        .rows
+        .iter()
+        .map(|row| match row.values.as_slice() {
+            [GraphValue::Edge(edge)] => edge.clone(),
+            values => panic!("expected one selected edge value, got {values:?}"),
+        })
+        .collect()
+}
+
+fn graph_row_adjacency_selected_edge_query(
+    labels: &[&str],
+    direction: Direction,
+    limit: usize,
+) -> GraphRowQuery {
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![GraphPatternPiece::Edge(GraphEdgePattern {
+            alias: Some("edge".to_string()),
+            from_alias: "source".to_string(),
+            to_alias: "target".to_string(),
+            direction,
+            label_filter: labels.iter().map(|label| (*label).to_string()).collect(),
+            filter: None,
+        })],
+    );
+    query.return_items = Some(vec![graph_return_binding(
+        "edge",
+        GraphReturnProjection::Selected(GraphSelectedProjection::Edge(selected_edge(
+            GraphPropertySelection::All,
+        ))),
+    )]);
+    query.output.mode = GraphOutputMode::Projected;
+    query.page.limit = limit;
+    query.options.allow_full_scan = false;
+    query.options.include_plan = true;
+    query
+}
+
+#[test]
+fn graph_row_adjacency_pull_forced_sources_prove_same_id_layers_compaction_and_reopen() {
+    let (dir, engine) = graph_row_test_engine();
+    let smaller = insert_graph_row_node(&engine, "AdjPublicNode", "same-id-smaller", &[]);
+    let target_a = insert_graph_row_node(&engine, "AdjPublicNode", "same-id-target-a", &[]);
+    let original = insert_graph_row_node(&engine, "AdjPublicNode", "same-id-original", &[]);
+    let target_b = insert_graph_row_node(&engine, "AdjPublicNode", "same-id-target-b", &[]);
+    let larger = insert_graph_row_node(&engine, "AdjPublicNode", "same-id-larger", &[]);
+    engine.flush().unwrap();
+
+    let old_label = engine.ensure_edge_label("ADJ_PUBLIC_OLD").unwrap();
+    let new_label = engine.ensure_edge_label("ADJ_PUBLIC_NEW").unwrap();
+    for index in 0..64u64 {
+        let source = insert_graph_row_node(
+            &engine,
+            "AdjPublicFiller",
+            &format!("same-id-filler-source-{index:03}"),
+            &[],
+        );
+        let target = insert_graph_row_node(
+            &engine,
+            "AdjPublicFiller",
+            &format!("same-id-filler-target-{index:03}"),
+            &[],
+        );
+        insert_graph_row_edge(&engine, source, target, "ADJ_PUBLIC_NEW", &[]);
+    }
+    let fixed_id = 9_440_005;
+    let mut old = prepared_adjacency_test_edge(fixed_id, original, target_a, old_label);
+    old.props.insert("version".to_string(), PropValue::Int(1));
+    write_internal_wal_op(&engine, &WalOp::UpsertEdge(old)).unwrap();
+    engine.flush().unwrap();
+
+    let query = graph_row_adjacency_selected_edge_query(
+        &["ADJ_PUBLIC_OLD", "ADJ_PUBLIC_NEW"],
+        Direction::Outgoing,
+        7,
+    );
+    let old_only = graph_row_adjacency_selected_edge_query(
+        &["ADJ_PUBLIC_OLD"],
+        Direction::Outgoing,
+        128,
+    );
+    let new_only = graph_row_adjacency_selected_edge_query(
+        &["ADJ_PUBLIC_NEW"],
+        Direction::Outgoing,
+        128,
+    );
+    let (_, segment_adjacency, _, _) =
+        graph_row_adjacency_forced_differential(&engine, &query);
+    assert!(graph_row_adjacency_selected_edges(&segment_adjacency)
+        .iter()
+        .any(|edge| edge.id == Some(fixed_id) && edge.from == Some(original)));
+    let (_, segment_old, _, _) = graph_row_adjacency_forced_differential(&engine, &old_only);
+    let (_, segment_new, _, _) = graph_row_adjacency_forced_differential(&engine, &new_only);
+    assert_eq!(
+        graph_row_adjacency_selected_edges(&segment_old)
+            .iter()
+            .filter(|edge| edge.id == Some(fixed_id))
+            .count(),
+        1
+    );
+    assert!(!graph_row_adjacency_selected_edges(&segment_new)
+        .iter()
+        .any(|edge| edge.id == Some(fixed_id)));
+
+    let mut moved_smaller =
+        prepared_adjacency_test_edge(fixed_id, smaller, target_b, new_label);
+    moved_smaller.updated_at = 2;
+    moved_smaller.weight = 2.0;
+    moved_smaller
+        .props
+        .insert("version".to_string(), PropValue::Int(2));
+    write_internal_wal_op(&engine, &WalOp::UpsertEdge(moved_smaller)).unwrap();
+    let active_warm = engine.query_graph_rows(&query).unwrap();
+    let mut active_query = query.clone();
+    active_query.at_epoch = Some(active_warm.stats.effective_at_epoch);
+    let active = engine.query_graph_rows(&active_query).unwrap();
+    assert_graph_row_explain_contains(active.plan.as_ref().unwrap(), "source=EdgePull{");
+    assert_graph_row_explain_contains(active.plan.as_ref().unwrap(), "mutable_active_memtable");
+    assert!(graph_row_adjacency_selected_edges(&active)
+        .iter()
+        .any(|edge| edge.id == Some(fixed_id) && edge.from == Some(smaller)));
+    let forced_active = with_graph_row_test_forced_edge_production(
+        GraphRowEdgeAnchorProduction::AdjacencyPull,
+        || engine.query_graph_rows(&active_query).unwrap(),
+    );
+    assert_eq!(forced_active.rows, active.rows);
+    assert_eq!(forced_active.next_cursor, active.next_cursor);
+    assert_graph_row_explain_contains(forced_active.plan.as_ref().unwrap(), "source=EdgePull{");
+    assert_graph_row_explain_contains(
+        forced_active.plan.as_ref().unwrap(),
+        "mutable_active_memtable",
+    );
+
+    engine.freeze_memtable().unwrap();
+    let (_, immutable_adjacency, _, _) =
+        graph_row_adjacency_forced_differential(&engine, &query);
+    let (_, immutable_old, _, _) =
+        graph_row_adjacency_forced_differential(&engine, &old_only);
+    let (_, immutable_new, _, _) =
+        graph_row_adjacency_forced_differential(&engine, &new_only);
+    assert!(!graph_row_adjacency_selected_edges(&immutable_old)
+        .iter()
+        .any(|edge| edge.id == Some(fixed_id)));
+    assert_eq!(
+        graph_row_adjacency_selected_edges(&immutable_new)
+            .iter()
+            .filter(|edge| edge.id == Some(fixed_id))
+            .count(),
+        1
+    );
+    assert_eq!(
+        graph_row_chunk_cursor_seek_runtime_metric(
+            &graph_row_explain_text(immutable_old.plan.as_ref().unwrap()),
+            "shadowed_or_stale_postings",
+        ),
+        1,
+        "the old-label posting must be visited and rejected as stale"
+    );
+    let immutable_edges = graph_row_adjacency_selected_edges(&immutable_adjacency);
+    assert!(immutable_edges.iter().any(|edge| {
+        edge.id == Some(fixed_id)
+            && edge.from == Some(smaller)
+            && edge.to == Some(target_b)
+            && edge.label.as_deref() == Some("ADJ_PUBLIC_NEW")
+            && edge.weight == Some(2.0)
+    }));
+    assert!(graph_row_explain_text(immutable_adjacency.plan.as_ref().unwrap())
+        .contains("shadowed_or_stale_postings="));
+
+    let mut moved_larger = prepared_adjacency_test_edge(fixed_id, larger, target_a, new_label);
+    moved_larger.updated_at = 3;
+    moved_larger.weight = 3.0;
+    moved_larger
+        .props
+        .insert("version".to_string(), PropValue::Int(3));
+    write_internal_wal_op(&engine, &WalOp::UpsertEdge(moved_larger)).unwrap();
+    let active_larger = engine.query_graph_rows(&query).unwrap();
+    assert_graph_row_explain_contains(
+        active_larger.plan.as_ref().unwrap(),
+        "mutable_active_memtable",
+    );
+    engine.freeze_memtable().unwrap();
+    let (_, layered_adjacency, _, _) =
+        graph_row_adjacency_forced_differential(&engine, &query);
+    let layered_edges = graph_row_adjacency_selected_edges(&layered_adjacency);
+    assert!(layered_edges.iter().any(|edge| {
+        edge.id == Some(fixed_id)
+            && edge.from == Some(larger)
+            && edge.to == Some(target_a)
+            && edge.props.as_ref().is_some_and(|props| {
+                props.get("version") == Some(&GraphValue::Int(3))
+            })
+    }));
+    assert!(!layered_edges
+        .iter()
+        .any(|edge| edge.id == Some(fixed_id) && edge.from == Some(smaller)));
+
+    let mut metadata_only = prepared_adjacency_test_edge(fixed_id, larger, target_a, new_label);
+    metadata_only.updated_at = 4;
+    metadata_only.weight = 4.0;
+    metadata_only
+        .props
+        .insert("version".to_string(), PropValue::Int(4));
+    write_internal_wal_op(&engine, &WalOp::UpsertEdge(metadata_only)).unwrap();
+    let metadata_active = engine.query_graph_rows(&new_only).unwrap();
+    assert_graph_row_explain_contains(
+        metadata_active.plan.as_ref().unwrap(),
+        "mutable_active_memtable",
+    );
+    engine.freeze_memtable().unwrap();
+    let (_, metadata_adjacency, _, _) =
+        graph_row_adjacency_forced_differential(&engine, &new_only);
+    let metadata_edges = graph_row_adjacency_selected_edges(&metadata_adjacency);
+    let metadata_edge = metadata_edges
+        .iter()
+        .find(|edge| edge.id == Some(fixed_id))
+        .expect("metadata-only update must remain visible");
+    assert_eq!(metadata_edge.from, Some(larger));
+    assert_eq!(metadata_edge.to, Some(target_a));
+    assert_eq!(metadata_edge.label.as_deref(), Some("ADJ_PUBLIC_NEW"));
+    assert_eq!(metadata_edge.weight, Some(4.0));
+    assert!(metadata_edge.props.as_ref().is_some_and(|props| {
+        props.get("version") == Some(&GraphValue::Int(4))
+    }));
+
+    write_internal_wal_op(
+        &engine,
+        &WalOp::DeleteEdge {
+            id: fixed_id,
+            deleted_at: 5,
+        },
+    )
+    .unwrap();
+    let tombstone_active = engine.query_graph_rows(&query).unwrap();
+    assert!(!graph_row_adjacency_selected_edges(&tombstone_active)
+        .iter()
+        .any(|edge| edge.id == Some(fixed_id)));
+    assert_graph_row_explain_contains(
+        tombstone_active.plan.as_ref().unwrap(),
+        "mutable_active_memtable",
+    );
+    engine.freeze_memtable().unwrap();
+    let (_, tombstone_adjacency, _, _) =
+        graph_row_adjacency_forced_differential(&engine, &query);
+    assert!(!graph_row_adjacency_selected_edges(&tombstone_adjacency)
+        .iter()
+        .any(|edge| edge.id == Some(fixed_id)));
+
+    let mut resurrected =
+        prepared_adjacency_test_edge(fixed_id, original, target_b, old_label);
+    resurrected.updated_at = 6;
+    resurrected.weight = 6.0;
+    resurrected
+        .props
+        .insert("version".to_string(), PropValue::Int(6));
+    write_internal_wal_op(&engine, &WalOp::UpsertEdge(resurrected)).unwrap();
+    let resurrection_active = engine.query_graph_rows(&query).unwrap();
+    let pinned_epoch = resurrection_active.stats.effective_at_epoch;
+    assert_graph_row_explain_contains(
+        resurrection_active.plan.as_ref().unwrap(),
+        "mutable_active_memtable",
+    );
+    engine.freeze_memtable().unwrap();
+
+    let mut pinned = query.clone();
+    pinned.at_epoch = Some(pinned_epoch);
+    let (_, final_immutable, _, _) =
+        graph_row_adjacency_forced_differential(&engine, &pinned);
+    let final_rows = final_immutable.rows.clone();
+    let final_cursor = final_immutable.next_cursor.clone();
+    let final_edges = graph_row_adjacency_selected_edges(&final_immutable);
+    assert!(final_edges.iter().any(|edge| {
+        edge.id == Some(fixed_id)
+            && edge.from == Some(original)
+            && edge.to == Some(target_b)
+            && edge.label.as_deref() == Some("ADJ_PUBLIC_OLD")
+            && edge.weight == Some(6.0)
+    }));
+
+    engine.flush().unwrap();
+    let (_, flushed, _, _) = graph_row_adjacency_forced_differential(&engine, &pinned);
+    assert_eq!(flushed.rows, final_rows);
+    assert_eq!(flushed.next_cursor, final_cursor);
+    engine.compact().unwrap();
+    let (_, compacted, _, _) = graph_row_adjacency_forced_differential(&engine, &pinned);
+    assert_eq!(compacted.rows, final_rows);
+    assert_eq!(compacted.next_cursor, final_cursor);
+
+    drop(engine);
+    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    let (_, reopened_adjacency, _, _) =
+        graph_row_adjacency_forced_differential(&reopened, &pinned);
+    assert_eq!(reopened_adjacency.rows, final_rows);
+    assert_eq!(reopened_adjacency.next_cursor, final_cursor);
+}
+
+#[test]
+fn graph_row_adjacency_pull_public_orientation_filter_endpoint_and_policy_matrix() {
+    let (_dir, engine) = graph_row_test_engine();
+    let a = insert_graph_row_node(
+        &engine,
+        "AdjMatrixSource",
+        "matrix-a",
+        &[("kind", PropValue::String("keep".to_string()))],
+    );
+    let b = insert_graph_row_node(
+        &engine,
+        "AdjMatrixTarget",
+        "matrix-b",
+        &[("kind", PropValue::String("keep".to_string()))],
+    );
+    let c = engine
+        .upsert_node(
+            "AdjMatrixTarget",
+            "matrix-c",
+            UpsertNodeOptions {
+                props: graph_row_props(&[(
+                    "kind",
+                    PropValue::String("drop".to_string()),
+                )]),
+                weight: 0.1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let first = engine
+        .upsert_edge(
+            a,
+            b,
+            "ADJ_MATRIX_ONE",
+            UpsertEdgeOptions {
+                props: graph_row_props(&[("score", PropValue::Int(7))]),
+                valid_from: Some(10),
+                valid_to: Some(20),
+                weight: 1.0,
+            },
+        )
+        .unwrap();
+    let second = engine
+        .upsert_edge(
+            b,
+            a,
+            "ADJ_MATRIX_TWO",
+            UpsertEdgeOptions {
+                props: graph_row_props(&[("score", PropValue::Int(9))]),
+                valid_from: Some(10),
+                valid_to: Some(20),
+                weight: 1.0,
+            },
+        )
+        .unwrap();
+    let loop_edge = engine
+        .upsert_edge(
+            a,
+            a,
+            "ADJ_MATRIX_TWO",
+            UpsertEdgeOptions {
+                props: graph_row_props(&[("score", PropValue::Int(11))]),
+                valid_from: Some(10),
+                valid_to: Some(20),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let rejected = engine
+        .upsert_edge(
+            a,
+            c,
+            "ADJ_MATRIX_ONE",
+            UpsertEdgeOptions {
+                props: graph_row_props(&[("score", PropValue::Int(1))]),
+                valid_from: Some(10),
+                valid_to: Some(20),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let missing_edge_id = 9_440_006;
+    let matrix_one_label = engine.ensure_edge_label("ADJ_MATRIX_ONE").unwrap();
+    let mut missing_endpoint =
+        prepared_adjacency_test_edge(missing_edge_id, a, 9_999_999, matrix_one_label);
+    missing_endpoint.valid_from = 10;
+    missing_endpoint.valid_to = 20;
+    missing_endpoint
+        .props
+        .insert("score".to_string(), PropValue::Int(7));
+    write_internal_wal_op(&engine, &WalOp::UpsertEdge(missing_endpoint)).unwrap();
+    engine.flush().unwrap();
+
+    let mut both = graph_row_adjacency_selected_edge_query(
+        &["ADJ_MATRIX_TWO", "ADJ_MATRIX_ONE", "ADJ_MATRIX_TWO"],
+        Direction::Both,
+        20,
+    );
+    both.at_epoch = Some(15);
+    let (_, both_adjacency, _, _) = graph_row_adjacency_forced_differential(&engine, &both);
+    let both_ids = graph_row_adjacency_selected_edges(&both_adjacency)
+        .iter()
+        .map(|edge| edge.id.unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        both_ids,
+        vec![loop_edge, first, second, rejected, first, second, rejected]
+    );
+    assert!(!both_ids.contains(&missing_edge_id));
+
+    for (direction, expected) in [
+        (
+            Direction::Outgoing,
+            vec![loop_edge, first, rejected, second],
+        ),
+        (
+            Direction::Incoming,
+            vec![loop_edge, second, first, rejected],
+        ),
+    ] {
+        let mut directed = both.clone();
+        let GraphPatternPiece::Edge(edge) = &mut directed.pieces[0] else {
+            unreachable!()
+        };
+        edge.direction = direction;
+        let (_, adjacency, _, _) =
+            graph_row_adjacency_forced_differential(&engine, &directed);
+        assert_eq!(
+            graph_row_adjacency_selected_edges(&adjacency)
+                .iter()
+                .map(|edge| edge.id.unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    let mut equality = both.clone();
+    let GraphPatternPiece::Edge(edge) = &mut equality.pieces[0] else {
+        unreachable!()
+    };
+    edge.filter = Some(EdgeFilterExpr::PropertyEquals {
+        key: "score".to_string(),
+        value: PropValue::Int(7),
+    });
+    let (_, equality_adjacency, _, _) =
+        graph_row_adjacency_forced_differential(&engine, &equality);
+    assert_eq!(
+        graph_row_adjacency_selected_edges(&equality_adjacency)
+            .iter()
+            .map(|edge| edge.id.unwrap())
+            .collect::<Vec<_>>(),
+        vec![first, first]
+    );
+
+    let mut range = both.clone();
+    let GraphPatternPiece::Edge(edge) = &mut range.pieces[0] else {
+        unreachable!()
+    };
+    edge.filter = Some(EdgeFilterExpr::PropertyRange {
+        key: "score".to_string(),
+        lower: Some(PropertyRangeBound::Included(PropValue::Int(8))),
+        upper: Some(PropertyRangeBound::Included(PropValue::Int(10))),
+    });
+    let (_, range_adjacency, _, _) =
+        graph_row_adjacency_forced_differential(&engine, &range);
+    assert_eq!(
+        graph_row_adjacency_selected_edges(&range_adjacency)
+            .iter()
+            .map(|edge| edge.id.unwrap())
+            .collect::<Vec<_>>(),
+        vec![second, second]
+    );
+
+    let mut residual = both.clone();
+    residual.where_ = Some(GraphExpr::Binary {
+        left: Box::new(graph_prop("edge", "score")),
+        op: GraphBinaryOp::Gt,
+        right: Box::new(GraphExpr::Int(7)),
+    });
+    let (_, residual_adjacency, _, _) =
+        graph_row_adjacency_forced_differential(&engine, &residual);
+    assert_eq!(
+        graph_row_adjacency_selected_edges(&residual_adjacency)
+            .iter()
+            .map(|edge| edge.id.unwrap())
+            .collect::<Vec<_>>(),
+        vec![loop_edge, second, second]
+    );
+
+    for (epoch_ms, expected) in [
+        (9, Vec::new()),
+        (
+            10,
+            vec![loop_edge, first, second, rejected, first, second, rejected],
+        ),
+        (20, Vec::new()),
+    ] {
+        let mut temporal = both.clone();
+        let GraphPatternPiece::Edge(edge) = &mut temporal.pieces[0] else {
+            unreachable!()
+        };
+        edge.filter = Some(EdgeFilterExpr::ValidAt { epoch_ms });
+        let temporal_adjacency = engine.query_graph_rows(&temporal).unwrap();
+        let runtime_once = graph_row_chunk_runtime_once_result(&engine, &temporal);
+        graph_row_chunk_assert_page_parity(
+            &temporal_adjacency,
+            &runtime_once,
+            "temporal boundary/RuntimeOnce",
+        );
+        assert_eq!(
+            graph_row_adjacency_selected_edges(&temporal_adjacency)
+                .iter()
+                .map(|edge| edge.id.unwrap())
+                .collect::<Vec<_>>(),
+            expected,
+            "valid_at={epoch_ms}"
+        );
+    }
+
+    let mut endpoint = both.clone();
+    endpoint.nodes[1] = graph_node_with_label("target", "AdjMatrixTarget");
+    endpoint.nodes[1].filter = Some(NodeFilterExpr::PropertyEquals {
+        key: "kind".to_string(),
+        value: PropValue::String("keep".to_string()),
+    });
+    let (_, endpoint_adjacency, _, _) =
+        graph_row_adjacency_forced_differential(&engine, &endpoint);
+    assert_eq!(
+        graph_row_adjacency_selected_edges(&endpoint_adjacency)
+            .iter()
+            .map(|edge| edge.id.unwrap())
+            .collect::<Vec<_>>(),
+        vec![first, second]
+    );
+
+    engine
+        .set_prune_policy(
+            "adj-matrix-node-policy",
+            PrunePolicy {
+                max_age_ms: None,
+                max_weight: Some(0.5),
+                label: Some("AdjMatrixTarget".to_string()),
+            },
+        )
+        .unwrap();
+    let (_, policy_adjacency, _, _) =
+        graph_row_adjacency_forced_differential(&engine, &both);
+    assert_eq!(
+        graph_row_adjacency_selected_edges(&policy_adjacency)
+            .iter()
+            .map(|edge| edge.id.unwrap())
+            .collect::<Vec<_>>(),
+        vec![loop_edge, first, second, first, second]
+    );
+    engine.remove_prune_policy("adj-matrix-node-policy").unwrap();
+
+    engine.delete_node(c).unwrap();
+    engine.flush().unwrap();
+    let (_, deleted_endpoint, _, _) =
+        graph_row_adjacency_forced_differential(&engine, &both);
+    assert_eq!(
+        graph_row_adjacency_selected_edges(&deleted_endpoint)
+            .iter()
+            .map(|edge| edge.id.unwrap())
+            .collect::<Vec<_>>(),
+        vec![loop_edge, first, second, first, second]
+    );
+    assert!(!graph_row_adjacency_selected_edges(&deleted_endpoint)
+        .iter()
+        .any(|edge| edge.id == Some(missing_edge_id)));
+
+    let mut successful_zero = equality;
+    let GraphPatternPiece::Edge(edge) = &mut successful_zero.pieces[0] else {
+        unreachable!()
+    };
+    edge.direction = Direction::Outgoing;
+    edge.filter = Some(EdgeFilterExpr::PropertyEquals {
+        key: "score".to_string(),
+        value: PropValue::Int(9),
+    });
+    successful_zero.page.limit = 1;
+    let (_, zero_adjacency, _, _) =
+        graph_row_adjacency_forced_differential(&engine, &successful_zero);
+    let zero_plan = zero_adjacency.plan.as_ref().unwrap();
+    assert_eq!(
+        graph_row_adjacency_selected_edges(&zero_adjacency)
+            .iter()
+            .map(|edge| edge.id.unwrap())
+            .collect::<Vec<_>>(),
+        vec![second]
+    );
+    let zero_text = graph_row_explain_text(zero_plan);
+    assert_eq!(
+        graph_row_chunk_cursor_seek_runtime_metric(&zero_text, "completed_owner_groups"),
+        2
+    );
+    assert_eq!(
+        graph_row_chunk_cursor_seek_runtime_metric(&zero_text, "last_completed_owner"),
+        b as usize
+    );
+    assert_graph_row_explain_contains(zero_plan, "proof_boundary=completed_owner_group");
+}
+
+#[test]
+fn graph_row_adjacency_pull_low_id_hub_and_sparse_label_are_truthful() {
+    let (_dir, hub_engine) = graph_row_test_engine();
+    let hub = insert_graph_row_node(&hub_engine, "AdjHub", "hub-owner", &[]);
+    let mut hub_edge_ids = Vec::new();
+    for index in 0..4_100u64 {
+        let target = insert_graph_row_node(
+            &hub_engine,
+            "AdjHubTarget",
+            &format!("hub-target-{index:04}"),
+            &[],
+        );
+        hub_edge_ids.push(insert_graph_row_edge(
+            &hub_engine,
+            hub,
+            target,
+            "ADJ_PUBLIC_HUB",
+            &[],
+        ));
+    }
+    let mut tail_edge_ids = Vec::new();
+    let mut tail_owner_ids = Vec::new();
+    for index in 0..20u64 {
+        let source = insert_graph_row_node(
+            &hub_engine,
+            "AdjHubTail",
+            &format!("hub-tail-source-{index:02}"),
+            &[],
+        );
+        let target = insert_graph_row_node(
+            &hub_engine,
+            "AdjHubTail",
+            &format!("hub-tail-target-{index:02}"),
+            &[],
+        );
+        tail_owner_ids.push(source);
+        tail_edge_ids.push(insert_graph_row_edge(
+            &hub_engine,
+            source,
+            target,
+            "ADJ_PUBLIC_HUB",
+            &[],
+        ));
+    }
+    hub_engine.flush().unwrap();
+
+    let mut hub_query = graph_row_adjacency_selected_edge_query(
+        &["ADJ_PUBLIC_HUB"],
+        Direction::Outgoing,
+        10,
+    );
+    let (automatic, forced_adjacency, _, _) =
+        graph_row_adjacency_forced_differential(&hub_engine, &hub_query);
+    assert_graph_row_explain_contains(automatic.plan.as_ref().unwrap(), "source=EdgePull{");
+    assert_graph_row_explain_contains(
+        automatic.plan.as_ref().unwrap(),
+        "reason=owner_bound_exceeds_pull_ceiling",
+    );
+    assert_graph_row_explain_contains(
+        automatic.plan.as_ref().unwrap(),
+        "H=4100; K=11; F=4096",
+    );
+    let forced_text = graph_row_explain_text(forced_adjacency.plan.as_ref().unwrap());
+    assert!(
+        graph_row_chunk_cursor_seek_runtime_metric(&forced_text, "raw_adjacency_postings_scanned")
+            >= 4_100,
+        "the first page must finish the whole low-ID owner: {forced_text}"
+    );
+    assert!(forced_text.contains("early_exit=true"), "{forced_text}");
+
+    let (_, first_trace) = with_graph_row_test_adjacency_pull_trace(|| {
+        with_graph_row_test_forced_edge_production(
+            GraphRowEdgeAnchorProduction::AdjacencyPull,
+            || hub_engine.query_graph_rows(&hub_query).unwrap(),
+        )
+    });
+    assert!(first_trace.len() > 1, "{first_trace:?}");
+    assert!(first_trace.iter().all(|pull| {
+        pull.oriented_metadata <= 4_096
+            && pull.physical_scan_units <= 4_096
+            && pull.raw_postings_scanned <= 4_096
+    }));
+    let completed_index = first_trace
+        .iter()
+        .position(|pull| pull.pending_completed_through_owner == Some(hub))
+        .expect("the hub boundary must eventually complete");
+    assert!(first_trace[..completed_index]
+        .iter()
+        .all(|pull| pull.pending_completed_through_owner.is_none()));
+
+    hub_query.page.limit = 4_095;
+    let first_large = with_graph_row_test_forced_edge_production(
+        GraphRowEdgeAnchorProduction::AdjacencyPull,
+        || hub_engine.query_graph_rows(&hub_query).unwrap(),
+    );
+    assert_eq!(first_large.rows.len(), 4_095);
+    let cursor = first_large.next_cursor.clone().unwrap();
+    hub_query.at_epoch = Some(first_large.stats.effective_at_epoch);
+    hub_query.page.cursor = Some(cursor);
+    hub_query.page.limit = 10;
+    let (same_owner_page, same_owner_trace) = with_graph_row_test_adjacency_pull_trace(|| {
+        with_graph_row_test_forced_edge_production(
+            GraphRowEdgeAnchorProduction::AdjacencyPull,
+            || hub_engine.query_graph_rows(&hub_query).unwrap(),
+        )
+    });
+    let (same_owner_repeat, repeat_trace) = with_graph_row_test_adjacency_pull_trace(|| {
+        with_graph_row_test_forced_edge_production(
+            GraphRowEdgeAnchorProduction::AdjacencyPull,
+            || hub_engine.query_graph_rows(&hub_query).unwrap(),
+        )
+    });
+    assert_eq!(same_owner_page.rows, same_owner_repeat.rows);
+    assert_eq!(same_owner_page.next_cursor, same_owner_repeat.next_cursor);
+    assert_eq!(same_owner_page.rows.len(), 10);
+    let page_ids = graph_row_adjacency_selected_edges(&same_owner_page)
+        .iter()
+        .map(|edge| edge.id.unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(&page_ids[..5], &hub_edge_ids[4_095..]);
+    assert_eq!(&page_ids[5..], &tail_edge_ids[..5]);
+    let same_owner_text = graph_row_explain_text(same_owner_page.plan.as_ref().unwrap());
+    assert!(same_owner_text.contains("cursor_seek=anchor_ge:"), "{same_owner_text}");
+    assert!(
+        graph_row_chunk_cursor_seek_runtime_metric(
+            &same_owner_text,
+            "raw_adjacency_postings_scanned"
+        ) >= 4_100,
+        "inclusive same-owner replay must report repeated hub work: {same_owner_text}"
+    );
+    assert!(same_owner_trace.iter().all(|pull| {
+        pull.oriented_metadata <= 4_096
+            && pull.physical_scan_units <= 4_096
+            && pull.raw_postings_scanned <= 4_096
+    }));
+    assert_eq!(repeat_trace, same_owner_trace);
+    assert!(same_owner_trace
+        .iter()
+        .filter(|pull| pull.partial_owner_pull)
+        .all(|pull| pull.pending_completed_through_owner.is_none()));
+    let stopping_pull = same_owner_trace.last().expect("crossing page pull trace");
+    assert_eq!(
+        stopping_pull.pending_completed_through_owner,
+        Some(tail_owner_ids[5])
+    );
+    assert_eq!(
+        stopping_pull.pending_last_completed_owner,
+        Some(tail_owner_ids[5])
+    );
+    assert!(stopping_pull.has_more);
+    assert!(!stopping_pull.partial_owner_pull);
+    assert_eq!(
+        graph_row_chunk_cursor_seek_runtime_metric(&same_owner_text, "completed_owner_groups"),
+        7
+    );
+    assert_eq!(
+        graph_row_chunk_cursor_seek_runtime_metric(&same_owner_text, "last_completed_owner"),
+        tail_owner_ids[5] as usize
+    );
+    assert!(same_owner_text.contains("early_exit=true"), "{same_owner_text}");
+    let runtime_page = graph_row_chunk_runtime_once_result(&hub_engine, &hub_query);
+    graph_row_chunk_assert_page_parity(
+        &same_owner_page,
+        &runtime_page,
+        "same-owner hub cursor RuntimeOnce",
+    );
+    let trace_peaks = |trace: &[GraphRowTestAdjacencyPullTrace]| {
+        (
+            trace
+                .iter()
+                .map(|pull| pull.oriented_metadata)
+                .max()
+                .unwrap_or(0),
+            trace
+                .iter()
+                .map(|pull| pull.raw_postings_scanned)
+                .max()
+                .unwrap_or(0),
+            trace
+                .iter()
+                .map(|pull| pull.physical_scan_units)
+                .max()
+                .unwrap_or(0),
+        )
+    };
+    let first_peaks = trace_peaks(&first_trace);
+    let cursor_peaks = trace_peaks(&same_owner_trace);
+    eprintln!(
+        "Phase 44b forced hub capability: automatic_source=EdgePull; H=4100; first_selection_capacity=11; first_raw_total={}; first_output_raw_physical_peaks={first_peaks:?}; first_early_exit=true; cursor_seek=inclusive_owner; cursor_selection_capacity=11; cursor_raw_total={}; cursor_output_raw_physical_peaks={cursor_peaks:?}; large_first_selection_capacity=4096; completed_owner_groups=7",
+        graph_row_chunk_cursor_seek_runtime_metric(
+            &forced_text,
+            "raw_adjacency_postings_scanned"
+        ),
+        graph_row_chunk_cursor_seek_runtime_metric(
+            &same_owner_text,
+            "raw_adjacency_postings_scanned"
+        ),
+    );
+
+    let (_sparse_dir, sparse_engine) = graph_row_test_engine();
+    let mut sparse_ids = Vec::new();
+    for index in 0..1_000u64 {
+        let source = insert_graph_row_node(
+            &sparse_engine,
+            "AdjSparse",
+            &format!("sparse-source-{index:04}"),
+            &[],
+        );
+        let target = insert_graph_row_node(
+            &sparse_engine,
+            "AdjSparse",
+            &format!("sparse-target-{index:04}"),
+            &[],
+        );
+        insert_graph_row_edge(
+            &sparse_engine,
+            source,
+            target,
+            "ADJ_SPARSE_DENSE",
+            &[],
+        );
+        if index % 100 == 99 {
+            sparse_ids.push(insert_graph_row_edge(
+                &sparse_engine,
+                source,
+                target,
+                "ADJ_SPARSE_RARE",
+                &[],
+            ));
+        }
+    }
+    sparse_engine.flush().unwrap();
+    let mut sparse_query = graph_row_adjacency_selected_edge_query(
+        &["ADJ_SPARSE_RARE"],
+        Direction::Outgoing,
+        4,
+    );
+    let (sparse_auto, sparse_adjacency, _, _) =
+        graph_row_adjacency_forced_differential(&sparse_engine, &sparse_query);
+    let sparse_auto_text = graph_row_explain_text(sparse_auto.plan.as_ref().unwrap());
+    let sparse_first_cost = sparse_auto_text
+        .lines()
+        .find(|line| line.contains("kind=AdjacencyPull;") && line.contains("; P="))
+        .unwrap_or_else(|| panic!("sparse first-page adjacency cost line: {sparse_auto_text}"));
+    for fact in [
+        "P=1010; M=10; O=10; A=10; C=10; R=Some(10); H=1; K=5; F=4096; L=1; S=0",
+        "owners_needed=5; index_entries=1010; raw_postings_needed=5; candidate_edges=5; owner_merge_work=5",
+        "dense=false; prefix_heuristic=true; fanout_complete=true; partial_or_stale=false; coverage=advisory",
+        "edge_pull_work=54; ordered_work=1020; four_x_pass=false",
+        "decision=rejected; reason=four_x_margin_failed",
+    ] {
+        assert!(sparse_first_cost.contains(fact), "missing {fact}: {sparse_first_cost}");
+    }
+    assert!(sparse_auto_text.contains("source=EdgePull{"), "{sparse_auto_text}");
+    let expected_first = sparse_ids[..4].to_vec();
+    assert_eq!(
+        graph_row_adjacency_selected_edges(&sparse_adjacency)
+            .iter()
+            .map(|edge| edge.id.unwrap())
+            .collect::<Vec<_>>(),
+        expected_first
+    );
+    sparse_query.at_epoch = Some(sparse_adjacency.stats.effective_at_epoch);
+    sparse_query.page.cursor = sparse_adjacency.next_cursor.clone();
+    let (sparse_cursor_auto, sparse_cursor_adjacency, _, _) =
+        graph_row_adjacency_forced_differential(&sparse_engine, &sparse_query);
+    assert_eq!(
+        graph_row_adjacency_selected_edges(&sparse_cursor_adjacency)
+            .iter()
+            .map(|edge| edge.id.unwrap())
+            .collect::<Vec<_>>(),
+        sparse_ids[4..8]
+    );
+    assert_graph_row_explain_contains(
+        sparse_cursor_adjacency.plan.as_ref().unwrap(),
+        "cursor_seek=anchor_ge:",
+    );
+    let sparse_cursor_text = graph_row_explain_text(sparse_cursor_auto.plan.as_ref().unwrap());
+    let sparse_cursor_cost = sparse_cursor_text
+        .lines()
+        .find(|line| line.contains("kind=AdjacencyPull;") && line.contains("; P="))
+        .unwrap_or_else(|| panic!("sparse cursor-page adjacency cost line: {sparse_cursor_text}"));
+    for fact in [
+        "P=1010; M=10; O=10; A=10; C=10; R=Some(10); H=1; K=5; F=4096; L=1",
+        "owners_needed=5; index_entries=1010; raw_postings_needed=5; candidate_edges=5; owner_merge_work=5",
+        "coverage=advisory",
+        "edge_pull_work=54",
+        "four_x_pass=false",
+        "decision=rejected; reason=four_x_margin_failed",
+    ] {
+        assert!(sparse_cursor_cost.contains(fact), "missing {fact}: {sparse_cursor_cost}");
+    }
+    let cursor_seek_work = graph_row_chunk_cursor_seek_runtime_metric(sparse_cursor_cost, "S");
+    assert!(cursor_seek_work > 0, "{sparse_cursor_cost}");
+    assert_eq!(
+        graph_row_chunk_cursor_seek_runtime_metric(sparse_cursor_cost, "ordered_work"),
+        1_020 + cursor_seek_work
+    );
+    assert!(sparse_cursor_text.contains("source=EdgePull{"), "{sparse_cursor_text}");
+}
+
+#[test]
+fn graph_row_adjacency_pull_invalid_header_rejects_only_adjacency_alternative() {
+    let (_dir, engine) = graph_row_test_engine();
+    for index in 0..1_000u64 {
+        let source = insert_graph_row_node(
+            &engine,
+            "AdjInvalidHeader",
+            &format!("invalid-header-source-{index:04}"),
+            &[],
+        );
+        let target = insert_graph_row_node(
+            &engine,
+            "AdjInvalidHeader",
+            &format!("invalid-header-target-{index:04}"),
+            &[],
+        );
+        insert_graph_row_edge(
+            &engine,
+            source,
+            target,
+            "ADJ_INVALID_HEADER",
+            &[],
+        );
+    }
+    engine.flush().unwrap();
+
+    let mut query = graph_row_adjacency_selected_edge_query(
+        &["ADJ_INVALID_HEADER"],
+        Direction::Outgoing,
+        10,
+    );
+    let warm = engine.query_graph_rows(&query).unwrap();
+    query.at_epoch = Some(warm.stats.effective_at_epoch);
+    let runtime_once = graph_row_chunk_runtime_once_result(&engine, &query);
+
+    let automatic = with_graph_row_test_invalid_adjacency_header(|| {
+        engine.query_graph_rows(&query).unwrap()
+    });
+    let forced_adjacency = with_graph_row_test_invalid_adjacency_header(|| {
+        with_graph_row_test_forced_edge_production(
+            GraphRowEdgeAnchorProduction::AdjacencyPull,
+            || engine.query_graph_rows(&query).unwrap(),
+        )
+    });
+    let forced_edge = with_graph_row_test_invalid_adjacency_header(|| {
+        with_graph_row_test_forced_edge_production(
+            GraphRowEdgeAnchorProduction::EdgePull,
+            || engine.query_graph_rows(&query).unwrap(),
+        )
+    });
+    for (name, result) in [
+        ("automatic", &automatic),
+        ("forced AdjacencyPull", &forced_adjacency),
+        ("forced EdgePull", &forced_edge),
+    ] {
+        graph_row_chunk_assert_page_parity(result, &runtime_once, name);
+        let plan = result.plan.as_ref().unwrap();
+        assert_graph_row_explain_contains(plan, "kind=AdjacencyPull");
+        assert_graph_row_explain_contains(plan, "reason=invalid_adjacency_header");
+        assert_graph_row_explain_contains(plan, "source=EdgePull{edge=alias:edge}");
+        assert_graph_row_explain_contains(plan, "choice=EdgePullChunk");
+        for forbidden in [
+            "source=AdjacencyPull{",
+            "choice=AdjacencyPullChunk",
+            "source_order=logical_from_group_asc",
+            "proof_boundary=completed_owner_group",
+            "adjacency_index_entries_scanned=",
+            "raw_adjacency_postings_scanned=",
+            "shadowed_or_stale_postings=",
+        ] {
+            assert_graph_row_explain_not_contains(plan, forbidden);
+        }
+    }
+}
+
+#[test]
+fn graph_row_adjacency_pull_public_corruption_is_lazy_terminal_and_never_falls_back() {
+    let (_dir, engine) = graph_row_test_engine();
+    let mut owners = Vec::new();
+    for index in 0..1_000u64 {
+        let source = insert_graph_row_node(
+            &engine,
+            "AdjPublicError",
+            &format!("error-source-{index:04}"),
+            &[],
+        );
+        let target = insert_graph_row_node(
+            &engine,
+            "AdjPublicError",
+            &format!("error-target-{index:04}"),
+            &[],
+        );
+        owners.push(source);
+        insert_graph_row_edge(
+            &engine,
+            source,
+            target,
+            "ADJ_PUBLIC_ERROR",
+            &[],
+        );
+    }
+    engine.flush().unwrap();
+
+    let mut query = graph_row_adjacency_selected_edge_query(
+        &["ADJ_PUBLIC_ERROR"],
+        Direction::Outgoing,
+        1,
+    );
+    engine.reset_query_execution_counters_for_test();
+    let required = with_graph_row_test_adjacency_posting_failure(owners[0], || {
+        with_graph_row_test_forced_edge_production(
+            GraphRowEdgeAnchorProduction::AdjacencyPull,
+            || engine.query_graph_rows(&query),
+        )
+    })
+    .unwrap_err();
+    assert!(matches!(required, EngineError::CorruptRecord(_)));
+    let required_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(required_counters.graph_row_edge_pull_executions, 0);
+    assert_eq!(required_counters.graph_row_chunk_early_exits, 0);
+
+    let skipped = with_graph_row_test_adjacency_posting_failure(owners[900], || {
+        with_graph_row_test_forced_edge_production(
+            GraphRowEdgeAnchorProduction::AdjacencyPull,
+            || engine.query_graph_rows(&query).unwrap(),
+        )
+    });
+    assert_eq!(skipped.rows.len(), 1);
+    assert_graph_row_explain_contains(skipped.plan.as_ref().unwrap(), "early_exit=true");
+
+    query.page.limit = 900;
+    let prefix = with_graph_row_test_forced_edge_production(
+        GraphRowEdgeAnchorProduction::AdjacencyPull,
+        || engine.query_graph_rows(&query).unwrap(),
+    );
+    assert_eq!(prefix.rows.len(), 900);
+    query.at_epoch = Some(prefix.stats.effective_at_epoch);
+    query.page.cursor = prefix.next_cursor;
+    query.page.limit = 1;
+    engine.reset_query_execution_counters_for_test();
+    let later = with_graph_row_test_adjacency_posting_failure(owners[900], || {
+        with_graph_row_test_forced_edge_production(
+            GraphRowEdgeAnchorProduction::AdjacencyPull,
+            || engine.query_graph_rows(&query),
+        )
+    })
+    .unwrap_err();
+    assert!(matches!(later, EngineError::CorruptRecord(_)));
+    let later_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(later_counters.graph_row_edge_pull_executions, 0);
+    assert_eq!(later_counters.graph_row_chunk_early_exits, 0);
 }
 
 #[test]
@@ -19560,7 +22701,7 @@ fn graph_row_planner_edge_property_in_anchor_preserves_signed_zero() {
         vec![positive, negative]
     );
     let explain = result.plan.as_ref().unwrap();
-    assert_graph_row_explain_contains(explain, "choice=DelegatedEdgeQuery");
+    assert_graph_row_explain_contains(explain, "choice=EdgePullChunk");
     assert_graph_row_explain_contains(explain, "EdgePropertyEqualityIndex");
     assert_graph_row_explain_contains(explain, "semantic numeric equality/range equivalence");
 }
@@ -19707,7 +22848,7 @@ fn graph_row_planner_high_fanout_small_limit_returns_deterministic_top_rows() {
 }
 
 #[test]
-fn graph_row_explain_records_skipped_source_after_empty_frontier() {
+fn graph_row_edge_pull_empty_result_does_not_prepare_later_sources() {
     let (_dir, engine) = graph_row_test_engine();
     let source = insert_graph_row_node(&engine, "GRAPH_ROW_SKIP_SOURCE", "skip-source", &[]);
     let first = insert_graph_row_node(&engine, "GRAPH_ROW_SKIP_SOURCE", "skip-first", &[]);
@@ -19745,15 +22886,15 @@ fn graph_row_explain_records_skipped_source_after_empty_frontier() {
     let explain = result.plan.as_ref().unwrap();
     assert_graph_row_explain_contains(explain, "edge=alias:empty_edge");
     assert_graph_row_explain_contains(explain, "choice=EmptyResult");
-    assert_graph_row_explain_contains(explain, "edge=alias:skipped_edge");
-    assert_graph_row_explain_contains(explain, "choice=SkippedEmptyFrontier");
-    assert_graph_row_explain_contains(explain, "planned_driver=EndpointAdjacency");
-    assert_graph_row_explain_contains(explain, "skipped_due_to_empty_frontier=true");
-    assert_graph_row_explain_contains(explain, "materialized_source=none");
+    assert_graph_row_explain_not_contains(explain, "choice=SkippedEmptyFrontier");
+    assert_graph_row_explain_contains(
+        explain,
+        "ChunkedRowProductionRuntime source=EdgePull{edge=alias:empty_edge}; source_pulls=0; successful_leaves=0; scheduled_sizes=[]; leaf_size_min=0; leaf_size_max=0; source_rows=0; produced_rows=0",
+    );
 }
 
 #[test]
-fn graph_row_planner_broad_label_only_edge_anchor_errors_with_cap_source() {
+fn graph_row_planner_broad_label_only_edge_anchor_streams_under_cap() {
     let (_dir, engine) = graph_row_test_engine();
     for index in 0..3 {
         let source = insert_graph_row_node(
@@ -19786,13 +22927,13 @@ fn graph_row_planner_broad_label_only_edge_anchor_errors_with_cap_source() {
         GraphReturnProjection::IdOnly,
     )]);
 
-    let err = engine.query_graph_rows(&query).unwrap_err();
-    let message = err.to_string();
-    assert!(message.contains("max_frontier"), "{message}");
-    assert!(message.contains("exceeded configured cap 2"), "{message}");
-    // DEC-42-012: delegated cap errors deliberately drop the obsolete
-    // source=EdgeCandidateSource suffix.
-    assert!(!message.contains("source=EdgeCandidateSource"), "{message}");
+    query.options.include_plan = true;
+    let result = engine.query_graph_rows(&query).unwrap();
+    assert_eq!(graph_row_single_u64_column(result.clone()), vec![1, 2, 3]);
+    let explain = result.plan.as_ref().unwrap();
+    assert_graph_row_explain_contains(explain, "choice=EdgePullChunk");
+    assert_graph_row_explain_contains(explain, "source_rows=3");
+    assert_graph_row_explain_contains(explain, "leaf_size_max=2");
 }
 
 #[test]
@@ -20399,6 +23540,22 @@ fn graph_row_chunk_assert_page_parity(
         actual.stats.rows_returned, oracle.stats.rows_returned,
         "{context}: rows_returned"
     );
+    let edge_pull = actual.plan.as_ref().is_some_and(|plan| {
+        plan.plan.iter().any(|node| {
+            node.kind == "ChunkedRowProductionRuntime"
+                && node.detail.contains("source=EdgePull{")
+        })
+    });
+    if edge_pull {
+        assert_eq!(
+            actual.stats.rows_after_filter, oracle.stats.rows_after_filter,
+            "{context}: rows_after_filter"
+        );
+        assert_eq!(
+            actual.stats.rows_seen_for_page, oracle.stats.rows_seen_for_page,
+            "{context}: rows_seen_for_page"
+        );
+    }
     assert_eq!(
         actual.stats.effective_at_epoch, oracle.stats.effective_at_epoch,
         "{context}: effective epoch"
@@ -20437,6 +23594,1198 @@ fn graph_row_chunk_assert_walk_parity(
         page_index = page_index.saturating_add(1);
         assert!(page_index < 10_000, "cursor walk must terminate");
     }
+}
+
+#[test]
+fn graph_row_edge_pull_native_shapes_keep_node_as_logical_slot_zero() {
+    let required = graph_edge_with_label(Some("edge"), "source", "middle", "EQ44_SLOT");
+    let optional = graph_optional(
+        vec![graph_edge_with_label(
+            Some("optional"),
+            "middle",
+            "target",
+            "EQ44_SLOT_OPTIONAL",
+        )],
+        None,
+    );
+    let vlp = graph_vlp(Some("path"), None, "middle", "target", 1, 3);
+    for query in [
+        graph_query(&["source", "middle"], vec![required.clone()]),
+        graph_query(
+            &["source", "middle", "target"],
+            vec![required.clone(), optional],
+        ),
+        graph_query(&["source", "middle", "target"], vec![required, vlp]),
+    ] {
+        let normalized = normalize_graph_row_query(&query).unwrap();
+        assert_eq!(
+            normalized.binding_schema.slots()[0].kind,
+            GraphBindingSlotKind::Node
+        );
+    }
+}
+
+#[test]
+fn graph_row_edge_pull_eq44_1_2_3_9_10_12_equivalence_and_reopen() {
+    let (dir, engine) = graph_row_test_engine();
+    let sources = (0..6)
+        .map(|index| {
+            insert_graph_row_node(
+                &engine,
+                "Eq44Source",
+                &format!("eq44-source-{index}"),
+                &[("keep", PropValue::Bool(index % 2 == 0))],
+            )
+        })
+        .collect::<Vec<_>>();
+    let targets = (0..6)
+        .map(|index| {
+            insert_graph_row_node(
+                &engine,
+                "Eq44Target",
+                &format!("eq44-target-{index}"),
+                &[("keep", PropValue::Bool(index % 2 == 0))],
+            )
+        })
+        .collect::<Vec<_>>();
+    for index in (0..6).rev() {
+        insert_graph_row_edge(
+            &engine,
+            sources[index],
+            targets[5 - index],
+            "EQ44_PRIMARY",
+            &[("rank", PropValue::Int(index as i64))],
+        );
+    }
+    insert_graph_row_edge(
+        &engine,
+        sources[0],
+        sources[0],
+        "EQ44_PRIMARY",
+        &[("rank", PropValue::Int(6))],
+    );
+
+    let mut filtered = graph_query(
+        &["source", "target"],
+        vec![GraphPatternPiece::Edge(GraphEdgePattern {
+            alias: Some("edge".to_string()),
+            from_alias: "source".to_string(),
+            to_alias: "target".to_string(),
+            direction: Direction::Outgoing,
+            label_filter: vec!["EQ44_PRIMARY".to_string()],
+            filter: Some(EdgeFilterExpr::PropertyRange {
+                key: "rank".to_string(),
+                lower: Some(PropertyRangeBound::Included(PropValue::Int(2))),
+                upper: None,
+            }),
+        })],
+    );
+    filtered.options.allow_full_scan = false;
+    filtered.page.limit = 4;
+    filtered.return_items = Some(vec![
+        graph_return_binding("source", GraphReturnProjection::IdOnly),
+        graph_return_binding("edge", GraphReturnProjection::IdOnly),
+        graph_return_binding("target", GraphReturnProjection::IdOnly),
+    ]);
+    graph_row_chunk_assert_forced_equivalence(
+        &engine,
+        &filtered,
+        &[1, 3, 256, usize::MAX],
+    );
+
+    let mut label_only = filtered.clone();
+    let GraphPatternPiece::Edge(label_edge) = &mut label_only.pieces[0] else {
+        unreachable!()
+    };
+    label_edge.filter = None;
+    graph_row_chunk_assert_forced_equivalence(&engine, &label_only, &[1, 7, usize::MAX]);
+
+    let mut unlabeled = label_only.clone();
+    let GraphPatternPiece::Edge(unlabeled_edge) = &mut unlabeled.pieces[0] else {
+        unreachable!()
+    };
+    unlabeled_edge.label_filter.clear();
+    unlabeled.options.allow_full_scan = true;
+    graph_row_chunk_assert_forced_equivalence(&engine, &unlabeled, &[1, 7, usize::MAX]);
+
+    let mut both = label_only.clone();
+    let GraphPatternPiece::Edge(both_edge) = &mut both.pieces[0] else {
+        unreachable!()
+    };
+    both_edge.direction = Direction::Both;
+    graph_row_chunk_assert_forced_equivalence(&engine, &both, &[1, 2, 7, 256]);
+
+    let mut residual_order = label_only.clone();
+    residual_order.where_ = Some(GraphExpr::Binary {
+        left: Box::new(graph_prop("target", "keep")),
+        op: GraphBinaryOp::Eq,
+        right: Box::new(GraphExpr::Bool(true)),
+    });
+    residual_order.order_by = vec![
+        GraphOrderItem {
+            expr: graph_prop("edge", "rank"),
+            direction: GraphOrderDirection::Desc,
+        },
+        GraphOrderItem {
+            expr: GraphExpr::Function {
+                name: GraphFunction::Id,
+                args: vec![GraphExpr::Binding("source".to_string())],
+            },
+            direction: GraphOrderDirection::Asc,
+        },
+    ];
+    residual_order.page.skip = 1;
+    residual_order.page.limit = 2;
+    graph_row_chunk_assert_forced_equivalence(
+        &engine,
+        &residual_order,
+        &[1, 7, 256, usize::MAX],
+    );
+
+    let mut endpoint_filtered = label_only.clone();
+    endpoint_filtered.nodes[1].filter = Some(NodeFilterExpr::PropertyEquals {
+        key: "keep".to_string(),
+        value: PropValue::Bool(true),
+    });
+    graph_row_chunk_assert_forced_equivalence(
+        &engine,
+        &endpoint_filtered,
+        &[1, 3, usize::MAX],
+    );
+
+    engine.flush().unwrap();
+    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    graph_row_chunk_assert_forced_equivalence(
+        &reopened,
+        &filtered,
+        &[1, 3, 256, usize::MAX],
+    );
+    graph_row_chunk_assert_forced_equivalence(&reopened, &both, &[1, 2, 7, 256]);
+    graph_row_chunk_assert_forced_equivalence(
+        &reopened,
+        &residual_order,
+        &[1, 7, 256, usize::MAX],
+    );
+    graph_row_chunk_assert_forced_equivalence(
+        &reopened,
+        &endpoint_filtered,
+        &[1, 3, usize::MAX],
+    );
+}
+
+#[test]
+fn graph_row_edge_pull_eq44_4_6_7_8_11_suffix_and_branch_equivalence() {
+    let (dir, engine) = graph_row_test_engine();
+    let sources = (0..5)
+        .map(|index| {
+            insert_graph_row_node(
+                &engine,
+                "Eq44BranchSource",
+                &format!("eq44-branch-source-{index}"),
+                &[],
+            )
+        })
+        .collect::<Vec<_>>();
+    let middles = (0..5)
+        .map(|index| {
+            insert_graph_row_node(
+                &engine,
+                "Eq44BranchMiddle",
+                &format!("eq44-branch-middle-{index}"),
+                &[],
+            )
+        })
+        .collect::<Vec<_>>();
+    let targets = (0..5)
+        .map(|index| {
+            insert_graph_row_node(
+                &engine,
+                "Eq44BranchTarget",
+                &format!("eq44-branch-target-{index}"),
+                &[],
+            )
+        })
+        .collect::<Vec<_>>();
+    for index in 0..5 {
+        insert_graph_row_edge(
+            &engine,
+            sources[index],
+            middles[index],
+            "EQ44_BRANCH_A",
+            &[],
+        );
+        insert_graph_row_edge(
+            &engine,
+            middles[index],
+            targets[index],
+            "EQ44_SECOND_HOP",
+            &[("status", PropValue::String("hot".to_string()))],
+        );
+        if index < 3 {
+            let doc = insert_graph_row_node(
+                &engine,
+                "Eq44BranchDoc",
+                &format!("eq44-branch-doc-{index}"),
+                &[],
+            );
+            insert_graph_row_edge(
+                &engine,
+                middles[index],
+                doc,
+                "EQ44_OPTIONAL",
+                &[],
+            );
+        }
+        if index < 2 {
+            insert_graph_row_edge(
+                &engine,
+                sources[index],
+                targets[4 - index],
+                "EQ44_BRANCH_B",
+                &[],
+            );
+        }
+    }
+    let empty_seed = insert_graph_row_edge(
+        &engine,
+        sources[0],
+        targets[0],
+        "EQ44_BRANCH_EMPTY",
+        &[],
+    );
+    engine.delete_edge(empty_seed).unwrap();
+
+    let mut multi_label = graph_query(
+        &["source", "target"],
+        vec![GraphPatternPiece::Edge(GraphEdgePattern {
+            alias: Some("edge".to_string()),
+            from_alias: "source".to_string(),
+            to_alias: "target".to_string(),
+            direction: Direction::Outgoing,
+            label_filter: vec![
+                "EQ44_BRANCH_EMPTY".to_string(),
+                "EQ44_BRANCH_B".to_string(),
+                "EQ44_BRANCH_A".to_string(),
+            ],
+            filter: None,
+        })],
+    );
+    multi_label.options.allow_full_scan = false;
+    multi_label.return_items = Some(vec![graph_return_binding(
+        "edge",
+        GraphReturnProjection::IdOnly,
+    )]);
+    graph_row_chunk_assert_forced_equivalence(&engine, &multi_label, &[1, 3, usize::MAX]);
+    multi_label.options.include_plan = true;
+    reset_prepared_edge_source_test_snapshot();
+    engine.reset_query_execution_counters_for_test();
+    let multi_label_one = with_graph_row_test_chunk_override(1, || {
+        engine.query_graph_rows(&multi_label).unwrap()
+    });
+    let multi_label_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(multi_label_counters.graph_row_edge_pull_executions, 1);
+    assert_eq!(multi_label_counters.graph_row_delegated_edge_queries, 8);
+    assert_eq!(multi_label_counters.graph_row_delegated_verified_candidates, 7);
+    assert_eq!(multi_label_counters.graph_row_chunks_executed, 7);
+    let prepared_snapshot = prepared_edge_source_test_snapshot();
+    assert_eq!(prepared_snapshot.branch_plans, 3);
+    assert_eq!(prepared_snapshot.preparations, 3);
+    let multi_label_plan = format!("{:?}", multi_label_one.plan.unwrap());
+    assert!(multi_label_plan.contains("source_pulls=8"), "{multi_label_plan}");
+
+    let repeated_source = insert_graph_row_node(
+        &engine,
+        "Eq44BranchSource",
+        "eq44-branch-source-repeated",
+        &[],
+    );
+    insert_graph_row_edge(
+        &engine,
+        repeated_source,
+        middles[0],
+        "EQ44_BRANCH_A",
+        &[],
+    );
+
+    let mut two_hop = graph_query(
+        &["source", "middle", "target"],
+        vec![
+            graph_edge_with_label(Some("seed"), "source", "middle", "EQ44_BRANCH_A"),
+            graph_edge_with_label(
+                Some("fanout"),
+                "middle",
+                "target",
+                "EQ44_SECOND_HOP",
+            ),
+        ],
+    );
+    two_hop.options.allow_full_scan = false;
+    graph_row_chunk_assert_forced_equivalence(&engine, &two_hop, &[1, 3, 256]);
+
+    let mut optional = graph_query(
+        &["source", "middle", "doc"],
+        vec![
+            graph_edge_with_label(Some("seed"), "source", "middle", "EQ44_BRANCH_A"),
+            graph_optional(
+                vec![graph_edge_with_label(
+                    Some("optional"),
+                    "middle",
+                    "doc",
+                    "EQ44_OPTIONAL",
+                )],
+                None,
+            ),
+        ],
+    );
+    optional.options.allow_full_scan = false;
+    graph_row_chunk_assert_forced_equivalence(&engine, &optional, &[1, 3, 256]);
+    let optional_oracle = graph_row_chunk_runtime_once_result(&engine, &optional);
+    assert_eq!(optional_oracle.rows.len(), 6);
+    let doc_column = optional_oracle
+        .columns
+        .iter()
+        .position(|column| column == "doc")
+        .unwrap();
+    assert_eq!(
+        optional_oracle
+            .rows
+            .iter()
+            .filter(|row| row.values[doc_column] == GraphValue::Null)
+            .count(),
+        2
+    );
+    engine.reset_query_execution_counters_for_test();
+    with_graph_row_test_chunk_override(1, || engine.query_graph_rows(&optional).unwrap());
+    let optional_cache = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(optional_cache.graph_row_edge_pull_executions, 1);
+    assert!(optional_cache.graph_row_optional_group_cache_hits > 0);
+    assert!(optional_cache.graph_row_result_cache_units_peak > 0);
+    assert_eq!(optional_cache.graph_row_node_verification_cache_hits, 0);
+
+    let mut later_empty_optional = graph_query(
+        &["source", "middle", "doc"],
+        vec![
+            GraphPatternPiece::Edge(GraphEdgePattern {
+                alias: Some("seed".to_string()),
+                from_alias: "source".to_string(),
+                to_alias: "middle".to_string(),
+                direction: Direction::Outgoing,
+                label_filter: vec![
+                    "EQ44_BRANCH_EMPTY".to_string(),
+                    "EQ44_BRANCH_B".to_string(),
+                    "EQ44_BRANCH_A".to_string(),
+                ],
+                filter: None,
+            }),
+            graph_optional(
+                vec![graph_edge_with_label(
+                    Some("optional"),
+                    "middle",
+                    "doc",
+                    "EQ44_OPTIONAL",
+                )],
+                None,
+            ),
+        ],
+    );
+    later_empty_optional.options.allow_full_scan = false;
+    later_empty_optional.options.include_plan = true;
+    engine.reset_query_execution_counters_for_test();
+    let later_empty_result = with_graph_row_test_chunk_override(usize::MAX, || {
+        engine.query_graph_rows(&later_empty_optional).unwrap()
+    });
+    let later_empty_plan = format!("{:?}", later_empty_result.plan.unwrap());
+    let later_empty_cache = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(later_empty_cache.graph_row_edge_pull_executions, 1);
+    assert!(later_empty_cache.graph_row_result_cache_units_peak > 0);
+    assert!(later_empty_plan.contains("source_pulls=3"), "{later_empty_plan}");
+
+    let uncorrelated_source =
+        insert_graph_row_node(&engine, "Eq44Uncorrelated", "eq44-uncorrelated-source", &[]);
+    let uncorrelated_target =
+        insert_graph_row_node(&engine, "Eq44Uncorrelated", "eq44-uncorrelated-target", &[]);
+    insert_graph_row_edge(
+        &engine,
+        uncorrelated_source,
+        uncorrelated_target,
+        "EQ44_UNCORRELATED_OPTIONAL",
+        &[],
+    );
+    let mut uncorrelated_optional = graph_query(
+        &["source", "middle", "optional_source", "optional_target"],
+        vec![
+            graph_edge_with_label(Some("seed"), "source", "middle", "EQ44_BRANCH_A"),
+            graph_optional(
+                vec![graph_edge_with_label(
+                    Some("optional"),
+                    "optional_source",
+                    "optional_target",
+                    "EQ44_UNCORRELATED_OPTIONAL",
+                )],
+                None,
+            ),
+        ],
+    );
+    uncorrelated_optional.options.allow_full_scan = true;
+    graph_row_chunk_assert_forced_equivalence(
+        &engine,
+        &uncorrelated_optional,
+        &[1, 3, 256],
+    );
+    assert_eq!(
+        graph_row_chunk_runtime_once_result(&engine, &uncorrelated_optional)
+            .rows
+            .len(),
+        6
+    );
+
+    let mut vlp = graph_vlp(Some("path"), None, "middle", "target", 1, 3);
+    let GraphPatternPiece::VariableLength(vlp_pattern) = &mut vlp else {
+        unreachable!()
+    };
+    vlp_pattern.label_filter = vec!["EQ44_SECOND_HOP".to_string()];
+    let mut with_vlp = graph_query(
+        &["source", "middle", "target"],
+        vec![
+            graph_edge_with_label(Some("seed"), "source", "middle", "EQ44_BRANCH_A"),
+            vlp,
+        ],
+    );
+    with_vlp.options.allow_full_scan = false;
+    graph_row_chunk_assert_forced_equivalence(&engine, &with_vlp, &[1, 2, 7]);
+    engine.reset_query_execution_counters_for_test();
+    with_graph_row_test_chunk_override(1, || engine.query_graph_rows(&with_vlp).unwrap());
+    let vlp_cache = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(vlp_cache.graph_row_edge_pull_executions, 1);
+    assert!(vlp_cache.graph_row_vlp_cross_chunk_cache_hits > 0);
+    assert!(vlp_cache.graph_row_result_cache_units_peak > 0);
+    assert_eq!(vlp_cache.graph_row_node_verification_cache_hits, 0);
+
+    let mut one_hop_vlp = with_vlp.clone();
+    let GraphPatternPiece::VariableLength(one_hop) = &mut one_hop_vlp.pieces[1] else {
+        unreachable!()
+    };
+    one_hop.max_hops = 1;
+    one_hop.filter = Some(EdgeFilterExpr::PropertyEquals {
+        key: "status".to_string(),
+        value: PropValue::String("hot".to_string()),
+    });
+    graph_row_chunk_assert_forced_equivalence(&engine, &one_hop_vlp, &[1, 2, 7]);
+    assert_eq!(
+        graph_row_chunk_runtime_once_result(&engine, &one_hop_vlp)
+            .rows
+            .len(),
+        6
+    );
+
+    let mut reverse_vlp = one_hop_vlp.clone();
+    let GraphPatternPiece::VariableLength(reverse) = &mut reverse_vlp.pieces[1] else {
+        unreachable!()
+    };
+    reverse.from_alias = "target".to_string();
+    reverse.to_alias = "middle".to_string();
+    reverse.direction = Direction::Incoming;
+    graph_row_chunk_assert_forced_equivalence(&engine, &reverse_vlp, &[1, 2, 7]);
+    assert_eq!(
+        graph_row_chunk_runtime_once_result(&engine, &reverse_vlp)
+            .rows
+            .len(),
+        6
+    );
+
+    let mut path_cap = with_vlp.clone();
+    path_cap.options.max_paths_per_start = 0;
+    engine.reset_query_execution_counters_for_test();
+    let path_error = with_graph_row_test_chunk_override(1, || {
+        engine.query_graph_rows(&path_cap).unwrap_err()
+    });
+    assert!(path_error
+        .to_string()
+        .contains("max_paths_per_start exceeded configured cap 0"));
+    let path_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(path_counters.graph_row_edge_pull_executions, 1);
+    assert_eq!(path_counters.graph_row_chunk_cap_retries, 0);
+
+    let lead_source = insert_graph_row_node(&engine, "Eq44Lead", "eq44-lead-source", &[]);
+    let lead_target = insert_graph_row_node(&engine, "Eq44Lead", "eq44-lead-target", &[]);
+    let lead_doc = insert_graph_row_node(&engine, "Eq44Lead", "eq44-lead-doc", &[]);
+    insert_graph_row_edge(
+        &engine,
+        lead_source,
+        lead_target,
+        "EQ44_LEADING_EDGE",
+        &[],
+    );
+    insert_graph_row_edge(
+        &engine,
+        lead_target,
+        lead_doc,
+        "EQ44_LEADING_OPTIONAL",
+        &[],
+    );
+    for index in 0..5 {
+        insert_graph_row_edge(
+            &engine,
+            sources[index],
+            targets[index],
+            "EQ44_LATER_REQUIRED",
+            &[],
+        );
+    }
+    let mut barrier = graph_query(
+        &["lead_source", "lead_target", "lead_doc", "later_source", "later_target"],
+        vec![
+            graph_edge_with_label(
+                Some("lead"),
+                "lead_source",
+                "lead_target",
+                "EQ44_LEADING_EDGE",
+            ),
+            graph_optional(
+                vec![graph_edge_with_label(
+                    Some("optional"),
+                    "lead_target",
+                    "lead_doc",
+                    "EQ44_LEADING_OPTIONAL",
+                )],
+                None,
+            ),
+            graph_edge_with_label(
+                Some("later"),
+                "later_source",
+                "later_target",
+                "EQ44_LATER_REQUIRED",
+            ),
+        ],
+    );
+    barrier.options.allow_full_scan = false;
+    graph_row_chunk_assert_forced_equivalence(&engine, &barrier, &[1, 3, 7]);
+
+    let mut leading_vlp = graph_vlp(
+        Some("lead_path"),
+        None,
+        "lead_target",
+        "lead_doc",
+        1,
+        1,
+    );
+    let GraphPatternPiece::VariableLength(leading_vlp_pattern) = &mut leading_vlp else {
+        unreachable!()
+    };
+    leading_vlp_pattern.label_filter = vec!["EQ44_LEADING_OPTIONAL".to_string()];
+    let mut vlp_barrier = graph_query(
+        &["lead_source", "lead_target", "lead_doc", "later_source", "later_target"],
+        vec![
+            graph_edge_with_label(
+                Some("lead"),
+                "lead_source",
+                "lead_target",
+                "EQ44_LEADING_EDGE",
+            ),
+            leading_vlp,
+            graph_edge_with_label(
+                Some("later"),
+                "later_source",
+                "later_target",
+                "EQ44_LATER_REQUIRED",
+            ),
+        ],
+    );
+    vlp_barrier.options.allow_full_scan = false;
+    graph_row_chunk_assert_forced_equivalence(&engine, &vlp_barrier, &[1, 3, 7]);
+
+    engine.flush().unwrap();
+    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    for query in [
+        &optional,
+        &uncorrelated_optional,
+        &one_hop_vlp,
+        &reverse_vlp,
+        &barrier,
+        &vlp_barrier,
+    ] {
+        graph_row_chunk_assert_forced_equivalence(&reopened, query, &[1, 3, 7]);
+    }
+}
+
+#[test]
+fn graph_row_edge_pull_eq44_5_raw_ids_preserve_verification_and_counters() {
+    let (dir, engine) = graph_row_test_engine();
+    let source = insert_graph_row_node(&engine, "Eq44Raw", "eq44-raw-source", &[]);
+    let targets = (0..4)
+        .map(|index| {
+            insert_graph_row_node(
+                &engine,
+                "Eq44Raw",
+                &format!("eq44-raw-target-{index}"),
+                &[],
+            )
+        })
+        .collect::<Vec<_>>();
+    let edge_ids = targets
+        .iter()
+        .map(|target| insert_graph_row_edge(&engine, source, *target, "EQ44_RAW", &[]))
+        .collect::<Vec<_>>();
+    engine.delete_edge(edge_ids[1]).unwrap();
+
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![graph_edge_with_label(
+            Some("edge"),
+            "source",
+            "target",
+            "EQ44_RAW",
+        )],
+    );
+    query.options.allow_full_scan = false;
+    query.options.include_plan = true;
+    query.return_items = Some(vec![graph_return_binding(
+        "edge",
+        GraphReturnProjection::IdOnly,
+    )]);
+    let mut normalized = normalize_graph_row_query(&query).unwrap();
+    normalized.edge_id_constraints.insert(
+        "edge".to_string(),
+        vec![edge_ids[3], u64::MAX, edge_ids[0], edge_ids[1], edge_ids[3]],
+    );
+    normalized.at_epoch = Some(now_millis());
+
+    let assert_view = |engine: &DatabaseEngine| {
+        let view = engine.published_state().view.clone();
+        let run = |reason| {
+            let cursor_state = graph_row_prepare_cursor_state(
+                &normalized.page,
+                normalized.at_epoch,
+                &normalized.options,
+            )
+            .unwrap();
+            view.query_graph_rows_outcome_with_source_policy(&normalized, cursor_state, reason)
+                .unwrap()
+                .value
+        };
+        let oracle = run(Some(GraphRowRuntimeOnceReason::NonNodeInitialDriver));
+        assert_eq!(graph_row_single_u64_column(oracle.clone()), vec![edge_ids[0], edge_ids[3]]);
+        for size in [1, 2, 7, usize::MAX] {
+            engine.reset_query_execution_counters_for_test();
+            let actual = with_graph_row_test_chunk_override(size, || run(None));
+            graph_row_chunk_assert_page_parity(&actual, &oracle, &format!("raw size {size}"));
+            let counters = engine.query_execution_counter_snapshot_for_test();
+            assert_eq!(counters.graph_row_edge_pull_executions, 1);
+            assert_eq!(counters.graph_row_delegated_edge_queries, 0);
+            assert_eq!(counters.graph_row_delegated_verified_candidates, 0);
+            let plan = format!("{:?}", actual.plan.unwrap());
+            assert!(plan.contains("materialized_source=EdgePullExplicitIds"), "{plan}");
+            if size == 1 {
+                assert_eq!(counters.graph_row_chunks_executed, 4);
+                assert!(plan.contains("source_pulls=4; successful_leaves=4"), "{plan}");
+                assert!(plan.contains("source_rows=4"), "{plan}");
+            }
+        }
+        for page_limit in [1, 2, 7, 100] {
+            for size in [1, 2, 7, usize::MAX] {
+                let mut actual_query = normalized.clone();
+                let mut oracle_query = normalized.clone();
+                actual_query.page.limit = page_limit;
+                oracle_query.page.limit = page_limit;
+                loop {
+                    let run_page = |query: &NormalizedGraphRowQuery, reason| {
+                        let cursor_state = graph_row_prepare_cursor_state(
+                            &query.page,
+                            query.at_epoch,
+                            &query.options,
+                        )
+                        .unwrap();
+                        view.query_graph_rows_outcome_with_source_policy(
+                            query,
+                            cursor_state,
+                            reason,
+                        )
+                        .unwrap()
+                        .value
+                    };
+                    let oracle = run_page(
+                        &oracle_query,
+                        Some(GraphRowRuntimeOnceReason::NonNodeInitialDriver),
+                    );
+                    let actual = with_graph_row_test_chunk_override(size, || {
+                        run_page(&actual_query, None)
+                    });
+                    graph_row_chunk_assert_page_parity(
+                        &actual,
+                        &oracle,
+                        &format!("raw page_limit {page_limit}, size {size}"),
+                    );
+                    match oracle.next_cursor {
+                        Some(cursor) => {
+                            actual_query.page.cursor = Some(cursor.clone());
+                            oracle_query.page.cursor = Some(cursor);
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    };
+    assert_view(&engine);
+
+    let mut raw_before_empty_query = query.clone();
+    let GraphPatternPiece::Edge(raw_before_empty_edge) = &mut raw_before_empty_query.pieces[0]
+    else {
+        unreachable!()
+    };
+    raw_before_empty_edge.filter = Some(EdgeFilterExpr::PropertyIn {
+        key: "missing".to_string(),
+        values: Vec::new(),
+    });
+    raw_before_empty_query.options.max_frontier = 0;
+    let mut raw_before_empty = normalize_graph_row_query(&raw_before_empty_query).unwrap();
+    raw_before_empty
+        .edge_id_constraints
+        .insert("edge".to_string(), vec![edge_ids[0]]);
+    let cursor_state = graph_row_prepare_cursor_state(
+        &raw_before_empty.page,
+        raw_before_empty.at_epoch,
+        &raw_before_empty.options,
+    )
+    .unwrap();
+    engine.reset_query_execution_counters_for_test();
+    let raw_before_empty_error = match engine
+        .published_state()
+        .view
+        .query_graph_rows_outcome(&raw_before_empty, cursor_state)
+    {
+        Ok(_) => panic!("RawIds must take precedence over the static EmptyResult source"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        raw_before_empty_error.to_string(),
+        "invalid operation: graph row max_frontier exceeded configured cap 0"
+    );
+    let precedence_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(precedence_counters.graph_row_edge_pull_executions, 1);
+    assert_eq!(precedence_counters.graph_row_delegated_edge_queries, 0);
+
+    engine.flush().unwrap();
+    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    assert_view(&reopened);
+}
+
+#[test]
+fn graph_row_edge_pull_empty_result_frontier_zero_and_no_explain_allocations() {
+    let (_dir, engine) = graph_row_test_engine();
+    let source = insert_graph_row_node(&engine, "Eq44Empty", "eq44-empty-source", &[]);
+    let target = insert_graph_row_node(&engine, "Eq44Empty", "eq44-empty-target", &[]);
+    insert_graph_row_edge(&engine, source, target, "EQ44_EMPTY", &[]);
+
+    let mut empty = graph_query(
+        &["source", "target"],
+        vec![GraphPatternPiece::Edge(GraphEdgePattern {
+            alias: Some("edge".to_string()),
+            from_alias: "source".to_string(),
+            to_alias: "target".to_string(),
+            direction: Direction::Outgoing,
+            label_filter: vec!["EQ44_EMPTY".to_string()],
+            filter: Some(EdgeFilterExpr::PropertyIn {
+                key: "missing".to_string(),
+                values: Vec::new(),
+            }),
+        })],
+    );
+    empty.options.allow_full_scan = false;
+    empty.options.include_plan = true;
+    engine.reset_query_execution_counters_for_test();
+    let empty_result = engine.query_graph_rows(&empty).unwrap();
+    assert!(empty_result.rows.is_empty());
+    let empty_plan = format!("{:?}", empty_result.plan.unwrap());
+    assert!(empty_plan.contains("source=EdgePull{edge=alias:edge}"), "{empty_plan}");
+    assert!(empty_plan.contains("materialized_source=EmptyResult"), "{empty_plan}");
+    assert!(empty_plan.contains("source_pulls=0; successful_leaves=0"), "{empty_plan}");
+    let empty_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(empty_counters.graph_row_edge_pull_executions, 1);
+    assert_eq!(empty_counters.graph_row_chunks_executed, 0);
+    assert_eq!(empty_counters.graph_row_delegated_edge_queries, 0);
+
+    let mut frontier_zero = graph_query(
+        &["source", "target"],
+        vec![graph_edge_with_label(
+            Some("edge"),
+            "source",
+            "target",
+            "EQ44_EMPTY",
+        )],
+    );
+    frontier_zero.options.allow_full_scan = false;
+    frontier_zero.options.max_frontier = 0;
+    engine.reset_query_execution_counters_for_test();
+    assert_eq!(
+        engine.query_graph_rows(&frontier_zero).unwrap_err().to_string(),
+        "invalid operation: graph row max_frontier exceeded configured cap 0"
+    );
+    let zero_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(zero_counters.graph_row_edge_pull_executions, 1);
+    assert_eq!(zero_counters.graph_row_delegated_edge_queries, 1);
+    assert_eq!(zero_counters.graph_row_delegated_verified_candidates, 1);
+    assert_eq!(zero_counters.graph_row_chunks_executed, 0);
+
+    let mut no_explain = frontier_zero;
+    no_explain.options.max_frontier = GraphQueryOptions::default().max_frontier;
+    no_explain.options.include_plan = false;
+    let scratch_allocs = graph_row_test_scratch_trace_allocs(|| {
+        engine.query_graph_rows(&no_explain).unwrap();
+    });
+    assert_eq!(scratch_allocs, 0);
+}
+
+#[test]
+fn graph_row_edge_pull_default_caps_stream_200k_raw_candidates() {
+    const CANDIDATE_COUNT: usize = 200_000;
+
+    let (_dir, engine) = graph_row_test_engine();
+    let source = insert_graph_row_node(&engine, "Eq44LargeRaw", "eq44-large-raw-source", &[]);
+    let target = insert_graph_row_node(&engine, "Eq44LargeRaw", "eq44-large-raw-target", &[]);
+    let edge = insert_graph_row_edge(&engine, source, target, "EQ44_LARGE_RAW", &[]);
+    engine.delete_edge(edge).unwrap();
+
+    let mut query = graph_query(
+        &["source", "target"],
+        vec![graph_edge_with_label(
+            Some("edge"),
+            "source",
+            "target",
+            "EQ44_LARGE_RAW",
+        )],
+    );
+    query.options.allow_full_scan = false;
+    query.options.include_plan = true;
+    let mut normalized = normalize_graph_row_query(&query).unwrap();
+    normalized.edge_id_constraints.insert(
+        "edge".to_string(),
+        (1_000_000..1_000_000 + CANDIDATE_COUNT as u64).collect(),
+    );
+    let cursor_state = graph_row_prepare_cursor_state(
+        &normalized.page,
+        normalized.at_epoch,
+        &normalized.options,
+    )
+    .unwrap();
+
+    engine.reset_query_execution_counters_for_test();
+    let result = engine
+        .published_state()
+        .view
+        .query_graph_rows_outcome(&normalized, cursor_state)
+        .unwrap()
+        .value;
+    assert!(result.rows.is_empty());
+    let plan = format!("{:?}", result.plan.unwrap());
+    assert!(
+        plan.contains("source_pulls=49; successful_leaves=49"),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("source_rows=200000; produced_rows=0"),
+        "{plan}"
+    );
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.graph_row_edge_pull_executions, 1);
+    assert_eq!(counters.graph_row_chunks_executed, 49);
+    assert_eq!(counters.graph_row_delegated_edge_queries, 0);
+    assert_eq!(counters.graph_row_delegated_verified_candidates, 0);
+    assert_eq!(counters.graph_row_chunk_cap_retries, 0);
+}
+
+#[test]
+fn graph_row_edge_pull_pull_and_sink_errors_preserve_exact_accounting() {
+    let (_dir, engine) = graph_row_test_engine();
+    let source = insert_graph_row_node(&engine, "Eq44Error", "eq44-error-source", &[]);
+    let target = insert_graph_row_node(&engine, "Eq44Error", "eq44-error-target", &[]);
+    insert_graph_row_edge(&engine, source, target, "EQ44_ERROR", &[]);
+
+    let mut edge_pull = graph_query(
+        &["source", "target"],
+        vec![graph_edge_with_label(
+            Some("edge"),
+            "source",
+            "target",
+            "EQ44_ERROR",
+        )],
+    );
+    edge_pull.options.allow_full_scan = false;
+
+    engine.reset_query_execution_counters_for_test();
+    let pull_error = with_graph_row_test_prepared_pull_failure(|| {
+        engine.query_graph_rows(&edge_pull).unwrap_err()
+    });
+    assert_eq!(
+        pull_error.to_string(),
+        "invalid operation: injected graph-row prepared edge pull failure"
+    );
+    let pull = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(pull.graph_row_edge_pull_executions, 1);
+    assert_eq!(pull.graph_row_delegated_edge_queries, 1);
+    assert_eq!(pull.graph_row_delegated_verified_candidates, 0);
+    assert_eq!(pull.graph_row_chunks_executed, 0);
+    assert_eq!(pull.graph_row_chunk_cap_retries, 0);
+
+    engine.reset_query_execution_counters_for_test();
+    let edge_sink_error = with_graph_row_test_sink_failure(|| {
+        engine.query_graph_rows(&edge_pull).unwrap_err()
+    });
+    assert_eq!(
+        edge_sink_error.to_string(),
+        "invalid operation: injected graph-row production sink failure"
+    );
+    let edge_sink = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(edge_sink.graph_row_edge_pull_executions, 1);
+    assert_eq!(edge_sink.graph_row_delegated_edge_queries, 1);
+    assert_eq!(edge_sink.graph_row_delegated_verified_candidates, 1);
+    assert_eq!(edge_sink.graph_row_chunks_executed, 1);
+    assert_eq!(edge_sink.graph_row_chunk_cap_retries, 0);
+
+    let mut anchor_pull = edge_pull;
+    anchor_pull.nodes[0].ids = vec![source];
+    engine.reset_query_execution_counters_for_test();
+    let anchor_sink_error = with_graph_row_test_sink_failure(|| {
+        engine.query_graph_rows(&anchor_pull).unwrap_err()
+    });
+    assert_eq!(
+        anchor_sink_error.to_string(),
+        "invalid operation: injected graph-row production sink failure"
+    );
+    let anchor_sink = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(anchor_sink.graph_row_edge_pull_executions, 0);
+    assert_eq!(anchor_sink.graph_row_delegated_edge_queries, 0);
+    assert_eq!(anchor_sink.graph_row_chunks_executed, 1);
+}
+
+#[test]
+fn graph_row_edge_pull_retry_splits_deterministically_and_propagates_one_entry_failure() {
+    fn execute_forced_branch_driver(
+        engine: &DatabaseEngine,
+        query: &GraphRowQuery,
+    ) -> Result<(GraphRowProductionOutput, GraphRowExplainTrace), EngineError> {
+        let normalized = normalize_graph_row_query(query).unwrap();
+        let view = engine.published_state().view.clone();
+        let runtime = view.normalize_graph_row_runtime_plan(&normalized).unwrap();
+        let mut physical = view
+            .plan_graph_row_physical(&normalized, &runtime, false, true)
+            .unwrap();
+        physical.initial_driver = GraphRowInitialDriver::Edge {
+            edge_index: 1,
+            edge_name: "alias:branch".to_string(),
+        };
+        physical.edge_order = vec![1, 0];
+        physical.segments[0].initial_driver = physical.initial_driver.clone();
+        physical.segments[0].edge_order = physical.edge_order.clone();
+        let cursor_state = graph_row_prepare_cursor_state(
+            &normalized.page,
+            normalized.at_epoch,
+            &normalized.options,
+        )
+        .unwrap();
+        let effective_at_epoch = cursor_state.effective_at_epoch;
+        let policy_cutoffs = view.query_policy_cutoffs();
+        let mut trace = GraphRowExplainTrace::default();
+        let output = with_graph_row_test_chunk_override(2, || {
+            view.graph_row_execute_chunked(
+                &normalized,
+                &runtime,
+                &physical,
+                None,
+                &cursor_state,
+                0,
+                true,
+                effective_at_epoch,
+                policy_cutoffs.as_ref(),
+                Some(&mut trace),
+            )
+        })?;
+        Ok((output, trace))
+    }
+
+    let (_dir, engine) = graph_row_test_engine();
+    let sources = (0..6)
+        .map(|index| {
+            insert_graph_row_node(
+                &engine,
+                "Eq44RetrySource",
+                &format!("eq44-retry-source-{index}"),
+                &[],
+            )
+        })
+        .collect::<Vec<_>>();
+    let middles = (0..2)
+        .map(|index| {
+            insert_graph_row_node(
+                &engine,
+                "Eq44RetryMiddle",
+                &format!("eq44-retry-middle-{index}"),
+                &[("kind", PropValue::String("good".to_string()))],
+            )
+        })
+        .collect::<Vec<_>>();
+    for (index, source) in sources.iter().enumerate() {
+        insert_graph_row_edge(
+            &engine,
+            *source,
+            middles[index / 3],
+            "EQ44_RETRY_SEED",
+            &[],
+        );
+    }
+    let targets = (0..2)
+        .map(|index| {
+            insert_graph_row_node(
+                &engine,
+                "Eq44RetryTarget",
+                &format!("eq44-retry-target-{index}"),
+                &[("kind", PropValue::String("good".to_string()))],
+            )
+        })
+        .collect::<Vec<_>>();
+    for index in 0..2 {
+        insert_graph_row_edge(
+            &engine,
+            middles[index],
+            targets[index],
+            "EQ44_RETRY_BRANCH",
+            &[],
+        );
+    }
+    let mut query = graph_query(
+        &["source", "middle", "target"],
+        vec![
+            graph_edge_with_label(
+                Some("seed"),
+                "source",
+                "middle",
+                "EQ44_RETRY_SEED",
+            ),
+            graph_edge_with_label(
+                Some("branch"),
+                "middle",
+                "target",
+                "EQ44_RETRY_BRANCH",
+            ),
+        ],
+    );
+    query.options.allow_full_scan = false;
+    query.options.include_plan = true;
+    query.options.max_frontier = 4;
+    query.options.max_intermediate_bindings = 4;
+    query.page.limit = 10;
+    query.nodes[1].filter = Some(NodeFilterExpr::PropertyEquals {
+        key: "kind".to_string(),
+        value: PropValue::String("good".to_string()),
+    });
+    query.nodes[2].filter = Some(NodeFilterExpr::PropertyEquals {
+        key: "kind".to_string(),
+        value: PropValue::String("good".to_string()),
+    });
+    engine.reset_query_execution_counters_for_test();
+    let (result, trace) = execute_forced_branch_driver(&engine, &query).unwrap();
+    let GraphRowProductionOutput::CollectAll(result) = result else {
+        panic!("forced EdgePull retry test must use collect-all")
+    };
+    assert_eq!(result.rows.len(), 6);
+    let plan = trace
+        .plan
+        .iter()
+        .find(|node| node.kind == "ChunkedRowProductionRuntime")
+        .unwrap()
+        .detail
+        .clone();
+    let counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(counters.graph_row_edge_pull_executions, 1);
+    assert_eq!(counters.graph_row_chunk_cap_retries, 1, "{plan}");
+    assert_eq!(counters.graph_row_chunks_executed, 2);
+    assert_eq!(counters.graph_row_delegated_edge_queries, 1);
+    assert_eq!(counters.graph_row_delegated_verified_candidates, 2);
+    assert_eq!(counters.graph_row_node_verification_resolutions, 4);
+    assert_eq!(counters.graph_row_node_verification_cache_hits, 4);
+    assert_eq!(counters.graph_row_node_verification_cache_units_peak, 4);
+    assert_eq!(
+        counters.graph_row_fixed_edge_workspace_growths, 2,
+        "the retry halves must reuse capacities grown by the failed parent attempt"
+    );
+    assert!(plan.contains("source_pulls=1"), "{plan}");
+    assert!(plan.contains("source_rows=2"), "{plan}");
+    assert!(plan.contains("cap_retries=1"), "{plan}");
+
+    let mut both_query = query.clone();
+    let GraphPatternPiece::Edge(both_branch) = &mut both_query.pieces[1] else {
+        unreachable!()
+    };
+    both_branch.direction = Direction::Both;
+    engine.reset_query_execution_counters_for_test();
+    let (both_result, _) = execute_forced_branch_driver(&engine, &both_query).unwrap();
+    let GraphRowProductionOutput::CollectAll(both_result) = both_result else {
+        panic!("forced Direction::Both EdgePull retry must use collect-all")
+    };
+    assert_eq!(both_result.rows.len(), 6);
+    let both_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(both_counters.graph_row_edge_pull_executions, 1);
+    assert_eq!(both_counters.graph_row_chunk_cap_retries, 1);
+    assert_eq!(both_counters.graph_row_chunks_executed, 2);
+    assert!(both_counters.graph_row_fixed_edge_workspace_growths <= 2);
+
+    for branch in 0..2 {
+        let source = insert_graph_row_node(
+            &engine,
+            "Eq44RetrySource",
+            &format!("eq44-retry-terminal-source-{branch}"),
+            &[],
+        );
+        insert_graph_row_edge(
+            &engine,
+            source,
+            middles[0],
+            "EQ44_RETRY_SEED",
+            &[],
+        );
+    }
+    engine.reset_query_execution_counters_for_test();
+    let error = match execute_forced_branch_driver(&engine, &query) {
+        Ok(_) => panic!("one-entry EdgePull retry must propagate its cap error"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        "invalid operation: graph row max_frontier exceeded configured cap 4"
+    );
+    let terminal = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(terminal.graph_row_edge_pull_executions, 1);
+    assert_eq!(terminal.graph_row_chunk_cap_retries, 1);
+    assert_eq!(terminal.graph_row_chunks_executed, 0);
+    assert_eq!(terminal.graph_row_delegated_edge_queries, 1);
+    assert_eq!(terminal.graph_row_delegated_verified_candidates, 2);
+    assert!(
+        terminal.graph_row_fixed_edge_workspace_growths > 0,
+        "terminal failed attempts must report scratch growth before cleanup"
+    );
+
+    let mut intermediate_query = query;
+    intermediate_query.options.max_frontier = 100;
+    intermediate_query.options.max_intermediate_bindings = 4;
+    engine.reset_query_execution_counters_for_test();
+    let intermediate_error = match execute_forced_branch_driver(&engine, &intermediate_query) {
+        Ok(_) => panic!("one-entry EdgePull retry must preserve its intermediate cap error"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        intermediate_error.to_string(),
+        "invalid operation: graph row max_intermediate_bindings exceeded configured cap 4"
+    );
+    let intermediate = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(intermediate.graph_row_edge_pull_executions, 1);
+    assert_eq!(intermediate.graph_row_chunk_cap_retries, 1);
+    assert_eq!(intermediate.graph_row_chunks_executed, 0);
+    assert_eq!(intermediate.graph_row_delegated_edge_queries, 1);
+    assert_eq!(intermediate.graph_row_delegated_verified_candidates, 2);
+    assert!(
+        intermediate.graph_row_fixed_edge_workspace_growths > 0,
+        "intermediate-cap failures must report scratch growth before cleanup"
+    );
 }
 
 #[test]
@@ -21175,7 +25524,7 @@ fn graph_row_chunk_typed_frontier_retry_and_runtime_once_no_retry() {
     assert_eq!(counters.graph_row_chunk_cap_retries, 1);
     assert_eq!(counters.graph_row_chunks_executed, 2);
 
-    let mut runtime_once = graph_query(
+    let mut edge_pull = graph_query(
         &["source", "target"],
         vec![graph_edge_with_label(
             Some("edge"),
@@ -21184,20 +25533,15 @@ fn graph_row_chunk_typed_frontier_retry_and_runtime_once_no_retry() {
             "CHUNK_FRONTIER_EDGE",
         )],
     );
-    runtime_once.options.max_intermediate_bindings = 100;
-    runtime_once.options.max_frontier = 4;
+    edge_pull.options.max_intermediate_bindings = 100;
+    edge_pull.options.max_frontier = 4;
     engine.reset_query_execution_counters_for_test();
-    let error = engine.query_graph_rows(&runtime_once).unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "invalid operation: graph row max_frontier exceeded configured cap 4"
-    );
-    assert_eq!(
-        engine
-            .query_execution_counter_snapshot_for_test()
-            .graph_row_chunk_cap_retries,
-        0
-    );
+    let edge_pull_result = engine.query_graph_rows(&edge_pull).unwrap();
+    assert_eq!(edge_pull_result.rows.len(), 6);
+    assert!(edge_pull_result.stats.frontier_peak <= 4);
+    let edge_pull_counters = engine.query_execution_counter_snapshot_for_test();
+    assert_eq!(edge_pull_counters.graph_row_edge_pull_executions, 1);
+    assert_eq!(edge_pull_counters.graph_row_chunk_cap_retries, 0);
 }
 
 #[test]
@@ -21297,7 +25641,7 @@ fn graph_row_chunk_proof_classification_and_fast_path_matrix() {
         "{later_plan}"
     );
 
-    let mut runtime_once = graph_query(
+    let mut edge_pull = graph_query(
         &["a", "b"],
         vec![graph_edge_with_label(
             Some("edge"),
@@ -21306,29 +25650,29 @@ fn graph_row_chunk_proof_classification_and_fast_path_matrix() {
             "CHUNK_PROOF_EDGE",
         )],
     );
-    runtime_once.options.include_plan = true;
-    let runtime_once_plan = format!(
+    edge_pull.options.include_plan = true;
+    let edge_pull_plan = format!(
         "{:?}",
         engine
-            .query_graph_rows(&runtime_once)
+            .query_graph_rows(&edge_pull)
             .unwrap()
             .plan
             .unwrap()
     );
     assert!(
-        runtime_once_plan.contains("source=RuntimeOnce{reason=NonNodeInitialDriver}"),
-        "{runtime_once_plan}"
+        edge_pull_plan.contains("source=EdgePull{edge=alias:edge}"),
+        "{edge_pull_plan}"
     );
     assert!(
-        runtime_once_plan.contains("eligibility=non_node_initial_driver"),
-        "{runtime_once_plan}"
+        edge_pull_plan.contains("eligibility=edge_id_order_not_logical_prefix"),
+        "{edge_pull_plan}"
     );
-    assert!(runtime_once_plan.contains("source_pulls=0"), "{runtime_once_plan}");
-    assert!(runtime_once_plan.contains("successful_leaves=1"), "{runtime_once_plan}");
-    assert!(runtime_once_plan.contains("scheduled_sizes=[]"), "{runtime_once_plan}");
+    assert!(edge_pull_plan.contains("source_pulls=1"), "{edge_pull_plan}");
+    assert!(edge_pull_plan.contains("successful_leaves=1"), "{edge_pull_plan}");
+    assert!(edge_pull_plan.contains("scheduled_sizes=4096..4096"), "{edge_pull_plan}");
     assert!(
-        runtime_once_plan.contains("leaf_size_min=0; leaf_size_max=0; source_rows=0"),
-        "{runtime_once_plan}"
+        edge_pull_plan.contains("leaf_size_min=1; leaf_size_max=1; source_rows=1"),
+        "{edge_pull_plan}"
     );
 
     let mut fast = graph_query(&["n"], Vec::new());
@@ -21536,7 +25880,7 @@ fn graph_row_chunk_early_exit_proof_gate_runtime_once_stage_and_fast_path_matrix
     );
     assert!(later_plan.contains("early_exit=false"), "{later_plan}");
 
-    let mut runtime_once = graph_query(
+    let mut edge_pull = graph_query(
         &["a", "b"],
         vec![graph_edge_with_label(
             Some("edge"),
@@ -21545,19 +25889,19 @@ fn graph_row_chunk_early_exit_proof_gate_runtime_once_stage_and_fast_path_matrix
             "EARLY_GATE_EDGE",
         )],
     );
-    runtime_once.options.include_plan = true;
-    let runtime_once_plan = format!(
+    edge_pull.options.include_plan = true;
+    let edge_pull_plan = format!(
         "{:?}",
-        engine.query_graph_rows(&runtime_once).unwrap().plan.unwrap()
+        engine.query_graph_rows(&edge_pull).unwrap().plan.unwrap()
     );
-    assert!(runtime_once_plan.contains("eligibility=non_node_initial_driver"));
-    assert!(runtime_once_plan.contains("early_exit=false"));
-    assert!(runtime_once_plan.contains(
+    assert!(edge_pull_plan.contains("eligibility=edge_id_order_not_logical_prefix"));
+    assert!(edge_pull_plan.contains("early_exit=false"));
+    assert!(edge_pull_plan.contains(
         "result_cache_units=0/65536; cache_no_admit=0; optional_cache_hits=0; \
          vlp_cross_chunk_cache_hits=0"
     ));
 
-    let mut empty_runtime_once = graph_query(
+    let mut empty_edge_pull = graph_query(
         &["a", "b"],
         vec![graph_edge_with_label(
             Some("edge"),
@@ -21566,21 +25910,21 @@ fn graph_row_chunk_early_exit_proof_gate_runtime_once_stage_and_fast_path_matrix
             "EARLY_GATE_UNKNOWN_EDGE_LABEL",
         )],
     );
-    empty_runtime_once.options.include_plan = true;
+    empty_edge_pull.options.include_plan = true;
     let empty_plan = format!(
         "{:?}",
         engine
-            .query_graph_rows(&empty_runtime_once)
+            .query_graph_rows(&empty_edge_pull)
             .unwrap()
             .plan
             .unwrap()
     );
     assert!(
-        empty_plan.contains("source=RuntimeOnce{reason=NonNodeInitialDriver}"),
+        empty_plan.contains("source=EdgePull{edge=alias:edge}"),
         "{empty_plan}"
     );
     assert!(empty_plan.contains("source=EmptyResult"), "{empty_plan}");
-    assert!(empty_plan.contains("eligibility=non_node_initial_driver"));
+    assert!(empty_plan.contains("eligibility=edge_id_order_not_logical_prefix"));
     assert!(empty_plan.contains("early_exit=false"));
 
     let normalized = normalize_graph_row_query(&eligible).unwrap();
@@ -22337,7 +26681,7 @@ fn graph_row_chunk_cursor_seek_proof_source_validation_and_fast_path_gates() {
     assert!(ordered_plan.contains("anchor_seek=ineligible"), "{ordered_plan}");
     assert_eq!(engine.query_execution_counter_snapshot_for_test().graph_row_cursor_anchor_seeks, 0);
 
-    let mut empty_runtime_once = graph_query(
+    let mut empty_edge_pull = graph_query(
         &["a", "b"],
         vec![graph_edge_with_label(
             Some("edge"),
@@ -22346,14 +26690,14 @@ fn graph_row_chunk_cursor_seek_proof_source_validation_and_fast_path_gates() {
             "CURSOR_SEEK_UNKNOWN_EDGE",
         )],
     );
-    empty_runtime_once.options.include_plan = true;
+    empty_edge_pull.options.include_plan = true;
     engine.reset_query_execution_counters_for_test();
-    let empty_plan = format!("{:?}", engine.query_graph_rows(&empty_runtime_once).unwrap().plan.unwrap());
-    assert!(empty_plan.contains("source=RuntimeOnce{reason=NonNodeInitialDriver}"));
+    let empty_plan = format!("{:?}", engine.query_graph_rows(&empty_edge_pull).unwrap().plan.unwrap());
+    assert!(empty_plan.contains("source=EdgePull{edge=alias:edge}"));
     assert!(empty_plan.contains("cursor_seek=none"));
     assert_eq!(engine.query_execution_counter_snapshot_for_test().graph_row_cursor_anchor_seeks, 0);
 
-    let mut runtime_once = graph_query(
+    let mut edge_pull = graph_query(
         &["a", "b"],
         vec![graph_edge_with_label(
             Some("edge"),
@@ -22362,14 +26706,14 @@ fn graph_row_chunk_cursor_seek_proof_source_validation_and_fast_path_gates() {
             "CURSOR_SEEK_GATE_EDGE",
         )],
     );
-    runtime_once.page.limit = 1;
-    runtime_once.options.include_plan = true;
-    let runtime_first = engine.query_graph_rows(&runtime_once).unwrap();
-    runtime_once.at_epoch = Some(runtime_first.stats.effective_at_epoch);
-    runtime_once.page.cursor = runtime_first.next_cursor;
+    edge_pull.page.limit = 1;
+    edge_pull.options.include_plan = true;
+    let runtime_first = engine.query_graph_rows(&edge_pull).unwrap();
+    edge_pull.at_epoch = Some(runtime_first.stats.effective_at_epoch);
+    edge_pull.page.cursor = runtime_first.next_cursor;
     engine.reset_query_execution_counters_for_test();
-    let runtime_plan = format!("{:?}", engine.query_graph_rows(&runtime_once).unwrap().plan.unwrap());
-    assert!(runtime_plan.contains("source=RuntimeOnce{reason=NonNodeInitialDriver}"));
+    let runtime_plan = format!("{:?}", engine.query_graph_rows(&edge_pull).unwrap().plan.unwrap());
+    assert!(runtime_plan.contains("source=EdgePull{edge=alias:edge}"));
     assert!(runtime_plan.contains("cursor_seek=none"));
     assert_eq!(engine.query_execution_counter_snapshot_for_test().graph_row_cursor_anchor_seeks, 0);
 

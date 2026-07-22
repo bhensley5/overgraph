@@ -163,11 +163,53 @@ impl EdgeSetOpExecutionMode {
 #[derive(Clone, Debug)]
 struct GraphRowPhysicalPlan {
     initial_driver: GraphRowInitialDriver,
+    initial_edge_production: Option<GraphRowEdgeAnchorProduction>,
     edge_order: Vec<usize>,
     segments: Vec<GraphRowPhysicalSegment>,
     edge_source_choices: Vec<Option<GraphRowEdgeCandidateSourceChoice>>,
     alternatives: Vec<GraphRowPlanAlternative>,
     notes: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphRowEdgeAnchorProduction {
+    EdgePull,
+    AdjacencyPull,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GraphRowOrderedProductionContext {
+    selection_capacity: usize,
+    physical_pull_ceiling: usize,
+    cursor_owner_inclusive: Option<u64>,
+    page_sink: bool,
+}
+
+impl GraphRowOrderedProductionContext {
+    pub(crate) fn enabled(
+        selection_capacity: usize,
+        cursor_owner_inclusive: Option<u64>,
+        max_intermediate_bindings: usize,
+        max_frontier: usize,
+    ) -> Self {
+        Self {
+            selection_capacity,
+            physical_pull_ceiling: GRAPH_ROW_CHUNK_MAX
+                .min(max_intermediate_bindings)
+                .min(max_frontier),
+            cursor_owner_inclusive,
+            page_sink: true,
+        }
+    }
+
+    pub(crate) const fn disabled() -> Self {
+        Self {
+            selection_capacity: 0,
+            physical_pull_ceiling: 0,
+            cursor_owner_inclusive: None,
+            page_sink: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -210,6 +252,7 @@ struct GraphRowNodeAnchorPlan {
 #[derive(Clone)]
 struct GraphRowEdgeSourceCost {
     cost: PlanCost,
+    adjacency_universe_equivalent: bool,
     detail: Option<String>,
     warnings: Vec<QueryPlanWarning>,
 }
@@ -279,9 +322,49 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     static GRAPH_ROW_TEST_LEGACY_ESTIMATOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GRAPH_ROW_TEST_FORCED_EDGE_PRODUCTION: std::cell::Cell<Option<GraphRowEdgeAnchorProduction>> = const { std::cell::Cell::new(None) };
+    static GRAPH_ROW_TEST_INVALID_ADJACENCY_HEADER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static GRAPH_ROW_TEST_PLAN_SIGNATURE_CAPTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static GRAPH_ROW_TEST_PLAN_SIGNATURES: std::cell::RefCell<Vec<GraphRowTestPlanSignature>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn with_graph_row_test_invalid_adjacency_header<T>(run: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            GRAPH_ROW_TEST_INVALID_ADJACENCY_HEADER.with(|invalid| invalid.set(self.0));
+        }
+    }
+
+    let previous = GRAPH_ROW_TEST_INVALID_ADJACENCY_HEADER.with(|invalid| invalid.replace(true));
+    let reset = Reset(previous);
+    let result = run();
+    drop(reset);
+    result
+}
+
+#[cfg(test)]
+fn with_graph_row_test_forced_edge_production<T>(
+    production: GraphRowEdgeAnchorProduction,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<GraphRowEdgeAnchorProduction>);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            GRAPH_ROW_TEST_FORCED_EDGE_PRODUCTION.with(|forced| forced.set(self.0));
+        }
+    }
+
+    let previous = GRAPH_ROW_TEST_FORCED_EDGE_PRODUCTION
+        .with(|forced| forced.replace(Some(production)));
+    let reset = Reset(previous);
+    let result = run();
+    drop(reset);
+    result
 }
 
 #[cfg(test)]
@@ -296,6 +379,7 @@ pub(crate) struct GraphRowTestSegmentSignature {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GraphRowTestPlanSignature {
     pub(crate) initial_driver: String,
+    pub(crate) initial_edge_production: Option<String>,
     pub(crate) segments: Vec<GraphRowTestSegmentSignature>,
     pub(crate) edge_order: Vec<usize>,
     pub(crate) edge_source_choices: Vec<Option<String>>,
@@ -378,6 +462,7 @@ struct GraphRowPhysicalSegment {
 
 struct GraphRowPhysicalSegmentPlan {
     segment: GraphRowPhysicalSegment,
+    initial_edge_production: Option<GraphRowEdgeAnchorProduction>,
     source_choices: Vec<(usize, GraphRowEdgeCandidateSourceChoice)>,
     alternatives: Vec<GraphRowPlanAlternative>,
 }
@@ -418,6 +503,9 @@ fn record_graph_row_test_plan_signature(plan: &GraphRowPhysicalPlan) {
     }
     let signature = GraphRowTestPlanSignature {
         initial_driver: graph_row_test_driver_signature(&plan.initial_driver),
+        initial_edge_production: plan
+            .initial_edge_production
+            .map(|production| format!("{production:?}")),
         segments: plan
             .segments
             .iter()
@@ -832,6 +920,364 @@ struct GraphRowPlanCost {
     frontier_capped: bool,
     source_rank: usize,
     canonical_key: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphRowOrderedCostCoverage {
+    Complete,
+    Advisory,
+    Uncomputable,
+}
+
+impl GraphRowOrderedCostCoverage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Advisory => "advisory",
+            Self::Uncomputable => "uncomputable",
+        }
+    }
+}
+
+fn graph_row_ordered_cost_coverage(
+    prefix_heuristic: bool,
+    partial_or_stale: bool,
+    fanout_complete: bool,
+) -> GraphRowOrderedCostCoverage {
+    if prefix_heuristic || partial_or_stale || !fanout_complete {
+        GraphRowOrderedCostCoverage::Advisory
+    } else {
+        GraphRowOrderedCostCoverage::Complete
+    }
+}
+
+fn graph_row_ordered_cost_is_admitted(
+    coverage: GraphRowOrderedCostCoverage,
+    ordered_work: u64,
+    edge_pull_work: u64,
+) -> bool {
+    match coverage {
+        GraphRowOrderedCostCoverage::Complete => ordered_work < edge_pull_work,
+        GraphRowOrderedCostCoverage::Advisory => ordered_work <= edge_pull_work / 4,
+        GraphRowOrderedCostCoverage::Uncomputable => false,
+    }
+}
+
+fn graph_row_ordered_advisory_confidence_rank(
+    partial_or_stale: bool,
+    fanout_complete: bool,
+) -> u8 {
+    if partial_or_stale || !fanout_complete {
+        EstimateConfidence::Low.rank()
+    } else {
+        EstimateConfidence::Medium.rank()
+    }
+}
+
+fn graph_row_ordered_runtime_shape_is_eligible(steps: &[GraphRowRuntimeStep]) -> bool {
+    matches!(steps, [GraphRowRuntimeStep::RequiredSegment(0)])
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GraphRowOrderedCursorCostInput {
+    physical_groups: u64,
+    raw_postings: u64,
+    logical_owners: u64,
+    dense: bool,
+}
+
+#[derive(Debug)]
+struct GraphRowOrderedSourceCostInputs {
+    physical_groups: u64,
+    matching_groups: u64,
+    logical_owners: u64,
+    raw_postings: u64,
+    candidate_edges: u64,
+    max_owner_postings: u64,
+    cursor_count: u64,
+    seek_work: u64,
+    cursors: Vec<GraphRowOrderedCursorCostInput>,
+    stale_risk: StalePostingRisk,
+    hub_risk: GraphRowHubRisk,
+    partial_or_stale: bool,
+}
+
+struct GraphRowOrderedAlternative {
+    cost: Option<GraphRowPlanCost>,
+    detail: String,
+}
+
+fn u128_clamped(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn u128_product_clamped(left: u64, right: u64) -> u64 {
+    u128_clamped(u128::from(left) * u128::from(right))
+}
+
+fn u128_mul_div_ceil_clamped(left: u64, right: u64, divisor: u64) -> u64 {
+    debug_assert!(divisor > 0);
+    let numerator = u128::from(left) * u128::from(right);
+    let divisor = u128::from(divisor);
+    u128_clamped(numerator.div_ceil(divisor))
+}
+
+fn graph_row_ordered_segment_seek_work(physical_groups: u64) -> u64 {
+    if physical_groups == 0 {
+        0
+    } else {
+        u64::from(u64::BITS - physical_groups.leading_zeros())
+    }
+}
+
+fn graph_row_ordered_hub_risk(
+    source_nodes: u64,
+    total_edges: u64,
+    max_fanout: u64,
+) -> GraphRowHubRisk {
+    if total_edges == 0 {
+        return GraphRowHubRisk::Low;
+    }
+    if source_nodes == 0 || max_fanout == 0 {
+        return GraphRowHubRisk::Unknown;
+    }
+    let average = total_edges.div_ceil(source_nodes).max(1);
+    if max_fanout >= average.saturating_mul(GRAPH_ROW_HUB_HIGH_RATIO) {
+        GraphRowHubRisk::High
+    } else if max_fanout >= average.saturating_mul(GRAPH_ROW_HUB_MEDIUM_RATIO) {
+        GraphRowHubRisk::Medium
+    } else {
+        GraphRowHubRisk::Low
+    }
+}
+
+fn graph_row_ordered_alternative_from_inputs(
+    inputs: Result<GraphRowOrderedSourceCostInputs, &'static str>,
+    edge_pull: &GraphRowPlanCost,
+    adjacency_universe_equivalent: bool,
+    single_label_requested: bool,
+    bound_where_present: bool,
+    selection_capacity: usize,
+    physical_pull_ceiling: usize,
+) -> GraphRowOrderedAlternative {
+    if !adjacency_universe_equivalent {
+        return GraphRowOrderedAlternative {
+            cost: None,
+            detail: format!(
+                "coverage=uncomputable; edge_pull_work={}; decision=rejected; reason=candidate_universe_not_equivalent",
+                edge_pull.estimated_work
+            ),
+        };
+    }
+    let inputs = match inputs {
+        Ok(inputs) => inputs,
+        Err(reason) => {
+            return GraphRowOrderedAlternative {
+                cost: None,
+                detail: format!(
+                    "coverage={}; decision=rejected; reason={reason}; edge_pull_work={}",
+                    GraphRowOrderedCostCoverage::Uncomputable.as_str(),
+                    edge_pull.estimated_work
+                ),
+            };
+        }
+    };
+    debug_assert_eq!(
+        inputs
+            .cursors
+            .iter()
+            .fold(0u128, |sum, cursor| sum + u128::from(cursor.raw_postings)),
+        u128::from(inputs.raw_postings),
+        "ordered cursor raw-posting inputs must aggregate exactly"
+    );
+    debug_assert_eq!(
+        inputs
+            .cursors
+            .iter()
+            .fold(0u128, |sum, cursor| sum + u128::from(cursor.logical_owners)),
+        u128::from(inputs.logical_owners),
+        "ordered cursor logical-owner inputs must aggregate exactly"
+    );
+    let r = (edge_pull.fanout_complete && !bound_where_present)
+        .then_some(edge_pull.simulated_frontier)
+        .filter(|frontier| *frontier > 0);
+    let k = u64::try_from(selection_capacity).unwrap_or(u64::MAX).max(1);
+    let f = u64::try_from(physical_pull_ceiling).unwrap_or(u64::MAX);
+    let owner_bound_exceeds_pull_ceiling = inputs.max_owner_postings > f;
+    let owners_needed = r.map_or(inputs.logical_owners, |frontier| {
+        inputs
+            .logical_owners
+            .min(u128_mul_div_ceil_clamped(k, inputs.logical_owners, frontier).max(1))
+    });
+    let dense = single_label_requested
+        && !inputs.partial_or_stale
+        && !inputs.cursors.is_empty()
+        && inputs.cursors.iter().all(|cursor| cursor.dense);
+    let index_entries = if dense {
+        inputs.cursors.iter().fold(0u64, |sum, cursor| {
+            sum.saturating_add(cursor.physical_groups.min(owners_needed.saturating_add(1)))
+        })
+    } else {
+        inputs.physical_groups
+    };
+    let raw_postings_needed = inputs.raw_postings.min(u128_product_clamped(
+        owners_needed,
+        inputs.max_owner_postings,
+    ));
+    let candidate_edges = inputs.candidate_edges.min(raw_postings_needed);
+    let owner_merge_work = u128_product_clamped(owners_needed, inputs.cursor_count);
+
+    if edge_pull.estimated_work == u64::MAX
+        || edge_pull.anchor_cost.estimated_work == u64::MAX
+        || edge_pull.anchor_cost.estimated_work > edge_pull.estimated_work
+    {
+        return GraphRowOrderedAlternative {
+            cost: None,
+            detail: format!(
+                "P={}; M={}; O={}; A={}; C={}; R={r:?}; H={}; K={k}; F={f}; L={}; S={}; dense={dense}; prefix_heuristic={}; coverage=uncomputable; edge_pull_work={}; decision=rejected; reason=invalid_downstream_subtraction",
+                inputs.physical_groups,
+                inputs.matching_groups,
+                inputs.logical_owners,
+                inputs.raw_postings,
+                inputs.candidate_edges,
+                inputs.max_owner_postings,
+                inputs.cursor_count,
+                inputs.seek_work,
+                r.is_some(),
+                edge_pull.estimated_work,
+            ),
+        };
+    }
+    let downstream_work = edge_pull.estimated_work - edge_pull.anchor_cost.estimated_work;
+    let scaled_downstream = u128_mul_div_ceil_clamped(
+        downstream_work,
+        candidate_edges,
+        inputs.candidate_edges.max(1),
+    );
+    let ordered_source_work = inputs
+        .seek_work
+        .saturating_add(index_entries)
+        .saturating_add(raw_postings_needed)
+        .saturating_add(owner_merge_work);
+    let ordered_work = ordered_source_work.saturating_add(scaled_downstream);
+    if ordered_source_work == u64::MAX || ordered_work == u64::MAX {
+        return GraphRowOrderedAlternative {
+            cost: None,
+            detail: format!(
+                "P={}; M={}; O={}; A={}; C={}; R={r:?}; H={}; K={k}; F={f}; L={}; S={}; dense={dense}; prefix_heuristic={}; coverage=uncomputable; edge_pull_work={}; ordered_work={ordered_work}; decision=rejected; reason=saturated_ordered_work",
+                inputs.physical_groups,
+                inputs.matching_groups,
+                inputs.logical_owners,
+                inputs.raw_postings,
+                inputs.candidate_edges,
+                inputs.max_owner_postings,
+                inputs.cursor_count,
+                inputs.seek_work,
+                r.is_some(),
+                edge_pull.estimated_work,
+            ),
+        };
+    }
+
+    let coverage = graph_row_ordered_cost_coverage(
+        r.is_some(),
+        inputs.partial_or_stale,
+        edge_pull.fanout_complete,
+    );
+    let cost_admitted =
+        graph_row_ordered_cost_is_admitted(coverage, ordered_work, edge_pull.estimated_work);
+    #[cfg(test)]
+    let forced_adjacency = GRAPH_ROW_TEST_FORCED_EDGE_PRODUCTION.with(|forced| {
+        forced.get() == Some(GraphRowEdgeAnchorProduction::AdjacencyPull)
+    });
+    #[cfg(not(test))]
+    let forced_adjacency = false;
+    let admitted = (!owner_bound_exceeds_pull_ceiling && cost_admitted) || forced_adjacency;
+    let admission_reason = if owner_bound_exceeds_pull_ceiling && !forced_adjacency {
+        "owner_bound_exceeds_pull_ceiling"
+    } else {
+        match (coverage, cost_admitted) {
+            (GraphRowOrderedCostCoverage::Complete, true) => "strict_work_win",
+            (GraphRowOrderedCostCoverage::Complete, false) => "not_strictly_cheaper",
+            (GraphRowOrderedCostCoverage::Advisory, true) => "four_x_margin_passed",
+            (GraphRowOrderedCostCoverage::Advisory, false) => "four_x_margin_failed",
+            (GraphRowOrderedCostCoverage::Uncomputable, _) => "uncomputable",
+        }
+    };
+    let detail = format!(
+        "P={}; M={}; O={}; A={}; C={}; R={r:?}; H={}; K={k}; F={f}; L={}; S={}; owners_needed={owners_needed}; index_entries={index_entries}; raw_postings_needed={raw_postings_needed}; candidate_edges={candidate_edges}; owner_merge_work={owner_merge_work}; dense={dense}; prefix_heuristic={}; fanout_complete={}; partial_or_stale={}; coverage={}; edge_pull_work={}; ordered_work={ordered_work}; four_x_pass={}; decision={}; reason={admission_reason}",
+        inputs.physical_groups,
+        inputs.matching_groups,
+        inputs.logical_owners,
+        inputs.raw_postings,
+        inputs.candidate_edges,
+        inputs.max_owner_postings,
+        inputs.cursor_count,
+        inputs.seek_work,
+        r.is_some(),
+        edge_pull.fanout_complete,
+        inputs.partial_or_stale,
+        coverage.as_str(),
+        edge_pull.estimated_work,
+        matches!(coverage, GraphRowOrderedCostCoverage::Advisory).then_some(cost_admitted).map_or("n/a", |passed| if passed { "true" } else { "false" }),
+        if admitted { "admitted" } else { "rejected" },
+    );
+    if !admitted {
+        return GraphRowOrderedAlternative { cost: None, detail };
+    }
+
+    let mut cost = edge_pull.clone();
+    cost.anchor_cost.estimated_work = ordered_source_work;
+    cost.anchor_cost.estimated_candidates = Some(raw_postings_needed);
+    match coverage {
+        GraphRowOrderedCostCoverage::Complete => {
+            cost.anchor_cost.estimate_kind_rank = cost
+                .anchor_cost
+                .estimate_kind_rank
+                .max(PlannerEstimateKind::UpperBound.rank());
+        }
+        GraphRowOrderedCostCoverage::Advisory => {
+            cost.anchor_cost.estimate_kind_rank =
+                if cost.anchor_cost.estimate_kind_rank == PlannerEstimateKind::Unknown.rank() {
+                    PlannerEstimateKind::Unknown.rank()
+                } else {
+                    PlannerEstimateKind::StatsEstimated.rank()
+                };
+            let confidence = graph_row_ordered_advisory_confidence_rank(
+                inputs.partial_or_stale,
+                edge_pull.fanout_complete,
+            );
+            cost.anchor_cost.confidence_rank = cost.anchor_cost.confidence_rank.max(confidence);
+            cost.confidence_rank = cost.confidence_rank.max(confidence);
+            cost.fanout_complete = false;
+        }
+        GraphRowOrderedCostCoverage::Uncomputable => unreachable!(),
+    }
+    cost.anchor_cost.stale_risk_rank = cost
+        .anchor_cost
+        .stale_risk_rank
+        .max(inputs.stale_risk.rank());
+    cost.stale_risk_rank = cost.stale_risk_rank.max(inputs.stale_risk.rank());
+    cost.hub_risk_rank = cost.hub_risk_rank.max(inputs.hub_risk.rank());
+    cost.anchor_cost.materialization_rank = PlanMaterializationClass::StreamingLegalUniverse.rank();
+    cost.anchor_cost.source_rank = cost
+        .anchor_cost
+        .source_rank
+        .checked_add(1)
+        .expect("graph-row source rank overflow");
+    cost.source_rank = cost
+        .source_rank
+        .checked_add(1)
+        .expect("graph-row source rank overflow");
+    cost.anchor_cost
+        .canonical_key
+        .push_str(":production=adjacency_pull");
+    cost.canonical_key.push_str(":production=adjacency_pull");
+    cost.estimated_work = ordered_work;
+    GraphRowOrderedAlternative {
+        cost: Some(cost),
+        detail,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3446,6 +3892,27 @@ impl EdgePhysicalPlan {
                     && inputs
                         .iter()
                         .all(EdgePhysicalPlan::members_are_eager_index_sources)
+            }
+        }
+    }
+
+    fn is_full_adjacency_candidate_universe(&self) -> bool {
+        match self {
+            EdgePhysicalPlan::Empty => false,
+            EdgePhysicalPlan::Source(source) => matches!(
+                source.kind,
+                EdgeQueryCandidateSourceKind::EdgeLabelIndex
+                    | EdgeQueryCandidateSourceKind::FallbackFullEdgeScan
+            ),
+            EdgePhysicalPlan::BufferedIdSort(input) => {
+                input.is_full_adjacency_candidate_universe()
+            }
+            EdgePhysicalPlan::Intersect { inputs, .. }
+            | EdgePhysicalPlan::Union { inputs, .. } => {
+                !inputs.is_empty()
+                    && inputs
+                        .iter()
+                        .all(EdgePhysicalPlan::is_full_adjacency_candidate_universe)
             }
         }
     }
@@ -6794,6 +7261,7 @@ impl ReadView {
             let cost = EdgePhysicalPlan::Empty.plan_cost();
             return Ok(Some(GraphRowEdgeSourceCost {
                 cost,
+                adjacency_universe_equivalent: false,
                 detail: build_explain.then(|| {
                     "source=EmptyResult; reason=always_false_or_empty_label_filter".to_string()
                 }),
@@ -6849,9 +7317,11 @@ impl ReadView {
         let driver = EdgePhysicalPlan::union(drivers);
         let mut cost = driver.plan_cost();
         cost.estimated_work = graph_row_edge_source_materialization_work(&driver);
+        let adjacency_universe_equivalent = driver.is_full_adjacency_candidate_universe();
         finalize_plan_warnings(&mut warnings);
         Ok(Some(GraphRowEdgeSourceCost {
             cost,
+            adjacency_universe_equivalent,
             detail: build_explain.then(|| {
                 format!("source=EdgeCandidateSource; {}", details.join(" | "))
             }),
@@ -6904,12 +7374,325 @@ impl ReadView {
             .expect("graph row edge-source cost memo entry must be initialized"))
     }
 
+    fn graph_row_adjacency_pull_eligibility_reason(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+        segment: &GraphRowRequiredSegment,
+        segment_index: usize,
+        edge: &GraphRowRuntimeEdge,
+        context: GraphRowOrderedProductionContext,
+    ) -> Option<&'static str> {
+        if !context.page_sink {
+            return Some("non_page_sink");
+        }
+        if context.selection_capacity == 0 {
+            return Some("zero_selection_capacity");
+        }
+        if !query.initial_bound_slots.is_empty() {
+            return Some("initial_bound_slots");
+        }
+        if segment_index != 0 || !graph_row_ordered_runtime_shape_is_eligible(&runtime.steps) {
+            return Some("not_required_segment_zero");
+        }
+        if !segment.barriers_before.is_empty() {
+            return Some("preceding_barrier");
+        }
+        let Some(first_slot) = query.binding_schema.slots().first() else {
+            return Some("logical_from_not_slot_zero");
+        };
+        let first_slot_ref = crate::graph_row::GraphBindingSlotRef {
+            kind: first_slot.kind,
+            index: first_slot.index,
+        };
+        if first_slot.kind != crate::graph_row::GraphBindingSlotKind::Node
+            || edge.from_slot != first_slot_ref
+        {
+            return Some("logical_from_not_slot_zero");
+        }
+        if !query.bound_order_by.is_empty() {
+            return Some("ordered_query");
+        }
+        if !edge.candidate_edge_ids.is_empty() {
+            return Some("explicit_edge_ids");
+        }
+        if edge.filter.is_always_false()
+            || edge
+                .label_filter_ids
+                .as_ref()
+                .is_some_and(|label_ids| label_ids.is_empty())
+        {
+            return Some("empty_result");
+        }
+        if !self.memtable.retained_edge_record_keys_is_empty() {
+            return Some("mutable_active_memtable");
+        }
+        None
+    }
+
+    fn graph_row_ordered_source_cost_inputs(
+        &self,
+        edge: &GraphRowRuntimeEdge,
+        cursor_page: bool,
+    ) -> Result<GraphRowOrderedSourceCostInputs, &'static str> {
+        #[cfg(test)]
+        if GRAPH_ROW_TEST_INVALID_ADJACENCY_HEADER.with(std::cell::Cell::get) {
+            return Err("invalid_adjacency_header");
+        }
+
+        let mut physical_groups = 0u128;
+        let mut matching_groups = 0u128;
+        let mut logical_owners = 0u128;
+        let mut raw_postings = 0u128;
+        let mut candidate_edges = 0u128;
+        let mut max_owner_postings = 0u128;
+        let mut seek_work = 0u128;
+        let mut cursors = Vec::new();
+        let mut stale_risk = StalePostingRisk::Low;
+        let mut hub_risk = GraphRowHubRisk::Low;
+        let mut partial_or_stale = false;
+
+        for &planner_direction in Self::graph_row_planner_directions(edge.direction) {
+            let physical_direction = match planner_direction {
+                PlannerStatsDirection::Outgoing => Direction::Outgoing,
+                PlannerStatsDirection::Incoming => Direction::Incoming,
+            };
+
+            for epoch in &self.immutable_epochs {
+                let p = u64::try_from(
+                    epoch
+                        .memtable
+                        .retained_ordered_adj_outer_group_count(physical_direction),
+                )
+                .map_err(|_| "invalid_adjacency_header")?;
+                if p == 0 {
+                    continue;
+                }
+                let a = epoch
+                    .memtable
+                    .retained_ordered_adj_posting_slot_count(physical_direction);
+                let o = p;
+                let immutable_seek = u128::from(crate::engine::MEMTABLE_REFILL_SEEK_UNITS)
+                    * (u128::from(p) + 1 + u128::from(a) + u128::from(o));
+                physical_groups += u128::from(p);
+                matching_groups += u128::from(p);
+                logical_owners += u128::from(o);
+                raw_postings += u128::from(a);
+                candidate_edges += u128::from(a);
+                max_owner_postings += u128::from(a);
+                seek_work += immutable_seek;
+                hub_risk = higher_graph_row_hub_risk(hub_risk, GraphRowHubRisk::High);
+                cursors.push(GraphRowOrderedCursorCostInput {
+                    physical_groups: p,
+                    raw_postings: a,
+                    logical_owners: o,
+                    dense: false,
+                });
+            }
+
+            for segment in &self.segments {
+                let p = u64::try_from(
+                    segment
+                        .adjacency_group_count(physical_direction)
+                        .map_err(|_| "invalid_adjacency_header")?,
+                )
+                .map_err(|_| "invalid_adjacency_header")?;
+                if p == 0 {
+                    continue;
+                }
+                let stats = match segment.planner_stats_availability() {
+                    crate::planner_stats::PlannerStatsAvailability::Available(stats) => {
+                        stats.as_ref()
+                    }
+                    crate::planner_stats::PlannerStatsAvailability::Missing
+                    | crate::planner_stats::PlannerStatsAvailability::Unavailable { .. } => {
+                        return Err("missing_adjacency_stats");
+                    }
+                };
+                let family = stats
+                    .adjacency_stats
+                    .iter()
+                    .filter(|row| row.direction == planner_direction)
+                    .collect::<Vec<_>>();
+                let unlabeled = family
+                    .iter()
+                    .copied()
+                    .find(|row| row.edge_label_id.is_none())
+                    .ok_or("missing_adjacency_stats")?;
+                let mut labeled_group_sum = 0u128;
+                for row in &family {
+                    if row.source_node_count > p
+                        || u128::from(row.total_edges)
+                            > u128::from(row.source_node_count) * u128::from(row.max_fanout)
+                    {
+                        return Err("invalid_adjacency_header");
+                    }
+                    if row.edge_label_id.is_some() {
+                        labeled_group_sum = labeled_group_sum
+                            .checked_add(u128::from(row.source_node_count))
+                            .ok_or("invalid_adjacency_header")?;
+                    }
+                }
+                if labeled_group_sum != u128::from(p) {
+                    return Err("invalid_adjacency_header");
+                }
+
+                let selected = edge.label_filter_ids.as_deref().map(|labels| {
+                    family
+                        .iter()
+                        .copied()
+                        .filter(|row| {
+                            row.edge_label_id
+                                .is_some_and(|label| labels.binary_search(&label).is_ok())
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let (m, o, a, h, selected_source_nodes) = match selected.as_deref() {
+                    None => (
+                        p,
+                        unlabeled.source_node_count,
+                        unlabeled.total_edges,
+                        u64::from(unlabeled.max_fanout),
+                        unlabeled.source_node_count,
+                    ),
+                    Some(rows) => {
+                        let source_nodes = rows
+                            .iter()
+                            .fold(0u128, |sum, row| sum + u128::from(row.source_node_count));
+                        let total_edges = rows
+                            .iter()
+                            .fold(0u128, |sum, row| sum + u128::from(row.total_edges));
+                        let max_fanout = rows
+                            .iter()
+                            .fold(0u128, |sum, row| sum + u128::from(row.max_fanout));
+                        let source_nodes = u128_clamped(source_nodes);
+                        (
+                            source_nodes,
+                            unlabeled.source_node_count.min(source_nodes),
+                            u128_clamped(total_edges),
+                            u128_clamped(max_fanout),
+                            source_nodes,
+                        )
+                    }
+                };
+                let dense = edge
+                    .label_filter_ids
+                    .as_deref()
+                    .is_some_and(|labels| labels.len() == 1 && selected_source_nodes == p);
+                let segment_stale_risk = self
+                    .planner_stats
+                    .segment_stale_risks
+                    .get(&segment.segment_id)
+                    .copied()
+                    .unwrap_or(StalePostingRisk::Unknown);
+                stale_risk = if stale_risk.rank() >= segment_stale_risk.rank() {
+                    stale_risk
+                } else {
+                    segment_stale_risk
+                };
+                partial_or_stale |= segment_stale_risk != StalePostingRisk::Low;
+                hub_risk = higher_graph_row_hub_risk(
+                    hub_risk,
+                    graph_row_ordered_hub_risk(selected_source_nodes, a, h),
+                );
+
+                physical_groups += u128::from(p);
+                matching_groups += u128::from(m);
+                logical_owners += u128::from(o);
+                raw_postings += u128::from(a);
+                candidate_edges += u128::from(a);
+                max_owner_postings += u128::from(h);
+                if cursor_page {
+                    seek_work += u128::from(graph_row_ordered_segment_seek_work(p));
+                }
+                cursors.push(GraphRowOrderedCursorCostInput {
+                    physical_groups: p,
+                    raw_postings: a,
+                    logical_owners: o,
+                    dense,
+                });
+            }
+        }
+
+        if [
+            physical_groups,
+            matching_groups,
+            logical_owners,
+            raw_postings,
+            candidate_edges,
+            max_owner_postings,
+            seek_work,
+            cursors.len() as u128,
+        ]
+        .into_iter()
+        .any(|value| value > u128::from(u64::MAX))
+        {
+            return Err("saturated_ordered_cost_input");
+        }
+
+        Ok(GraphRowOrderedSourceCostInputs {
+            physical_groups: physical_groups as u64,
+            matching_groups: matching_groups as u64,
+            logical_owners: logical_owners as u64,
+            raw_postings: raw_postings as u64,
+            candidate_edges: candidate_edges as u64,
+            max_owner_postings: max_owner_postings as u64,
+            cursor_count: cursors.len() as u64,
+            seek_work: seek_work as u64,
+            cursors,
+            stale_risk,
+            hub_risk,
+            partial_or_stale,
+        })
+    }
+
+    fn graph_row_ordered_alternative(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        edge: &GraphRowRuntimeEdge,
+        edge_pull: &GraphRowPlanCost,
+        adjacency_universe_equivalent: bool,
+        context: GraphRowOrderedProductionContext,
+    ) -> GraphRowOrderedAlternative {
+        graph_row_ordered_alternative_from_inputs(
+            self.graph_row_ordered_source_cost_inputs(
+                edge,
+                context.cursor_owner_inclusive.is_some(),
+            ),
+            edge_pull,
+            adjacency_universe_equivalent,
+            edge.label_filter_ids
+                .as_deref()
+                .is_some_and(|labels| labels.len() == 1),
+            query.bound_where.is_some(),
+            context.selection_capacity,
+            context.physical_pull_ceiling,
+        )
+    }
+    #[cfg(test)]
     fn plan_graph_row_physical(
         &self,
         query: &NormalizedGraphRowQuery,
         runtime: &GraphRowRuntimePlan,
         build_explain: bool,
         distinct_frontier_context: bool,
+    ) -> Result<GraphRowPhysicalPlan, EngineError> {
+        self.plan_graph_row_physical_with_ordered_context(
+            query,
+            runtime,
+            build_explain,
+            distinct_frontier_context,
+            GraphRowOrderedProductionContext::disabled(),
+        )
+    }
+
+    fn plan_graph_row_physical_with_ordered_context(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        runtime: &GraphRowRuntimePlan,
+        build_explain: bool,
+        distinct_frontier_context: bool,
+        ordered_context: GraphRowOrderedProductionContext,
     ) -> Result<GraphRowPhysicalPlan, EngineError> {
         let edge_bound = self.graph_row_physical_edge_bound_context();
         let known_node_ids = runtime
@@ -6965,6 +7748,7 @@ impl ReadView {
             };
             let plan = GraphRowPhysicalPlan {
                 initial_driver,
+                initial_edge_production: None,
                 edge_order: Vec::new(),
                 segments: Vec::new(),
                 edge_source_choices: Vec::new(),
@@ -6990,6 +7774,7 @@ impl ReadView {
         let mut initial_driver = GraphRowInitialDriver::Empty {
             reason: "no required fixed edge segment".to_string(),
         };
+        let mut initial_edge_production = None;
         let mut edge_order = Vec::with_capacity(runtime.edges.len());
         let mut segments = Vec::with_capacity(required_segments.len());
         let mut edge_source_choices = vec![None; runtime.edges.len()];
@@ -7010,9 +7795,11 @@ impl ReadView {
                 edge_bound,
                 distinct_frontier_context,
                 build_explain,
+                ordered_context,
             )?;
             if segment_index == 0 {
                 initial_driver = planned.segment.initial_driver.clone();
+                initial_edge_production = planned.initial_edge_production;
             }
             for (edge_index, choice) in &planned.source_choices {
                 if let Some(slot) = edge_source_choices.get_mut(*edge_index) {
@@ -7024,8 +7811,30 @@ impl ReadView {
             segments.push(planned.segment);
         }
 
+        debug_assert!(match (&initial_driver, initial_edge_production) {
+            (GraphRowInitialDriver::Edge { edge_index, .. }, Some(_)) => {
+                edge_order.first() == Some(edge_index)
+                    && segments.first().is_some_and(|segment| {
+                        matches!(
+                            &segment.initial_driver,
+                            GraphRowInitialDriver::Edge {
+                                edge_index: segment_edge_index,
+                                ..
+                            } if segment_edge_index == edge_index
+                        )
+                    })
+            }
+            (GraphRowInitialDriver::Edge { .. }, None) => false,
+            (GraphRowInitialDriver::Empty { .. } | GraphRowInitialDriver::Node { .. }, None) => {
+                true
+            }
+            (GraphRowInitialDriver::Empty { .. } | GraphRowInitialDriver::Node { .. }, Some(_)) => {
+                false
+            }
+        });
         let plan = GraphRowPhysicalPlan {
             initial_driver,
+            initial_edge_production,
             edge_order,
             segments,
             edge_source_choices,
@@ -7057,6 +7866,7 @@ impl ReadView {
         edge_bound: GraphRowPhysicalEdgeBoundContext,
         distinct_frontier_context: bool,
         build_explain: bool,
+        ordered_context: GraphRowOrderedProductionContext,
     ) -> Result<GraphRowPhysicalSegmentPlan, EngineError> {
         let mut alternatives = Vec::new();
         let mut candidates = Vec::new();
@@ -7119,6 +7929,7 @@ impl ReadView {
                         },
                         edge_order,
                         source_choices,
+                        None,
                         cost,
                         "NodeAnchor".to_string(),
                         build_explain.then(|| {
@@ -7213,24 +8024,83 @@ impl ReadView {
             )?;
             edge_order.insert(0, edge_index);
             source_choices.insert(0, (edge_index, graph_row_initial_edge_source_choice(edge)));
+            let edge_driver = GraphRowInitialDriver::Edge {
+                edge_index,
+                edge_name: edge.explain_name(),
+            };
+            let edge_detail = build_explain.then(|| {
+                format!(
+                    "segment={segment_index}; edge={}; {}; warnings={:?}",
+                    edge.explain_name(),
+                    edge_source_cost.detail.as_deref().unwrap_or_default(),
+                    edge_source_cost.warnings
+                )
+            });
             candidates.push((
-                GraphRowInitialDriver::Edge {
-                    edge_index,
-                    edge_name: edge.explain_name(),
-                },
-                edge_order,
-                source_choices,
-                cost,
+                edge_driver.clone(),
+                edge_order.clone(),
+                source_choices.clone(),
+                Some(GraphRowEdgeAnchorProduction::EdgePull),
+                cost.clone(),
                 "EdgeAnchor".to_string(),
-                build_explain.then(|| {
-                    format!(
-                        "segment={segment_index}; edge={}; {}; warnings={:?}",
-                        edge.explain_name(),
-                        edge_source_cost.detail.unwrap_or_default(),
-                        edge_source_cost.warnings
-                    )
-                }),
+                edge_detail,
             ));
+
+            match self.graph_row_adjacency_pull_eligibility_reason(
+                query,
+                runtime,
+                segment,
+                segment_index,
+                edge,
+                ordered_context,
+            ) {
+                Some(reason) => {
+                    if build_explain {
+                        alternatives.push(GraphRowPlanAlternative {
+                            chosen: false,
+                            kind: "AdjacencyPull".to_string(),
+                            detail: format!(
+                                "segment={segment_index}; edge={}; coverage=uncomputable; decision=rejected; reason={reason}",
+                                edge.explain_name()
+                            ),
+                            decision: Some(format!("decision=rejected_by={reason}")),
+                            cost: None,
+                        });
+                    }
+                }
+                None => {
+                    let ordered = self.graph_row_ordered_alternative(
+                        query,
+                        edge,
+                        &cost,
+                        edge_source_cost.adjacency_universe_equivalent,
+                        ordered_context,
+                    );
+                    if let Some(ordered_cost) = ordered.cost {
+                        candidates.push((
+                            edge_driver,
+                            edge_order,
+                            source_choices,
+                            Some(GraphRowEdgeAnchorProduction::AdjacencyPull),
+                            ordered_cost,
+                            "AdjacencyPull".to_string(),
+                            build_explain.then_some(ordered.detail),
+                        ));
+                    } else if build_explain {
+                        alternatives.push(GraphRowPlanAlternative {
+                            chosen: false,
+                            kind: "AdjacencyPull".to_string(),
+                            detail: format!(
+                                "segment={segment_index}; edge={}; {}",
+                                edge.explain_name(),
+                                ordered.detail
+                            ),
+                            decision: Some("decision=rejected_by=ordered_admission".to_string()),
+                            cost: None,
+                        });
+                    }
+                }
+            }
         }
 
         if candidates.is_empty() {
@@ -7265,19 +8135,31 @@ impl ReadView {
                     },
                     edge_order,
                 },
+                initial_edge_production: None,
                 source_choices,
                 alternatives,
             });
         }
 
-        candidates.sort_by(|left, right| left.3.cmp(&right.3));
+        candidates.sort_by(|left, right| left.4.cmp(&right.4));
+        #[cfg(test)]
+        if let Some(forced) = GRAPH_ROW_TEST_FORCED_EDGE_PRODUCTION.with(std::cell::Cell::get) {
+            if let Some(index) = candidates
+                .iter()
+                .position(|candidate| candidate.3 == Some(forced))
+            {
+                candidates.swap(0, index);
+            }
+        }
         let chosen_cost = candidates
             .first()
-            .map(|candidate| candidate.3.clone())
+            .map(|candidate| candidate.4.clone())
             .expect("candidates must be non-empty");
-        let (initial_driver, edge_order, source_choices, _, _, _) =
+        let (initial_driver, edge_order, source_choices, initial_edge_production, _, _, _) =
             candidates.first().cloned().expect("candidates must be non-empty");
-        for (candidate_index, (_, _, _, cost, kind, detail)) in candidates.into_iter().enumerate() {
+        for (candidate_index, (_, _, _, _, cost, kind, detail)) in
+            candidates.into_iter().enumerate()
+        {
             let chosen = candidate_index == 0 && cost == chosen_cost;
             let decision = if chosen {
                 "decision=chosen_lowest_cost_or_deterministic_tie_breaker".to_string()
@@ -7305,6 +8187,7 @@ impl ReadView {
                 initial_driver,
                 edge_order,
             },
+            initial_edge_production,
             source_choices,
             alternatives,
         })
@@ -11596,6 +12479,537 @@ mod query_plan_unit_tests {
     use super::*;
 
     #[test]
+    fn graph_row_ordered_runtime_shape_requires_only_required_segment_zero() {
+        let slot = |kind| crate::graph_row::GraphBindingSlotRef { kind, index: 0 };
+        assert!(graph_row_ordered_runtime_shape_is_eligible(&[
+            GraphRowRuntimeStep::RequiredSegment(0),
+        ]));
+        assert!(!graph_row_ordered_runtime_shape_is_eligible(&[]));
+        assert!(!graph_row_ordered_runtime_shape_is_eligible(&[
+            GraphRowRuntimeStep::RequiredSegment(1),
+        ]));
+        assert!(!graph_row_ordered_runtime_shape_is_eligible(&[
+            GraphRowRuntimeStep::RequiredSegment(0),
+            GraphRowRuntimeStep::RequiredSegment(1),
+        ]));
+        assert!(!graph_row_ordered_runtime_shape_is_eligible(&[
+            GraphRowRuntimeStep::RequiredSegment(0),
+            GraphRowRuntimeStep::FixedPath(GraphRowRuntimeFixedPath {
+                alias: "path".to_string(),
+                path_slot: slot(crate::graph_row::GraphBindingSlotKind::Path),
+                node_slots: Vec::new(),
+                edge_slots: Vec::new(),
+            }),
+        ]));
+        assert!(!graph_row_ordered_runtime_shape_is_eligible(&[
+            GraphRowRuntimeStep::RequiredSegment(0),
+            GraphRowRuntimeStep::Optional(GraphRowRuntimeOptionalGroup {
+                piece_index: 0,
+                piece_path: Box::default(),
+                pieces_len: 0,
+                runtime: Box::new(GraphRowRuntimePlan {
+                    nodes: Vec::new(),
+                    node_by_alias: BTreeMap::new(),
+                    edges: Vec::new(),
+                    required_segments: Vec::new(),
+                    steps: Vec::new(),
+                    warnings: Vec::new(),
+                }),
+                introduced_slots: Vec::new(),
+                dependency_slots: Vec::new(),
+                left_slots: Vec::new(),
+                where_expr: None,
+                where_needs: EntityProjectionNeeds::default(),
+                where_present: false,
+            }),
+        ]));
+        assert!(!graph_row_ordered_runtime_shape_is_eligible(&[
+            GraphRowRuntimeStep::RequiredSegment(0),
+            GraphRowRuntimeStep::VariableLength(GraphRowRuntimeVariableLength {
+                piece_index: 0,
+                piece_path: Box::default(),
+                path_alias: None,
+                edge_alias: None,
+                path_slot: None,
+                edge_slot: None,
+                hidden_slot: None,
+                from_alias: "from".to_string(),
+                to_alias: "to".to_string(),
+                from_slot: slot(crate::graph_row::GraphBindingSlotKind::Node),
+                to_slot: crate::graph_row::GraphBindingSlotRef {
+                    kind: crate::graph_row::GraphBindingSlotKind::Node,
+                    index: 1,
+                },
+                direction: Direction::Outgoing,
+                candidate_edge_ids: Vec::new(),
+                label_filter_ids: None,
+                filter: NormalizedEdgeFilter::AlwaysTrue,
+                min_hops: 1,
+                max_hops: 1,
+                warnings: Vec::new(),
+            }),
+        ]));
+    }
+
+    #[test]
+    fn graph_row_ordered_coverage_and_admission_lock_incomplete_fanout_to_advisory() {
+        assert_eq!(
+            graph_row_ordered_cost_coverage(false, false, true),
+            GraphRowOrderedCostCoverage::Complete
+        );
+        assert_eq!(
+            graph_row_ordered_cost_coverage(true, false, true),
+            GraphRowOrderedCostCoverage::Advisory
+        );
+        assert_eq!(
+            graph_row_ordered_cost_coverage(false, true, true),
+            GraphRowOrderedCostCoverage::Advisory
+        );
+        assert_eq!(
+            graph_row_ordered_cost_coverage(false, false, false),
+            GraphRowOrderedCostCoverage::Advisory
+        );
+        assert_eq!(
+            graph_row_ordered_advisory_confidence_rank(false, true),
+            EstimateConfidence::Medium.rank()
+        );
+        assert_eq!(
+            graph_row_ordered_advisory_confidence_rank(false, false),
+            EstimateConfidence::Low.rank()
+        );
+        assert_eq!(
+            graph_row_ordered_advisory_confidence_rank(true, true),
+            EstimateConfidence::Low.rank()
+        );
+
+        assert!(graph_row_ordered_cost_is_admitted(
+            GraphRowOrderedCostCoverage::Complete,
+            99,
+            100,
+        ));
+        assert!(!graph_row_ordered_cost_is_admitted(
+            GraphRowOrderedCostCoverage::Complete,
+            100,
+            100,
+        ));
+        assert!(graph_row_ordered_cost_is_admitted(
+            GraphRowOrderedCostCoverage::Advisory,
+            25,
+            100,
+        ));
+        assert!(!graph_row_ordered_cost_is_admitted(
+            GraphRowOrderedCostCoverage::Advisory,
+            26,
+            100,
+        ));
+        assert!(!graph_row_ordered_cost_is_admitted(
+            GraphRowOrderedCostCoverage::Uncomputable,
+            0,
+            u64::MAX,
+        ));
+    }
+
+    #[test]
+    fn graph_row_ordered_alternative_table_covers_costing_failures_and_mutations() {
+        fn edge_pull(total_work: u64, anchor_work: u64, fanout_complete: bool) -> GraphRowPlanCost {
+            GraphRowPlanCost {
+                anchor_cost: PlanCost {
+                    estimated_work: anchor_work,
+                    estimated_candidates: Some(20),
+                    estimate_kind_rank: PlannerEstimateKind::StatsExact.rank(),
+                    confidence_rank: EstimateConfidence::High.rank(),
+                    stale_risk_rank: StalePostingRisk::Low.rank(),
+                    materialization_rank: PlanMaterializationClass::EagerIndex.rank(),
+                    source_rank: 7,
+                    canonical_key: "anchor".to_string(),
+                },
+                estimated_work: total_work,
+                simulated_frontier: 100,
+                fanout_complete,
+                confidence_rank: EstimateConfidence::High.rank(),
+                stale_risk_rank: StalePostingRisk::Low.rank(),
+                hub_risk_rank: GraphRowHubRisk::Low.rank(),
+                frontier_capped: true,
+                source_rank: 11,
+                canonical_key: "plan".to_string(),
+            }
+        }
+
+        fn inputs(
+            dense: bool,
+            partial_or_stale: bool,
+            stale_risk: StalePostingRisk,
+            hub_risk: GraphRowHubRisk,
+            seek_work: u64,
+        ) -> GraphRowOrderedSourceCostInputs {
+            GraphRowOrderedSourceCostInputs {
+                physical_groups: 100,
+                matching_groups: 100,
+                logical_owners: 10,
+                raw_postings: 20,
+                candidate_edges: 20,
+                max_owner_postings: 2,
+                cursor_count: 1,
+                seek_work,
+                cursors: vec![GraphRowOrderedCursorCostInput {
+                    physical_groups: 100,
+                    raw_postings: 20,
+                    logical_owners: 10,
+                    dense,
+                }],
+                stale_risk,
+                hub_risk,
+                partial_or_stale,
+            }
+        }
+
+        struct Case {
+            name: &'static str,
+            inputs: Result<GraphRowOrderedSourceCostInputs, &'static str>,
+            edge_pull: GraphRowPlanCost,
+            bound_where_present: bool,
+            expect_cost: bool,
+            detail_fragments: &'static [&'static str],
+        }
+
+        let cases = vec![
+            Case {
+                name: "dense_complete",
+                inputs: Ok(inputs(
+                    true,
+                    false,
+                    StalePostingRisk::Low,
+                    GraphRowHubRisk::Low,
+                    0,
+                )),
+                edge_pull: edge_pull(1_000, 500, true),
+                bound_where_present: true,
+                expect_cost: true,
+                detail_fragments: &["dense=true", "coverage=complete", "ordered_work=541"],
+            },
+            Case {
+                name: "r_advisory",
+                inputs: Ok(inputs(
+                    true,
+                    false,
+                    StalePostingRisk::Low,
+                    GraphRowHubRisk::Low,
+                    0,
+                )),
+                edge_pull: edge_pull(1_000, 500, true),
+                bound_where_present: false,
+                expect_cost: true,
+                detail_fragments: &[
+                    "prefix_heuristic=true",
+                    "coverage=advisory",
+                    "four_x_pass=true",
+                ],
+            },
+            Case {
+                name: "incomplete_fanout_advisory",
+                inputs: Ok(inputs(
+                    true,
+                    false,
+                    StalePostingRisk::Low,
+                    GraphRowHubRisk::Low,
+                    0,
+                )),
+                edge_pull: edge_pull(1_000, 1_000, false),
+                bound_where_present: false,
+                expect_cost: true,
+                detail_fragments: &["fanout_complete=false", "coverage=advisory"],
+            },
+            Case {
+                name: "stale_advisory",
+                inputs: Ok(inputs(
+                    true,
+                    true,
+                    StalePostingRisk::High,
+                    GraphRowHubRisk::High,
+                    0,
+                )),
+                edge_pull: edge_pull(1_000, 1_000, true),
+                bound_where_present: true,
+                expect_cost: true,
+                detail_fragments: &["partial_or_stale=true", "coverage=advisory"],
+            },
+            Case {
+                name: "missing",
+                inputs: Err("missing_adjacency_stats"),
+                edge_pull: edge_pull(1_000, 500, true),
+                bound_where_present: true,
+                expect_cost: false,
+                detail_fragments: &["coverage=uncomputable", "reason=missing_adjacency_stats"],
+            },
+            Case {
+                name: "malformed",
+                inputs: Ok(inputs(
+                    true,
+                    false,
+                    StalePostingRisk::Low,
+                    GraphRowHubRisk::Low,
+                    0,
+                )),
+                edge_pull: edge_pull(100, 200, true),
+                bound_where_present: true,
+                expect_cost: false,
+                detail_fragments: &["coverage=uncomputable", "invalid_downstream_subtraction"],
+            },
+            Case {
+                name: "saturated",
+                inputs: Ok(inputs(
+                    true,
+                    false,
+                    StalePostingRisk::Low,
+                    GraphRowHubRisk::Low,
+                    u64::MAX,
+                )),
+                edge_pull: edge_pull(1_000, 500, true),
+                bound_where_present: true,
+                expect_cost: false,
+                detail_fragments: &["coverage=uncomputable", "saturated_ordered_work"],
+            },
+            Case {
+                name: "exact_work_tie",
+                inputs: Ok(inputs(
+                    true,
+                    false,
+                    StalePostingRisk::Low,
+                    GraphRowHubRisk::Low,
+                    0,
+                )),
+                edge_pull: edge_pull(1_000, 41, true),
+                bound_where_present: true,
+                expect_cost: false,
+                detail_fragments: &["coverage=complete", "ordered_work=1000", "not_strictly_cheaper"],
+            },
+        ];
+
+        for case in cases {
+            let alternative = graph_row_ordered_alternative_from_inputs(
+                case.inputs,
+                &case.edge_pull,
+                true,
+                true,
+                case.bound_where_present,
+                10,
+                4_096,
+            );
+            assert_eq!(alternative.cost.is_some(), case.expect_cost, "{}", case.name);
+            for fragment in case.detail_fragments {
+                assert!(
+                    alternative.detail.contains(fragment),
+                    "{} missing {fragment:?}: {}",
+                    case.name,
+                    alternative.detail
+                );
+            }
+        }
+
+        fn owner_bound_inputs(max_owner_postings: u64) -> GraphRowOrderedSourceCostInputs {
+            GraphRowOrderedSourceCostInputs {
+                physical_groups: 100,
+                matching_groups: 100,
+                logical_owners: 10,
+                raw_postings: 8_194,
+                candidate_edges: 8_194,
+                max_owner_postings,
+                cursor_count: 1,
+                seek_work: 0,
+                cursors: vec![GraphRowOrderedCursorCostInput {
+                    physical_groups: 100,
+                    raw_postings: 8_194,
+                    logical_owners: 10,
+                    dense: true,
+                }],
+                stale_risk: StalePostingRisk::Low,
+                hub_risk: GraphRowHubRisk::High,
+                partial_or_stale: false,
+            }
+        }
+
+        let owner_at_ceiling = graph_row_ordered_alternative_from_inputs(
+            Ok(owner_bound_inputs(4_096)),
+            &edge_pull(1_000_000, 500_000, true),
+            true,
+            true,
+            true,
+            10,
+            4_096,
+        );
+        assert!(owner_at_ceiling.cost.is_some(), "{}", owner_at_ceiling.detail);
+        assert!(owner_at_ceiling.detail.contains("H=4096; K=10; F=4096"));
+
+        let owner_above_ceiling = graph_row_ordered_alternative_from_inputs(
+            Ok(owner_bound_inputs(4_097)),
+            &edge_pull(1_000_000, 500_000, true),
+            true,
+            true,
+            true,
+            10,
+            4_096,
+        );
+        assert!(owner_above_ceiling.cost.is_none());
+        assert!(owner_above_ceiling
+            .detail
+            .contains("H=4097; K=10; F=4096"));
+        assert!(owner_above_ceiling
+            .detail
+            .contains("decision=rejected; reason=owner_bound_exceeds_pull_ceiling"));
+
+        let forced_owner_above_ceiling = with_graph_row_test_forced_edge_production(
+            GraphRowEdgeAnchorProduction::AdjacencyPull,
+            || {
+                graph_row_ordered_alternative_from_inputs(
+                    Ok(owner_bound_inputs(4_097)),
+                    &edge_pull(1_000_000, 500_000, true),
+                    true,
+                    true,
+                    true,
+                    10,
+                    4_096,
+                )
+            },
+        );
+        assert!(
+            forced_owner_above_ceiling.cost.is_some(),
+            "forced test-only AdjacencyPull must bypass the owner-bound admission safeguard: {}",
+            forced_owner_above_ceiling.detail
+        );
+
+        let complete_edge_pull = edge_pull(1_000, 500, true);
+        let complete = graph_row_ordered_alternative_from_inputs(
+            Ok(inputs(
+                true,
+                false,
+                StalePostingRisk::Low,
+                GraphRowHubRisk::Low,
+                0,
+            )),
+            &complete_edge_pull,
+            true,
+            true,
+            true,
+            10,
+            4_096,
+        )
+        .cost
+        .expect("dense complete alternative must be admitted");
+        assert_eq!(complete.anchor_cost.estimated_work, 41);
+        assert_eq!(complete.anchor_cost.estimated_candidates, Some(20));
+        assert_eq!(
+            complete.anchor_cost.estimate_kind_rank,
+            PlannerEstimateKind::UpperBound.rank()
+        );
+        assert_eq!(
+            complete.anchor_cost.confidence_rank,
+            complete_edge_pull.anchor_cost.confidence_rank
+        );
+        assert_eq!(
+            complete.anchor_cost.stale_risk_rank,
+            complete_edge_pull.anchor_cost.stale_risk_rank
+        );
+        assert_eq!(
+            complete.anchor_cost.materialization_rank,
+            PlanMaterializationClass::StreamingLegalUniverse.rank()
+        );
+        assert_eq!(complete.anchor_cost.source_rank, 8);
+        assert_eq!(complete.source_rank, 12);
+        assert_eq!(complete.anchor_cost.canonical_key, "anchor:production=adjacency_pull");
+        assert_eq!(complete.canonical_key, "plan:production=adjacency_pull");
+        assert_eq!(complete.estimated_work, 541);
+        assert_eq!(complete.simulated_frontier, complete_edge_pull.simulated_frontier);
+        assert_eq!(complete.frontier_capped, complete_edge_pull.frontier_capped);
+        assert!(complete.fanout_complete);
+
+        let stale_edge_pull = edge_pull(1_000, 1_000, true);
+        let stale = graph_row_ordered_alternative_from_inputs(
+            Ok(inputs(
+                true,
+                true,
+                StalePostingRisk::High,
+                GraphRowHubRisk::High,
+                0,
+            )),
+            &stale_edge_pull,
+            true,
+            true,
+            true,
+            10,
+            4_096,
+        )
+        .cost
+        .expect("stale advisory alternative must pass the four-x gate");
+        assert_eq!(
+            stale.anchor_cost.estimate_kind_rank,
+            PlannerEstimateKind::StatsEstimated.rank()
+        );
+        assert_eq!(stale.anchor_cost.confidence_rank, EstimateConfidence::Low.rank());
+        assert_eq!(stale.confidence_rank, EstimateConfidence::Low.rank());
+        assert_eq!(stale.anchor_cost.stale_risk_rank, StalePostingRisk::High.rank());
+        assert_eq!(stale.stale_risk_rank, StalePostingRisk::High.rank());
+        assert_eq!(stale.hub_risk_rank, GraphRowHubRisk::High.rank());
+        assert!(!stale.fanout_complete);
+
+        let incomplete = graph_row_ordered_alternative_from_inputs(
+            Ok(inputs(
+                true,
+                false,
+                StalePostingRisk::Low,
+                GraphRowHubRisk::Low,
+                0,
+            )),
+            &edge_pull(1_000, 1_000, false),
+            true,
+            true,
+            false,
+            10,
+            4_096,
+        )
+        .cost
+        .expect("incomplete-fanout advisory alternative must pass the four-x gate");
+        assert_eq!(incomplete.confidence_rank, EstimateConfidence::Low.rank());
+        assert!(!incomplete.fanout_complete);
+    }
+
+    #[test]
+    fn graph_row_ordered_cost_widened_arithmetic_and_seek_depth_are_exact() {
+        assert_eq!(u128_mul_div_ceil_clamped(10, 10, 6), 17);
+        assert_eq!(
+            u128_mul_div_ceil_clamped(u64::MAX, u64::MAX, u64::MAX),
+            u64::MAX
+        );
+        assert_eq!(u128_product_clamped(u64::MAX, 2), u64::MAX);
+        assert_eq!(graph_row_ordered_segment_seek_work(0), 0);
+        assert_eq!(graph_row_ordered_segment_seek_work(1), 1);
+        assert_eq!(graph_row_ordered_segment_seek_work(2), 2);
+        assert_eq!(graph_row_ordered_segment_seek_work(3), 2);
+        assert_eq!(graph_row_ordered_segment_seek_work(u64::MAX), 64);
+    }
+
+    #[test]
+    fn graph_row_ordered_production_context_locks_page_and_disabled_modes() {
+        assert_eq!(
+            GraphRowOrderedProductionContext::enabled(10, Some(42), 3_000, 2_000),
+            GraphRowOrderedProductionContext {
+                selection_capacity: 10,
+                physical_pull_ceiling: 2_000,
+                cursor_owner_inclusive: Some(42),
+                page_sink: true,
+            }
+        );
+        assert_eq!(
+            GraphRowOrderedProductionContext::disabled(),
+            GraphRowOrderedProductionContext {
+                selection_capacity: 0,
+                physical_pull_ceiling: 0,
+                cursor_owner_inclusive: None,
+                page_sink: false,
+            }
+        );
+    }
+
+    #[test]
     fn graph_row_legacy_estimator_scope_is_nested_panic_safe_and_thread_local() {
         assert!(!graph_row_test_legacy_estimator_is_enabled());
         with_graph_row_test_legacy_estimator(|| {
@@ -11623,6 +13037,55 @@ mod query_plan_unit_tests {
     }
 
     #[test]
+    fn graph_row_forced_edge_production_scope_is_nested_panic_safe_and_thread_local() {
+        let current = || GRAPH_ROW_TEST_FORCED_EDGE_PRODUCTION.with(std::cell::Cell::get);
+        assert_eq!(current(), None);
+        with_graph_row_test_forced_edge_production(GraphRowEdgeAnchorProduction::EdgePull, || {
+            assert_eq!(current(), Some(GraphRowEdgeAnchorProduction::EdgePull));
+            with_graph_row_test_forced_edge_production(
+                GraphRowEdgeAnchorProduction::AdjacencyPull,
+                || assert_eq!(current(), Some(GraphRowEdgeAnchorProduction::AdjacencyPull)),
+            );
+            assert_eq!(current(), Some(GraphRowEdgeAnchorProduction::EdgePull));
+
+            let isolated = std::thread::spawn(current).join().unwrap();
+            assert_eq!(isolated, None, "the forced source must be thread-local");
+        });
+        assert_eq!(current(), None);
+
+        let panicked = std::panic::catch_unwind(|| {
+            with_graph_row_test_forced_edge_production(
+                GraphRowEdgeAnchorProduction::AdjacencyPull,
+                || panic!("forced source reset oracle"),
+            );
+        });
+        assert!(panicked.is_err());
+        assert_eq!(current(), None);
+    }
+
+    #[test]
+    fn graph_row_invalid_adjacency_header_scope_is_nested_panic_safe_and_thread_local() {
+        let current = || GRAPH_ROW_TEST_INVALID_ADJACENCY_HEADER.with(std::cell::Cell::get);
+        assert!(!current());
+        with_graph_row_test_invalid_adjacency_header(|| {
+            assert!(current());
+            with_graph_row_test_invalid_adjacency_header(|| assert!(current()));
+            assert!(current());
+            assert!(!std::thread::spawn(current).join().unwrap());
+        });
+        assert!(!current());
+
+        let panicked = std::panic::catch_unwind(|| {
+            with_graph_row_test_invalid_adjacency_header(|| {
+                assert!(current());
+                panic!("invalid-header scope reset oracle");
+            });
+        });
+        assert!(panicked.is_err());
+        assert!(!current());
+    }
+
+    #[test]
     fn graph_row_plan_signature_capture_is_inactive_nested_and_panic_safe() {
         fn plan(alias: &str) -> GraphRowPhysicalPlan {
             GraphRowPhysicalPlan {
@@ -11630,6 +13093,7 @@ mod query_plan_unit_tests {
                     node_index: 0,
                     alias: alias.to_string(),
                 },
+                initial_edge_production: None,
                 edge_order: Vec::new(),
                 segments: Vec::new(),
                 edge_source_choices: Vec::new(),

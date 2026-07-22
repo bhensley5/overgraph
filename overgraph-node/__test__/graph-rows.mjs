@@ -21,6 +21,12 @@ function approxArray(actual, expected) {
   }
 }
 
+function graphRowPlanDetail(result, kind) {
+  const node = result.plan?.plan.find(candidate => candidate.kind === kind);
+  assert.ok(node, `expected ${kind} in graph-row plan`);
+  return node.detail;
+}
+
 describe('graph row connector API', () => {
   let tmpDir;
   let db;
@@ -334,6 +340,118 @@ describe('graph row connector API', () => {
     assert.match(explainText, /VariableLength|variable/i);
     assert.match(explainText, /Optional|optional/i);
     assert.equal(explain.cursor.codecImplemented, true);
+  });
+
+  it('keeps ordered adjacency pages exact across active and flushed public execution', () => {
+    const localTmpDir = mkdtempSync(join(tmpdir(), 'overgraph-graph-row-node-adjacency-'));
+    const localDb = OverGraph.open(join(localTmpDir, 'db'), {
+      walSyncMode: 'group-commit',
+      groupCommitIntervalMs: 1,
+    });
+    try {
+      const expected = [];
+      for (let ordinal = 0; ordinal < 1_000; ordinal += 1) {
+        const sourceId = localDb.upsertNode(
+          'ConnectorAdjacencySource',
+          `connector-adjacency-source-${ordinal.toString().padStart(4, '0')}`
+        );
+        const targetId = localDb.upsertNode(
+          'ConnectorAdjacencyTarget',
+          `connector-adjacency-target-${ordinal.toString().padStart(4, '0')}`
+        );
+        const edgeId = localDb.upsertEdge(
+          sourceId,
+          targetId,
+          'CONNECTOR_ADJACENCY_EDGE'
+        );
+        expected.push({ source_id: sourceId, edge_id: edgeId, target_id: targetId });
+      }
+
+      const request = {
+        nodes: [{ alias: 'source' }, { alias: 'target' }],
+        pieces: [{
+          kind: 'edge',
+          alias: 'edge',
+          fromAlias: 'source',
+          toAlias: 'target',
+          labelFilter: ['CONNECTOR_ADJACENCY_EDGE'],
+        }],
+        return: [
+          { expr: { binding: 'source' }, as: 'source_id' },
+          { expr: { binding: 'edge' }, as: 'edge_id' },
+          { expr: { binding: 'target' }, as: 'target_id' },
+        ],
+        limit: 10,
+        options: {
+          includePlan: true,
+          maxFrontier: 1_024,
+          maxIntermediateBindings: 1_024,
+        },
+      };
+
+      const active = localDb.queryGraphRows(request);
+      assert.deepEqual(active.rows, expected.slice(0, 10));
+      assert.equal(typeof active.nextCursor, 'string');
+      assert.match(graphRowPlanDetail(active, 'GraphRowSourceRead'), /choice=EdgePullChunk/);
+      assert.match(graphRowPlanDetail(active, 'ChunkedRowProductionRuntime'), /source=EdgePull\{/);
+      assert.ok(
+        active.plan.plan.some(node => (
+          node.kind === 'GraphRowPlanAlternative'
+          && /kind=AdjacencyPull/.test(node.detail)
+          && /reason=mutable_active_memtable/.test(node.detail)
+        )),
+        'expected active adjacency alternative rejection with mutable_active_memtable'
+      );
+
+      const pinnedRequest = { ...request, atEpoch: active.stats.effectiveAtEpoch };
+      localDb.flush();
+      const first = localDb.queryGraphRows(pinnedRequest);
+      assert.deepEqual(first.rows, expected.slice(0, 10));
+      assert.equal(first.nextCursor, active.nextCursor);
+      assert.equal(first.plan.fingerprint, active.plan.fingerprint);
+      assert.equal(first.stats.effectiveAtEpoch, active.stats.effectiveAtEpoch);
+      assert.match(graphRowPlanDetail(first, 'GraphRowSourceRead'), /choice=AdjacencyPullChunk/);
+      const firstRuntime = graphRowPlanDetail(first, 'ChunkedRowProductionRuntime');
+      for (const fact of [
+        /source=AdjacencyPull\{/,
+        /source_order=logical_from_group_asc/,
+        /proof_boundary=completed_owner_group/,
+        /early_exit=true/,
+        /cursor_seek=none/,
+      ]) {
+        assert.match(firstRuntime, fact);
+      }
+
+      const repeatedFirst = localDb.queryGraphRows(pinnedRequest);
+      assert.deepEqual(repeatedFirst.rows, first.rows);
+      assert.equal(repeatedFirst.nextCursor, first.nextCursor);
+      assert.equal(repeatedFirst.plan.fingerprint, first.plan.fingerprint);
+      assert.equal(repeatedFirst.stats.effectiveAtEpoch, first.stats.effectiveAtEpoch);
+
+      const cursorRequest = { ...pinnedRequest, cursor: first.nextCursor };
+      const second = localDb.queryGraphRows(cursorRequest);
+      assert.deepEqual(second.rows, expected.slice(10, 20));
+      assert.equal(typeof second.nextCursor, 'string');
+      assert.notEqual(second.nextCursor, first.nextCursor);
+      assert.equal(second.plan.fingerprint, first.plan.fingerprint);
+      assert.equal(second.stats.effectiveAtEpoch, first.stats.effectiveAtEpoch);
+      assert.equal(second.plan.cursor.supplied, true);
+      assert.match(graphRowPlanDetail(second, 'GraphRowSourceRead'), /choice=AdjacencyPullChunk/);
+      const secondRuntime = graphRowPlanDetail(second, 'ChunkedRowProductionRuntime');
+      assert.match(secondRuntime, /source=AdjacencyPull\{/);
+      assert.match(secondRuntime, /source_order=logical_from_group_asc/);
+      assert.match(secondRuntime, /proof_boundary=completed_owner_group/);
+      assert.match(secondRuntime, /early_exit=true/);
+      assert.match(secondRuntime, /cursor_seek=anchor_ge:/);
+
+      const repeatedSecond = localDb.queryGraphRows(cursorRequest);
+      assert.deepEqual(repeatedSecond.rows, second.rows);
+      assert.equal(repeatedSecond.nextCursor, second.nextCursor);
+      assert.equal(repeatedSecond.plan.fingerprint, second.plan.fingerprint);
+      assert.equal(repeatedSecond.stats.effectiveAtEpoch, second.stats.effectiveAtEpoch);
+    } finally {
+      closeDir(localDb, localTmpDir);
+    }
   });
 
   it('runs structured graph pipeline queries through sync and async connector APIs', async () => {

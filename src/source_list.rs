@@ -7,7 +7,7 @@
 //! checks that consult all live sources in the correct order. Engine read paths
 //! delegate to `SourceList` instead of open-coding memtable + segment logic.
 
-use crate::edge_metadata::{EdgeMetadataCandidate, RangeBoundFlags};
+use crate::edge_metadata::{EdgeMetadataCandidate, EdgeMetadataVisibilityState, RangeBoundFlags};
 use crate::engine::ReadViewImmutableEpoch;
 use crate::error::EngineError;
 use crate::memtable::Memtable;
@@ -30,6 +30,22 @@ pub struct SourceList<'a> {
     pub(crate) snapshot_seq: u64,
     #[cfg(test)]
     pub(crate) selected_field_read_counters: Option<&'a SelectedFieldReadCounters>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EdgeMetadataSourceLayer {
+    Active,
+    Immutable(usize),
+    Segment(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum EdgeMetadataSourceOpinion {
+    MissingOrTombstoned,
+    Live {
+        layer: EdgeMetadataSourceLayer,
+        meta: EdgeMetadataCandidate,
+    },
 }
 
 pub(crate) enum LimitedEdgeIndexRead {
@@ -388,46 +404,129 @@ impl<'a> SourceList<'a> {
             .enumerate()
             .map(|(index, &id)| (index, id))
             .collect();
+        let mut visibility = vec![EdgeMetadataVisibilityState::Missing; ids.len()];
 
-        remaining.retain(|&(index, id)| {
-            if let Some(meta) = self.active.get_edge_metadata_at(id, self.snapshot_seq) {
-                results[index] = Some(meta);
-                false
-            } else {
-                !self.active.is_edge_deleted_at(id, self.snapshot_seq)
-            }
-        });
-
-        for epoch in self.immutable {
+        for memtable in std::iter::once(self.active)
+            .chain(self.immutable.iter().map(|epoch| epoch.memtable.as_ref()))
+        {
             if remaining.is_empty() {
                 break;
             }
-            remaining.retain(|&(index, id)| {
-                if let Some(meta) = epoch.memtable.get_edge_metadata_at(id, self.snapshot_seq) {
+            let prior = std::mem::take(&mut remaining);
+            remaining =
+                memtable.batch_get_edge_metadata_at(&prior, self.snapshot_seq, &mut visibility);
+            for (index, _) in prior {
+                if let EdgeMetadataVisibilityState::Live(meta) = visibility[index] {
                     results[index] = Some(meta);
-                    false
-                } else {
-                    !epoch.memtable.is_edge_deleted_at(id, self.snapshot_seq)
                 }
-            });
+            }
         }
 
         if !remaining.is_empty() {
             remaining.sort_unstable_by_key(|&(_, id)| id);
-            for seg in self.segments {
+            for segment in self.segments {
                 if remaining.is_empty() {
                     break;
                 }
-                remaining.retain(|&(_, id)| !seg.is_edge_deleted(id));
-                if remaining.is_empty() {
-                    break;
-                }
-                seg.get_edge_metadata_batch(&remaining, &mut results)?;
+                remaining.retain(|&(_, id)| !segment.is_edge_deleted(id));
+                segment.get_edge_metadata_batch(&remaining, &mut results)?;
                 remaining.retain(|&(index, _)| results[index].is_none());
             }
         }
 
         Ok(results)
+    }
+
+    pub(crate) fn find_edge_metadata_with_source(
+        &self,
+        ids: &[u64],
+    ) -> Result<Vec<EdgeMetadataSourceOpinion>, EngineError> {
+        let mut results = vec![None; ids.len()];
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut remaining: Vec<(usize, u64)> = ids
+            .iter()
+            .enumerate()
+            .map(|(index, &id)| (index, id))
+            .collect();
+        let mut visibility = vec![EdgeMetadataVisibilityState::Missing; ids.len()];
+
+        {
+            let mut resolve_memtable =
+                |memtable: &Memtable,
+                 layer: EdgeMetadataSourceLayer,
+                 remaining: &mut Vec<(usize, u64)>| {
+                    if remaining.is_empty() {
+                        return;
+                    }
+                    let prior = std::mem::take(remaining);
+                    *remaining = memtable.batch_get_edge_metadata_at(
+                        &prior,
+                        self.snapshot_seq,
+                        &mut visibility,
+                    );
+                    for (index, _) in prior {
+                        match visibility[index] {
+                            EdgeMetadataVisibilityState::Live(meta) => {
+                                results[index] =
+                                    Some(EdgeMetadataSourceOpinion::Live { layer, meta });
+                            }
+                            EdgeMetadataVisibilityState::Deleted => {
+                                results[index] =
+                                    Some(EdgeMetadataSourceOpinion::MissingOrTombstoned);
+                            }
+                            EdgeMetadataVisibilityState::Missing => {}
+                        }
+                    }
+                };
+
+            resolve_memtable(self.active, EdgeMetadataSourceLayer::Active, &mut remaining);
+            for (index, epoch) in self.immutable.iter().enumerate() {
+                resolve_memtable(
+                    &epoch.memtable,
+                    EdgeMetadataSourceLayer::Immutable(index),
+                    &mut remaining,
+                );
+            }
+        }
+        if !remaining.is_empty() {
+            remaining.sort_unstable_by_key(|&(_, id)| id);
+            let mut segment_metadata = vec![None; ids.len()];
+            let mut live_lookups = Vec::with_capacity(remaining.len());
+            for (segment_index, segment) in self.segments.iter().enumerate() {
+                if remaining.is_empty() {
+                    break;
+                }
+                let prior = std::mem::take(&mut remaining);
+                live_lookups.clear();
+                for &(index, id) in &prior {
+                    if segment.is_edge_deleted(id) {
+                        results[index] = Some(EdgeMetadataSourceOpinion::MissingOrTombstoned);
+                    } else {
+                        segment_metadata[index] = None;
+                        live_lookups.push((index, id));
+                    }
+                }
+                segment.get_edge_metadata_batch(&live_lookups, &mut segment_metadata)?;
+                for &(index, id) in &live_lookups {
+                    if let Some(meta) = segment_metadata[index] {
+                        results[index] = Some(EdgeMetadataSourceOpinion::Live {
+                            layer: EdgeMetadataSourceLayer::Segment(segment_index),
+                            meta,
+                        });
+                    } else {
+                        remaining.push((index, id));
+                    }
+                }
+            }
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|opinion| opinion.unwrap_or(EdgeMetadataSourceOpinion::MissingOrTombstoned))
+            .collect())
     }
 
     pub(crate) fn find_node_visibility_meta(
@@ -2499,6 +2598,55 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(new.id, 2);
+    }
+
+    #[test]
+    fn test_find_edge_metadata_batch_preserves_precedence_tombstones_and_layers() {
+        let frozen = {
+            let mt = Memtable::new();
+            mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 10, 20, 1)), 1);
+            mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 20, 30, 2)), 1);
+            mt.apply_op(&WalOp::UpsertEdge(make_edge(3, 30, 40, 3)), 1);
+            mt
+        };
+        let active = Memtable::new();
+        active.apply_op(&WalOp::UpsertEdge(make_edge(1, 40, 50, 7)), 2);
+        active.apply_op(
+            &WalOp::DeleteEdge {
+                id: 2,
+                deleted_at: 2,
+            },
+            2,
+        );
+        let immutable = vec![wrap_imm(frozen)];
+        let sources = sources_for(&active, &immutable, 2);
+        let ids = [1, 2, 3, 99, 1];
+
+        let opinions = sources.find_edge_metadata_with_source(&ids).unwrap();
+        assert!(matches!(
+            opinions[0],
+            EdgeMetadataSourceOpinion::Live {
+                layer: EdgeMetadataSourceLayer::Active,
+                meta: EdgeMetadataCandidate { label_id: 7, .. },
+            }
+        ));
+        assert_eq!(opinions[1], EdgeMetadataSourceOpinion::MissingOrTombstoned);
+        assert!(matches!(
+            opinions[2],
+            EdgeMetadataSourceOpinion::Live {
+                layer: EdgeMetadataSourceLayer::Immutable(0),
+                meta: EdgeMetadataCandidate { label_id: 3, .. },
+            }
+        ));
+        assert_eq!(opinions[3], EdgeMetadataSourceOpinion::MissingOrTombstoned);
+        assert_eq!(opinions[4], opinions[0]);
+
+        let metadata = sources.find_edge_metadata(&ids).unwrap();
+        assert_eq!(metadata[0].map(|meta| meta.label_id), Some(7));
+        assert!(metadata[1].is_none());
+        assert_eq!(metadata[2].map(|meta| meta.label_id), Some(3));
+        assert!(metadata[3].is_none());
+        assert_eq!(metadata[4], metadata[0]);
     }
 
     #[test]

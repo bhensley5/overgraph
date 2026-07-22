@@ -1,4 +1,5 @@
 const QUERY_VERIFY_CHUNK: usize = 256;
+const PREPARED_EDGE_ENDPOINT_VISIBILITY_CAP: usize = 65_536;
 const PROPERTY_IN_LINEAR_VERIFY_THRESHOLD: usize = 16;
 const EDGE_INTERSECTION_TINY_SET: usize = 64;
 
@@ -64,6 +65,171 @@ struct VerifiedEdgeMetadataPage {
     next_cursor: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // CP44.2 substrate is activated by the later EdgePull checkpoint.
+enum PreparedEdgeSourceMode {
+    Empty,
+    NativeCursor,
+    RetainedIds,
+    StreamedSingle,
+    StreamedUnion,
+    StreamedIntersect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum PreparedEdgeFallback {
+    None,
+    PreparedLegalUniverse,
+}
+
+#[allow(dead_code)]
+enum PreparedEdgeCandidateCursor {
+    Empty,
+    Union(EdgeStreamSet),
+    Intersect(LeapfrogIntersection<EdgeCandidateCursor>),
+}
+
+#[allow(dead_code)]
+impl PreparedEdgeCandidateCursor {
+    fn next_ge(&mut self, bound: u64) -> Result<Option<u64>, EngineError> {
+        match self {
+            Self::Empty => Ok(None),
+            Self::Union(stream) => stream.next_ge(bound),
+            Self::Intersect(stream) => stream.next_ge(bound),
+        }
+    }
+
+    fn append_chunk(
+        &mut self,
+        bound: u64,
+        upper_exclusive: Option<u64>,
+        max: usize,
+        out: &mut Vec<u64>,
+    ) -> Result<(), EngineError> {
+        match self {
+            Self::Empty => Ok(()),
+            Self::Union(stream) => stream.append_chunk(bound, upper_exclusive, max, out),
+            Self::Intersect(stream) => {
+                stream.append_chunk(bound, upper_exclusive, max, out)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct PreparedEdgeMetadataPull {
+    metadata: Vec<EdgeMetadataForQuery>,
+    has_more: bool,
+    followups: Vec<SecondaryIndexReadFollowup>,
+}
+
+#[allow(dead_code)]
+struct PreparedEdgeMetadataPullSource<'view, 'policy> {
+    read_view: &'view ReadView,
+    policy_cutoffs: Option<&'policy PrecomputedPruneCutoffs>,
+    planning_limit: usize,
+    execution_query: NormalizedEdgeQuery,
+    candidates: PreparedEdgeCandidateCursor,
+    next_bound: u64,
+    end_bound: u64,
+    verified_lookahead: VecDeque<EdgeMetadataForQuery>,
+    candidates_exhausted: bool,
+    retained_id_units: usize,
+    prepared_mode: PreparedEdgeSourceMode,
+    fallback: PreparedEdgeFallback,
+    candidate_batch: Vec<u64>,
+    verified_batch: Vec<EdgeMetadataForQuery>,
+    endpoint_visibility_cache: EdgeEndpointVisibilityCache,
+    _retained_id_budget: PreparedEdgeIdBudget,
+}
+
+#[allow(dead_code)]
+impl PreparedEdgeMetadataPullSource<'_, '_> {
+    fn planning_limit(&self) -> usize {
+        self.planning_limit
+    }
+
+    fn retained_id_units(&self) -> usize {
+        self.retained_id_units
+    }
+
+    fn prepared_mode(&self) -> PreparedEdgeSourceMode {
+        self.prepared_mode
+    }
+
+    fn fallback(&self) -> PreparedEdgeFallback {
+        self.fallback
+    }
+
+    fn pull(
+        &mut self,
+        limit: usize,
+    ) -> Result<PreparedEdgeMetadataPull, EngineError> {
+        if limit == 0 || limit > self.planning_limit {
+            return Err(EngineError::InvalidOperation(format!(
+                "prepared edge metadata pull limit must be in 1..={}, got {limit}",
+                self.planning_limit
+            )));
+        }
+
+        let proof_target = limit.saturating_add(1);
+        while self.verified_lookahead.len() < proof_target && !self.candidates_exhausted {
+            self.candidate_batch.clear();
+            self.candidates.append_chunk(
+                self.next_bound,
+                self.end_bound.checked_add(1),
+                QUERY_VERIFY_CHUNK,
+                &mut self.candidate_batch,
+            )?;
+            if let Some(&last) = self.candidate_batch.last() {
+                if last == u64::MAX {
+                    self.candidates_exhausted = true;
+                } else {
+                    self.next_bound = last + 1;
+                }
+            }
+            if self.candidate_batch.len() < QUERY_VERIFY_CHUNK {
+                self.candidates_exhausted = true;
+            }
+            if self.candidate_batch.is_empty() {
+                continue;
+            }
+
+            self.verified_batch.clear();
+            self.endpoint_visibility_cache.begin_batch();
+            let _ = self.read_view.verify_edge_candidate_chunk(
+                &self.candidate_batch,
+                &self.execution_query,
+                self.policy_cutoffs,
+                &mut self.endpoint_visibility_cache,
+                &mut self.verified_batch,
+                usize::MAX,
+            )?;
+            #[cfg(test)]
+            note_prepared_edge_endpoint_cache_units_peak(
+                self.endpoint_visibility_cache.retained_units(),
+                self.endpoint_visibility_cache.transient_units(),
+            );
+            self.verified_lookahead
+                .extend(self.verified_batch.drain(..));
+        }
+
+        let output_len = limit.min(self.verified_lookahead.len());
+        let mut metadata = Vec::with_capacity(output_len);
+        metadata.extend(self.verified_lookahead.drain(..output_len));
+        let has_more = !self.verified_lookahead.is_empty();
+        debug_assert!(!metadata.is_empty() || !has_more);
+        debug_assert!(self.verified_lookahead.len() <= QUERY_VERIFY_CHUNK);
+        Ok(PreparedEdgeMetadataPull {
+            metadata,
+            has_more,
+            followups: Vec::new(),
+        })
+    }
+}
+
 enum VerifiedEdgeMetadataMaterializationResult {
     Ready {
         metadata: Vec<EdgeMetadataForQuery>,
@@ -77,6 +243,29 @@ enum VerifiedEdgeMetadataMaterializationResult {
 enum CandidateMaterializationResult {
     Ready {
         ids: Vec<u64>,
+        followups: Vec<SecondaryIndexReadFollowup>,
+    },
+    TooBroad {
+        followups: Vec<SecondaryIndexReadFollowup>,
+    },
+}
+
+#[allow(dead_code)]
+enum PreparedEagerMaterializationResult {
+    Ready {
+        ids: PreparedRetainedEdgeIds,
+        followups: Vec<SecondaryIndexReadFollowup>,
+    },
+    TooBroad {
+        followups: Vec<SecondaryIndexReadFollowup>,
+    },
+}
+
+#[allow(dead_code)]
+enum PreparedCandidateBuildResult {
+    Ready {
+        candidates: PreparedEdgeCandidateCursor,
+        mode: PreparedEdgeSourceMode,
         followups: Vec<SecondaryIndexReadFollowup>,
     },
     TooBroad {
@@ -137,9 +326,20 @@ enum LabelEdgeSource<'a> {
     },
 }
 
-#[derive(Default)]
 struct EdgeEndpointVisibilityCache {
     visible: NodeIdMap<bool>,
+    transient: NodeIdMap<bool>,
+    retained_limit: usize,
+}
+
+impl Default for EdgeEndpointVisibilityCache {
+    fn default() -> Self {
+        Self {
+            visible: NodeIdMap::default(),
+            transient: NodeIdMap::default(),
+            retained_limit: usize::MAX,
+        }
+    }
 }
 
 impl FullScanNodeSource<'_> {
@@ -288,6 +488,34 @@ impl<'a> LabelEdgeSource<'a> {
 }
 
 impl EdgeEndpointVisibilityCache {
+    fn prepared(retained_limit: usize) -> Self {
+        Self {
+            visible: NodeIdMap::with_capacity_and_hasher(
+                retained_limit,
+                Default::default(),
+            ),
+            transient: NodeIdMap::with_capacity_and_hasher(
+                QUERY_VERIFY_CHUNK.saturating_mul(2),
+                Default::default(),
+            ),
+            retained_limit,
+        }
+    }
+
+    fn begin_batch(&mut self) {
+        self.transient.clear();
+    }
+
+    #[cfg(test)]
+    fn retained_units(&self) -> usize {
+        self.visible.len()
+    }
+
+    #[cfg(test)]
+    fn transient_units(&self) -> usize {
+        self.transient.len()
+    }
+
     fn ensure_endpoint_ids(
         &mut self,
         sources: &SourceList<'_>,
@@ -295,8 +523,12 @@ impl EdgeEndpointVisibilityCache {
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
     ) -> Result<(), EngineError> {
         let mut missing = Vec::new();
+        let mut seen_missing = NodeIdSet::default();
         for &endpoint_id in endpoint_ids {
-            if !self.visible.contains_key(&endpoint_id) {
+            if !self.visible.contains_key(&endpoint_id)
+                && !self.transient.contains_key(&endpoint_id)
+                && seen_missing.insert(endpoint_id)
+            {
                 missing.push(endpoint_id);
             }
         }
@@ -304,8 +536,10 @@ impl EdgeEndpointVisibilityCache {
             return Ok(());
         }
 
-        missing.sort_unstable();
-        missing.dedup();
+        #[cfg(test)]
+        if self.retained_limit != usize::MAX {
+            note_prepared_edge_endpoint_visibility_resolutions(missing.len());
+        }
         let states = sources.find_node_visibility_meta(&missing)?;
         for (&endpoint_id, state) in missing.iter().zip(states.iter()) {
             let visible = match state {
@@ -314,7 +548,11 @@ impl EdgeEndpointVisibilityCache {
                 }),
                 NodeVisibilityState::Deleted | NodeVisibilityState::Missing => false,
             };
-            self.visible.insert(endpoint_id, visible);
+            if self.visible.len() < self.retained_limit {
+                self.visible.insert(endpoint_id, visible);
+            } else {
+                self.transient.insert(endpoint_id, visible);
+            }
         }
         Ok(())
     }
@@ -334,8 +572,17 @@ impl EdgeEndpointVisibilityCache {
     }
 
     fn edge_endpoints_visible(&self, meta: EdgeMetadataCandidate) -> bool {
-        self.visible.get(&meta.from).copied().unwrap_or(false)
-            && self.visible.get(&meta.to).copied().unwrap_or(false)
+        self.visible
+            .get(&meta.from)
+            .or_else(|| self.transient.get(&meta.from))
+            .copied()
+            .unwrap_or(false)
+            && self
+                .visible
+                .get(&meta.to)
+                .or_else(|| self.transient.get(&meta.to))
+                .copied()
+                .unwrap_or(false)
     }
 }
 
@@ -1407,6 +1654,19 @@ enum GraphRowPlanBarrierKind {
     VariableLength,
 }
 
+struct GraphRowAnchoredEdgeSourceOverride<'a> {
+    edge_index: usize,
+    read: GraphRowAnchoredEdgeSourceRead<'a>,
+    consumed: std::cell::Cell<bool>,
+}
+
+#[derive(Clone, Copy)]
+enum GraphRowAnchoredEdgeSourceRead<'a> {
+    DelegatedMetadata(&'a [EdgeMetadataForQuery]),
+    OrientedMetadata(&'a [GraphRowOrientedEdge]),
+    RawIds(&'a [u64]),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GraphRowEdgeCandidateSourceChoice {
     ExplicitIds,
@@ -1414,6 +1674,9 @@ enum GraphRowEdgeCandidateSourceChoice {
     EdgeCandidateSource,
     DelegatedEdgeQuery,
     MixedEndpointAndEdgeSource,
+    #[allow(dead_code)] // The CP44.4 driver supplies the locked explain detail.
+    EdgePullChunk,
+    AdjacencyPullChunk,
     EmptyResult,
     SkippedEmptyFrontier,
 }
@@ -1458,6 +1721,19 @@ struct GraphRowFixedEdgeCandidates {
     endpoints_verified: bool,
 }
 
+#[derive(Clone, Copy)]
+struct GraphRowVerifiedNodeIds<'a> {
+    all_candidate_endpoints_proven: bool,
+    ids: &'a NodeIdSet,
+}
+
+impl GraphRowVerifiedNodeIds<'_> {
+    fn contains(&self, node_id: &u64) -> bool {
+        self.all_candidate_endpoints_proven || self.ids.contains(node_id)
+    }
+}
+
+#[derive(Default)]
 struct GraphRowEdgeCandidateBuckets {
     by_pair: HashMap<(u64, u64), Vec<usize>>,
     by_from: NodeIdMap<Vec<usize>>,
@@ -1991,6 +2267,8 @@ fn graph_row_source_choice_label(choice: GraphRowEdgeCandidateSourceChoice) -> &
         GraphRowEdgeCandidateSourceChoice::MixedEndpointAndEdgeSource => {
             "MixedEndpointAndEdgeSource"
         }
+        GraphRowEdgeCandidateSourceChoice::EdgePullChunk => "EdgePullChunk",
+        GraphRowEdgeCandidateSourceChoice::AdjacencyPullChunk => "AdjacencyPullChunk",
         GraphRowEdgeCandidateSourceChoice::EmptyResult => "EmptyResult",
         GraphRowEdgeCandidateSourceChoice::SkippedEmptyFrontier => "SkippedEmptyFrontier",
     }
@@ -2045,39 +2323,45 @@ fn graph_row_delegated_filter_with_valid_at(
     normalize_normalized_edge_and_filter(flattened)
 }
 
-fn graph_row_edge_orientations(
-    direction: Direction,
-    meta: EdgeMetadataForQuery,
-) -> Vec<(u64, u64)> {
-    match direction {
-        Direction::Outgoing => vec![(meta.from, meta.to)],
-        Direction::Incoming => vec![(meta.to, meta.from)],
-        Direction::Both if meta.from == meta.to => vec![(meta.from, meta.to)],
-        Direction::Both => vec![(meta.from, meta.to), (meta.to, meta.from)],
-    }
-}
-
 impl GraphRowEdgeCandidateBuckets {
     fn new(candidates: &[GraphRowOrientedEdge]) -> Self {
-        let mut by_pair: HashMap<(u64, u64), Vec<usize>> = HashMap::new();
-        let mut by_from: NodeIdMap<Vec<usize>> = NodeIdMap::default();
-        let mut by_to: NodeIdMap<Vec<usize>> = NodeIdMap::default();
+        let mut buckets = Self::default();
+        buckets.rebuild(candidates);
+        buckets
+    }
+
+    fn rebuild(&mut self, candidates: &[GraphRowOrientedEdge]) {
+        self.by_pair.clear();
+        self.by_from.clear();
+        self.by_to.clear();
         for (index, candidate) in candidates.iter().enumerate() {
-            by_pair
+            self.by_pair
                 .entry((candidate.logical_from, candidate.logical_to))
                 .or_default()
                 .push(index);
-            by_from
+            self.by_from
                 .entry(candidate.logical_from)
                 .or_default()
                 .push(index);
-            by_to.entry(candidate.logical_to).or_default().push(index);
+            self.by_to
+                .entry(candidate.logical_to)
+                .or_default()
+                .push(index);
         }
-        Self {
-            by_pair,
-            by_from,
-            by_to,
-        }
+    }
+
+    fn clear(&mut self) {
+        self.by_pair.clear();
+        self.by_from.clear();
+        self.by_to.clear();
+    }
+
+    #[cfg(test)]
+    fn retained_capacity(&self) -> usize {
+        self.by_pair
+            .capacity()
+            .saturating_add(self.by_from.capacity())
+            .saturating_add(self.by_to.capacity())
     }
 
     fn indices_for(&self, from: Option<u64>, to: Option<u64>) -> Option<&[usize]> {
@@ -5405,6 +5689,356 @@ impl ReadView {
         }
     }
 
+    #[allow(dead_code)]
+    fn adopt_prepared_limited_ids(
+        &self,
+        ids: Vec<u64>,
+        allowed: usize,
+        budget: &PreparedEdgeIdBudget,
+    ) -> Result<PreparedRetainedEdgeIds, ()> {
+        let retained = PreparedRetainedEdgeIds::from_limited_read(ids, budget).map_err(|_| ())?;
+        if retained.ids.len() > allowed {
+            drop(retained);
+            return Err(());
+        }
+        Ok(retained)
+    }
+
+    #[allow(dead_code)]
+    fn collect_prepared_stream_ids(
+        &self,
+        mut stream: impl CandidateCursorSeek,
+        allowed: usize,
+        budget: &PreparedEdgeIdBudget,
+    ) -> Result<Option<PreparedRetainedEdgeIds>, EngineError> {
+        let mut retained = PreparedRetainedEdgeIds::from_exact(
+            Vec::with_capacity(allowed.saturating_add(1).min(QUERY_VERIFY_CHUNK)),
+            budget,
+        )
+        .expect("empty retained-ID reservation is infallible");
+        let mut bound = 0u64;
+        loop {
+            let Some(candidate) = stream.next_ge(bound)? else {
+                return Ok(Some(retained));
+            };
+            if retained.ids.len() == allowed {
+                if retained
+                    .try_push_overflow_sentinel(candidate, budget)
+                    .is_err()
+                {
+                    return Ok(None);
+                }
+                drop(retained);
+                return Ok(None);
+            }
+            if retained.try_push(candidate, budget).is_err() {
+                return Ok(None);
+            }
+            if candidate == u64::MAX {
+                return Ok(Some(retained));
+            }
+            bound = candidate + 1;
+        }
+    }
+
+    #[allow(dead_code)]
+    fn prepare_eager_edge_candidate_source(
+        &self,
+        query: &NormalizedEdgeQuery,
+        cap_context: EdgeQueryCapContext,
+        source: &PlannedEdgeCandidateSource,
+        budget: &PreparedEdgeIdBudget,
+    ) -> Result<PreparedEagerMaterializationResult, EngineError> {
+        if matches!(
+            source.materialization,
+            EdgeCandidateMaterialization::Precomputed(_)
+                | EdgeCandidateMaterialization::EdgeTripleIndex { .. }
+                | EdgeCandidateMaterialization::FromEndpointAdjacency { .. }
+                | EdgeCandidateMaterialization::ToEndpointAdjacency { .. }
+                | EdgeCandidateMaterialization::AnyEndpointAdjacency { .. }
+        ) {
+            return Err(EngineError::InvalidOperation(
+                "prepared graph-row edge source received unreachable anchored input source".into(),
+            ));
+        }
+        if matches!(
+            source.materialization,
+            EdgeCandidateMaterialization::FallbackFullEdgeScan
+        ) {
+            return Ok(PreparedEagerMaterializationResult::TooBroad {
+                followups: Vec::new(),
+            });
+        }
+
+        let source_cap = cap_context.source_cap(source.kind, query.page.limit, source.estimate);
+        if !edge_materialization_uses_limited_probe(&source.materialization)
+            && source
+                .estimate
+                .known_upper_bound()
+                .is_some_and(|count| count > source_cap as u64)
+        {
+            return Ok(PreparedEagerMaterializationResult::TooBroad {
+                followups: Vec::new(),
+            });
+        }
+        let allowed = source_cap.min(budget.remaining());
+        let read_limit = allowed.saturating_add(1);
+        #[cfg(test)]
+        note_prepared_edge_eager_materialization();
+        let mut followups = Vec::new();
+
+        let ids = match &source.materialization {
+            EdgeCandidateMaterialization::EdgeLabelIndex { label_id } => {
+                let stream = self.build_prepared_label_edge_cursor(*label_id)?;
+                let Some(ids) = self.collect_prepared_stream_ids(stream, allowed, budget)? else {
+                    return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+                };
+                return Ok(PreparedEagerMaterializationResult::Ready { ids, followups });
+            }
+            EdgeCandidateMaterialization::EdgeWeightIndex { label_id, bounds } => self
+                .sources()
+                .edge_ids_by_weight_range_limited(*label_id, *bounds, read_limit)?,
+            EdgeCandidateMaterialization::EdgeUpdatedAtIndex { label_id, bounds } => self
+                .sources()
+                .edge_ids_by_updated_at_range_limited(*label_id, *bounds, read_limit)?,
+            EdgeCandidateMaterialization::EdgeValidFromIndex { label_id, bounds } => self
+                .sources()
+                .edge_ids_by_valid_from_range_limited(*label_id, *bounds, read_limit)?,
+            EdgeCandidateMaterialization::EdgeValidToIndex { label_id, bounds } => self
+                .sources()
+                .edge_ids_by_valid_to_range_limited(*label_id, *bounds, read_limit)?,
+            EdgeCandidateMaterialization::EdgePropertyEqualityIndex {
+                index_id,
+                value_hashes,
+                ..
+            } => {
+                let (ids, followup) = self.ready_edge_equality_candidate_ids_raw_limited(
+                    *index_id,
+                    value_hashes,
+                    read_limit,
+                )?;
+                followups.extend(materialization_followups(followup));
+                let Some(ids) = ids else {
+                    return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+                };
+                ids
+            }
+            EdgeCandidateMaterialization::EdgePropertyRangeIndex {
+                index_id,
+                lower,
+                upper,
+                ..
+            } => {
+                let (ids, followup) = self.ready_edge_range_candidate_ids(
+                    *index_id,
+                    lower.as_ref(),
+                    upper.as_ref(),
+                    read_limit,
+                )?;
+                followups.extend(materialization_followups(followup));
+                let Some(ids) = ids else {
+                    return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+                };
+                ids
+            }
+            EdgeCandidateMaterialization::CompoundPrefixIndex { entry, bounds, .. } => {
+                let mut retained = PreparedRetainedEdgeIds::from_exact(Vec::new(), budget)
+                    .map_err(|_| EngineError::InvalidOperation("prepared edge retained-ID budget accounting failed".into()))?;
+                for bound in bounds {
+                    let allowed = source_cap.min(budget.remaining());
+                    let result = self.sources().edge_ids_by_compound_prefix_limited(
+                        entry,
+                        bound,
+                        allowed.saturating_add(1),
+                    );
+                    let ids = match result {
+                        Ok(crate::source_list::LimitedCompoundIndexRead::Ready(ids)) => ids,
+                        Ok(crate::source_list::LimitedCompoundIndexRead::TooBroad) => {
+                            return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+                        }
+                        Ok(crate::source_list::LimitedCompoundIndexRead::MissingSidecar) => {
+                            followups.extend(materialization_followups(
+                                self.compound_sidecar_failure_followup(entry, None),
+                            ));
+                            return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+                        }
+                        Err(error) => {
+                            followups.extend(materialization_followups(
+                                self.compound_sidecar_failure_followup(entry, Some(error)),
+                            ));
+                            return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+                        }
+                    };
+                    let Ok(mut next) = self.adopt_prepared_limited_ids(ids, allowed, budget) else {
+                        return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+                    };
+                    retained.append(&mut next);
+                }
+                retained.normalize();
+                if retained.ids.len() > source_cap {
+                    return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+                }
+                return Ok(PreparedEagerMaterializationResult::Ready {
+                    ids: retained,
+                    followups,
+                });
+            }
+            EdgeCandidateMaterialization::CompoundRangeIndex { entry, bounds, .. } => {
+                let mut retained = PreparedRetainedEdgeIds::from_exact(Vec::new(), budget)
+                    .map_err(|_| EngineError::InvalidOperation("prepared edge retained-ID budget accounting failed".into()))?;
+                for bound in bounds {
+                    let allowed = source_cap.min(budget.remaining());
+                    let result = self.sources().edge_ids_by_compound_range_limited(
+                        entry,
+                        bound,
+                        allowed.saturating_add(1),
+                    );
+                    let ids = match result {
+                        Ok(crate::source_list::LimitedCompoundIndexRead::Ready(ids)) => ids,
+                        Ok(crate::source_list::LimitedCompoundIndexRead::TooBroad) => {
+                            return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+                        }
+                        Ok(crate::source_list::LimitedCompoundIndexRead::MissingSidecar) => {
+                            followups.extend(materialization_followups(
+                                self.compound_sidecar_failure_followup(entry, None),
+                            ));
+                            return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+                        }
+                        Err(error) => {
+                            followups.extend(materialization_followups(
+                                self.compound_sidecar_failure_followup(entry, Some(error)),
+                            ));
+                            return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+                        }
+                    };
+                    let Ok(mut next) = self.adopt_prepared_limited_ids(ids, allowed, budget) else {
+                        return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+                    };
+                    retained.append(&mut next);
+                }
+                retained.normalize();
+                if retained.ids.len() > source_cap {
+                    return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+                }
+                return Ok(PreparedEagerMaterializationResult::Ready {
+                    ids: retained,
+                    followups,
+                });
+            }
+            EdgeCandidateMaterialization::Precomputed(_)
+            | EdgeCandidateMaterialization::EdgeTripleIndex { .. }
+            | EdgeCandidateMaterialization::FromEndpointAdjacency { .. }
+            | EdgeCandidateMaterialization::ToEndpointAdjacency { .. }
+            | EdgeCandidateMaterialization::AnyEndpointAdjacency { .. }
+            | EdgeCandidateMaterialization::FallbackFullEdgeScan => unreachable!("handled above"),
+        };
+        let Ok(mut ids) = self.adopt_prepared_limited_ids(ids, allowed, budget) else {
+            return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+        };
+        ids.normalize();
+        Ok(PreparedEagerMaterializationResult::Ready { ids, followups })
+    }
+
+    #[allow(dead_code)]
+    fn prepare_eager_edge_physical_plan(
+        &self,
+        query: &NormalizedEdgeQuery,
+        cap_context: EdgeQueryCapContext,
+        plan: &EdgePhysicalPlan,
+        budget: &PreparedEdgeIdBudget,
+    ) -> Result<PreparedEagerMaterializationResult, EngineError> {
+        match plan {
+            EdgePhysicalPlan::Empty => Ok(PreparedEagerMaterializationResult::Ready {
+                ids: PreparedRetainedEdgeIds::from_exact(Vec::new(), budget)
+                    .map_err(|_| EngineError::InvalidOperation("prepared edge retained-ID budget accounting failed".into()))?,
+                followups: Vec::new(),
+            }),
+            EdgePhysicalPlan::Source(source) => {
+                self.prepare_eager_edge_candidate_source(query, cap_context, source, budget)
+            }
+            EdgePhysicalPlan::BufferedIdSort(input) => {
+                self.prepare_eager_edge_physical_plan(query, cap_context, input, budget)
+            }
+            EdgePhysicalPlan::Intersect { inputs, .. } => {
+                let mut retained: Option<PreparedRetainedEdgeIds> = None;
+                let mut followups = Vec::new();
+                for input in inputs {
+                    if retained.as_ref().is_some_and(|ids| ids.ids.len() <= EDGE_INTERSECTION_TINY_SET)
+                        && edge_plan_is_filter_source(input)
+                    {
+                        continue;
+                    }
+                    match self.prepare_eager_edge_physical_plan(query, cap_context, input, budget)? {
+                        PreparedEagerMaterializationResult::Ready {
+                            mut ids,
+                            followups: mut input_followups,
+                        } => {
+                            followups.append(&mut input_followups);
+                            ids.normalize();
+                            if ids.ids.is_empty() {
+                                return Ok(PreparedEagerMaterializationResult::Ready { ids, followups });
+                            }
+                            if let Some(mut accumulator) = retained.take() {
+                                accumulator.retain(|id| ids.ids.binary_search(&id).is_ok());
+                                retained = Some(accumulator);
+                            } else {
+                                retained = Some(ids);
+                            }
+                        }
+                        PreparedEagerMaterializationResult::TooBroad {
+                            followups: mut input_followups,
+                        } => followups.append(&mut input_followups),
+                    }
+                }
+                match retained {
+                    Some(ids) => Ok(PreparedEagerMaterializationResult::Ready { ids, followups }),
+                    None => Ok(PreparedEagerMaterializationResult::TooBroad { followups }),
+                }
+            }
+            EdgePhysicalPlan::Union { inputs, .. } => {
+                let cap = cap_context.union_total_cap(
+                    plan.members_are_eager_index_sources(),
+                    query.page.limit,
+                    plan.estimate(),
+                );
+                let mut retained = PreparedRetainedEdgeIds::from_exact(Vec::new(), budget)
+                    .map_err(|_| EngineError::InvalidOperation("prepared edge retained-ID budget accounting failed".into()))?;
+                let mut followups = Vec::new();
+                let mut total_len = 0usize;
+                for input in inputs {
+                    match self.prepare_eager_edge_physical_plan(query, cap_context, input, budget)? {
+                        PreparedEagerMaterializationResult::Ready {
+                            mut ids,
+                            followups: mut input_followups,
+                        } => {
+                            total_len = total_len.saturating_add(ids.ids.len());
+                            followups.append(&mut input_followups);
+                            if total_len > cap {
+                                return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+                            }
+                            retained.append(&mut ids);
+                        }
+                        PreparedEagerMaterializationResult::TooBroad {
+                            followups: mut input_followups,
+                        } => {
+                            followups.append(&mut input_followups);
+                            return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
+                        }
+                    }
+                }
+                retained.normalize();
+                if retained.ids.len() > cap {
+                    Ok(PreparedEagerMaterializationResult::TooBroad { followups })
+                } else {
+                    Ok(PreparedEagerMaterializationResult::Ready {
+                        ids: retained,
+                        followups,
+                    })
+                }
+            }
+        }
+    }
+
     fn materialize_edge_candidate_source(
         &self,
         query: &NormalizedEdgeQuery,
@@ -5990,9 +6624,29 @@ impl ReadView {
         self.note_edge_verifier_metadata_lookup(chunk.len());
         let metadata = self.sources().find_edge_metadata(chunk)?;
         let metas = metadata.iter().filter_map(|meta| *meta).collect::<Vec<_>>();
+        self.verify_resolved_edge_metadata_chunk(
+            &metas,
+            query,
+            policy_cutoffs,
+            endpoint_cache,
+            verified,
+            target,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_resolved_edge_metadata_chunk(
+        &self,
+        metas: &[EdgeMetadataCandidate],
+        query: &NormalizedEdgeQuery,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        endpoint_cache: &mut EdgeEndpointVisibilityCache,
+        verified: &mut Vec<EdgeMetadataForQuery>,
+        target: usize,
+    ) -> Result<ControlFlow<()>, EngineError> {
         {
             let sources = self.sources();
-            endpoint_cache.ensure_edge_endpoints(&sources, &metas, policy_cutoffs)?;
+            endpoint_cache.ensure_edge_endpoints(&sources, metas, policy_cutoffs)?;
         }
 
         let mut decisions = Vec::new();
@@ -6001,7 +6655,7 @@ impl ReadView {
         collect_edge_filter_property_keys(&query.filter, &mut property_keys);
         let include_created_at = edge_filter_needs_created_at(&query.filter);
 
-        for meta in metas {
+        for &meta in metas {
             if !endpoint_cache.edge_endpoints_visible(meta) {
                 continue;
             }
@@ -6199,6 +6853,280 @@ impl ReadView {
         })?;
 
         Ok(finalize_verified_edge_metadata_page(verified, limit))
+    }
+
+    #[allow(dead_code)]
+    fn build_prepared_edge_candidates(
+        &self,
+        planning_query: &NormalizedEdgeQuery,
+        execution_mode: EdgeDriverExecutionMode,
+        cap_context: EdgeQueryCapContext,
+        driver: &EdgePhysicalPlan,
+        budget: &PreparedEdgeIdBudget,
+    ) -> Result<PreparedCandidateBuildResult, EngineError> {
+        if matches!(driver, EdgePhysicalPlan::Empty) {
+            return Ok(PreparedCandidateBuildResult::Ready {
+                candidates: PreparedEdgeCandidateCursor::Empty,
+                mode: PreparedEdgeSourceMode::Empty,
+                followups: Vec::new(),
+            });
+        }
+
+        if execution_mode == EdgeDriverExecutionMode::Eager {
+            if let EdgePhysicalPlan::Source(source) = driver {
+                match &source.materialization {
+                    EdgeCandidateMaterialization::Precomputed(_)
+                    | EdgeCandidateMaterialization::EdgeTripleIndex { .. }
+                    | EdgeCandidateMaterialization::FromEndpointAdjacency { .. }
+                    | EdgeCandidateMaterialization::ToEndpointAdjacency { .. }
+                    | EdgeCandidateMaterialization::AnyEndpointAdjacency { .. } => {
+                        return Err(EngineError::InvalidOperation(
+                            "prepared graph-row edge source received unreachable anchored input source"
+                                .into(),
+                        ));
+                    }
+                    EdgeCandidateMaterialization::EdgeLabelIndex { label_id } => {
+                        return Ok(PreparedCandidateBuildResult::Ready {
+                            candidates: PreparedEdgeCandidateCursor::Union(
+                                self.build_prepared_label_edge_cursor(*label_id)?,
+                            ),
+                            mode: PreparedEdgeSourceMode::NativeCursor,
+                            followups: Vec::new(),
+                        });
+                    }
+                    EdgeCandidateMaterialization::FallbackFullEdgeScan => {
+                        return Ok(PreparedCandidateBuildResult::Ready {
+                            candidates: PreparedEdgeCandidateCursor::Union(
+                                self.build_prepared_full_scan_edge_cursor(),
+                            ),
+                            mode: PreparedEdgeSourceMode::NativeCursor,
+                            followups: Vec::new(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            return match self.prepare_eager_edge_physical_plan(
+                planning_query,
+                cap_context,
+                driver,
+                budget,
+            )? {
+                PreparedEagerMaterializationResult::Ready { ids, followups } => {
+                    Ok(PreparedCandidateBuildResult::Ready {
+                        candidates: PreparedEdgeCandidateCursor::Union(EdgeStreamSet::new(vec![
+                            EdgeCandidateCursor::prepared_sorted_buffer(ids),
+                        ])),
+                        mode: PreparedEdgeSourceMode::RetainedIds,
+                        followups,
+                    })
+                }
+                PreparedEagerMaterializationResult::TooBroad { followups } => {
+                    Ok(PreparedCandidateBuildResult::TooBroad { followups })
+                }
+            };
+        }
+
+        match self.prepare_streamed_edge_driver(planning_query, cap_context, driver, budget)? {
+            PreparedEdgeStreamBuildResult::Ready {
+                topology,
+                followups,
+            } => {
+                let (candidates, mode) = match topology {
+                    PreparedEdgeStreamTopology::Union(stream) => (
+                        PreparedEdgeCandidateCursor::Union(stream),
+                        if matches!(driver, EdgePhysicalPlan::Union { .. }) {
+                            PreparedEdgeSourceMode::StreamedUnion
+                        } else {
+                            PreparedEdgeSourceMode::StreamedSingle
+                        },
+                    ),
+                    PreparedEdgeStreamTopology::Intersect(stream) => (
+                        PreparedEdgeCandidateCursor::Intersect(stream),
+                        PreparedEdgeSourceMode::StreamedIntersect,
+                    ),
+                };
+                Ok(PreparedCandidateBuildResult::Ready {
+                    candidates,
+                    mode,
+                    followups,
+                })
+            }
+            PreparedEdgeStreamBuildResult::TooBroad { followups } => {
+                Ok(PreparedCandidateBuildResult::TooBroad { followups })
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn prepare_edge_legal_universe_candidate(
+        &self,
+        source: &PlannedEdgeCandidateSource,
+    ) -> Result<PreparedEdgeCandidateCursor, EngineError> {
+        match &source.materialization {
+            EdgeCandidateMaterialization::EdgeLabelIndex { label_id } => Ok(
+                PreparedEdgeCandidateCursor::Union(
+                    self.build_prepared_label_edge_cursor(*label_id)?,
+                ),
+            ),
+            EdgeCandidateMaterialization::FallbackFullEdgeScan => Ok(
+                PreparedEdgeCandidateCursor::Union(self.build_prepared_full_scan_edge_cursor()),
+            ),
+            EdgeCandidateMaterialization::Precomputed(_)
+            | EdgeCandidateMaterialization::EdgeTripleIndex { .. }
+            | EdgeCandidateMaterialization::FromEndpointAdjacency { .. }
+            | EdgeCandidateMaterialization::ToEndpointAdjacency { .. }
+            | EdgeCandidateMaterialization::AnyEndpointAdjacency { .. } => Err(
+                EngineError::InvalidOperation(
+                    "prepared graph-row edge source received unreachable anchored input source"
+                        .into(),
+                ),
+            ),
+            _ => Err(EngineError::InvalidOperation(
+                "prepared graph-row edge source legal-universe fallback was not cursor-native"
+                    .into(),
+            )),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn prepare_edge_metadata_pull_source<'view, 'policy>(
+        &'view self,
+        planning_query: &NormalizedEdgeQuery,
+        execution_query: &NormalizedEdgeQuery,
+        planned: PlannedEdgeQuery,
+        policy_cutoffs: Option<&'policy PrecomputedPruneCutoffs>,
+    ) -> Result<
+        (
+            PreparedEdgeMetadataPullSource<'view, 'policy>,
+            Vec<SecondaryIndexReadFollowup>,
+        ),
+        EngineError,
+    > {
+        #[cfg(test)]
+        note_prepared_edge_preparation();
+        let planning_limit = planning_query.page.limit.unwrap_or(0);
+        if planning_limit == 0 {
+            return Err(EngineError::InvalidOperation(
+                "prepared edge metadata source requires a positive planning limit".into(),
+            ));
+        }
+        let mut execution_query = execution_query.clone();
+        execution_query.page.after = None;
+        let bounds = streamed_edge_bounds(planning_query);
+        let PlannedEdgeQuery {
+            driver,
+            execution_mode,
+            cap_context,
+            legal_universe_fallback,
+            warnings: _,
+            mut followups,
+        } = planned;
+        let budget = PreparedEdgeIdBudget::default();
+
+        let (candidates, prepared_mode, fallback) = if bounds.is_none() {
+            (
+                PreparedEdgeCandidateCursor::Empty,
+                PreparedEdgeSourceMode::Empty,
+                PreparedEdgeFallback::None,
+            )
+        } else {
+            match self.build_prepared_edge_candidates(
+                planning_query,
+                execution_mode,
+                cap_context,
+                &driver,
+                &budget,
+            )? {
+                PreparedCandidateBuildResult::Ready {
+                    candidates,
+                    mode,
+                    followups: mut preparation_followups,
+                } => {
+                    followups.append(&mut preparation_followups);
+                    (candidates, mode, PreparedEdgeFallback::None)
+                }
+                PreparedCandidateBuildResult::TooBroad {
+                    followups: mut preparation_followups,
+                } => {
+                    followups.append(&mut preparation_followups);
+                    debug_assert_eq!(budget.live(), 0);
+                    #[cfg(test)]
+                    note_prepared_edge_fallback_selection();
+                    let fallback_source = if let Some(source) = legal_universe_fallback {
+                        source
+                    } else {
+                        let mut sources = self.edge_legal_universe_sources(planning_query);
+                        if sources.is_empty() {
+                            return Err(EngineError::InvalidOperation(
+                                "edge query requires label, ids, from_ids, to_ids, endpoint_ids, or allow_full_scan"
+                                    .into(),
+                            ));
+                        }
+                        sources.sort_by_cached_key(|source| {
+                            EdgePhysicalPlan::source(source.clone()).plan_cost()
+                        });
+                        sources.remove(0)
+                    };
+                    (
+                        self.prepare_edge_legal_universe_candidate(&fallback_source)?,
+                        PreparedEdgeSourceMode::NativeCursor,
+                        PreparedEdgeFallback::PreparedLegalUniverse,
+                    )
+                }
+            }
+        };
+
+        let (next_bound, end_bound) = bounds.unwrap_or((0, 0));
+        let candidates_exhausted = matches!(candidates, PreparedEdgeCandidateCursor::Empty);
+        let retained_id_units = budget.live();
+        Ok((
+            PreparedEdgeMetadataPullSource {
+                read_view: self,
+                policy_cutoffs,
+                planning_limit,
+                execution_query,
+                candidates,
+                next_bound,
+                end_bound,
+                verified_lookahead: VecDeque::new(),
+                candidates_exhausted,
+                retained_id_units,
+                prepared_mode,
+                fallback,
+                candidate_batch: Vec::with_capacity(QUERY_VERIFY_CHUNK),
+                verified_batch: Vec::with_capacity(QUERY_VERIFY_CHUNK),
+                endpoint_visibility_cache: EdgeEndpointVisibilityCache::prepared(
+                    PREPARED_EDGE_ENDPOINT_VISIBILITY_CAP,
+                ),
+                _retained_id_budget: budget,
+            },
+            followups,
+        ))
+    }
+
+    #[cfg(test)]
+    fn plan_and_prepare_edge_metadata_pull_source_for_test<'view, 'policy>(
+        &'view self,
+        planning_query: &NormalizedEdgeQuery,
+        execution_query: &NormalizedEdgeQuery,
+        policy_cutoffs: Option<&'policy PrecomputedPruneCutoffs>,
+    ) -> Result<
+        (
+            PreparedEdgeMetadataPullSource<'view, 'policy>,
+            Vec<SecondaryIndexReadFollowup>,
+        ),
+        EngineError,
+    > {
+        note_prepared_edge_branch_plan();
+        let planned = self.plan_normalized_edge_query(planning_query)?;
+        self.prepare_edge_metadata_pull_source(
+            planning_query,
+            execution_query,
+            planned,
+            policy_cutoffs,
+        )
     }
 
     fn query_edge_metadata_page_from_source_driver(
@@ -7045,11 +7973,23 @@ impl ReadView {
 
         let planning_started_at = profile_timers.planning_started();
         let runtime = self.normalize_graph_row_runtime_plan(query)?;
-        let physical_plan = self.plan_graph_row_physical(
+        let ordered_context = runtime_once_reason.map_or_else(
+            || {
+                GraphRowOrderedProductionContext::enabled(
+                    selection_capacity,
+                    graph_row_cursor_owner_inclusive(&cursor_state),
+                    query.options.max_intermediate_bindings,
+                    query.options.max_frontier,
+                )
+            },
+            |_| GraphRowOrderedProductionContext::disabled(),
+        );
+        let physical_plan = self.plan_graph_row_physical_with_ordered_context(
             query,
             &runtime,
             query.options.include_plan,
             true,
+            ordered_context,
         )?;
         profile_timers.finish_planning(planning_started_at);
         let policy_cutoffs = self.query_policy_cutoffs();
@@ -7437,6 +8377,7 @@ impl ReadView {
             query,
             runtime,
             physical_plan,
+            None,
             initial_rows,
             goal,
             effective_at_epoch,
@@ -7464,6 +8405,7 @@ impl ReadView {
         query: &NormalizedGraphRowQuery,
         runtime: &GraphRowRuntimePlan,
         physical_plan: &GraphRowPhysicalPlan,
+        anchored_edge_source_override: Option<&GraphRowAnchoredEdgeSourceOverride<'_>>,
         initial_rows: Option<Vec<crate::graph_row::GraphBindingRow>>,
         goal: GraphRowRuntimeGoal,
         effective_at_epoch: i64,
@@ -7482,6 +8424,7 @@ impl ReadView {
             query,
             runtime,
             physical_plan,
+            anchored_edge_source_override,
             initial_rows,
             goal,
             effective_at_epoch,
@@ -7512,6 +8455,7 @@ impl ReadView {
         query: &NormalizedGraphRowQuery,
         runtime: &GraphRowRuntimePlan,
         physical_plan: &GraphRowPhysicalPlan,
+        anchored_edge_source_override: Option<&GraphRowAnchoredEdgeSourceOverride<'_>>,
         initial_rows: Option<Vec<crate::graph_row::GraphBindingRow>>,
         goal: GraphRowRuntimeGoal,
         effective_at_epoch: i64,
@@ -7589,6 +8533,7 @@ impl ReadView {
                         runtime,
                         physical_plan,
                         segment_plan,
+                        anchored_edge_source_override,
                         rows.take(),
                         step_goal,
                         effective_at_epoch,
@@ -7596,6 +8541,7 @@ impl ReadView {
                         followups,
                         frontier_peak,
                         explain_trace.as_deref_mut(),
+                        caches,
                     )?
                 }
                 GraphRowRuntimeStep::FixedPath(path) => {
@@ -7731,6 +8677,7 @@ impl ReadView {
         runtime: &GraphRowRuntimePlan,
         physical_plan: &GraphRowPhysicalPlan,
         segment_plan: &GraphRowPhysicalSegment,
+        anchored_edge_source_override: Option<&GraphRowAnchoredEdgeSourceOverride<'_>>,
         current_rows: Option<Vec<crate::graph_row::GraphBindingRow>>,
         goal: GraphRowRuntimeGoal,
         effective_at_epoch: i64,
@@ -7738,6 +8685,7 @@ impl ReadView {
         followups: &mut Vec<SecondaryIndexReadFollowup>,
         frontier_peak: &mut usize,
         mut explain_trace: Option<&mut GraphRowExplainTrace>,
+        caches: &mut GraphRowExecutionCaches,
     ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
         let mut rows = match current_rows {
             Some(rows) => self.graph_row_seed_required_segment_rows(
@@ -7771,11 +8719,17 @@ impl ReadView {
             } else {
                 GraphRowRuntimeGoal::AllRows
             };
+            let edge_source_override = anchored_edge_source_override.filter(|source_override| {
+                segment_plan.segment_index == 0
+                    && position == 0
+                    && edge_index == source_override.edge_index
+            });
             rows = self.graph_row_expand_fixed_edge(
                 query,
                 runtime,
                 edge,
                 planned_source_choice,
+                edge_source_override,
                 rows,
                 edge_goal,
                 effective_at_epoch,
@@ -7783,6 +8737,7 @@ impl ReadView {
                 followups,
                 frontier_peak,
                 explain_trace.as_deref_mut(),
+                caches,
             )?;
         }
         Ok(rows)
@@ -8003,11 +8958,12 @@ impl ReadView {
         {
             ProductionRc::clone(plan)
         } else {
-            let plan = ProductionRc::new(self.plan_graph_row_physical(
+            let plan = ProductionRc::new(self.plan_graph_row_physical_with_ordered_context(
                 query,
                 &group.runtime,
                 query.options.include_plan,
                 false,
+                GraphRowOrderedProductionContext::disabled(),
             )?);
             caches
                 .optional_physical_plans
@@ -8075,6 +9031,7 @@ impl ReadView {
                 query,
                 &group.runtime,
                 group_physical_plan,
+                None,
                 Some(vec![query.binding_schema.empty_row()]),
                 GraphRowRuntimeGoal::AllRows,
                 effective_at_epoch,
@@ -8154,6 +9111,7 @@ impl ReadView {
                 query,
                 &group.runtime,
                 group_physical_plan,
+                None,
                 Some(vec![query.binding_schema.empty_row()]),
                 GraphRowRuntimeGoal::AllRows,
                 effective_at_epoch,
@@ -8329,6 +9287,7 @@ impl ReadView {
                 query,
                 &group.runtime,
                 group_physical_plan,
+                None,
                 Some(representatives),
                 GraphRowRuntimeGoal::AllRows,
                 effective_at_epoch,
@@ -8481,6 +9440,7 @@ impl ReadView {
                 query,
                 &group.runtime,
                 group_physical_plan,
+                None,
                 Some(representatives),
                 GraphRowRuntimeGoal::AllRows,
                 effective_at_epoch,
@@ -8860,15 +9820,17 @@ impl ReadView {
                 missing_rows.push(row.clone());
             }
         }
+        let mut candidate_scratch = Vec::new();
         let candidate_batch = if missing_rows.is_empty() {
             GraphRowFixedEdgeCandidates {
-                edges: Vec::new(),
+                edges: candidate_scratch,
                 endpoints_verified: false,
             }
         } else {
             self.graph_row_fixed_edge_candidates(
                 query,
                 &temp_edge,
+                None,
                 None,
                 &missing_rows,
                 effective_at_epoch,
@@ -8877,6 +9839,7 @@ impl ReadView {
                 frontier_peak,
                 edge_explain_trace,
                 Some(path),
+                &mut candidate_scratch,
             )?
         };
 
@@ -8888,27 +9851,46 @@ impl ReadView {
             from_candidates.push(candidate.logical_from);
             to_candidates.push(candidate.logical_to);
         }
-        let verified_from = if from_candidates.is_empty() {
-            NodeIdSet::default()
+        let mut verified_ids = Vec::new();
+        let mut verified_from_ids = NodeIdSet::default();
+        let verified_from_all = if from_candidates.is_empty() {
+            false
         } else {
             self.graph_row_verified_or_proven_node_ids(
                 from_node,
-                from_candidates,
+                &mut from_candidates,
                 policy_cutoffs,
                 candidate_batch.endpoints_verified,
+                &mut verified_ids,
+                &mut verified_from_ids,
             )?
         };
-        let verified_to = if to_candidates.is_empty() {
-            NodeIdSet::default()
+        let mut verified_to_ids = NodeIdSet::default();
+        let verified_to_all = if to_candidates.is_empty() {
+            false
         } else if from_node.alias == to_node.alias {
-            verified_from.clone()
+            verified_from_all
         } else {
             self.graph_row_verified_or_proven_node_ids(
                 to_node,
-                to_candidates,
+                &mut to_candidates,
                 policy_cutoffs,
                 candidate_batch.endpoints_verified,
+                &mut verified_ids,
+                &mut verified_to_ids,
             )?
+        };
+        let verified_from = GraphRowVerifiedNodeIds {
+            all_candidate_endpoints_proven: verified_from_all,
+            ids: &verified_from_ids,
+        };
+        let verified_to = GraphRowVerifiedNodeIds {
+            all_candidate_endpoints_proven: verified_to_all,
+            ids: if from_node.alias == to_node.alias {
+                &verified_from_ids
+            } else {
+                &verified_to_ids
+            },
         };
 
         let candidates = candidate_batch.edges;
@@ -9310,7 +10292,7 @@ impl ReadView {
         if paths.is_empty() {
             return Ok(paths);
         }
-        let candidate_ids = paths
+        let mut candidate_ids = paths
             .iter()
             .filter_map(|path| {
                 if use_start_node {
@@ -9320,8 +10302,15 @@ impl ReadView {
                 }
             })
             .collect::<Vec<_>>();
-        let verified =
-            self.graph_row_verified_node_ids(endpoint_node, candidate_ids, policy_cutoffs)?;
+        let mut verified_ids = Vec::new();
+        let mut verified = NodeIdSet::default();
+        self.graph_row_verified_node_ids(
+            endpoint_node,
+            &mut candidate_ids,
+            policy_cutoffs,
+            &mut verified_ids,
+            &mut verified,
+        )?;
         Ok(paths
             .into_iter()
             .filter(|path| {
@@ -9682,6 +10671,7 @@ impl ReadView {
         runtime: &GraphRowRuntimePlan,
         edge: &GraphRowRuntimeEdge,
         planned_source_choice: Option<GraphRowEdgeCandidateSourceChoice>,
+        anchored_edge_source_override: Option<&GraphRowAnchoredEdgeSourceOverride<'_>>,
         rows: Vec<crate::graph_row::GraphBindingRow>,
         goal: GraphRowRuntimeGoal,
         effective_at_epoch: i64,
@@ -9689,6 +10679,7 @@ impl ReadView {
         followups: &mut Vec<SecondaryIndexReadFollowup>,
         frontier_peak: &mut usize,
         explain_trace: Option<&mut GraphRowExplainTrace>,
+        caches: &mut GraphRowExecutionCaches,
     ) -> Result<Vec<crate::graph_row::GraphBindingRow>, EngineError> {
         if rows.is_empty() {
             if let Some(trace) = explain_trace {
@@ -9734,109 +10725,168 @@ impl ReadView {
             return Ok(rows);
         }
 
-        let candidate_batch = self.graph_row_fixed_edge_candidates(
-            query,
-            edge,
-            planned_source_choice,
-            &rows,
-            effective_at_epoch,
-            policy_cutoffs,
-            followups,
-            frontier_peak,
-            explain_trace,
-            None,
-        )?;
-        if candidate_batch.edges.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let from_node = &runtime.nodes[*runtime.node_by_alias.get(&edge.from_alias).ok_or_else(
-            || {
-                EngineError::InvalidOperation(format!(
-                    "graph row edge references missing node alias '{}'",
-                    edge.from_alias
-                ))
-            },
-        )?];
-        let to_node = &runtime.nodes[*runtime.node_by_alias.get(&edge.to_alias).ok_or_else(
-            || {
-                EngineError::InvalidOperation(format!(
-                    "graph row edge references missing node alias '{}'",
-                    edge.to_alias
-                ))
-            },
-        )?];
-
-        let mut from_candidates = Vec::new();
-        let mut to_candidates = Vec::new();
-        for candidate in &candidate_batch.edges {
-            from_candidates.push(candidate.logical_from);
-            to_candidates.push(candidate.logical_to);
-        }
-        let verified_from = self.graph_row_verified_or_proven_node_ids(
-            from_node,
-            from_candidates,
-            policy_cutoffs,
-            candidate_batch.endpoints_verified,
-        )?;
-        let verified_to = if from_node.alias == to_node.alias {
-            verified_from.clone()
-        } else {
-            self.graph_row_verified_or_proven_node_ids(
-                to_node,
-                to_candidates,
+        let mut workspace = std::mem::take(&mut caches.fixed_edge_workspace);
+        workspace.clear();
+        #[cfg(test)]
+        let workspace_capacity_before = workspace.retained_capacity();
+        let result = (|| {
+            let candidate_batch = self.graph_row_fixed_edge_candidates(
+                query,
+                edge,
+                planned_source_choice,
+                anchored_edge_source_override,
+                &rows,
+                effective_at_epoch,
                 policy_cutoffs,
-                candidate_batch.endpoints_verified,
-            )?
-        };
+                followups,
+                frontier_peak,
+                explain_trace,
+                None,
+                &mut workspace.oriented_edges,
+            )?;
+            let endpoints_verified = candidate_batch.endpoints_verified;
+            workspace.oriented_edges = candidate_batch.edges;
+            if workspace.oriented_edges.is_empty() {
+                return Ok(Vec::new());
+            }
 
-        let candidates = candidate_batch.edges;
-        let buckets = GraphRowEdgeCandidateBuckets::new(&candidates);
-        let mut next_rows = Vec::new();
-        for row in rows {
-            let bound_from = row.node_id_for_slot_if_bound(edge.from_slot)?;
-            let bound_to = row.node_id_for_slot_if_bound(edge.to_slot)?;
-            if bound_from.is_some() || bound_to.is_some() {
-                let Some(indices) = buckets.indices_for(bound_from, bound_to) else {
-                    continue;
-                };
-                for &candidate_index in indices {
-                    let candidate = &candidates[candidate_index];
-                    self.graph_row_push_edge_candidate_row(
-                        query,
-                        edge,
-                        &verified_from,
-                        &verified_to,
-                        bound_from,
-                        bound_to,
-                        &row,
-                        candidate,
-                        &mut next_rows,
-                    )?;
-                    if goal.reached(next_rows.len()) {
-                        return Ok(next_rows);
-                    }
+            let from_node = &runtime.nodes[*runtime
+                .node_by_alias
+                .get(&edge.from_alias)
+                .ok_or_else(|| {
+                    EngineError::InvalidOperation(format!(
+                        "graph row edge references missing node alias '{}'",
+                        edge.from_alias
+                    ))
+                })?];
+            let to_node = &runtime.nodes[*runtime
+                .node_by_alias
+                .get(&edge.to_alias)
+                .ok_or_else(|| {
+                    EngineError::InvalidOperation(format!(
+                        "graph row edge references missing node alias '{}'",
+                        edge.to_alias
+                    ))
+                })?];
+
+            let from_is_proven = endpoints_verified
+                && graph_row_node_query_is_visibility_only(&from_node.query);
+            let to_is_proven = endpoints_verified
+                && graph_row_node_query_is_visibility_only(&to_node.query);
+            for candidate in &workspace.oriented_edges {
+                if !from_is_proven {
+                    workspace.from_candidates.push(candidate.logical_from);
                 }
+                if !to_is_proven {
+                    workspace.to_candidates.push(candidate.logical_to);
+                }
+            }
+            let use_cross_leaf_cache = anchored_edge_source_override.is_some();
+            let from_all_proven = self.graph_row_verified_or_cached_node_ids(
+                from_node,
+                &mut workspace.from_candidates,
+                policy_cutoffs,
+                endpoints_verified,
+                caches,
+                use_cross_leaf_cache,
+                &mut workspace.verification_misses,
+                &mut workspace.verified_ids,
+                &mut workspace.from_verified,
+            )?;
+            let to_all_proven = if from_node.alias == to_node.alias {
+                from_all_proven
             } else {
-                for candidate in &candidates {
-                    self.graph_row_push_edge_candidate_row(
-                        query,
-                        edge,
-                        &verified_from,
-                        &verified_to,
-                        bound_from,
-                        bound_to,
-                        &row,
-                        candidate,
-                        &mut next_rows,
-                    )?;
-                    if goal.reached(next_rows.len()) {
-                        return Ok(next_rows);
+                self.graph_row_verified_or_cached_node_ids(
+                    to_node,
+                    &mut workspace.to_candidates,
+                    policy_cutoffs,
+                    endpoints_verified,
+                    caches,
+                    use_cross_leaf_cache,
+                    &mut workspace.verification_misses,
+                    &mut workspace.verified_ids,
+                    &mut workspace.to_verified,
+                )?
+            };
+
+            let has_bound_endpoint = rows.iter().try_fold(false, |has_bound, row| {
+                Ok::<_, EngineError>(
+                    has_bound
+                        || row.node_id_for_slot_if_bound(edge.from_slot)?.is_some()
+                        || row.node_id_for_slot_if_bound(edge.to_slot)?.is_some(),
+                )
+            })?;
+            if has_bound_endpoint {
+                workspace.buckets.rebuild(&workspace.oriented_edges);
+                #[cfg(test)]
+                self.note_graph_row_fixed_edge_bucket_build();
+            }
+            let verified_from = GraphRowVerifiedNodeIds {
+                all_candidate_endpoints_proven: from_all_proven,
+                ids: &workspace.from_verified,
+            };
+            let verified_to = GraphRowVerifiedNodeIds {
+                all_candidate_endpoints_proven: to_all_proven,
+                ids: if from_node.alias == to_node.alias {
+                    &workspace.from_verified
+                } else {
+                    &workspace.to_verified
+                },
+            };
+            let mut next_rows = Vec::new();
+            for row in rows {
+                let bound_from = row.node_id_for_slot_if_bound(edge.from_slot)?;
+                let bound_to = row.node_id_for_slot_if_bound(edge.to_slot)?;
+                if bound_from.is_some() || bound_to.is_some() {
+                    let Some(indices) = workspace.buckets.indices_for(bound_from, bound_to)
+                    else {
+                        continue;
+                    };
+                    for &candidate_index in indices {
+                        let candidate = &workspace.oriented_edges[candidate_index];
+                        self.graph_row_push_edge_candidate_row(
+                            query,
+                            edge,
+                            &verified_from,
+                            &verified_to,
+                            bound_from,
+                            bound_to,
+                            &row,
+                            candidate,
+                            &mut next_rows,
+                        )?;
+                        if goal.reached(next_rows.len()) {
+                            return Ok(next_rows);
+                        }
+                    }
+                } else {
+                    for candidate in &workspace.oriented_edges {
+                        self.graph_row_push_edge_candidate_row(
+                            query,
+                            edge,
+                            &verified_from,
+                            &verified_to,
+                            bound_from,
+                            bound_to,
+                            &row,
+                            candidate,
+                            &mut next_rows,
+                        )?;
+                        if goal.reached(next_rows.len()) {
+                            return Ok(next_rows);
+                        }
                     }
                 }
             }
+            Ok(next_rows)
+        })();
+        #[cfg(test)]
+        if workspace.retained_capacity() > workspace_capacity_before {
+            self.note_graph_row_fixed_edge_workspace_growth();
         }
-        Ok(next_rows)
+        workspace.clear();
+        caches.fixed_edge_workspace = workspace;
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9844,8 +10894,8 @@ impl ReadView {
         &self,
         query: &NormalizedGraphRowQuery,
         edge: &GraphRowRuntimeEdge,
-        verified_from: &NodeIdSet,
-        verified_to: &NodeIdSet,
+        verified_from: &GraphRowVerifiedNodeIds,
+        verified_to: &GraphRowVerifiedNodeIds,
         bound_from: Option<u64>,
         bound_to: Option<u64>,
         row: &crate::graph_row::GraphBindingRow,
@@ -9911,6 +10961,7 @@ impl ReadView {
         query: &NormalizedGraphRowQuery,
         edge: &GraphRowRuntimeEdge,
         planned_source_choice: Option<GraphRowEdgeCandidateSourceChoice>,
+        anchored_edge_source_override: Option<&GraphRowAnchoredEdgeSourceOverride<'_>>,
         rows: &[crate::graph_row::GraphBindingRow],
         effective_at_epoch: i64,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
@@ -9918,7 +10969,86 @@ impl ReadView {
         frontier_peak: &mut usize,
         mut explain_trace: Option<&mut GraphRowExplainTrace>,
         vlp_cap_context: Option<&GraphRowRuntimeVariableLength>,
+        oriented_scratch: &mut Vec<GraphRowOrientedEdge>,
     ) -> Result<GraphRowFixedEdgeCandidates, EngineError> {
+        if let Some(source_override) = anchored_edge_source_override {
+            debug_assert!(
+                !source_override.consumed.replace(true),
+                "anchored edge source override must be consumed exactly once"
+            );
+            debug_assert_eq!(
+                rows.len(),
+                1,
+                "anchored edge source override requires exactly one input row"
+            );
+            debug_assert!(
+                vlp_cap_context.is_none(),
+                "anchored edge source override must not enter VLP execution"
+            );
+            let row = rows
+                .first()
+                .expect("anchored edge source override requires one input row");
+            debug_assert_eq!(row.node_id_for_slot_if_bound(edge.from_slot)?, None);
+            debug_assert_eq!(row.node_id_for_slot_if_bound(edge.to_slot)?, None);
+
+            return match source_override.read {
+                GraphRowAnchoredEdgeSourceRead::DelegatedMetadata(metadata) => {
+                    graph_row_record_frontier_cap_peak(
+                        frontier_peak,
+                        metadata.len(),
+                        query.options.max_frontier,
+                        vlp_cap_context,
+                    )?;
+                    self.graph_row_orient_fixed_edge_metadata(
+                        query,
+                        edge,
+                        metadata.iter().copied(),
+                        true,
+                        frontier_peak,
+                        vlp_cap_context,
+                        oriented_scratch,
+                    )
+                }
+                GraphRowAnchoredEdgeSourceRead::OrientedMetadata(metadata) => {
+                    graph_row_record_frontier_cap_peak(
+                        frontier_peak,
+                        metadata.len(),
+                        query.options.max_frontier,
+                        vlp_cap_context,
+                    )?;
+                    oriented_scratch.extend_from_slice(metadata);
+                    Ok(GraphRowFixedEdgeCandidates {
+                        edges: std::mem::take(oriented_scratch),
+                        endpoints_verified: true,
+                    })
+                }
+                GraphRowAnchoredEdgeSourceRead::RawIds(ids) => {
+                    debug_assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+                    graph_row_record_frontier_cap_peak(
+                        frontier_peak,
+                        ids.len(),
+                        query.options.max_frontier,
+                        vlp_cap_context,
+                    )?;
+                    let verified = self.graph_row_verify_edge_candidates(
+                        ids,
+                        edge,
+                        effective_at_epoch,
+                        policy_cutoffs,
+                    )?;
+                    self.graph_row_orient_fixed_edge_metadata(
+                        query,
+                        edge,
+                        verified,
+                        false,
+                        frontier_peak,
+                        vlp_cap_context,
+                        oriented_scratch,
+                    )
+                }
+            };
+        }
+
         let mut has_bound_endpoint = false;
         let mut has_unbound_endpoint_pair = false;
         let mut outgoing = Vec::new();
@@ -9991,7 +11121,7 @@ impl ReadView {
                 );
             }
             return Ok(GraphRowFixedEdgeCandidates {
-                edges: Vec::new(),
+                edges: std::mem::take(oriented_scratch),
                 endpoints_verified: false,
             });
         } else if has_bound_endpoint
@@ -10298,8 +11428,40 @@ impl ReadView {
                 );
             }
         }
-        candidate_ids.sort_unstable();
-        candidate_ids.dedup();
+        self.graph_row_finish_fixed_edge_candidates(
+            query,
+            edge,
+            candidate_ids,
+            delegated_metadata,
+            all_candidates_delegated,
+            false,
+            effective_at_epoch,
+            policy_cutoffs,
+            frontier_peak,
+            vlp_cap_context,
+            oriented_scratch,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_finish_fixed_edge_candidates(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        edge: &GraphRowRuntimeEdge,
+        mut candidate_ids: Vec<u64>,
+        delegated_metadata: Vec<EdgeMetadataForQuery>,
+        all_candidates_delegated: bool,
+        candidates_already_normalized: bool,
+        effective_at_epoch: i64,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        frontier_peak: &mut usize,
+        vlp_cap_context: Option<&GraphRowRuntimeVariableLength>,
+        oriented_scratch: &mut Vec<GraphRowOrientedEdge>,
+    ) -> Result<GraphRowFixedEdgeCandidates, EngineError> {
+        if !candidates_already_normalized {
+            candidate_ids.sort_unstable();
+            candidate_ids.dedup();
+        }
         graph_row_record_frontier_cap_peak(
             frontier_peak,
             candidate_ids.len(),
@@ -10317,17 +11479,48 @@ impl ReadView {
                 policy_cutoffs,
             )?
         };
-        let mut oriented = Vec::new();
+        self.graph_row_orient_fixed_edge_metadata(
+            query,
+            edge,
+            verified,
+            all_candidates_delegated,
+            frontier_peak,
+            vlp_cap_context,
+            oriented_scratch,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_orient_fixed_edge_metadata(
+        &self,
+        query: &NormalizedGraphRowQuery,
+        edge: &GraphRowRuntimeEdge,
+        verified: impl IntoIterator<Item = EdgeMetadataForQuery>,
+        endpoints_verified: bool,
+        frontier_peak: &mut usize,
+        vlp_cap_context: Option<&GraphRowRuntimeVariableLength>,
+        oriented_scratch: &mut Vec<GraphRowOrientedEdge>,
+    ) -> Result<GraphRowFixedEdgeCandidates, EngineError> {
+        oriented_scratch.clear();
         for meta in verified {
-            for (logical_from, logical_to) in graph_row_edge_orientations(edge.direction, meta) {
-                oriented.push(GraphRowOrientedEdge {
+            let mut push = |logical_from, logical_to| {
+                oriented_scratch.push(GraphRowOrientedEdge {
                     meta,
                     logical_from,
                     logical_to,
                 });
+            };
+            match edge.direction {
+                Direction::Outgoing => push(meta.from, meta.to),
+                Direction::Incoming => push(meta.to, meta.from),
+                Direction::Both if meta.from == meta.to => push(meta.from, meta.to),
+                Direction::Both => {
+                    push(meta.from, meta.to);
+                    push(meta.to, meta.from);
+                }
             }
         }
-        oriented.sort_by_key(|candidate| {
+        oriented_scratch.sort_by_key(|candidate| {
             (
                 candidate.logical_from,
                 candidate.logical_to,
@@ -10336,13 +11529,13 @@ impl ReadView {
         });
         graph_row_record_frontier_cap_peak(
             frontier_peak,
-            oriented.len(),
+            oriented_scratch.len(),
             query.options.max_frontier,
             vlp_cap_context,
         )?;
         Ok(GraphRowFixedEdgeCandidates {
-            edges: oriented,
-            endpoints_verified: all_candidates_delegated,
+            edges: std::mem::take(oriented_scratch),
+            endpoints_verified,
         })
     }
 
@@ -11061,12 +12254,15 @@ impl ReadView {
     fn graph_row_verified_node_ids(
         &self,
         node: &GraphRowRuntimeNode,
-        mut candidate_ids: Vec<u64>,
+        candidate_ids: &mut Vec<u64>,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
-    ) -> Result<NodeIdSet, EngineError> {
+        verified_ids: &mut Vec<u64>,
+        accepted: &mut NodeIdSet,
+    ) -> Result<(), EngineError> {
         candidate_ids.sort_unstable();
         candidate_ids.dedup();
-        let mut verified = Vec::new();
+        verified_ids.clear();
+        accepted.clear();
         let mut property_keys = Vec::new();
         collect_node_filter_property_keys(&node.query.filter, &mut property_keys);
         let include_key = !node.query.keys.is_empty() || node_filter_needs_key(&node.query.filter);
@@ -11079,26 +12275,134 @@ impl ReadView {
                 include_key,
                 include_created_at,
                 &property_keys,
-                &mut verified,
+                verified_ids,
                 usize::MAX,
             )?;
         }
-        Ok(verified.into_iter().collect())
+        accepted.extend(verified_ids.iter().copied());
+        Ok(())
     }
 
     fn graph_row_verified_or_proven_node_ids(
         &self,
         node: &GraphRowRuntimeNode,
-        mut candidate_ids: Vec<u64>,
+        candidate_ids: &mut Vec<u64>,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
         endpoints_verified: bool,
-    ) -> Result<NodeIdSet, EngineError> {
+        verified_ids: &mut Vec<u64>,
+        accepted: &mut NodeIdSet,
+    ) -> Result<bool, EngineError> {
         if endpoints_verified && graph_row_node_query_is_visibility_only(&node.query) {
-            candidate_ids.sort_unstable();
-            candidate_ids.dedup();
-            return Ok(candidate_ids.into_iter().collect());
+            #[cfg(test)]
+            self.note_graph_row_all_candidate_endpoints_proven();
+            accepted.clear();
+            return Ok(true);
         }
-        self.graph_row_verified_node_ids(node, candidate_ids, policy_cutoffs)
+        #[cfg(test)]
+        self.note_graph_row_node_verification_set_build();
+        self.graph_row_verified_node_ids(
+            node,
+            candidate_ids,
+            policy_cutoffs,
+            verified_ids,
+            accepted,
+        )?;
+        Ok(false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_row_verified_or_cached_node_ids(
+        &self,
+        node: &GraphRowRuntimeNode,
+        candidate_ids: &mut Vec<u64>,
+        policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
+        endpoints_verified: bool,
+        caches: &mut GraphRowExecutionCaches,
+        use_cross_leaf_cache: bool,
+        misses: &mut Vec<u64>,
+        verified_ids: &mut Vec<u64>,
+        accepted: &mut NodeIdSet,
+    ) -> Result<bool, EngineError> {
+        if endpoints_verified && graph_row_node_query_is_visibility_only(&node.query) {
+            #[cfg(test)]
+            self.note_graph_row_all_candidate_endpoints_proven();
+            accepted.clear();
+            return Ok(true);
+        }
+        if !use_cross_leaf_cache || !caches.node_verification_enabled {
+            return self.graph_row_verified_or_proven_node_ids(
+                node,
+                candidate_ids,
+                policy_cutoffs,
+                endpoints_verified,
+                verified_ids,
+                accepted,
+            );
+        }
+
+        candidate_ids.sort_unstable();
+        candidate_ids.dedup();
+        accepted.clear();
+        misses.clear();
+        #[cfg(test)]
+        self.note_graph_row_node_verification_set_build();
+        for &node_id in candidate_ids.iter() {
+            match caches.node_verification_get(node.slot, node_id) {
+                Some(true) => {
+                    accepted.insert(node_id);
+                    #[cfg(test)]
+                    self.note_graph_row_node_verification_cache_hit();
+                }
+                Some(false) => {
+                    #[cfg(test)]
+                    self.note_graph_row_node_verification_cache_hit();
+                }
+                None => misses.push(node_id),
+            }
+        }
+        if misses.is_empty() {
+            return Ok(false);
+        }
+
+        #[cfg(test)]
+        self.note_graph_row_node_verification_resolutions(misses.len());
+        verified_ids.clear();
+        let mut property_keys = Vec::new();
+        collect_node_filter_property_keys(&node.query.filter, &mut property_keys);
+        let include_key = !node.query.keys.is_empty() || node_filter_needs_key(&node.query.filter);
+        let include_created_at = node_filter_needs_created_at(&node.query.filter);
+        for chunk in misses.chunks(QUERY_VERIFY_CHUNK) {
+            let _ = self.verify_node_candidate_chunk(
+                chunk,
+                &node.query,
+                policy_cutoffs,
+                include_key,
+                include_created_at,
+                &property_keys,
+                verified_ids,
+                usize::MAX,
+            )?;
+        }
+        #[cfg(test)]
+        if graph_row_test_take_node_verification_failure() {
+            return Err(EngineError::InvalidOperation(
+                "injected graph-row node verification failure".to_string(),
+            ));
+        }
+        verified_ids.sort_unstable();
+        verified_ids.dedup();
+        for &node_id in misses.iter() {
+            let matches = verified_ids.binary_search(&node_id).is_ok();
+            caches.node_verification_insert(node.slot, node_id, matches);
+            #[cfg(test)]
+            self.note_graph_row_node_verification_cache_units_peak(
+                caches.node_verification_cache.len(),
+            );
+            if matches {
+                accepted.insert(node_id);
+            }
+        }
+        Ok(false)
     }
 
     fn hydrate_graph_rows_for_needs(

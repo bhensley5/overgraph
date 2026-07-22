@@ -58,6 +58,11 @@ function metadataIndexExplainField(field) {
   return { source: 'metadata', key: null, field };
 }
 
+function gqlReadProjection(result) {
+  assert.equal(result.plan?.read.target, 'graph_row_query');
+  return result.plan.read.projection.join('\n');
+}
+
 describe('GQL connector API', () => {
   let tmpDir;
   let db;
@@ -600,6 +605,132 @@ describe('GQL connector API', () => {
     const repeat = db.executeGql(query, null, { includePlan: true });
     assert.deepEqual(repeat.rows, expected);
     assert.equal(repeat.nextCursor, null);
+  });
+
+  it('executes unlabeled edge-driven GQL through EdgePull', () => {
+    const localTmpDir = mkdtempSync(join(tmpdir(), 'overgraph-gql-node-edge-pull-'));
+    const localDb = OverGraph.open(join(localTmpDir, 'db'), { walSyncMode: 'immediate' });
+    try {
+      const first = localDb.upsertNode('ConnectorEdgePullNode', 'connector-edge-pull-first');
+      const second = localDb.upsertNode('ConnectorEdgePullNode', 'connector-edge-pull-second');
+      const third = localDb.upsertNode('ConnectorEdgePullNode', 'connector-edge-pull-third');
+      const firstEdge = localDb.upsertEdge(first, second, 'CONNECTOR_EDGE_PULL');
+      const secondEdge = localDb.upsertEdge(second, third, 'CONNECTOR_EDGE_PULL');
+      const expected = [
+        { source_id: first, edge_id: firstEdge, target_id: second },
+        { source_id: second, edge_id: secondEdge, target_id: third },
+      ];
+
+      const result = localDb.executeGql(
+        `MATCH (source)-[edge:CONNECTOR_EDGE_PULL]->(target)
+         RETURN id(source) AS source_id, id(edge) AS edge_id,
+                id(target) AS target_id`,
+        null,
+        { includePlan: true }
+      );
+
+      assert.deepEqual(result.rows, expected);
+      assert.equal(result.plan.read.target, 'graph_row_query');
+      const projection = result.plan.read.projection.join('\n');
+      assert.match(projection, /ChunkedRowProductionRuntime/);
+      assert.match(projection, /source=EdgePull\{/);
+      assert.match(projection, /eligibility=edge_id_order_not_logical_prefix/);
+    } finally {
+      closeDir(localDb, localTmpDir);
+    }
+  });
+
+  it('keeps ordered adjacency GQL pages exact across active and flushed execution', () => {
+    const localTmpDir = mkdtempSync(join(tmpdir(), 'overgraph-gql-node-adjacency-'));
+    const localDb = OverGraph.open(join(localTmpDir, 'db'), {
+      walSyncMode: 'group-commit',
+      groupCommitIntervalMs: 1,
+    });
+    try {
+      const expected = [];
+      for (let ordinal = 0; ordinal < 1_000; ordinal += 1) {
+        const sourceId = localDb.upsertNode(
+          'GqlConnectorAdjacencySource',
+          `gql-connector-adjacency-source-${ordinal.toString().padStart(4, '0')}`
+        );
+        const targetId = localDb.upsertNode(
+          'GqlConnectorAdjacencyTarget',
+          `gql-connector-adjacency-target-${ordinal.toString().padStart(4, '0')}`
+        );
+        const edgeId = localDb.upsertEdge(
+          sourceId,
+          targetId,
+          'GQL_CONNECTOR_ADJACENCY_EDGE'
+        );
+        expected.push({ source_id: sourceId, edge_id: edgeId, target_id: targetId });
+      }
+
+      const query = `MATCH (source)-[edge:GQL_CONNECTOR_ADJACENCY_EDGE]->(target)
+                     RETURN id(source) AS source_id, id(edge) AS edge_id,
+                            id(target) AS target_id LIMIT 25`;
+      const options = {
+        includePlan: true,
+        maxRows: 10,
+        maxFrontier: 1_024,
+        maxIntermediateBindings: 1_024,
+      };
+
+      const active = localDb.executeGql(query, null, options);
+      assert.deepEqual(active.rows, expected.slice(0, 10));
+      assert.equal(typeof active.nextCursor, 'string');
+      assert.match(gqlReadProjection(active), /choice=EdgePullChunk/);
+      assert.match(gqlReadProjection(active), /source=EdgePull\{/);
+      assert.match(gqlReadProjection(active), /mutable_active_memtable/);
+
+      localDb.flush();
+      const flippedCursorOptions = { ...options, cursor: active.nextCursor };
+      const flipped = localDb.executeGql(query, null, flippedCursorOptions);
+      assert.deepEqual(flipped.rows, expected.slice(10, 20));
+      assert.equal(typeof flipped.nextCursor, 'string');
+      assert.match(gqlReadProjection(flipped), /source=AdjacencyPull\{/);
+      assert.match(gqlReadProjection(flipped), /choice=AdjacencyPullChunk/);
+      assert.match(gqlReadProjection(flipped), /cursor_seek=anchor_ge:/);
+      const repeatedFlipped = localDb.executeGql(query, null, flippedCursorOptions);
+      assert.deepEqual(repeatedFlipped.rows, flipped.rows);
+      assert.equal(repeatedFlipped.nextCursor, flipped.nextCursor);
+
+      const first = localDb.executeGql(query, null, options);
+      assert.deepEqual(first.rows, expected.slice(0, 10));
+      assert.equal(typeof first.nextCursor, 'string');
+      const firstProjection = gqlReadProjection(first);
+      for (const fact of [
+        /source=AdjacencyPull\{/,
+        /choice=AdjacencyPullChunk/,
+        /source_order=logical_from_group_asc/,
+        /proof_boundary=completed_owner_group/,
+        /early_exit=true/,
+        /cursor_seek=none/,
+      ]) {
+        assert.match(firstProjection, fact);
+      }
+
+      const repeatedFirst = localDb.executeGql(query, null, options);
+      assert.deepEqual(repeatedFirst.rows, first.rows);
+
+      const cursorOptions = { ...options, cursor: first.nextCursor };
+      const second = localDb.executeGql(query, null, cursorOptions);
+      assert.deepEqual(second.rows, expected.slice(10, 20));
+      assert.equal(typeof second.nextCursor, 'string');
+      assert.notEqual(second.nextCursor, first.nextCursor);
+      const secondProjection = gqlReadProjection(second);
+      assert.match(secondProjection, /source=AdjacencyPull\{/);
+      assert.match(secondProjection, /choice=AdjacencyPullChunk/);
+      assert.match(secondProjection, /source_order=logical_from_group_asc/);
+      assert.match(secondProjection, /proof_boundary=completed_owner_group/);
+      assert.match(secondProjection, /early_exit=true/);
+      assert.match(secondProjection, /cursor_seek=anchor_ge:/);
+
+      const repeatedSecond = localDb.executeGql(query, null, cursorOptions);
+      assert.deepEqual(repeatedSecond.rows, second.rows);
+      assert.equal(repeatedSecond.nextCursor, second.nextCursor);
+    } finally {
+      closeDir(localDb, localTmpDir);
+    }
   });
 
   it('executes Phase 34 WITH, rich expressions, DISTINCT, aggregation, and compact rows', () => {

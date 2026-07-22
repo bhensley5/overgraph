@@ -672,6 +672,151 @@ def test_gql_chunked_early_exit_rows_order_and_plan(db):
     assert repeat["next_cursor"] is None
 
 
+def test_gql_unlabeled_edge_driven_query_uses_edge_pull(tmp_dir):
+    db = OverGraph.open(os.path.join(tmp_dir, "gql_edge_pull_db"))
+    try:
+        first = db.upsert_node("ConnectorEdgePullNode", "connector-edge-pull-first")
+        second = db.upsert_node("ConnectorEdgePullNode", "connector-edge-pull-second")
+        third = db.upsert_node("ConnectorEdgePullNode", "connector-edge-pull-third")
+        first_edge = db.upsert_edge(first, second, "CONNECTOR_EDGE_PULL")
+        second_edge = db.upsert_edge(second, third, "CONNECTOR_EDGE_PULL")
+        expected = [
+            {"source_id": first, "edge_id": first_edge, "target_id": second},
+            {"source_id": second, "edge_id": second_edge, "target_id": third},
+        ]
+
+        result = db.execute_gql(
+            """
+            MATCH (source)-[edge:CONNECTOR_EDGE_PULL]->(target)
+            RETURN id(source) AS source_id, id(edge) AS edge_id,
+                   id(target) AS target_id
+            """,
+            include_plan=True,
+        )
+
+        assert result["rows"] == expected
+        assert result["plan"]["read"]["target"] == "graph_row_query"
+        projection = "\n".join(result["plan"]["read"]["projection"])
+        assert "ChunkedRowProductionRuntime" in projection
+        assert "source=EdgePull{" in projection
+        assert "eligibility=edge_id_order_not_logical_prefix" in projection
+    finally:
+        db.close()
+
+
+def test_gql_adjacency_pull_pages_and_active_fallback(tmp_dir):
+    db = OverGraph.open(os.path.join(tmp_dir, "gql_adjacency_pull_db"))
+    try:
+        expected = []
+        for ordinal in range(1_024):
+            source_id = db.upsert_node(
+                "PyGqlAdjacencySource",
+                f"python-gql-adjacency-source-{ordinal:04d}",
+            )
+            target_id = db.upsert_node(
+                "PyGqlAdjacencyTarget",
+                f"python-gql-adjacency-target-{ordinal:04d}",
+            )
+            edge_id = db.upsert_edge(source_id, target_id, "PY_GQL_ADJACENCY_EDGE")
+            expected.append(
+                {
+                    "source_id": source_id,
+                    "edge_id": edge_id,
+                    "target_id": target_id,
+                }
+            )
+
+        query = """
+            MATCH (source)-[edge:PY_GQL_ADJACENCY_EDGE]->(target)
+            RETURN id(source) AS source_id, id(edge) AS edge_id,
+                   id(target) AS target_id LIMIT 30
+        """
+
+        active = db.execute_gql(query, include_plan=True, max_rows=10)
+        assert active["rows"] == expected[:10]
+        assert active["next_cursor"]
+        active_plan = "\n".join(active["plan"]["read"]["projection"])
+        assert "source=EdgePull{edge=alias:edge}" in active_plan
+        assert "choice=EdgePullChunk" in active_plan
+        assert "mutable_active_memtable" in active_plan
+        assert "source=AdjacencyPull{" not in active_plan
+
+        assert db.flush() is not None
+
+        flipped = db.execute_gql(
+            query,
+            include_plan=True,
+            max_rows=10,
+            cursor=active["next_cursor"],
+        )
+        repeated_flipped = db.execute_gql(
+            query,
+            include_plan=True,
+            max_rows=10,
+            cursor=active["next_cursor"],
+        )
+        assert flipped["rows"] == expected[10:20]
+        assert repeated_flipped["rows"] == flipped["rows"]
+        assert flipped["next_cursor"] == repeated_flipped["next_cursor"]
+        flipped_plan = "\n".join(flipped["plan"]["read"]["projection"])
+        assert "source=AdjacencyPull{edge=alias:edge}" in flipped_plan
+        assert "choice=AdjacencyPullChunk" in flipped_plan
+        assert "cursor_seek=anchor_ge:" in flipped_plan
+
+        first = db.execute_gql(query, include_plan=True, max_rows=10)
+        repeated_first = db.execute_gql(query, include_plan=True, max_rows=10)
+        assert first["rows"] == expected[:10]
+        assert repeated_first["rows"] == expected[:10]
+        assert first["next_cursor"]
+        first_plan = "\n".join(first["plan"]["read"]["projection"])
+        for fact in (
+            "source=AdjacencyPull{edge=alias:edge}",
+            "choice=AdjacencyPullChunk",
+            "source_order=logical_from_group_asc",
+            "proof_boundary=completed_owner_group",
+            "early_exit=true",
+        ):
+            assert fact in first_plan
+
+        second = db.execute_gql(
+            query,
+            include_plan=True,
+            max_rows=10,
+            cursor=first["next_cursor"],
+        )
+        repeated_second = db.execute_gql(
+            query,
+            include_plan=True,
+            max_rows=10,
+            cursor=first["next_cursor"],
+        )
+        assert second["rows"] == expected[10:20]
+        assert repeated_second["rows"] == expected[10:20]
+        assert second["next_cursor"] == repeated_second["next_cursor"]
+        assert second["next_cursor"]
+        second_plan = "\n".join(second["plan"]["read"]["projection"])
+        for fact in (
+            "source=AdjacencyPull{edge=alias:edge}",
+            "choice=AdjacencyPullChunk",
+            "source_order=logical_from_group_asc",
+            "proof_boundary=completed_owner_group",
+            "early_exit=true",
+            "cursor_seek=anchor_ge:",
+            "cursor_seek_units=",
+        ):
+            assert fact in second_plan
+
+        third = db.execute_gql(
+            query,
+            max_rows=10,
+            cursor=second["next_cursor"],
+        )
+        assert third["rows"] == expected[20:30]
+        assert third["next_cursor"] is None
+    finally:
+        db.close()
+
+
 @pytest.mark.asyncio
 async def test_gql_explain_async(async_db):
     await seed_async(async_db)

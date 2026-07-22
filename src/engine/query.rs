@@ -10415,7 +10415,19 @@ impl ReadView {
         trace: &mut GraphRowExplainTrace,
     ) -> Result<(), EngineError> {
         let runtime = self.normalize_graph_row_explain_runtime_plan(query, trace)?;
-        let physical_plan = self.plan_graph_row_physical(query, &runtime, true, true)?;
+        let selection_capacity = graph_row_selection_capacity(query, cursor_state)?;
+        let physical_plan = self.plan_graph_row_physical_with_ordered_context(
+            query,
+            &runtime,
+            true,
+            true,
+            GraphRowOrderedProductionContext::enabled(
+                selection_capacity,
+                graph_row_cursor_owner_inclusive(cursor_state),
+                query.options.max_intermediate_bindings,
+                query.options.max_frontier,
+            ),
+        )?;
         self.populate_graph_row_explain_trace_from_runtime(
             query,
             cursor_state,
@@ -10661,8 +10673,13 @@ impl ReadView {
                             group.where_present
                         ),
                     );
-                    let group_physical_plan =
-                        self.plan_graph_row_physical(query, &group.runtime, true, false)?;
+                    let group_physical_plan = self.plan_graph_row_physical_with_ordered_context(
+                        query,
+                        &group.runtime,
+                        true,
+                        false,
+                        GraphRowOrderedProductionContext::disabled(),
+                    )?;
                     trace.record_physical_plan(&group.runtime, &group_physical_plan);
                     self.record_graph_row_static_step_explain(query, &group.runtime, trace)?;
                 }

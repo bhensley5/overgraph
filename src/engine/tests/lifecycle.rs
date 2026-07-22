@@ -1,5 +1,625 @@
 // Lifecycle tests: open/close, WAL, flush, compaction, restart, group commit, backpressure.
 
+#[path = "../../../benches/phase44b_write_workload.rs"]
+mod phase44b_write_workload;
+
+use phase44b_write_workload as phase44b_workload;
+
+fn phase44b_edge_input(
+    shape: phase44b_workload::EdgeShape,
+    node_ids: &[u64],
+    label: &str,
+) -> EdgeInput {
+    let mut props = BTreeMap::new();
+    props.insert(
+        phase44b_workload::EDGE_PAYLOAD_KEY.to_string(),
+        PropValue::Bytes(vec![
+            shape.payload_byte;
+            phase44b_workload::EDGE_PAYLOAD_LEN
+        ]),
+    );
+    EdgeInput {
+        from: node_ids[shape.from_node_index],
+        to: node_ids[shape.to_node_index],
+        label: label.to_string(),
+        props,
+        weight: 1.0,
+        valid_from: None,
+        valid_to: None,
+    }
+}
+
+fn phase44b_preload_nodes(db: &DatabaseEngine) -> Vec<u64> {
+    let inputs = (0..phase44b_workload::ENDPOINT_NODE_COUNT)
+        .map(|index| NodeInput {
+            labels: vec![phase44b_workload::ENDPOINT_NODE_LABEL.to_string()],
+            key: format!("{}-{index}", phase44b_workload::ENDPOINT_NODE_KEY_PREFIX),
+            props: BTreeMap::new(),
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+        })
+        .collect();
+    let node_ids = db.batch_upsert_nodes(inputs).unwrap();
+    assert_eq!(node_ids.len(), phase44b_workload::ENDPOINT_NODE_COUNT);
+    node_ids
+}
+
+fn phase44b_preload_write_labels(db: &DatabaseEngine) {
+    db.ensure_edge_label(phase44b_workload::UPSERT_LABEL)
+        .unwrap();
+    for label in phase44b_workload::CHURN_LABELS {
+        db.ensure_edge_label(label).unwrap();
+    }
+}
+
+fn phase44b_preload_options() -> DbOptions {
+    DbOptions {
+        memtable_flush_threshold: 0,
+        memtable_hard_cap_bytes: 0,
+        max_immutable_memtables: 0,
+        compact_after_n_flushes: 0,
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    }
+}
+
+fn phase44b_control_options() -> DbOptions {
+    DbOptions {
+        memtable_flush_threshold: 1024 * 1024,
+        memtable_hard_cap_bytes: 4 * 1024 * 1024,
+        max_immutable_memtables: 4,
+        compact_after_n_flushes: 4,
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    }
+}
+
+fn phase44b_assert_initial_drain(db: &DatabaseEngine) {
+    let stats = db.stats().unwrap();
+    assert!(!db.bg_compact_active_for_test());
+    assert_eq!(stats.immutable_memtable_count, 0);
+    assert_eq!(stats.pending_flush_count, 0);
+    assert_eq!(db.flush_count_since_last_compact_for_test(), 0);
+}
+
+fn phase44b_final_flush_and_fixed_point_drain(
+    db: &DatabaseEngine,
+) -> Phase44bWriteAmplificationSnapshot {
+    db.flush().unwrap();
+    loop {
+        let stats = db.stats().unwrap();
+        if stats.immutable_memtable_count != 0 || stats.pending_flush_count != 0 {
+            db.flush().unwrap();
+            continue;
+        }
+        if db.bg_compact_active_for_test() {
+            db.wait_for_bg_compact();
+            continue;
+        }
+        let snapshot = db.phase44b_write_amplification_snapshot_for_test();
+        assert_eq!(
+            snapshot.auto_compaction_jobs_started, snapshot.auto_compaction_jobs_finished,
+            "no lifecycle work remains to balance automatic compaction jobs"
+        );
+        let final_stats = db.stats().unwrap();
+        assert_eq!(final_stats.immutable_memtable_count, 0);
+        assert_eq!(final_stats.pending_flush_count, 0);
+        assert!(!db.bg_compact_active_for_test());
+        return snapshot;
+    }
+}
+
+fn phase44b_regular_file_bytes_for_test(root: &Path) -> u64 {
+    let mut pending = vec![root.to_path_buf()];
+    let mut total = 0u64;
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                total = total.checked_add(entry.metadata().unwrap().len()).unwrap();
+            }
+        }
+    }
+    total
+}
+
+fn phase44b_print_vector(name: &str, snapshot: Phase44bWriteAmplificationSnapshot) {
+    let mean = snapshot
+        .flush_segment_bytes
+        .checked_div(snapshot.flush_segments_installed)
+        .expect("write control must install a flush segment");
+    println!(
+        "phase44b_write_control {name}: rotations={} wal_generations={} flush_segments={} flush_bytes={} mean_flush_bytes={} auto_started={} auto_finished={}",
+        snapshot.memtable_rotations,
+        snapshot.wal_generations_created,
+        snapshot.flush_segments_installed,
+        snapshot.flush_segment_bytes,
+        mean,
+        snapshot.auto_compaction_jobs_started,
+        snapshot.auto_compaction_jobs_finished,
+    );
+}
+
+fn phase44b_scan_active_ordered_memtable(
+    memtable: &Memtable,
+) -> (usize, u64, usize) {
+    assert_eq!(
+        memtable.estimated_size(),
+        memtable.estimated_size_full_for_test(),
+        "every modeled ordered-group/history byte must be reflected incrementally"
+    );
+    let mut outer_examined = 0usize;
+    let mut posting_examined = 0u64;
+    let mut visible_entries = 0usize;
+    for direction in [Direction::Outgoing, Direction::Incoming] {
+        let outer_before = outer_examined;
+        let postings_before = posting_examined;
+        let mut group_bound = std::ops::Bound::Unbounded;
+        loop {
+            let refill = memtable.refill_ordered_adj_owner_at(
+                direction,
+                None,
+                u64::MAX,
+                group_bound,
+                4096,
+            );
+            outer_examined = outer_examined.checked_add(refill.examined).unwrap();
+            if let Some(owner_id) = refill.owner_head {
+                let mut edge_bound = std::ops::Bound::Unbounded;
+                loop {
+                    let postings = memtable.refill_ordered_adj_postings_at(
+                        direction,
+                        owner_id,
+                        None,
+                        u64::MAX,
+                        edge_bound,
+                        4096,
+                        Vec::new(),
+                    );
+                    posting_examined = posting_examined
+                        .checked_add(postings.examined as u64)
+                        .unwrap();
+                    visible_entries = visible_entries
+                        .checked_add(postings.entries.len())
+                        .unwrap();
+                    if postings.exhausted {
+                        break;
+                    }
+                    edge_bound = std::ops::Bound::Excluded(
+                        postings
+                            .last_edge_id_examined
+                            .expect("bounded posting refill must return a resume key"),
+                    );
+                }
+                group_bound = std::ops::Bound::Excluded((owner_id, u32::MAX));
+            } else if refill.exhausted {
+                break;
+            } else {
+                group_bound = std::ops::Bound::Excluded(
+                    refill
+                        .last_group_key_examined
+                        .expect("bounded owner refill must return a resume key"),
+                );
+            }
+        }
+
+        assert!(
+            outer_examined - outer_before
+                <= memtable.retained_ordered_adj_outer_group_count(direction),
+            "ordered scan cannot examine more physical group keys than retained"
+        );
+        assert!(
+            posting_examined - postings_before
+                <= memtable.retained_ordered_adj_posting_slot_count(direction),
+            "ordered scan cannot examine more physical posting slots than retained"
+        );
+    }
+    (outer_examined, posting_examined, visible_entries)
+}
+
+#[test]
+fn phase44b_write_control_freeze_and_reopen_event_boundaries_are_exact() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase44b_freeze_events");
+    let options = phase44b_preload_options();
+    let db = DatabaseEngine::open(&db_path, &options).unwrap();
+
+    db.reset_phase44b_write_amplification_for_test();
+    db.freeze_memtable().unwrap();
+    assert_eq!(
+        db.phase44b_write_amplification_snapshot_for_test(),
+        Phase44bWriteAmplificationSnapshot::default(),
+        "an empty freeze is a no-op"
+    );
+
+    db.upsert_node("Phase44b", "freeze-event", UpsertNodeOptions::default())
+        .unwrap();
+    db.reset_phase44b_write_amplification_for_test();
+    db.force_next_runtime_manifest_write_error();
+    assert!(db.freeze_memtable().is_err());
+    assert_eq!(
+        db.phase44b_write_amplification_snapshot_for_test(),
+        Phase44bWriteAmplificationSnapshot::default(),
+        "a failed freeze must not count"
+    );
+
+    db.freeze_memtable().unwrap();
+    let frozen = db.phase44b_write_amplification_snapshot_for_test();
+    assert_eq!(frozen.memtable_rotations, 1);
+    assert_eq!(frozen.wal_generations_created, 1);
+    db.close().unwrap();
+
+    let reopened = DatabaseEngine::open(&db_path, &options).unwrap();
+    assert_eq!(
+        reopened.phase44b_write_amplification_snapshot_for_test(),
+        Phase44bWriteAmplificationSnapshot::default(),
+        "open/reopen must not count a WAL generation"
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn phase44b_write_control_flush_bytes_and_manual_compaction_are_exact() {
+    let dir = TempDir::new().unwrap();
+    let options = phase44b_preload_options();
+    let db = DatabaseEngine::open(dir.path(), &options).unwrap();
+    db.reset_phase44b_write_amplification_for_test();
+
+    db.upsert_node("Phase44b", "flush-one", UpsertNodeOptions::default())
+        .unwrap();
+    let first = db.flush().unwrap().unwrap();
+    let first_bytes = phase44b_regular_file_bytes_for_test(&segment_dir(dir.path(), first.id));
+    let first_snapshot = db.phase44b_write_amplification_snapshot_for_test();
+    assert_eq!(first_snapshot.flush_segments_installed, 1);
+    assert_eq!(first_snapshot.flush_segment_bytes, first_bytes);
+
+    db.upsert_node("Phase44b", "flush-two", UpsertNodeOptions::default())
+        .unwrap();
+    db.flush().unwrap();
+    let before_manual = db.phase44b_write_amplification_snapshot_for_test();
+    assert_eq!(before_manual.flush_segments_installed, 2);
+    db.compact().unwrap().unwrap();
+    assert_eq!(
+        db.phase44b_write_amplification_snapshot_for_test(),
+        before_manual,
+        "manual compaction output is not a flush segment and is not automatic"
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn phase44b_write_control_only_automatic_compaction_counts_and_drains() {
+    let dir = TempDir::new().unwrap();
+    let options = DbOptions {
+        compact_after_n_flushes: 2,
+        ..phase44b_preload_options()
+    };
+    let db = DatabaseEngine::open(dir.path(), &options).unwrap();
+    db.reset_phase44b_write_amplification_for_test();
+    for index in 0..2 {
+        db.upsert_node(
+            "Phase44b",
+            &format!("auto-compact-{index}"),
+            UpsertNodeOptions::default(),
+        )
+        .unwrap();
+        db.flush().unwrap();
+    }
+    let automatic = phase44b_final_flush_and_fixed_point_drain(&db);
+    assert_eq!(automatic.auto_compaction_jobs_started, 1);
+    assert_eq!(automatic.auto_compaction_jobs_finished, 1);
+    db.close().unwrap();
+
+    let manual_dir = dir.path().join("manual");
+    let manual = DatabaseEngine::open(&manual_dir, &phase44b_preload_options()).unwrap();
+    for index in 0..2 {
+        manual
+            .upsert_node(
+                "Phase44b",
+                &format!("manual-compact-{index}"),
+                UpsertNodeOptions::default(),
+            )
+            .unwrap();
+        manual.flush().unwrap();
+    }
+    manual.reset_phase44b_write_amplification_for_test();
+    manual.start_bg_compact().unwrap();
+    manual.wait_for_bg_compact();
+    assert_eq!(
+        manual.phase44b_write_amplification_snapshot_for_test(),
+        Phase44bWriteAmplificationSnapshot::default()
+    );
+    manual.close().unwrap();
+}
+
+#[test]
+fn phase44b_write_control_pre_rotation_scan_counts_dead_sentinel_slots() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase44b_pre_rotation_scan");
+    let preload = DatabaseEngine::open(&db_path, &phase44b_preload_options()).unwrap();
+    phase44b_preload_write_labels(&preload);
+    let node_ids = phase44b_preload_nodes(&preload);
+    preload.close().unwrap();
+
+    let options = DbOptions {
+        memtable_flush_threshold: 1024 * 1024,
+        memtable_hard_cap_bytes: 8 * 1024 * 1024,
+        max_immutable_memtables: 4,
+        compact_after_n_flushes: 0,
+        wal_sync_mode: WalSyncMode::Immediate,
+        ..DbOptions::default()
+    };
+    let db = DatabaseEngine::open(&db_path, &options).unwrap();
+    let sentinel_shape = phase44b_workload::churn_sentinel_edge();
+    let mut seed_shapes = vec![sentinel_shape];
+    seed_shapes.extend(phase44b_workload::churn_initial_transient_edges());
+    let seed_ids = db
+        .batch_upsert_edges(
+            seed_shapes
+                .iter()
+                .map(|shape| {
+                    phase44b_edge_input(
+                        *shape,
+                        &node_ids,
+                        phase44b_workload::CHURN_LABELS[shape.label_index],
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+    let mut live_transients = HashMap::new();
+    for (shape, edge_id) in seed_shapes.into_iter().zip(seed_ids) {
+        if shape.ordinal != phase44b_workload::CHURN_SENTINEL_ORDINAL {
+            live_transients.insert(shape.ordinal, edge_id);
+        }
+    }
+    let mut deleted_sample = None;
+    for call_index in 0..8 {
+        let batch = phase44b_workload::churn_batch(call_index);
+        let delete_edge_ids = batch
+            .delete_ordinals
+            .iter()
+            .map(|ordinal| live_transients.remove(ordinal).unwrap())
+            .collect::<Vec<_>>();
+        deleted_sample = delete_edge_ids.first().copied().or(deleted_sample);
+        let result = db
+            .graph_patch(GraphPatch {
+                upsert_edges: batch
+                    .insert_edges
+                    .iter()
+                    .map(|shape| {
+                        phase44b_edge_input(
+                            *shape,
+                            &node_ids,
+                            phase44b_workload::CHURN_LABELS[shape.label_index],
+                        )
+                    })
+                    .collect(),
+                delete_edge_ids,
+                ..GraphPatch::default()
+            })
+            .unwrap();
+        for (shape, edge_id) in batch.insert_edges.into_iter().zip(result.edge_ids) {
+            live_transients.insert(shape.ordinal, edge_id);
+        }
+    }
+
+    let active = db.active_memtable();
+    assert!(active.estimated_size() < options.memtable_flush_threshold);
+    let (_, raw_postings, visible_entries) = phase44b_scan_active_ordered_memtable(&active);
+    assert!(
+        raw_postings as usize > visible_entries,
+        "dead physical slots beside the live sentinel must count as raw work"
+    );
+    db.freeze_memtable().unwrap();
+    assert_eq!(db.active_memtable().estimated_size(), 0);
+    let frozen = db.immutable_memtable(0);
+    let (_, frozen_raw, frozen_visible) = phase44b_scan_active_ordered_memtable(&frozen);
+    assert_eq!((frozen_raw, frozen_visible), (raw_postings, visible_entries));
+
+    db.flush().unwrap();
+    db.close().unwrap();
+    let reopened = DatabaseEngine::open(&db_path, &options).unwrap();
+    assert!(reopened.get_edge(deleted_sample.unwrap()).unwrap().is_none());
+    for edge_id in live_transients.values() {
+        assert!(reopened.get_edge(*edge_id).unwrap().is_some());
+    }
+    reopened.close().unwrap();
+}
+
+#[test]
+fn phase44b_group_twin_survives_wal_replay_and_immutable_rotation() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase44b_group_replay");
+    let options = phase44b_preload_options();
+    let (from, edge_id);
+    {
+        let db = DatabaseEngine::open(&db_path, &options).unwrap();
+        from = db
+            .upsert_node("Phase44b", "replay-from", UpsertNodeOptions::default())
+            .unwrap();
+        let to = db
+            .upsert_node("Phase44b", "replay-to", UpsertNodeOptions::default())
+            .unwrap();
+        edge_id = db
+            .upsert_edge(from, to, "REPLAY_EDGE", UpsertEdgeOptions::default())
+            .unwrap();
+        db.freeze_memtable().unwrap();
+        db.close_fast().unwrap();
+    }
+
+    let db = DatabaseEngine::open(&db_path, &options).unwrap();
+    assert_eq!(db.immutable_memtable_count(), 1);
+    let frozen = db.immutable_memtable(0);
+    assert_eq!(
+        frozen.retained_ordered_adj_outer_group_count(Direction::Outgoing),
+        1
+    );
+    assert_eq!(
+        frozen.retained_ordered_adj_posting_slot_count(Direction::Outgoing),
+        1
+    );
+    let owner = frozen.refill_ordered_adj_owner_at(
+        Direction::Outgoing,
+        None,
+        u64::MAX,
+        std::ops::Bound::Included((from, u32::MIN)),
+        4096,
+    );
+    assert_eq!(owner.owner_head, Some(from));
+    let postings = frozen.refill_ordered_adj_postings_at(
+        Direction::Outgoing,
+        from,
+        None,
+        u64::MAX,
+        std::ops::Bound::Unbounded,
+        4096,
+        Vec::new(),
+    );
+    assert_eq!(
+        postings
+            .entries
+            .iter()
+            .map(|entry| entry.edge_id)
+            .collect::<Vec<_>>(),
+        vec![edge_id]
+    );
+    db.flush().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn phase44b_write_control_memtable_group_twin_upsert() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase44b_upsert_control");
+    let preload = DatabaseEngine::open(&db_path, &phase44b_preload_options()).unwrap();
+    phase44b_preload_write_labels(&preload);
+    let node_ids = phase44b_preload_nodes(&preload);
+    preload.close().unwrap();
+
+    let db = DatabaseEngine::open(&db_path, &phase44b_control_options()).unwrap();
+    phase44b_assert_initial_drain(&db);
+    db.reset_phase44b_write_amplification_for_test();
+    for call_index in 0..phase44b_workload::WRITE_CALL_COUNT {
+        let inputs = phase44b_workload::upsert_batch(call_index)
+            .into_iter()
+            .map(|shape| phase44b_edge_input(shape, &node_ids, phase44b_workload::UPSERT_LABEL))
+            .collect::<Vec<_>>();
+        assert_eq!(inputs.len(), phase44b_workload::WRITE_BATCH_SIZE);
+        let input_count = inputs.len();
+        assert_eq!(db.batch_upsert_edges(inputs).unwrap().len(), input_count);
+    }
+    let active = db.active_memtable();
+    assert!(active.estimated_size() < phase44b_control_options().memtable_flush_threshold);
+    let (_, raw_postings, visible_entries) = phase44b_scan_active_ordered_memtable(&active);
+    assert_eq!(raw_postings as usize, visible_entries);
+    let snapshot = phase44b_final_flush_and_fixed_point_drain(&db);
+    assert!(snapshot.flush_segments_installed > 0);
+    phase44b_print_vector("memtable_group_twin_upsert", snapshot);
+    assert!(db.active_memtable().retained_edge_record_keys_is_empty());
+    db.close().unwrap();
+    let reopened = DatabaseEngine::open(&db_path, &phase44b_control_options()).unwrap();
+    assert!(reopened.active_memtable().retained_edge_record_keys_is_empty());
+    reopened.close().unwrap();
+}
+
+#[test]
+fn phase44b_write_control_memtable_group_twin_churn() {
+    assert_eq!(
+        phase44b_workload::CHURN_OWNER_COUNT * phase44b_workload::CHURN_LABEL_COUNT,
+        phase44b_workload::CHURN_GROUP_COUNT
+    );
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase44b_churn_control");
+    let preload = DatabaseEngine::open(&db_path, &phase44b_preload_options()).unwrap();
+    phase44b_preload_write_labels(&preload);
+    let node_ids = phase44b_preload_nodes(&preload);
+    preload.close().unwrap();
+
+    let db = DatabaseEngine::open(&db_path, &phase44b_control_options()).unwrap();
+    phase44b_assert_initial_drain(&db);
+    let sentinel_shape = phase44b_workload::churn_sentinel_edge();
+    let mut seed_shapes = vec![sentinel_shape];
+    seed_shapes.extend(phase44b_workload::churn_initial_transient_edges());
+    let seed_inputs = seed_shapes
+        .iter()
+        .map(|shape| {
+            phase44b_edge_input(
+                *shape,
+                &node_ids,
+                phase44b_workload::CHURN_LABELS[shape.label_index],
+            )
+        })
+        .collect::<Vec<_>>();
+    let seed_ids = db.batch_upsert_edges(seed_inputs).unwrap();
+    let mut live_transients = HashMap::new();
+    for (shape, edge_id) in seed_shapes.into_iter().zip(seed_ids) {
+        if shape.ordinal != phase44b_workload::CHURN_SENTINEL_ORDINAL {
+            assert!(live_transients.insert(shape.ordinal, edge_id).is_none());
+        }
+    }
+    assert_eq!(
+        live_transients.len(),
+        phase44b_workload::CHURN_TRANSIENTS_PER_CALL
+    );
+    phase44b_assert_initial_drain(&db);
+    db.reset_phase44b_write_amplification_for_test();
+    for call_index in 0..phase44b_workload::WRITE_CALL_COUNT {
+        let batch = phase44b_workload::churn_batch(call_index);
+        let delete_edge_ids = batch
+            .delete_ordinals
+            .iter()
+            .map(|ordinal| live_transients.remove(ordinal).expect("live churn edge"))
+            .collect::<Vec<_>>();
+        let upsert_edges = batch
+            .insert_edges
+            .iter()
+            .map(|shape| {
+                phase44b_edge_input(
+                    *shape,
+                    &node_ids,
+                    phase44b_workload::CHURN_LABELS[shape.label_index],
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delete_edge_ids.len() + upsert_edges.len(),
+            phase44b_workload::MUTATIONS_PER_CALL
+        );
+        let result = db
+            .graph_patch(GraphPatch {
+                upsert_edges,
+                delete_edge_ids,
+                ..GraphPatch::default()
+            })
+            .unwrap();
+        assert_eq!(result.edge_ids.len(), batch.insert_edges.len());
+        for (shape, edge_id) in batch.insert_edges.into_iter().zip(result.edge_ids) {
+            assert!(live_transients.insert(shape.ordinal, edge_id).is_none());
+        }
+    }
+    assert_eq!(
+        live_transients.len(),
+        phase44b_workload::CHURN_TRANSIENTS_PER_CALL
+    );
+    let active = db.active_memtable();
+    assert!(active.estimated_size() < phase44b_control_options().memtable_flush_threshold);
+    let (_, raw_postings, visible_entries) = phase44b_scan_active_ordered_memtable(&active);
+    assert!(raw_postings as usize >= visible_entries);
+    let snapshot = phase44b_final_flush_and_fixed_point_drain(&db);
+    assert!(snapshot.flush_segments_installed > 0);
+    phase44b_print_vector("memtable_group_twin_churn", snapshot);
+    assert!(db.active_memtable().retained_edge_record_keys_is_empty());
+    db.close().unwrap();
+    let reopened = DatabaseEngine::open(&db_path, &phase44b_control_options()).unwrap();
+    assert!(reopened.active_memtable().retained_edge_record_keys_is_empty());
+    reopened.close().unwrap();
+}
+
 fn lifecycle_filter_names(names: &[&str]) -> Vec<String> {
     names.iter().map(|name| (*name).to_string()).collect()
 }
@@ -1125,6 +1745,119 @@ fn test_delete_operations() {
     assert_eq!(engine.edge_count().unwrap(), 0);
 
     engine.close().unwrap();
+}
+
+fn assert_same_id_resurrection_survives_compaction(background: bool) {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        compact_after_n_flushes: 0,
+        ..DbOptions::default()
+    };
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    let mut original_node = make_node(1, "resurrection-old");
+    original_node.props.insert(
+        "version".to_string(),
+        PropValue::String("old".to_string()),
+    );
+    write_internal_wal_op(&engine, &WalOp::UpsertNode(original_node)).unwrap();
+    write_internal_wal_op(&engine, &WalOp::UpsertNode(make_node(2, "endpoint-a"))).unwrap();
+    write_internal_wal_op(&engine, &WalOp::UpsertNode(make_node(3, "endpoint-b"))).unwrap();
+    write_internal_wal_op(&engine, &WalOp::UpsertEdge(make_edge(10, 1, 2))).unwrap();
+    engine.flush().unwrap();
+
+    write_internal_wal_op(
+        &engine,
+        &WalOp::DeleteNode {
+            id: 1,
+            deleted_at: 20_000,
+        },
+    )
+    .unwrap();
+    write_internal_wal_op(
+        &engine,
+        &WalOp::DeleteEdge {
+            id: 10,
+            deleted_at: 20_001,
+        },
+    )
+    .unwrap();
+    engine.flush().unwrap();
+    assert!(engine.get_node(1).unwrap().is_none());
+    assert!(engine.get_edge(10).unwrap().is_none());
+
+    let mut resurrected_node = make_node(1, "resurrection-new");
+    resurrected_node.updated_at = 30_000;
+    resurrected_node.weight = 0.75;
+    resurrected_node.props.insert(
+        "version".to_string(),
+        PropValue::String("new".to_string()),
+    );
+    let mut resurrected_edge = make_edge(10, 2, 3);
+    resurrected_edge.updated_at = 30_001;
+    resurrected_edge.weight = 2.5;
+    resurrected_edge.props.insert(
+        "version".to_string(),
+        PropValue::String("new".to_string()),
+    );
+    write_internal_wal_op(&engine, &WalOp::UpsertNode(resurrected_node)).unwrap();
+    write_internal_wal_op(&engine, &WalOp::UpsertEdge(resurrected_edge)).unwrap();
+    engine.flush().unwrap();
+
+    let assert_latest = |engine: &DatabaseEngine| {
+        let node = engine.get_node(1).unwrap().expect("resurrected node");
+        assert_eq!(node.key, "resurrection-new");
+        assert_eq!(node.updated_at, 30_000);
+        assert_eq!(node.weight, 0.75);
+        assert_eq!(
+            node.props.get("version"),
+            Some(&PropValue::String("new".to_string()))
+        );
+        assert!(engine
+            .find_existing_node(1, "resurrection-old")
+            .unwrap()
+            .is_none());
+
+        let edge = engine.get_edge(10).unwrap().expect("resurrected edge");
+        assert_eq!((edge.from, edge.to), (2, 3));
+        assert_eq!(edge.updated_at, 30_001);
+        assert_eq!(edge.weight, 2.5);
+        assert_eq!(
+            edge.props.get("version"),
+            Some(&PropValue::String("new".to_string()))
+        );
+    };
+    assert_latest(&engine);
+
+    if background {
+        engine.start_bg_compact().unwrap();
+        engine
+            .wait_for_bg_compact()
+            .expect("background same-ID resurrection compaction");
+    } else {
+        engine
+            .compact()
+            .unwrap()
+            .expect("synchronous same-ID resurrection compaction");
+    }
+    assert_eq!(engine.segments_for_test().len(), 1);
+    assert_latest(&engine);
+    engine.close().unwrap();
+
+    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    assert_eq!(reopened.segments_for_test().len(), 1);
+    assert_latest(&reopened);
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_same_id_node_and_edge_resurrection_survive_sync_compaction_and_reopen() {
+    assert_same_id_resurrection_survives_compaction(false);
+}
+
+#[test]
+fn test_same_id_node_and_edge_resurrection_survive_background_compaction_and_reopen() {
+    assert_same_id_resurrection_survives_compaction(true);
 }
 
 #[test]

@@ -1,8 +1,182 @@
 #[allow(dead_code)]
 pub(crate) type EdgeStreamSet = StreamSet<EdgeCandidateCursor>;
 
+const PREPARED_EDGE_RETAINED_ID_CAP: usize =
+    crate::planner_stats::PLANNER_STATS_HARD_CANDIDATE_CAP;
+
+#[derive(Clone, Copy, Default)]
+struct PreparedEdgeIdBudgetState {
+    live: usize,
+    peak: usize,
+}
+
+#[derive(Clone, Default)]
+struct PreparedEdgeIdBudget {
+    state: std::rc::Rc<std::cell::Cell<PreparedEdgeIdBudgetState>>,
+}
+
+impl PreparedEdgeIdBudget {
+    pub(crate) fn live(&self) -> usize {
+        self.state.get().live
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        PREPARED_EDGE_RETAINED_ID_CAP.saturating_sub(self.live())
+    }
+
+    fn reserve(&self, units: usize) -> Option<PreparedEdgeIdReservation> {
+        self.reserve_to_limit(units, PREPARED_EDGE_RETAINED_ID_CAP)
+    }
+
+    fn reserve_with_overflow_sentinel(
+        &self,
+        units: usize,
+    ) -> Option<PreparedEdgeIdReservation> {
+        self.reserve_to_limit(units, PREPARED_EDGE_RETAINED_ID_CAP.saturating_add(1))
+    }
+
+    fn reserve_to_limit(
+        &self,
+        units: usize,
+        limit: usize,
+    ) -> Option<PreparedEdgeIdReservation> {
+        let mut state = self.state.get();
+        let live = state.live.checked_add(units)?;
+        if live > limit {
+            return None;
+        }
+        state.live = live;
+        state.peak = state.peak.max(live);
+        self.state.set(state);
+        #[cfg(test)]
+        note_prepared_edge_retained_id_units_peak(live);
+        Some(PreparedEdgeIdReservation {
+            budget: self.clone(),
+            units,
+        })
+    }
+}
+
+pub(crate) struct PreparedEdgeIdReservation {
+    budget: PreparedEdgeIdBudget,
+    units: usize,
+}
+
+#[allow(dead_code)] // CP44.2 substrate is activated by the later EdgePull checkpoint.
+impl PreparedEdgeIdReservation {
+    fn shrink_to(&mut self, units: usize) {
+        debug_assert!(units <= self.units);
+        let released = self.units - units;
+        if released == 0 {
+            return;
+        }
+        let mut state = self.budget.state.get();
+        state.live = state.live.saturating_sub(released);
+        self.budget.state.set(state);
+        self.units = units;
+    }
+
+    fn transfer_from(&mut self, other: &mut Self) {
+        debug_assert!(std::rc::Rc::ptr_eq(
+            &self.budget.state,
+            &other.budget.state
+        ));
+        self.units = self.units.saturating_add(other.units);
+        other.units = 0;
+    }
+}
+
+impl Drop for PreparedEdgeIdReservation {
+    fn drop(&mut self) {
+        let mut state = self.budget.state.get();
+        state.live = state.live.saturating_sub(self.units);
+        self.budget.state.set(state);
+    }
+}
+
+struct PreparedRetainedEdgeIds {
+    ids: Vec<u64>,
+    reservation: PreparedEdgeIdReservation,
+}
+
+#[allow(dead_code)] // CP44.2 substrate is activated by the later EdgePull checkpoint.
+impl PreparedRetainedEdgeIds {
+    fn from_limited_read(
+        ids: Vec<u64>,
+        budget: &PreparedEdgeIdBudget,
+    ) -> Result<Self, Vec<u64>> {
+        let Some(reservation) = budget.reserve_with_overflow_sentinel(ids.len()) else {
+            return Err(ids);
+        };
+        if budget.live() > PREPARED_EDGE_RETAINED_ID_CAP {
+            drop(reservation);
+            return Err(ids);
+        }
+        Ok(Self { ids, reservation })
+    }
+
+    fn from_exact(ids: Vec<u64>, budget: &PreparedEdgeIdBudget) -> Result<Self, Vec<u64>> {
+        let Some(reservation) = budget.reserve(ids.len()) else {
+            return Err(ids);
+        };
+        Ok(Self { ids, reservation })
+    }
+
+    fn try_push(&mut self, id: u64, budget: &PreparedEdgeIdBudget) -> Result<(), ()> {
+        let Some(mut reservation) = budget.reserve(1) else {
+            return Err(());
+        };
+        self.reservation.transfer_from(&mut reservation);
+        self.ids.push(id);
+        Ok(())
+    }
+
+    fn try_push_overflow_sentinel(
+        &mut self,
+        id: u64,
+        budget: &PreparedEdgeIdBudget,
+    ) -> Result<(), ()> {
+        let Some(mut reservation) = budget.reserve_with_overflow_sentinel(1) else {
+            return Err(());
+        };
+        self.reservation.transfer_from(&mut reservation);
+        self.ids.push(id);
+        Ok(())
+    }
+
+    fn normalize(&mut self) {
+        self.ids.sort_unstable();
+        self.ids.dedup();
+        self.reservation.shrink_to(self.ids.len());
+    }
+
+    fn append(&mut self, other: &mut Self) {
+        self.ids.append(&mut other.ids);
+        self.reservation.transfer_from(&mut other.reservation);
+    }
+
+    fn retain(&mut self, mut predicate: impl FnMut(u64) -> bool) {
+        self.ids.retain(|id| predicate(*id));
+        self.reservation.shrink_to(self.ids.len());
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) enum EdgeCandidateCursor {
+    MemtableFullScan {
+        memtable: Arc<Memtable>,
+        snapshot_seq: u64,
+        held: Option<u64>,
+        last_seek_bound: Option<u64>,
+        exhausted: bool,
+    },
+    SegmentFullScan {
+        reader: Arc<SegmentReader>,
+        pos: usize,
+        held: Option<u64>,
+        last_seek_bound: Option<u64>,
+        exhausted: bool,
+    },
     MemtableLabel {
         memtable: Arc<Memtable>,
         label_id: u32,
@@ -48,6 +222,7 @@ pub(crate) enum EdgeCandidateCursor {
     },
     SortedBuffer {
         ids: Vec<u64>,
+        reservation: Option<PreparedEdgeIdReservation>,
         pos: usize,
         held: Option<u64>,
         last_seek_bound: Option<u64>,
@@ -57,6 +232,26 @@ pub(crate) enum EdgeCandidateCursor {
 
 #[allow(dead_code)]
 impl EdgeCandidateCursor {
+    pub(crate) fn memtable_full_scan(memtable: Arc<Memtable>, snapshot_seq: u64) -> Self {
+        Self::MemtableFullScan {
+            memtable,
+            snapshot_seq,
+            held: None,
+            last_seek_bound: None,
+            exhausted: false,
+        }
+    }
+
+    pub(crate) fn segment_full_scan(reader: Arc<SegmentReader>) -> Self {
+        Self::SegmentFullScan {
+            reader,
+            pos: 0,
+            held: None,
+            last_seek_bound: None,
+            exhausted: false,
+        }
+    }
+
     pub(crate) fn memtable_label(
         memtable: Arc<Memtable>,
         label_id: u32,
@@ -143,6 +338,20 @@ impl EdgeCandidateCursor {
         );
         Self::SortedBuffer {
             ids,
+            reservation: None,
+            pos: 0,
+            held: None,
+            last_seek_bound: None,
+            exhausted: false,
+        }
+    }
+
+    fn prepared_sorted_buffer(mut ids: PreparedRetainedEdgeIds) -> Self {
+        ids.normalize();
+        debug_assert!(ids.ids.windows(2).all(|window| window[0] < window[1]));
+        Self::SortedBuffer {
+            ids: ids.ids,
+            reservation: Some(ids.reservation),
             pos: 0,
             held: None,
             last_seek_bound: None,
@@ -152,6 +361,87 @@ impl EdgeCandidateCursor {
 
     pub(crate) fn next_ge(&mut self, bound: u64) -> Result<Option<u64>, EngineError> {
         match self {
+            Self::MemtableFullScan {
+                memtable,
+                snapshot_seq,
+                held,
+                last_seek_bound,
+                exhausted,
+            } => {
+                if let Some(head) = *held {
+                    if bound <= head {
+                        return Ok(Some(head));
+                    }
+                }
+                assert_monotonic_bound(*last_seek_bound, *held, bound);
+                *last_seek_bound = Some(bound);
+                if *exhausted {
+                    return Ok(None);
+                }
+                match memtable.next_visible_edge_id_after(*snapshot_seq, bound.checked_sub(1)) {
+                    Some(edge_id) => {
+                        *held = Some(edge_id);
+                        Ok(Some(edge_id))
+                    }
+                    None => {
+                        *held = None;
+                        *exhausted = true;
+                        Ok(None)
+                    }
+                }
+            }
+            Self::SegmentFullScan {
+                reader,
+                pos,
+                held,
+                last_seek_bound,
+                exhausted,
+            } => {
+                if let Some(head) = *held {
+                    if bound <= head {
+                        return Ok(Some(head));
+                    }
+                }
+                assert_monotonic_bound(*last_seek_bound, *held, bound);
+                *last_seek_bound = Some(bound);
+                if *exhausted {
+                    return Ok(None);
+                }
+                let count = reader.edge_meta_count() as usize;
+                let start = if held.is_some() { pos.saturating_add(1) } else { *pos };
+                if start >= count {
+                    *held = None;
+                    *exhausted = true;
+                    return Ok(None);
+                }
+
+                let (start_id, ..) = reader.edge_meta_at(start)?;
+                let (next_pos, edge_id) = if start_id >= bound {
+                    (start, start_id)
+                } else {
+                    let mut lo = start.saturating_add(1);
+                    let mut hi = count;
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        let (edge_id, ..) = reader.edge_meta_at(mid)?;
+                        if edge_id < bound {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    if lo >= count {
+                        *held = None;
+                        *exhausted = true;
+                        return Ok(None);
+                    }
+                    let (edge_id, ..) = reader.edge_meta_at(lo)?;
+                    (lo, edge_id)
+                };
+                *pos = next_pos;
+                *held = Some(edge_id);
+                Ok(Some(edge_id))
+            }
             Self::MemtableLabel {
                 memtable,
                 label_id,
@@ -344,6 +634,7 @@ impl EdgeCandidateCursor {
             }
             Self::SortedBuffer {
                 ids,
+                reservation: _,
                 pos,
                 held,
                 last_seek_bound,
@@ -386,11 +677,347 @@ impl EdgeCandidateCursor {
             }
         }
     }
+
+    pub(crate) fn append_chunk(
+        &mut self,
+        mut bound: u64,
+        upper_exclusive: Option<u64>,
+        max: usize,
+        out: &mut Vec<u64>,
+    ) -> Result<(), EngineError> {
+        let start_len = out.len();
+        macro_rules! accept {
+            ($candidate:expr) => {{
+                let candidate = $candidate;
+                if upper_exclusive.is_some_and(|upper| candidate >= upper) {
+                    break;
+                }
+                out.push(candidate);
+                if candidate == u64::MAX
+                    || out.len().saturating_sub(start_len) >= max
+                {
+                    break;
+                }
+                bound = candidate + 1;
+            }};
+        }
+        if max == 0 {
+            return Ok(());
+        }
+        match self {
+            Self::MemtableFullScan {
+                memtable,
+                snapshot_seq,
+                held,
+                last_seek_bound,
+                exhausted,
+            } => {
+                while !*exhausted && out.len().saturating_sub(start_len) < max {
+                    let candidate = if held.is_some_and(|head| bound <= head) {
+                        held.expect("checked held candidate")
+                    } else {
+                        match memtable
+                            .next_visible_edge_id_after(*snapshot_seq, bound.checked_sub(1))
+                        {
+                            Some(candidate) => candidate,
+                            None => {
+                                *held = None;
+                                *exhausted = true;
+                                break;
+                            }
+                        }
+                    };
+                    *held = Some(candidate);
+                    *last_seek_bound = Some(bound);
+                    accept!(candidate);
+                }
+            }
+            Self::SegmentFullScan {
+                reader,
+                pos,
+                held,
+                last_seek_bound,
+                exhausted,
+            } => {
+                while !*exhausted && out.len().saturating_sub(start_len) < max {
+                    let count = reader.edge_meta_count() as usize;
+                    let candidate = if held.is_some_and(|head| bound <= head) {
+                        held.expect("checked held candidate")
+                    } else {
+                        let start = if held.is_some() { pos.saturating_add(1) } else { *pos };
+                        if start >= count {
+                            *held = None;
+                            *exhausted = true;
+                            break;
+                        }
+                        let (next_candidate, ..) = reader.edge_meta_at(start)?;
+                        if next_candidate >= bound {
+                            *pos = start;
+                            next_candidate
+                        } else {
+                            let mut lo = start + 1;
+                            let mut hi = count;
+                            while lo < hi {
+                                let mid = lo + (hi - lo) / 2;
+                                let (edge_id, ..) = reader.edge_meta_at(mid)?;
+                                if edge_id < bound {
+                                    lo = mid + 1;
+                                } else {
+                                    hi = mid;
+                                }
+                            }
+                            if lo >= count {
+                                *held = None;
+                                *exhausted = true;
+                                break;
+                            }
+                            *pos = lo;
+                            let (candidate, ..) = reader.edge_meta_at(lo)?;
+                            candidate
+                        }
+                    };
+                    *held = Some(candidate);
+                    *last_seek_bound = Some(bound);
+                    accept!(candidate);
+                }
+            }
+            Self::MemtableLabel {
+                memtable,
+                label_id,
+                snapshot_seq,
+                held,
+                last_seek_bound,
+                exhausted,
+            } => {
+                while !*exhausted && out.len().saturating_sub(start_len) < max {
+                    let candidate = if held.is_some_and(|head| bound <= head) {
+                        held.expect("checked held candidate")
+                    } else {
+                        match memtable.next_visible_edge_by_label_id_ge(
+                            *label_id,
+                            *snapshot_seq,
+                            bound,
+                        ) {
+                            Some(candidate) => candidate,
+                            None => {
+                                *held = None;
+                                *exhausted = true;
+                                break;
+                            }
+                        }
+                    };
+                    *held = Some(candidate);
+                    *last_seek_bound = Some(bound);
+                    accept!(candidate);
+                }
+            }
+            Self::SegmentLabelPosting {
+                reader,
+                posting,
+                pos,
+                held,
+                last_seek_bound,
+                exhausted,
+            } => {
+                while !*exhausted && out.len().saturating_sub(start_len) < max {
+                    let candidate = if held.is_some_and(|head| bound <= head) {
+                        held.expect("checked held candidate")
+                    } else {
+                        let next_pos = if held.is_some() {
+                            pos.saturating_add(1)
+                        } else {
+                            reader.edge_label_posting_lower_bound_ge(posting, bound)?
+                        };
+                        let Some(candidate) = reader.edge_label_id_at_posting(*posting, next_pos)?
+                        else {
+                            *held = None;
+                            *exhausted = true;
+                            break;
+                        };
+                        if candidate < bound {
+                            let Some((next_pos, candidate)) = seek_ordered_id_posting_ge(
+                                |index| reader.edge_label_id_at_posting(*posting, index),
+                                next_pos,
+                                bound,
+                            )? else {
+                                *held = None;
+                                *exhausted = true;
+                                break;
+                            };
+                            *pos = next_pos;
+                            candidate
+                        } else {
+                            *pos = next_pos;
+                            candidate
+                        }
+                    };
+                    *held = Some(candidate);
+                    *last_seek_bound = Some(bound);
+                    accept!(candidate);
+                }
+            }
+            Self::SegmentEqualityGroup {
+                reader,
+                index_id,
+                offset,
+                id_count,
+                pos,
+                held,
+                last_seek_bound,
+                exhausted,
+            } => {
+                while !*exhausted && out.len().saturating_sub(start_len) < max {
+                    let candidate = if held.is_some_and(|head| bound <= head) {
+                        held.expect("checked held candidate")
+                    } else {
+                        let from_pos = if held.is_some() { pos.saturating_add(1) } else { *pos };
+                        match reader.secondary_eq_posting_seek_ge_for_target(
+                            *index_id,
+                            PlannerStatsDeclaredIndexTarget::EdgeProperty,
+                            *offset,
+                            *id_count,
+                            from_pos,
+                            bound,
+                        )? {
+                            Some((next_pos, candidate)) => {
+                                *pos = next_pos;
+                                candidate
+                            }
+                            None => {
+                                *held = None;
+                                *exhausted = true;
+                                break;
+                            }
+                        }
+                    };
+                    *held = Some(candidate);
+                    *last_seek_bound = Some(bound);
+                    accept!(candidate);
+                }
+            }
+            Self::MemtableAdjacency {
+                memtable,
+                node_id,
+                outgoing,
+                label_filter_id,
+                snapshot_seq,
+                held,
+                last_seek_bound,
+                exhausted,
+            } => {
+                while !*exhausted && out.len().saturating_sub(start_len) < max {
+                    let candidate = if held.is_some_and(|head| bound <= head) {
+                        held.expect("checked held candidate")
+                    } else {
+                        match memtable.next_visible_adj_edge_ge(
+                            *node_id,
+                            *outgoing,
+                            *label_filter_id,
+                            *snapshot_seq,
+                            bound,
+                        ) {
+                            Some(candidate) => candidate,
+                            None => {
+                                *held = None;
+                                *exhausted = true;
+                                break;
+                            }
+                        }
+                    };
+                    *held = Some(candidate);
+                    *last_seek_bound = Some(bound);
+                    accept!(candidate);
+                }
+            }
+            Self::SegmentAdjacency {
+                reader,
+                cursor,
+                held,
+                last_seek_bound,
+                exhausted,
+            } => {
+                while !*exhausted && out.len().saturating_sub(start_len) < max {
+                    let candidate = if held.is_some_and(|head| bound <= head) {
+                        held.expect("checked held candidate")
+                    } else {
+                        loop {
+                            match reader.next_adj_posting_edge_id(cursor)? {
+                                Some(candidate) if candidate >= bound => break candidate,
+                                Some(_) => continue,
+                                None => {
+                                    *held = None;
+                                    *exhausted = true;
+                                    break u64::MAX;
+                                }
+                            }
+                        }
+                    };
+                    if *exhausted {
+                        break;
+                    }
+                    *held = Some(candidate);
+                    *last_seek_bound = Some(bound);
+                    accept!(candidate);
+                }
+            }
+            Self::SortedBuffer {
+                ids,
+                reservation: _,
+                pos,
+                held,
+                last_seek_bound,
+                exhausted,
+            } => {
+                while !*exhausted && out.len().saturating_sub(start_len) < max {
+                    let candidate = if held.is_some_and(|head| bound <= head) {
+                        held.expect("checked held candidate")
+                    } else {
+                        let start = if held.is_some() { pos.saturating_add(1) } else { *pos };
+                        if start >= ids.len() {
+                            *held = None;
+                            *exhausted = true;
+                            break;
+                        }
+                        if ids[start] >= bound {
+                            *pos = start;
+                            ids[start]
+                        } else {
+                            let next_pos = start
+                                + 1
+                                + ids[start + 1..]
+                                    .partition_point(|&candidate| candidate < bound);
+                            if next_pos >= ids.len() {
+                                *held = None;
+                                *exhausted = true;
+                                break;
+                            }
+                            *pos = next_pos;
+                            ids[next_pos]
+                        }
+                    };
+                    *held = Some(candidate);
+                    *last_seek_bound = Some(bound);
+                    accept!(candidate);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl CandidateCursorSeek for EdgeCandidateCursor {
     fn next_ge(&mut self, bound: u64) -> Result<Option<u64>, EngineError> {
         EdgeCandidateCursor::next_ge(self, bound)
+    }
+
+    fn append_chunk(
+        &mut self,
+        bound: u64,
+        upper_exclusive: Option<u64>,
+        max: usize,
+        out: &mut Vec<u64>,
+    ) -> Result<(), EngineError> {
+        EdgeCandidateCursor::append_chunk(self, bound, upper_exclusive, max, out)
     }
 }
 
@@ -436,7 +1063,68 @@ enum EdgeStreamBuildResult {
 }
 
 #[allow(dead_code)]
+enum PreparedEdgeStreamTopology {
+    Union(EdgeStreamSet),
+    Intersect(LeapfrogIntersection<EdgeCandidateCursor>),
+}
+
+#[allow(dead_code)]
+enum PreparedEdgeStreamBuildResult {
+    Ready {
+        topology: PreparedEdgeStreamTopology,
+        followups: Vec<SecondaryIndexReadFollowup>,
+    },
+    TooBroad {
+        followups: Vec<SecondaryIndexReadFollowup>,
+    },
+}
+
+enum PreparedEdgeLeafBuildResult {
+    Ready(EdgeLeafStream),
+    Demoted {
+        followups: Vec<SecondaryIndexReadFollowup>,
+    },
+    TooBroad {
+        followups: Vec<SecondaryIndexReadFollowup>,
+    },
+}
+
+#[allow(dead_code)]
 impl ReadView {
+    fn build_prepared_label_edge_cursor(
+        &self,
+        label_id: u32,
+    ) -> Result<EdgeStreamSet, EngineError> {
+        let stream = self.build_label_edge_stream(label_id)?;
+        #[cfg(test)]
+        for _ in 0..stream.union.cursors.len() {
+            note_prepared_edge_native_cursor_build();
+        }
+        Ok(stream.into_stream_set())
+    }
+
+    fn build_prepared_full_scan_edge_cursor(&self) -> EdgeStreamSet {
+        let mut cursors = Vec::with_capacity(1 + self.immutable_epochs.len() + self.segments.len());
+        cursors.push(EdgeCandidateCursor::memtable_full_scan(
+            Arc::clone(&self.memtable),
+            self.snapshot_seq,
+        ));
+        for epoch in &self.immutable_epochs {
+            cursors.push(EdgeCandidateCursor::memtable_full_scan(
+                Arc::clone(&epoch.memtable),
+                self.snapshot_seq,
+            ));
+        }
+        for segment in &self.segments {
+            cursors.push(EdgeCandidateCursor::segment_full_scan(Arc::clone(segment)));
+        }
+        #[cfg(test)]
+        for _ in 0..cursors.len() {
+            note_prepared_edge_native_cursor_build();
+        }
+        EdgeStreamSet::new(cursors)
+    }
+
     fn build_label_edge_stream(&self, label_id: u32) -> Result<EdgeLeafStream, EngineError> {
         let mut cursors = Vec::new();
         cursors.push(EdgeCandidateCursor::memtable_label(
@@ -597,6 +1285,354 @@ impl ReadView {
         Ok(EdgeLeafStream::sorted_buffer(
             self.sources().edge_ids_by_triple(from, to, label_id)?,
         ))
+    }
+
+    fn prepare_streamed_edge_driver(
+        &self,
+        query: &NormalizedEdgeQuery,
+        cap_context: EdgeQueryCapContext,
+        plan: &EdgePhysicalPlan,
+        budget: &PreparedEdgeIdBudget,
+    ) -> Result<PreparedEdgeStreamBuildResult, EngineError> {
+        let mut followups = Vec::new();
+        match plan {
+            EdgePhysicalPlan::Intersect { inputs, .. } => {
+                let mut streams = Vec::new();
+                for input in inputs {
+                    match self.prepare_edge_leaf_stream(query, cap_context, input, budget)? {
+                        PreparedEdgeLeafBuildResult::Ready(stream) => {
+                            streams.push(stream.into_stream_set());
+                        }
+                        PreparedEdgeLeafBuildResult::Demoted {
+                            followups: mut input_followups,
+                        } => followups.append(&mut input_followups),
+                        PreparedEdgeLeafBuildResult::TooBroad {
+                            followups: mut input_followups,
+                        } => {
+                            followups.append(&mut input_followups);
+                            return Ok(PreparedEdgeStreamBuildResult::TooBroad { followups });
+                        }
+                    }
+                }
+                if streams.is_empty() {
+                    return Ok(PreparedEdgeStreamBuildResult::TooBroad { followups });
+                }
+                Ok(PreparedEdgeStreamBuildResult::Ready {
+                    topology: PreparedEdgeStreamTopology::Intersect(LeapfrogIntersection::new(
+                        streams,
+                    )),
+                    followups,
+                })
+            }
+            EdgePhysicalPlan::Union { inputs, .. } => {
+                match self.prepare_edge_union_leaf_stream(query, cap_context, inputs, budget)? {
+                    PreparedEdgeLeafBuildResult::Ready(stream) => {
+                        Ok(PreparedEdgeStreamBuildResult::Ready {
+                            topology: PreparedEdgeStreamTopology::Union(stream.into_stream_set()),
+                            followups,
+                        })
+                    }
+                    PreparedEdgeLeafBuildResult::Demoted {
+                        followups: mut input_followups,
+                    }
+                    | PreparedEdgeLeafBuildResult::TooBroad {
+                        followups: mut input_followups,
+                    } => {
+                        followups.append(&mut input_followups);
+                        Ok(PreparedEdgeStreamBuildResult::TooBroad { followups })
+                    }
+                }
+            }
+            _ => match self.prepare_edge_leaf_stream(query, cap_context, plan, budget)? {
+                PreparedEdgeLeafBuildResult::Ready(stream) => {
+                    Ok(PreparedEdgeStreamBuildResult::Ready {
+                        topology: PreparedEdgeStreamTopology::Union(stream.into_stream_set()),
+                        followups,
+                    })
+                }
+                PreparedEdgeLeafBuildResult::Demoted {
+                    followups: mut input_followups,
+                }
+                | PreparedEdgeLeafBuildResult::TooBroad {
+                    followups: mut input_followups,
+                } => {
+                    followups.append(&mut input_followups);
+                    Ok(PreparedEdgeStreamBuildResult::TooBroad { followups })
+                }
+            },
+        }
+    }
+
+    fn prepare_edge_leaf_stream(
+        &self,
+        query: &NormalizedEdgeQuery,
+        cap_context: EdgeQueryCapContext,
+        plan: &EdgePhysicalPlan,
+        budget: &PreparedEdgeIdBudget,
+    ) -> Result<PreparedEdgeLeafBuildResult, EngineError> {
+        match plan {
+            EdgePhysicalPlan::BufferedIdSort(input) => {
+                self.prepare_buffered_edge_leaf_stream(query, cap_context, input, budget)
+            }
+            EdgePhysicalPlan::Source(source) => {
+                self.prepare_edge_source_stream(query, cap_context, source, budget)
+            }
+            EdgePhysicalPlan::Empty => Ok(PreparedEdgeLeafBuildResult::Ready(
+                EdgeLeafStream::new(Vec::new()),
+            )),
+            EdgePhysicalPlan::Union { inputs, .. } => {
+                self.prepare_edge_union_leaf_stream(query, cap_context, inputs, budget)
+            }
+            EdgePhysicalPlan::Intersect { .. } => Ok(PreparedEdgeLeafBuildResult::TooBroad {
+                followups: Vec::new(),
+            }),
+        }
+    }
+
+    fn prepare_edge_union_leaf_stream(
+        &self,
+        query: &NormalizedEdgeQuery,
+        cap_context: EdgeQueryCapContext,
+        inputs: &[EdgePhysicalPlan],
+        budget: &PreparedEdgeIdBudget,
+    ) -> Result<PreparedEdgeLeafBuildResult, EngineError> {
+        let mut cursors = Vec::new();
+        let mut followups = Vec::new();
+        for input in inputs {
+            let built = match input {
+                EdgePhysicalPlan::Union { inputs, .. } => self
+                    .prepare_edge_union_leaf_stream(query, cap_context, inputs, budget)?,
+                _ => self.prepare_edge_leaf_stream(query, cap_context, input, budget)?,
+            };
+            match built {
+                PreparedEdgeLeafBuildResult::Ready(stream) => {
+                    cursors.extend(stream.into_cursors());
+                }
+                PreparedEdgeLeafBuildResult::Demoted {
+                    followups: mut input_followups,
+                }
+                | PreparedEdgeLeafBuildResult::TooBroad {
+                    followups: mut input_followups,
+                } => {
+                    followups.append(&mut input_followups);
+                    return Ok(PreparedEdgeLeafBuildResult::Demoted { followups });
+                }
+            }
+        }
+        Ok(PreparedEdgeLeafBuildResult::Ready(EdgeLeafStream::new(
+            cursors,
+        )))
+    }
+
+    fn prepare_edge_source_stream(
+        &self,
+        query: &NormalizedEdgeQuery,
+        cap_context: EdgeQueryCapContext,
+        source: &PlannedEdgeCandidateSource,
+        budget: &PreparedEdgeIdBudget,
+    ) -> Result<PreparedEdgeLeafBuildResult, EngineError> {
+        match &source.materialization {
+            EdgeCandidateMaterialization::Precomputed(_)
+            | EdgeCandidateMaterialization::EdgeTripleIndex { .. }
+            | EdgeCandidateMaterialization::FromEndpointAdjacency { .. }
+            | EdgeCandidateMaterialization::ToEndpointAdjacency { .. }
+            | EdgeCandidateMaterialization::AnyEndpointAdjacency { .. } => Err(
+                EngineError::InvalidOperation(
+                    "prepared graph-row edge source received unreachable anchored input source"
+                        .into(),
+                ),
+            ),
+            EdgeCandidateMaterialization::EdgeLabelIndex { label_id } => {
+                let stream = self.build_label_edge_stream(*label_id)?;
+                #[cfg(test)]
+                for _ in 0..stream.union.cursors.len() {
+                    note_prepared_edge_streamed_cursor_build();
+                }
+                Ok(PreparedEdgeLeafBuildResult::Ready(stream))
+            }
+            EdgeCandidateMaterialization::EdgePropertyEqualityIndex {
+                index_id,
+                value_hashes,
+                ..
+            } => self.prepare_equality_edge_stream(*index_id, value_hashes, budget),
+            EdgeCandidateMaterialization::EdgeWeightIndex { .. }
+            | EdgeCandidateMaterialization::EdgeUpdatedAtIndex { .. }
+            | EdgeCandidateMaterialization::EdgeValidFromIndex { .. }
+            | EdgeCandidateMaterialization::EdgeValidToIndex { .. }
+            | EdgeCandidateMaterialization::EdgePropertyRangeIndex { .. } => self
+                .prepare_buffered_edge_leaf_stream(
+                    query,
+                    cap_context,
+                    &EdgePhysicalPlan::Source(source.clone()),
+                    budget,
+                ),
+            EdgeCandidateMaterialization::CompoundPrefixIndex { .. }
+            | EdgeCandidateMaterialization::CompoundRangeIndex { .. }
+            | EdgeCandidateMaterialization::FallbackFullEdgeScan => {
+                Ok(PreparedEdgeLeafBuildResult::TooBroad {
+                    followups: Vec::new(),
+                })
+            }
+        }
+    }
+
+    fn prepare_equality_edge_stream(
+        &self,
+        index_id: u64,
+        value_hashes: &[u64],
+        budget: &PreparedEdgeIdBudget,
+    ) -> Result<PreparedEdgeLeafBuildResult, EngineError> {
+        let mut cursors = Vec::new();
+        let mut followups = Vec::new();
+        for segment in &self.segments {
+            let coverage = self.declared_index_runtime_coverage.state(
+                segment.segment_id,
+                index_id,
+                PlannerStatsDeclaredIndexTarget::EdgeProperty,
+                crate::planner_stats::PlannerStatsDeclaredIndexKind::Equality,
+            );
+            if coverage != crate::planner_stats::DeclaredIndexRuntimeCoverageState::Available {
+                followups.extend(materialization_followups(
+                    self.equality_sidecar_failure_followup(index_id, None),
+                ));
+                return Ok(PreparedEdgeLeafBuildResult::Demoted { followups });
+            }
+        }
+
+        for &value_hash in value_hashes {
+            let mut memtables = Vec::with_capacity(1 + self.immutable_epochs.len());
+            memtables.push(Arc::clone(&self.memtable));
+            memtables.extend(
+                self.immutable_epochs
+                    .iter()
+                    .map(|epoch| Arc::clone(&epoch.memtable)),
+            );
+            for memtable in memtables {
+                let count = memtable.secondary_eq_edge_hash_count_at(
+                    index_id,
+                    value_hash,
+                    self.snapshot_seq,
+                );
+                if count == 0 {
+                    continue;
+                }
+                let Some(mut reservation) = budget.reserve(count) else {
+                    return Ok(PreparedEdgeLeafBuildResult::Demoted { followups });
+                };
+                let ids = memtable.visible_secondary_eq_edge_ids_sorted(
+                    index_id,
+                    value_hash,
+                    self.snapshot_seq,
+                );
+                reservation.shrink_to(ids.len());
+                cursors.push(EdgeCandidateCursor::prepared_sorted_buffer(
+                    PreparedRetainedEdgeIds { ids, reservation },
+                ));
+                #[cfg(test)]
+                note_prepared_edge_streamed_cursor_build();
+            }
+            for segment in &self.segments {
+                match segment.secondary_eq_group_span_if_present_for_target(
+                    index_id,
+                    PlannerStatsDeclaredIndexTarget::EdgeProperty,
+                    value_hash,
+                ) {
+                    Ok(crate::segment_reader::SecondaryEqGroupSpanLookup::Found(span)) => {
+                        cursors.push(EdgeCandidateCursor::segment_equality_group(
+                            Arc::clone(segment),
+                            index_id,
+                            span.offset,
+                            span.id_count,
+                        ));
+                        #[cfg(test)]
+                        note_prepared_edge_streamed_cursor_build();
+                    }
+                    Ok(crate::segment_reader::SecondaryEqGroupSpanLookup::MissingValueGroup) => {}
+                    Ok(crate::segment_reader::SecondaryEqGroupSpanLookup::MissingSidecar) => {
+                        followups.extend(materialization_followups(
+                            self.equality_sidecar_failure_followup(index_id, None),
+                        ));
+                        return Ok(PreparedEdgeLeafBuildResult::Demoted { followups });
+                    }
+                    Err(error) => {
+                        followups.extend(materialization_followups(
+                            self.equality_sidecar_failure_followup(index_id, Some(error)),
+                        ));
+                        return Ok(PreparedEdgeLeafBuildResult::Demoted { followups });
+                    }
+                }
+            }
+        }
+        Ok(PreparedEdgeLeafBuildResult::Ready(EdgeLeafStream::new(
+            cursors,
+        )))
+    }
+
+    fn prepare_buffered_edge_leaf_stream(
+        &self,
+        query: &NormalizedEdgeQuery,
+        cap_context: EdgeQueryCapContext,
+        plan: &EdgePhysicalPlan,
+        budget: &PreparedEdgeIdBudget,
+    ) -> Result<PreparedEdgeLeafBuildResult, EngineError> {
+        let Some(source) = plan.as_source() else {
+            return Ok(PreparedEdgeLeafBuildResult::TooBroad {
+                followups: Vec::new(),
+            });
+        };
+        let source_cap = cap_context.source_cap(source.kind, query.page.limit, source.estimate);
+        let allowed = source_cap.min(budget.remaining());
+        let read_limit = allowed.saturating_add(1);
+        let mut followups = Vec::new();
+        let ids = match &source.materialization {
+            EdgeCandidateMaterialization::EdgePropertyRangeIndex {
+                index_id,
+                lower,
+                upper,
+                ..
+            } => {
+                let (ids, followup) = self.ready_edge_range_candidate_ids(
+                    *index_id,
+                    lower.as_ref(),
+                    upper.as_ref(),
+                    read_limit,
+                )?;
+                followups.extend(materialization_followups(followup));
+                let Some(ids) = ids else {
+                    return Ok(PreparedEdgeLeafBuildResult::Demoted { followups });
+                };
+                ids
+            }
+            EdgeCandidateMaterialization::EdgeWeightIndex { label_id, bounds } => self
+                .sources()
+                .edge_ids_by_weight_range_limited(*label_id, *bounds, read_limit)?,
+            EdgeCandidateMaterialization::EdgeUpdatedAtIndex { label_id, bounds } => self
+                .sources()
+                .edge_ids_by_updated_at_range_limited(*label_id, *bounds, read_limit)?,
+            EdgeCandidateMaterialization::EdgeValidFromIndex { label_id, bounds } => self
+                .sources()
+                .edge_ids_by_valid_from_range_limited(*label_id, *bounds, read_limit)?,
+            EdgeCandidateMaterialization::EdgeValidToIndex { label_id, bounds } => self
+                .sources()
+                .edge_ids_by_valid_to_range_limited(*label_id, *bounds, read_limit)?,
+            _ => return self.prepare_edge_leaf_stream(query, cap_context, plan, budget),
+        };
+        if ids.len() > allowed {
+            if let Ok(retained) = PreparedRetainedEdgeIds::from_limited_read(ids, budget) {
+                drop(retained);
+            }
+            return Ok(PreparedEdgeLeafBuildResult::Demoted { followups });
+        }
+        let retained = PreparedRetainedEdgeIds::from_limited_read(ids, budget)
+            .map_err(|_| EngineError::InvalidOperation("prepared edge retained-ID budget accounting failed".into()))?;
+        #[cfg(test)]
+        {
+            note_prepared_edge_buffered_sort();
+            note_prepared_edge_streamed_cursor_build();
+        }
+        Ok(PreparedEdgeLeafBuildResult::Ready(EdgeLeafStream::new(vec![
+            EdgeCandidateCursor::prepared_sorted_buffer(retained),
+        ])))
     }
 
     fn execute_streamed_edge_driver(
@@ -1124,6 +2160,31 @@ fn push_memtable_endpoint_cursors(
 mod edge_stream_tests {
     use super::*;
 
+    #[test]
+    fn prepared_edge_metadata_pull_budget_accepts_cap_and_releases_overflow_sentinel() {
+        reset_prepared_edge_source_test_snapshot();
+        let budget = PreparedEdgeIdBudget::default();
+        let retained = PreparedRetainedEdgeIds::from_exact(
+            (0..PREPARED_EDGE_RETAINED_ID_CAP as u64).collect(),
+            &budget,
+        )
+        .expect("exact retained-ID cap should fit");
+        assert_eq!(budget.live(), PREPARED_EDGE_RETAINED_ID_CAP);
+        drop(retained);
+        assert_eq!(budget.live(), 0);
+
+        let overflow = PreparedRetainedEdgeIds::from_limited_read(
+            (0..=PREPARED_EDGE_RETAINED_ID_CAP as u64).collect(),
+            &budget,
+        );
+        assert!(overflow.is_err());
+        assert_eq!(budget.live(), 0);
+        assert_eq!(
+            prepared_edge_source_test_snapshot().retained_id_units_peak,
+            PREPARED_EDGE_RETAINED_ID_CAP + 1
+        );
+    }
+
     fn sorted_cursor(ids: &[u64]) -> EdgeCandidateCursor {
         EdgeCandidateCursor::sorted_buffer(ids.to_vec())
     }
@@ -1244,6 +2305,67 @@ mod edge_stream_tests {
         }
     }
 
+    fn collect_cursor_seek(mut cursor: EdgeCandidateCursor, lower: u64) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut bound = lower;
+        while let Some(candidate) = cursor.next_ge(bound).unwrap() {
+            out.push(candidate);
+            if candidate == u64::MAX {
+                break;
+            }
+            bound = candidate + 1;
+        }
+        out
+    }
+
+    fn collect_cursor_bulk(
+        mut cursor: EdgeCandidateCursor,
+        lower: u64,
+        upper_exclusive: Option<u64>,
+        chunk_size: usize,
+    ) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut bound = lower;
+        loop {
+            let before = out.len();
+            cursor
+                .append_chunk(bound, upper_exclusive, chunk_size, &mut out)
+                .unwrap();
+            if out.len() == before {
+                break;
+            }
+            let last = *out.last().unwrap();
+            if last == u64::MAX {
+                break;
+            }
+            bound = last + 1;
+        }
+        out
+    }
+
+    fn assert_cursor_bulk_matches_seek(
+        name: &str,
+        mut factory: impl FnMut() -> EdgeCandidateCursor,
+    ) {
+        let expected = collect_cursor_seek(factory(), 0);
+        for chunk_size in [1, 2, 255, 256] {
+            assert_eq!(
+                collect_cursor_bulk(factory(), 0, None, chunk_size),
+                expected,
+                "{name}, full, chunk_size={chunk_size}"
+            );
+            assert_eq!(
+                collect_cursor_bulk(factory(), 2, Some(8), chunk_size),
+                expected
+                    .iter()
+                    .copied()
+                    .filter(|&candidate| (2..8).contains(&candidate))
+                    .collect::<Vec<_>>(),
+                "{name}, bounded, chunk_size={chunk_size}"
+            );
+        }
+    }
+
     #[test]
     fn edge_stream_sorted_buffer_cursor_contract() {
         let mut empty = sorted_cursor(&[]);
@@ -1271,10 +2393,12 @@ mod edge_stream_tests {
         let ids = [1, 3, 5, 8];
         let bounds = [0, 1, 1, 2, 3, 4, 5, 6, 8, 9, 9, u64::MAX];
         assert_cursor_sequence("sorted terminal", sorted_cursor(&ids), &ids, &bounds);
+        assert_cursor_bulk_matches_seek("sorted terminal", || sorted_cursor(&ids));
 
         let max_ids = [2, u64::MAX];
         let max_bounds = [0, 2, 2, 3, u64::MAX, u64::MAX];
         assert_cursor_sequence("sorted max", sorted_cursor(&max_ids), &max_ids, &max_bounds);
+        assert_cursor_bulk_matches_seek("sorted max", || sorted_cursor(&max_ids));
 
         let label_memtable = Arc::new(Memtable::new());
         for (seq, id) in ids.into_iter().enumerate() {
@@ -1286,6 +2410,19 @@ mod edge_stream_tests {
             &ids,
             &bounds,
         );
+        assert_cursor_bulk_matches_seek("memtable label", || {
+            EdgeCandidateCursor::memtable_label(
+                Arc::clone(&label_memtable),
+                33,
+                ids.len() as u64,
+            )
+        });
+        assert_cursor_bulk_matches_seek("memtable full scan", || {
+            EdgeCandidateCursor::memtable_full_scan(
+                Arc::clone(&label_memtable),
+                ids.len() as u64,
+            )
+        });
         assert_cursor_sequence(
             "memtable label absent",
             EdgeCandidateCursor::memtable_label(label_memtable, 34, ids.len() as u64),
@@ -1306,6 +2443,25 @@ mod edge_stream_tests {
             &max_ids,
             &max_bounds,
         );
+        assert_cursor_sequence(
+            "memtable full scan max",
+            EdgeCandidateCursor::memtable_full_scan(Arc::clone(&max_label_memtable), 2),
+            &max_ids,
+            &max_bounds,
+        );
+        assert_cursor_bulk_matches_seek("memtable label max", || {
+            EdgeCandidateCursor::memtable_label(
+                Arc::clone(&max_label_memtable),
+                34,
+                2,
+            )
+        });
+        assert_cursor_bulk_matches_seek("memtable full scan max", || {
+            EdgeCandidateCursor::memtable_full_scan(
+                Arc::clone(&max_label_memtable),
+                2,
+            )
+        });
 
         let segment_label_memtable = Memtable::new();
         for (seq, id) in ids.into_iter().enumerate() {
@@ -1321,6 +2477,15 @@ mod edge_stream_tests {
             &ids,
             &bounds,
         );
+        assert_cursor_bulk_matches_seek("segment label", || {
+            EdgeCandidateCursor::segment_label_posting(
+                Arc::clone(&label_reader),
+                label_posting,
+            )
+        });
+        assert_cursor_bulk_matches_seek("segment full scan", || {
+            EdgeCandidateCursor::segment_full_scan(Arc::clone(&label_reader))
+        });
 
         let max_segment_label_memtable = Memtable::new();
         for (seq, id) in max_ids.into_iter().enumerate() {
@@ -1333,10 +2498,28 @@ mod edge_stream_tests {
         let max_label_posting = max_label_reader.edge_label_posting(36).unwrap().unwrap();
         assert_cursor_sequence(
             "segment label max",
-            EdgeCandidateCursor::segment_label_posting(max_label_reader, max_label_posting),
+            EdgeCandidateCursor::segment_label_posting(
+                Arc::clone(&max_label_reader),
+                max_label_posting,
+            ),
             &max_ids,
             &max_bounds,
         );
+        assert_cursor_sequence(
+            "segment full scan max",
+            EdgeCandidateCursor::segment_full_scan(Arc::clone(&max_label_reader)),
+            &max_ids,
+            &max_bounds,
+        );
+        assert_cursor_bulk_matches_seek("segment label max", || {
+            EdgeCandidateCursor::segment_label_posting(
+                Arc::clone(&max_label_reader),
+                max_label_posting,
+            )
+        });
+        assert_cursor_bulk_matches_seek("segment full scan max", || {
+            EdgeCandidateCursor::segment_full_scan(Arc::clone(&max_label_reader))
+        });
 
         let entry = edge_equality_entry(93, 37, "status");
         let equality_memtable = Memtable::new();
@@ -1374,6 +2557,14 @@ mod edge_stream_tests {
             &ids,
             &bounds,
         );
+        assert_cursor_bulk_matches_seek("segment equality", || {
+            EdgeCandidateCursor::segment_equality_group(
+                Arc::clone(&eq_reader),
+                entry.index_id,
+                eq_span.offset,
+                eq_span.id_count,
+            )
+        });
 
         let max_entry = edge_equality_entry(94, 38, "status");
         let max_equality_memtable = Memtable::new();
@@ -1402,7 +2593,7 @@ mod edge_stream_tests {
         assert_cursor_sequence(
             "segment equality max",
             EdgeCandidateCursor::segment_equality_group(
-                max_eq_reader,
+                Arc::clone(&max_eq_reader),
                 max_entry.index_id,
                 max_eq_span.offset,
                 max_eq_span.id_count,
@@ -1410,6 +2601,14 @@ mod edge_stream_tests {
             &max_ids,
             &max_bounds,
         );
+        assert_cursor_bulk_matches_seek("segment equality max", || {
+            EdgeCandidateCursor::segment_equality_group(
+                Arc::clone(&max_eq_reader),
+                max_entry.index_id,
+                max_eq_span.offset,
+                max_eq_span.id_count,
+            )
+        });
 
         let adj_memtable = Arc::new(Memtable::new());
         adj_memtable.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 1);
@@ -1429,6 +2628,15 @@ mod edge_stream_tests {
             &ids,
             &bounds,
         );
+        assert_cursor_bulk_matches_seek("memtable adjacency", || {
+            EdgeCandidateCursor::memtable_adjacency(
+                Arc::clone(&adj_memtable),
+                1,
+                true,
+                Some(39),
+                ids.len() as u64 + 2,
+            )
+        });
         assert_cursor_sequence(
             "memtable adjacency missing node",
             EdgeCandidateCursor::memtable_adjacency(adj_memtable, 99, true, Some(39), 6),
@@ -1455,6 +2663,15 @@ mod edge_stream_tests {
             &max_ids,
             &max_bounds,
         );
+        assert_cursor_bulk_matches_seek("memtable adjacency max", || {
+            EdgeCandidateCursor::memtable_adjacency(
+                Arc::clone(&max_adj_memtable),
+                1,
+                true,
+                Some(40),
+                4,
+            )
+        });
 
         let segment_adj_memtable = Memtable::new();
         segment_adj_memtable.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 1);
@@ -1472,10 +2689,22 @@ mod edge_stream_tests {
         assert_eq!(adj_cursors.len(), 1);
         assert_cursor_sequence(
             "segment adjacency terminal",
-            EdgeCandidateCursor::segment_adjacency(adj_reader, adj_cursors.remove(0)),
+            EdgeCandidateCursor::segment_adjacency(
+                Arc::clone(&adj_reader),
+                adj_cursors.remove(0),
+            ),
             &ids,
             &bounds,
         );
+        assert_cursor_bulk_matches_seek("segment adjacency", || {
+            let mut cursors = adj_reader
+                .endpoint_adj_posting_cursors(&[1], Direction::Outgoing, Some(&adj_labels))
+                .unwrap();
+            EdgeCandidateCursor::segment_adjacency(
+                Arc::clone(&adj_reader),
+                cursors.remove(0),
+            )
+        });
 
         let max_segment_adj_memtable = Memtable::new();
         max_segment_adj_memtable.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 1);
@@ -1493,10 +2722,26 @@ mod edge_stream_tests {
         assert_eq!(max_adj_cursors.len(), 1);
         assert_cursor_sequence(
             "segment adjacency max",
-            EdgeCandidateCursor::segment_adjacency(max_adj_reader, max_adj_cursors.remove(0)),
+            EdgeCandidateCursor::segment_adjacency(
+                Arc::clone(&max_adj_reader),
+                max_adj_cursors.remove(0),
+            ),
             &max_ids,
             &max_bounds,
         );
+        assert_cursor_bulk_matches_seek("segment adjacency max", || {
+            let mut cursors = max_adj_reader
+                .endpoint_adj_posting_cursors(
+                    &[1],
+                    Direction::Outgoing,
+                    Some(&max_adj_labels),
+                )
+                .unwrap();
+            EdgeCandidateCursor::segment_adjacency(
+                Arc::clone(&max_adj_reader),
+                cursors.remove(0),
+            )
+        });
     }
 
     #[test]

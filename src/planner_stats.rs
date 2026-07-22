@@ -4747,6 +4747,13 @@ fn validate_adjacency_stats(stats: &SegmentPlannerStatsV1) -> Result<(), String>
         {
             return Err("planner stats adjacency fanout summary is inconsistent".to_string());
         }
+        if (adjacency.total_edges as u128)
+            > (adjacency.source_node_count as u128) * (adjacency.max_fanout as u128)
+        {
+            return Err(
+                "planner stats adjacency total exceeds source count times max fanout".to_string(),
+            );
+        }
         if adjacency.top_hubs.len() as u64 > adjacency.source_node_count {
             return Err("planner stats adjacency hub sample exceeds source count".to_string());
         }
@@ -6221,6 +6228,43 @@ mod tests {
         node_label_counts.insert(7, 1);
 
         assert!(validate_declared_index_stats(&stats, &node_label_counts).is_ok());
+    }
+
+    #[test]
+    fn adjacency_stats_validate_relational_fanout_bounds_with_widened_arithmetic() {
+        let row = |source_node_count, total_edges, max_fanout| AdjacencyPlannerStats {
+            direction: PlannerStatsDirection::Outgoing,
+            edge_label_id: None,
+            source_node_count,
+            total_edges,
+            min_fanout: 1,
+            max_fanout,
+            p50_fanout: 1,
+            p90_fanout: max_fanout,
+            p99_fanout: max_fanout,
+            top_hubs: Vec::new(),
+        };
+
+        let mut equality = minimal_stats(1);
+        equality.edge_count = 12;
+        equality.adjacency_stats = vec![row(3, 12, 4)];
+        assert!(validate_adjacency_stats(&equality).is_ok());
+
+        let mut impossible = minimal_stats(2);
+        impossible.edge_count = 5;
+        impossible.adjacency_stats = vec![row(2, 5, 2)];
+        assert_eq!(
+            validate_adjacency_stats(&impossible).unwrap_err(),
+            "planner stats adjacency total exceeds source count times max fanout"
+        );
+
+        let mut widened = minimal_stats(3);
+        widened.edge_count = u64::MAX;
+        widened.adjacency_stats = vec![row((u64::MAX / 2) + 1, u64::MAX, 2)];
+        assert!(
+            validate_adjacency_stats(&widened).is_ok(),
+            "the source-count/max-fanout product must be evaluated in u128"
+        );
     }
 
     fn ready_eq_entry(index_id: u64, label_id: u32, prop_key: &str) -> SecondaryIndexManifestEntry {

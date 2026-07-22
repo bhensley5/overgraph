@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-20
+
+### Changed
+
+#### Bounded Edge-Driven Graph Queries
+- **Edge-anchored reads now produce bounded chunks.** Eligible graph-row and GQL patterns whose physical driver is an edge source no longer retain the complete candidate universe at once. Prepared edge sources, deterministic retries, and bounded result caching preserve exact rows, ordering, cursors, and query fingerprints.
+- **Broad edge-driven queries can succeed under small in-flight caps.** Frontier and intermediate-binding limits now bound simultaneously retained work instead of rejecting a query solely because its total candidate stream exceeds a cap.
+
+#### Ordered Adjacency Execution
+- **Dense edge anchors can stop after a proven logical boundary.** Cost-eligible plans walk existing adjacency groups in logical-from node order, allowing limited reads to stop once unseen owners cannot change the selected page.
+- **Continuation pages seek to their logical owner.** Eligible cursor pages begin at the cursor's first logical node while preserving inclusive verification, deterministic pagination, and unchanged cursor bytes.
+- **Sparse and ineligible shapes retain the prepared edge fallback.** Explicit edge IDs, active mutable edge records, ordered queries, and cost-rejected plans continue through the bounded edge-ID source.
+
+### Fixed
+
+- **Unbounded edge-anchor retention.** Edge-driven fixed-pattern reads no longer need result state proportional to the complete candidate universe.
+- **Dense edge-anchor overwork.** Limited and cursor-based reads can avoid exhausting later adjacency owners when a complete owner boundary proves the final page.
+- **Hub-shaped plan safety.** Conservative owner bounds prevent automatic adjacency selection when one owner can exceed the effective pull ceiling.
+
 ## [0.16.0] - 2026-07-13
 
 ### Added
@@ -540,6 +559,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.17.0]: https://github.com/bhensley5/overgraph/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/bhensley5/overgraph/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/bhensley5/overgraph/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/bhensley5/overgraph/compare/v0.13.0...v0.14.0

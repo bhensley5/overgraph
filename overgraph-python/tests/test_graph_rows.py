@@ -260,6 +260,115 @@ def test_query_graph_rows_omitted_limit_defaults_to_1000(tmp_dir):
         db.close(force=True)
 
 
+def test_query_graph_rows_adjacency_pull_pages_and_active_fallback(tmp_dir):
+    db = OverGraph.open(os.path.join(tmp_dir, "graph_rows_adjacency_pull"))
+    try:
+        expected = []
+        for ordinal in range(1_024):
+            source_id = db.upsert_node(
+                "PyAdjacencySource",
+                f"python-adjacency-source-{ordinal:04d}",
+            )
+            target_id = db.upsert_node(
+                "PyAdjacencyTarget",
+                f"python-adjacency-target-{ordinal:04d}",
+            )
+            edge_id = db.upsert_edge(source_id, target_id, "PY_ADJACENCY_EDGE")
+            expected.append(
+                {
+                    "source_id": source_id,
+                    "edge_id": edge_id,
+                    "target_id": target_id,
+                }
+            )
+
+        request = {
+            "nodes": [{"alias": "source"}, {"alias": "target"}],
+            "pieces": [
+                {
+                    "kind": "edge",
+                    "alias": "edge",
+                    "from": "source",
+                    "to": "target",
+                    "labels": ["PY_ADJACENCY_EDGE"],
+                }
+            ],
+            "return": [
+                {"expr": {"binding": "source"}, "as": "source_id"},
+                {"expr": {"binding": "edge"}, "as": "edge_id"},
+                {"expr": {"binding": "target"}, "as": "target_id"},
+            ],
+            "limit": 10,
+            "options": {"include_plan": True},
+        }
+
+        active = db.query_graph_rows(request)
+        assert active["rows"] == expected[:10]
+        assert active["next_cursor"]
+        active_plan = repr(active["plan"])
+        assert "source=EdgePull{edge=alias:edge}" in active_plan
+        assert "choice=EdgePullChunk" in active_plan
+        assert "mutable_active_memtable" in active_plan
+        assert "source=AdjacencyPull{" not in active_plan
+
+        assert db.flush() is not None
+
+        request = {
+            **request,
+            "at_epoch": active["stats"]["effective_at_epoch"],
+        }
+
+        first = db.query_graph_rows(request)
+        repeated_first = db.query_graph_rows(request)
+        assert first["rows"] == expected[:10]
+        assert repeated_first["rows"] == expected[:10]
+        assert first["next_cursor"] == active["next_cursor"]
+        assert first["next_cursor"] == repeated_first["next_cursor"]
+        assert first["next_cursor"]
+        assert first["plan"]["fingerprint"] == active["plan"]["fingerprint"]
+        assert repeated_first["plan"]["fingerprint"] == first["plan"]["fingerprint"]
+        assert first["stats"]["effective_at_epoch"] == active["stats"]["effective_at_epoch"]
+        assert repeated_first["stats"]["effective_at_epoch"] == first["stats"]["effective_at_epoch"]
+        first_plan = repr(first["plan"])
+        for fact in (
+            "source=AdjacencyPull{edge=alias:edge}",
+            "choice=AdjacencyPullChunk",
+            "source_order=logical_from_group_asc",
+            "proof_boundary=completed_owner_group",
+            "early_exit=true",
+        ):
+            assert fact in first_plan
+
+        cursor_request = {**request, "cursor": first["next_cursor"]}
+        second = db.query_graph_rows(cursor_request)
+        repeated_second = db.query_graph_rows(cursor_request)
+        assert second["rows"] == expected[10:20]
+        assert repeated_second["rows"] == expected[10:20]
+        assert second["next_cursor"] == repeated_second["next_cursor"]
+        assert second["next_cursor"]
+        assert second["plan"]["fingerprint"] == first["plan"]["fingerprint"]
+        assert repeated_second["plan"]["fingerprint"] == second["plan"]["fingerprint"]
+        assert second["stats"]["effective_at_epoch"] == first["stats"]["effective_at_epoch"]
+        assert repeated_second["stats"]["effective_at_epoch"] == second["stats"]["effective_at_epoch"]
+        second_plan = repr(second["plan"])
+        for fact in (
+            "source=AdjacencyPull{edge=alias:edge}",
+            "choice=AdjacencyPullChunk",
+            "source_order=logical_from_group_asc",
+            "proof_boundary=completed_owner_group",
+            "early_exit=true",
+            "cursor_seek=anchor_ge:",
+            "cursor_seek_units=",
+        ):
+            assert fact in second_plan
+
+        third = db.query_graph_rows({**request, "cursor": second["next_cursor"]})
+        assert third["rows"] == expected[20:30]
+        assert third["next_cursor"]
+    finally:
+        db.close(force=True)
+
+
 def test_query_graph_rows_explain_params_and_expression_tags(tmp_dir):
     ids = seed_graph(db := OverGraph.open(os.path.join(tmp_dir, "expr_test")))
     try:
