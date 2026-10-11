@@ -5957,6 +5957,52 @@ fn test_bg_compact_writes_during() {
 }
 
 #[test]
+fn test_wait_for_bg_compaction_observes_completion_after_initial_queue_check() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(
+        dir.path(),
+        &DbOptions {
+            memtable_flush_threshold: 0,
+            compact_after_n_flushes: 0,
+            ..DbOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(db.wait_for_bg_compact().is_none());
+    for key in ["first", "second"] {
+        db.upsert_node("Person", key, UpsertNodeOptions::default())
+            .unwrap();
+        db.flush().unwrap();
+    }
+    let (ready_rx, release_tx) = db.set_bg_compact_pause();
+    db.start_bg_compact().unwrap();
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+
+    let mut observed_empty_queue = false;
+    let stats = db.runtime.wait_for_bg_compaction_after_queue_check(|| {
+        assert!(
+            !observed_empty_queue,
+            "completion must be returned on this iteration"
+        );
+        observed_empty_queue = true;
+        let progress_seq = db.runtime.lifecycle_progress_seq();
+        release_tx.send(()).unwrap();
+        db.runtime.wait_for_lifecycle_progress(progress_seq).unwrap();
+        assert!(!db.bg_compact_active_for_test());
+    });
+    assert!(observed_empty_queue);
+    assert!(stats.is_some(), "a completed compaction must not be missed");
+    assert_eq!(db.segments_for_test().len(), 1);
+    assert!(
+        db.wait_for_bg_compact().is_none(),
+        "completion is consumed once"
+    );
+    db.close().unwrap();
+}
+
+#[test]
 fn test_flushes_while_bg_compact_is_outstanding_count_toward_next_run() {
     let dir = TempDir::new().unwrap();
     let opts = DbOptions {
@@ -15697,6 +15743,54 @@ fn test_property_range_index_manifest_reopens_and_reseeds_active_memtable() {
     let ready = wait_for_property_index_state(&reopened, info.index_id, SecondaryIndexState::Ready);
     assert_eq!(ready.index_id, info.index_id);
     reopened.close().unwrap();
+}
+
+#[test]
+fn test_wait_one_flush_observes_completion_after_initial_queue_check() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(
+        dir.path(),
+        &DbOptions {
+            memtable_flush_threshold: 0,
+            compact_after_n_flushes: 0,
+            ..DbOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(db.wait_one_flush().unwrap().is_none());
+    db.upsert_node("Person", "flush-race", UpsertNodeOptions::default())
+        .unwrap();
+    db.freeze_memtable().unwrap();
+    let (publish_ready_rx, publish_release_tx) = db.set_flush_publish_pause();
+    db.enqueue_one_flush().unwrap();
+    publish_ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+
+    let mut observed_empty_queue = false;
+    let flushed = db
+        .runtime
+        .wait_one_flush_after_queue_check(|| {
+            assert!(
+                !observed_empty_queue,
+                "completion must be returned on this iteration"
+            );
+            observed_empty_queue = true;
+            // Complete the flush only after the waiter's first empty queue read.
+            let progress_seq = db.runtime.lifecycle_progress_seq();
+            publish_release_tx.send(()).unwrap();
+            db.runtime.wait_for_lifecycle_progress(progress_seq).unwrap();
+            assert_eq!(db.in_flight_count(), 0);
+        })
+        .unwrap()
+        .expect("a completed flush must not be mistaken for an idle pipeline");
+    assert!(observed_empty_queue);
+    assert_eq!(flushed.id, db.segments_for_test()[0].segment_id);
+    assert!(
+        db.wait_one_flush().unwrap().is_none(),
+        "completion is consumed once"
+    );
+    db.close().unwrap();
 }
 
 #[test]

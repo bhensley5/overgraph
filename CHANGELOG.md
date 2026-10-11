@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-10-11
+
+### Fixed
+
+- Close a race in publishing background flush and compaction completion, with deterministic regression coverage for both paths.
+
+### Changed
+
+- Refresh the roadmap with clearer plans for vector spaces, combined retrieval, concurrent reads and writes, and more predictable query performance.
+
 ## [0.17.0] - 2026-07-20
 
 ### Changed
@@ -559,6 +569,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.17.1]: https://github.com/bhensley5/overgraph/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/bhensley5/overgraph/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/bhensley5/overgraph/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/bhensley5/overgraph/compare/v0.14.0...v0.15.0

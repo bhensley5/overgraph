@@ -3630,10 +3630,15 @@ fn test_find_nodes_range_fallback_orders_and_paginates() {
         )
         .unwrap();
 
+    // Keep the declaration Building while exercising the fallback routes.
+    let (build_ready_rx, build_release_tx) = engine.set_secondary_index_build_pause();
     let info = engine
         .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
         .unwrap();
     assert_eq!(info.state, SecondaryIndexState::Building);
+    build_ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
 
     engine.reset_property_query_routes();
     let lower_only = engine
@@ -3698,6 +3703,8 @@ fn test_find_nodes_range_fallback_orders_and_paginates() {
     assert_eq!(routes.range_scan_fallback, 4);
     assert_eq!(routes.range_index_lookup, 0);
 
+    build_release_tx.send(()).unwrap();
+    wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
     engine.close().unwrap();
 }
 

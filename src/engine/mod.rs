@@ -5160,8 +5160,9 @@ impl DbRuntime {
                 PublishImpact::NoPublish
             });
         let _ = self.publish_locked(core, publish_impact, false);
-        drop(core_guard);
 
+        // Keep epoch removal and completion recording atomic to core observers.
+        // Nested locks follow the existing core -> lifecycle order.
         if progressed {
             let mut lifecycle = self.lifecycle.lock().unwrap();
             for (epoch_id, seg_info) in flush_result.completed_flushes {
@@ -5176,6 +5177,7 @@ impl DbRuntime {
             lifecycle.progress_seq = lifecycle.progress_seq.wrapping_add(1);
             self.lifecycle_cv.notify_all();
         }
+        drop(core_guard);
         progressed
     }
 
@@ -5261,6 +5263,14 @@ impl DbRuntime {
 
     #[cfg(test)]
     fn wait_one_flush_public(&self) -> Result<Option<SegmentInfo>, EngineError> {
+        self.wait_one_flush_after_queue_check(|| {})
+    }
+
+    #[cfg(test)]
+    fn wait_one_flush_after_queue_check(
+        &self,
+        mut after_queue_check: impl FnMut(),
+    ) -> Result<Option<SegmentInfo>, EngineError> {
         let _guard = self.admit_operation()?;
         loop {
             if let Some(info) = self.take_next_completed_flush() {
@@ -5268,8 +5278,14 @@ impl DbRuntime {
             }
 
             let wait_seq = self.lifecycle_progress_seq();
+            after_queue_check();
             let mut core_guard = self.core.lock().unwrap();
             let core = core_guard.as_mut().ok_or(EngineError::DatabaseClosed)?;
+            // A batch may have completed after the first queue check. The core
+            // lock also excludes batches that have not yet recorded completion.
+            if let Some(info) = self.take_next_completed_flush() {
+                return Ok(Some(info));
+            }
             if core.flush_pipeline_error.is_some() && !core.flush_pipeline_error_reported {
                 let err = core
                     .current_flush_pipeline_error()
@@ -5289,6 +5305,14 @@ impl DbRuntime {
 
     #[cfg(test)]
     fn wait_for_bg_compaction_public(&self) -> Option<CompactionStats> {
+        self.wait_for_bg_compaction_after_queue_check(|| {})
+    }
+
+    #[cfg(test)]
+    fn wait_for_bg_compaction_after_queue_check(
+        &self,
+        mut after_queue_check: impl FnMut(),
+    ) -> Option<CompactionStats> {
         let _guard = self.admit_operation().ok()?;
         loop {
             if let Some(stats) = self.take_next_completed_bg_compaction() {
@@ -5296,8 +5320,14 @@ impl DbRuntime {
             }
 
             let wait_seq = self.lifecycle_progress_seq();
+            after_queue_check();
             let core_guard = self.core.lock().unwrap();
             let core = core_guard.as_ref()?;
+            // Pair completion and active-work observations under the core lock,
+            // just as wait_one_flush_after_queue_check does for flushes.
+            if let Some(stats) = self.take_next_completed_bg_compaction() {
+                return Some(stats);
+            }
             core.bg_compact.as_ref()?;
             drop(core_guard);
             if self.wait_for_lifecycle_progress(wait_seq).is_err() {
