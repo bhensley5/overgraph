@@ -10213,6 +10213,8 @@ fn gql_index_lifecycle_retry_failed_declaration_matches_native_ensure() {
     assert_eq!(failed.state, SecondaryIndexState::Failed);
     assert_eq!(failed.last_error.as_deref(), Some("gql index forced failure"));
 
+    // Retrying restarts the worker; hold it before observing the intermediate state.
+    let (build_ready_rx, build_release_tx) = engine.set_secondary_index_build_pause();
     let retried = execute_gql_ok(&engine, source);
     let retry_index_id = assert_create_property_index_row(
         &retried,
@@ -10227,6 +10229,9 @@ fn gql_index_lifecycle_retry_failed_declaration_matches_native_ensure() {
         GqlValue::String("building".to_string())
     );
     assert_eq!(retried.rows[0].values[8], GqlValue::Null);
+    build_ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
     let native = native_node_index(
         &engine,
         "GqlIndexRetryFailedNode",
@@ -10237,6 +10242,12 @@ fn gql_index_lifecycle_retry_failed_declaration_matches_native_ensure() {
     assert_eq!(native.index_id, index_id);
     assert_eq!(native.state, SecondaryIndexState::Building);
     assert!(native.last_error.is_none());
+
+    build_release_tx.send(()).unwrap();
+    let ready = wait_for_property_index_state(&engine, index_id, SecondaryIndexState::Ready);
+    assert_eq!(ready.index_id, index_id);
+    assert!(ready.last_error.is_none());
+    engine.close().unwrap();
 }
 
 #[test]
