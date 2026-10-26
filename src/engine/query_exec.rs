@@ -296,8 +296,22 @@ fn materialization_followups(
 }
 
 enum FullScanNodeSource<'a> {
-    Owned(Vec<u64>),
-    Segment(&'a SegmentReader),
+    Owned {
+        ids: Vec<u64>,
+        next: usize,
+    },
+    #[cfg(feature = "production-concurrency")]
+    Memtable {
+        memtable: &'a Memtable,
+        snapshot_seq: u64,
+        upper: u64,
+        next_after: Option<u64>,
+        chunk: MemtableIdChunk,
+    },
+    Segment {
+        segment: &'a SegmentReader,
+        next: usize,
+    },
 }
 
 enum FullScanEdgeSource<'a> {
@@ -305,6 +319,7 @@ enum FullScanEdgeSource<'a> {
         memtable: &'a Memtable,
         snapshot_seq: u64,
         next_after: Option<u64>,
+        chunk: MemtableIdChunk,
     },
     Segment {
         segment: &'a SegmentReader,
@@ -318,6 +333,7 @@ enum LabelEdgeSource<'a> {
         snapshot_seq: u64,
         label_id: u32,
         next_after: Option<u64>,
+        chunk: MemtableIdChunk,
     },
     Segment {
         segment: &'a SegmentReader,
@@ -342,24 +358,70 @@ impl Default for EdgeEndpointVisibilityCache {
     }
 }
 
-impl FullScanNodeSource<'_> {
-    fn get_id(&self, index: usize) -> Result<Option<u64>, EngineError> {
-        match self {
-            FullScanNodeSource::Owned(ids) => Ok(ids.get(index).copied()),
-            FullScanNodeSource::Segment(segment) => segment.node_id_at_index(index),
+impl<'a> FullScanNodeSource<'a> {
+    fn memtable(
+        memtable: &'a Memtable,
+        snapshot_seq: u64,
+        after: Option<u64>,
+    ) -> Result<Self, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(upper) = memtable.node_id_scan_upper_bound() {
+            return Ok(Self::Memtable {
+                memtable,
+                snapshot_seq,
+                upper,
+                next_after: after,
+                chunk: MemtableIdChunk::default(),
+            });
         }
+        // The default hash-backed primary has no ordered ID directory. Materialize
+        // it once, preserving its existing cost rather than repeatedly rescanning it.
+        let ids = memtable.visible_node_ids_at(snapshot_seq)?;
+        let next = after.map_or(0, |id| ids.partition_point(|value| *value <= id));
+        Ok(Self::Owned { ids, next })
     }
 
-    fn seek_after(&self, after: Option<u64>) -> Result<usize, EngineError> {
-        let Some(after) = after else {
-            return Ok(0);
+    fn segment(segment: &'a SegmentReader, after: Option<u64>) -> Result<Self, EngineError> {
+        let next = match after {
+            Some(after) => segment.node_id_lower_bound(after)?,
+            None => 0,
         };
+        Ok(Self::Segment { segment, next })
+    }
+
+    fn next_id(&mut self) -> Result<Option<u64>, EngineError> {
         match self {
-            FullScanNodeSource::Owned(ids) => match ids.binary_search(&after) {
-                Ok(index) => Ok(index + 1),
-                Err(index) => Ok(index),
-            },
-            FullScanNodeSource::Segment(segment) => segment.node_id_lower_bound(after),
+            Self::Owned { ids, next } => {
+                let id = ids.get(*next).copied();
+                *next += usize::from(id.is_some());
+                Ok(id)
+            }
+            #[cfg(feature = "production-concurrency")]
+            Self::Memtable {
+                memtable,
+                snapshot_seq,
+                upper,
+                next_after,
+                chunk,
+            } => {
+                let bound = match *next_after {
+                    Some(u64::MAX) => return Ok(None),
+                    Some(id) => id + 1,
+                    None => 0,
+                };
+                let id = chunk.next_ge(bound, |start| {
+                    memtable.refill_node_ids_at(*snapshot_seq, start, *upper)
+                })?;
+                if let Some(id) = id {
+                    *next_after = Some(id);
+                }
+                Ok(id)
+            }
+            Self::Segment { segment, next } => {
+                let id = segment.node_id_at_index(*next)?;
+                *next += usize::from(id.is_some());
+                Ok(id)
+            }
         }
     }
 }
@@ -374,6 +436,7 @@ impl<'a> FullScanEdgeSource<'a> {
             memtable,
             snapshot_seq,
             next_after: after,
+            chunk: MemtableIdChunk::default(),
         }
     }
 
@@ -407,8 +470,16 @@ impl<'a> FullScanEdgeSource<'a> {
                 memtable,
                 snapshot_seq,
                 next_after,
+                chunk,
             } => {
-                let edge_id = memtable.next_visible_edge_id_after(*snapshot_seq, *next_after);
+                let bound = match *next_after {
+                    Some(u64::MAX) => return Ok(None),
+                    Some(id) => id + 1,
+                    None => 0,
+                };
+                let edge_id = chunk.next_ge(bound, |start| {
+                    memtable.refill_edge_ids_at(*snapshot_seq, start)
+                })?;
                 if let Some(edge_id) = edge_id {
                     *next_after = Some(edge_id);
                 }
@@ -438,6 +509,7 @@ impl<'a> LabelEdgeSource<'a> {
             snapshot_seq,
             label_id,
             next_after: after,
+            chunk: MemtableIdChunk::default(),
         }
     }
 
@@ -464,9 +536,16 @@ impl<'a> LabelEdgeSource<'a> {
                 snapshot_seq,
                 label_id,
                 next_after,
+                chunk,
             } => {
-                let edge_id =
-                    memtable.next_visible_edge_by_label_id_after(*label_id, *snapshot_seq, *next_after);
+                let bound = match *next_after {
+                    Some(u64::MAX) => return Ok(None),
+                    Some(id) => id + 1,
+                    None => 0,
+                };
+                let edge_id = chunk.next_ge(bound, |start| {
+                    memtable.refill_label_ids_at(true, *label_id, *snapshot_seq, start)
+                })?;
                 if let Some(edge_id) = edge_id {
                     *next_after = Some(edge_id);
                 }
@@ -5011,18 +5090,25 @@ impl ReadView {
         self.query_node_page_from_label_scan(query, &[single_label_id], hydrate, policy_cutoffs)
     }
 
-    fn full_scan_source_node_ids(&self) -> Result<Vec<FullScanNodeSource<'_>>, EngineError> {
+    fn full_scan_source_node_ids(
+        &self,
+        start_after: Option<u64>,
+    ) -> Result<Vec<FullScanNodeSource<'_>>, EngineError> {
         let mut sources = Vec::with_capacity(1 + self.immutable_epochs.len() + self.segments.len());
-        sources.push(FullScanNodeSource::Owned(
-            self.memtable.visible_node_ids_at(self.snapshot_seq),
-        ));
+        sources.push(FullScanNodeSource::memtable(
+            &self.memtable,
+            self.snapshot_seq,
+            start_after,
+        )?);
         for epoch in &self.immutable_epochs {
-            sources.push(FullScanNodeSource::Owned(
-                epoch.memtable.visible_node_ids_at(self.snapshot_seq),
-            ));
+            sources.push(FullScanNodeSource::memtable(
+                &epoch.memtable,
+                self.snapshot_seq,
+                start_after,
+            )?);
         }
         for segment in &self.segments {
-            sources.push(FullScanNodeSource::Segment(segment.as_ref()));
+            sources.push(FullScanNodeSource::segment(segment.as_ref(), start_after)?);
         }
         Ok(sources)
     }
@@ -5036,21 +5122,19 @@ impl ReadView {
     where
         F: FnMut(&[u64]) -> Result<ControlFlow<()>, EngineError>,
     {
-        let sources = self.full_scan_source_node_ids()?;
+        let mut sources = self.full_scan_source_node_ids(start_after)?;
         let mut heap = BinaryHeap::new();
-        for (source_index, source) in sources.iter().enumerate() {
-            let start = source.seek_after(start_after)?;
-            if let Some(node_id) = source.get_id(start)? {
-                heap.push(Reverse((node_id, source_index, start)));
+        for (source_index, source) in sources.iter_mut().enumerate() {
+            if let Some(node_id) = source.next_id()? {
+                heap.push(Reverse((node_id, source_index)));
             }
         }
 
         let mut chunk = Vec::with_capacity(chunk_limit.max(1));
         let mut last_seen = None;
-        while let Some(Reverse((node_id, source_index, offset))) = heap.pop() {
-            let next_offset = offset + 1;
-            if let Some(next_id) = sources[source_index].get_id(next_offset)? {
-                heap.push(Reverse((next_id, source_index, next_offset)));
+        while let Some(Reverse((node_id, source_index))) = heap.pop() {
+            if let Some(next_id) = sources[source_index].next_id()? {
+                heap.push(Reverse((next_id, source_index)));
             }
 
             if last_seen == Some(node_id) {
@@ -5222,13 +5306,13 @@ impl ReadView {
                         }
                         Ok(crate::source_list::LimitedCompoundIndexRead::MissingSidecar) => {
                             followups.extend(materialization_followups(
-                                self.compound_sidecar_failure_followup(entry, None),
+                                self.compound_sidecar_failure_followup(entry, None)?,
                             ));
                             return Ok(CandidateMaterializationResult::TooBroad { followups });
                         }
                         Err(error) => {
                             followups.extend(materialization_followups(
-                                self.compound_sidecar_failure_followup(entry, Some(error)),
+                                self.compound_sidecar_failure_followup(entry, Some(error))?,
                             ));
                             return Ok(CandidateMaterializationResult::TooBroad { followups });
                         }
@@ -5258,13 +5342,13 @@ impl ReadView {
                         }
                         Ok(crate::source_list::LimitedCompoundIndexRead::MissingSidecar) => {
                             followups.extend(materialization_followups(
-                                self.compound_sidecar_failure_followup(entry, None),
+                                self.compound_sidecar_failure_followup(entry, None)?,
                             ));
                             return Ok(CandidateMaterializationResult::TooBroad { followups });
                         }
                         Err(error) => {
                             followups.extend(materialization_followups(
-                                self.compound_sidecar_failure_followup(entry, Some(error)),
+                                self.compound_sidecar_failure_followup(entry, Some(error))?,
                             ));
                             return Ok(CandidateMaterializationResult::TooBroad { followups });
                         }
@@ -5680,11 +5764,11 @@ impl ReadView {
             Ok(crate::source_list::LimitedEdgeIndexRead::Ready(ids)) => Ok((Some(ids), None)),
             Ok(crate::source_list::LimitedEdgeIndexRead::TooBroad) => Ok((None, None)),
             Ok(crate::source_list::LimitedEdgeIndexRead::MissingSidecar) => {
-                Ok((None, self.equality_sidecar_failure_followup(index_id, None)))
+                Ok((None, self.equality_sidecar_failure_followup(index_id, None)?))
             }
             Err(error) => Ok((
                 None,
-                self.equality_sidecar_failure_followup(index_id, Some(error)),
+                self.equality_sidecar_failure_followup(index_id, Some(error))?,
             )),
         }
     }
@@ -5858,13 +5942,13 @@ impl ReadView {
                         }
                         Ok(crate::source_list::LimitedCompoundIndexRead::MissingSidecar) => {
                             followups.extend(materialization_followups(
-                                self.compound_sidecar_failure_followup(entry, None),
+                                self.compound_sidecar_failure_followup(entry, None)?,
                             ));
                             return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
                         }
                         Err(error) => {
                             followups.extend(materialization_followups(
-                                self.compound_sidecar_failure_followup(entry, Some(error)),
+                                self.compound_sidecar_failure_followup(entry, Some(error))?,
                             ));
                             return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
                         }
@@ -5900,13 +5984,13 @@ impl ReadView {
                         }
                         Ok(crate::source_list::LimitedCompoundIndexRead::MissingSidecar) => {
                             followups.extend(materialization_followups(
-                                self.compound_sidecar_failure_followup(entry, None),
+                                self.compound_sidecar_failure_followup(entry, None)?,
                             ));
                             return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
                         }
                         Err(error) => {
                             followups.extend(materialization_followups(
-                                self.compound_sidecar_failure_followup(entry, Some(error)),
+                                self.compound_sidecar_failure_followup(entry, Some(error))?,
                             ));
                             return Ok(PreparedEagerMaterializationResult::TooBroad { followups });
                         }
@@ -6202,13 +6286,13 @@ impl ReadView {
                         }
                         Ok(crate::source_list::LimitedCompoundIndexRead::MissingSidecar) => {
                             followups.extend(materialization_followups(
-                                self.compound_sidecar_failure_followup(entry, None),
+                                self.compound_sidecar_failure_followup(entry, None)?,
                             ));
                             return Ok(CandidateMaterializationResult::TooBroad { followups });
                         }
                         Err(error) => {
                             followups.extend(materialization_followups(
-                                self.compound_sidecar_failure_followup(entry, Some(error)),
+                                self.compound_sidecar_failure_followup(entry, Some(error))?,
                             ));
                             return Ok(CandidateMaterializationResult::TooBroad { followups });
                         }
@@ -6237,13 +6321,13 @@ impl ReadView {
                         }
                         Ok(crate::source_list::LimitedCompoundIndexRead::MissingSidecar) => {
                             followups.extend(materialization_followups(
-                                self.compound_sidecar_failure_followup(entry, None),
+                                self.compound_sidecar_failure_followup(entry, None)?,
                             ));
                             return Ok(CandidateMaterializationResult::TooBroad { followups });
                         }
                         Err(error) => {
                             followups.extend(materialization_followups(
-                                self.compound_sidecar_failure_followup(entry, Some(error)),
+                                self.compound_sidecar_failure_followup(entry, Some(error))?,
                             ));
                             return Ok(CandidateMaterializationResult::TooBroad { followups });
                         }
@@ -7057,7 +7141,7 @@ impl ReadView {
                     let fallback_source = if let Some(source) = legal_universe_fallback {
                         source
                     } else {
-                        let mut sources = self.edge_legal_universe_sources(planning_query);
+                        let mut sources = self.edge_legal_universe_sources(planning_query)?;
                         if sources.is_empty() {
                             return Err(EngineError::InvalidOperation(
                                 "edge query requires label, ids, from_ids, to_ids, endpoint_ids, or allow_full_scan"
@@ -7229,7 +7313,7 @@ impl ReadView {
         cap_context: EdgeQueryCapContext,
         policy_cutoffs: Option<&PrecomputedPruneCutoffs>,
     ) -> Result<(VerifiedEdgeMetadataPage, Vec<SecondaryIndexReadFollowup>), EngineError> {
-        let mut sources = self.edge_legal_universe_sources(query);
+        let mut sources = self.edge_legal_universe_sources(query)?;
         if sources.is_empty() {
             return Err(EngineError::InvalidOperation(
                 "edge query requires label, ids, from_ids, to_ids, endpoint_ids, or allow_full_scan"
@@ -11593,7 +11677,7 @@ impl ReadView {
             incoming,
             both,
             edge.label_filter_ids.as_deref(),
-        );
+        )?;
         let Some(edge_source_cost) = self.graph_row_edge_source_plan_cost(query, edge, false)?
         else {
             return Ok(GraphRowEdgeCandidateSourceChoice::EndpointAdjacency);
@@ -11624,7 +11708,7 @@ impl ReadView {
         incoming: &[u64],
         both: &[u64],
         label_filter_ids: Option<&[u32]>,
-    ) -> PlanCost {
+    ) -> Result<PlanCost, EngineError> { Ok({
         let mut count = 0u64;
         let mut confidence = EstimateConfidence::Exact;
         let mut exact = true;
@@ -11636,7 +11720,7 @@ impl ReadView {
             if node_ids.is_empty() {
                 continue;
             }
-            let estimate = self.edge_endpoint_estimate(node_ids, direction, label_filter_ids);
+            let estimate = self.edge_endpoint_estimate(node_ids, direction, label_filter_ids)?;
             match estimate.known_upper_bound() {
                 Some(estimate_count) => count = count.saturating_add(estimate_count),
                 None => exact = false,
@@ -11659,7 +11743,7 @@ impl ReadView {
             },
         );
         source.plan_cost()
-    }
+    }) }
 
     #[allow(clippy::too_many_arguments)]
     fn graph_row_delegated_edge_candidate_read(

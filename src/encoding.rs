@@ -36,14 +36,19 @@ fn write_sparse_vector_entry(buf: &mut Vec<u8>, dimension_id: u32, weight: f32) 
 
 const MAX_BYTES_LEN: usize = 64 * 1024 * 1024; // 64MB safety limit
 
-fn write_bytes(buf: &mut Vec<u8>, data: &[u8]) -> Result<(), EngineError> {
-    if data.len() > MAX_BYTES_LEN {
+fn validate_bytes_len(length: usize) -> Result<(), EngineError> {
+    if length > MAX_BYTES_LEN {
         return Err(EngineError::SerializationError(format!(
             "bytes payload too large: {} bytes (max {})",
-            data.len(),
-            MAX_BYTES_LEN
+            length, MAX_BYTES_LEN
         )));
     }
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_bytes(buf: &mut Vec<u8>, data: &[u8]) -> Result<(), EngineError> {
+    validate_bytes_len(data.len())?;
     write_u32(buf, data.len() as u32);
     buf.extend_from_slice(data);
     Ok(())
@@ -128,6 +133,11 @@ fn read_bytes(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>, EngineError> {
             len, MAX_BYTES_LEN
         )));
     }
+    if len > remaining_bytes(cursor) {
+        return Err(EngineError::CorruptRecord(
+            "unexpected EOF reading bytes".into(),
+        ));
+    }
     let mut buf = vec![0u8; len];
     cursor
         .read_exact(&mut buf)
@@ -137,6 +147,11 @@ fn read_bytes(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>, EngineError> {
 
 fn read_str(cursor: &mut Cursor<&[u8]>) -> Result<String, EngineError> {
     let len = read_u16(cursor)? as usize;
+    if len > remaining_bytes(cursor) {
+        return Err(EngineError::CorruptRecord(
+            "unexpected EOF reading string".into(),
+        ));
+    }
     let mut buf = vec![0u8; len];
     cursor
         .read_exact(&mut buf)
@@ -173,8 +188,248 @@ fn read_node_label_set(cursor: &mut Cursor<&[u8]>) -> Result<NodeLabelSet, Engin
 
 // --- Public API ---
 
+/// Count the production encoding without allocating its property/vector payload.
+/// A bounded writer stops an incorrect retirement trace before any encode growth.
+#[cfg(feature = "production-concurrency")]
+pub(crate) fn wal_op_encoded_len(op: &WalOp, limit: usize) -> Result<usize, EngineError> {
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self
+                .bytes
+                .checked_add(bytes.len())
+                .filter(|n| *n <= self.limit)
+                .ok_or_else(|| std::io::Error::other("WAL input exceeds admitted bytes"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn props_len(props: &BTreeMap<String, PropValue>, limit: usize) -> Result<usize, EngineError> {
+        let mut count = Counter { bytes: 0, limit };
+        serde::Serialize::serialize(props, &mut rmp_serde::Serializer::new(&mut count))
+            .map_err(|e| EngineError::SerializationError(e.to_string()))?;
+        validate_bytes_len(count.bytes)?;
+        Ok(count.bytes)
+    }
+    fn string_len(value: &str) -> Result<usize, EngineError> {
+        if value.len() > u16::MAX as usize {
+            return Err(EngineError::SerializationError(
+                "WAL string too long".into(),
+            ));
+        }
+        Ok(2 + value.len())
+    }
+    fn sum(parts: &[usize]) -> Result<usize, EngineError> {
+        parts
+            .iter()
+            .try_fold(0usize, |n, part| n.checked_add(*part))
+            .ok_or_else(|| EngineError::SerializationError("WAL size overflow".into()))
+    }
+    fn vector_len(length: Option<usize>, width: usize) -> Result<usize, EngineError> {
+        length.map_or(Ok(0), |n| {
+            n.checked_mul(width)
+                .and_then(|n| n.checked_add(4))
+                .ok_or_else(|| EngineError::SerializationError("WAL vector size overflow".into()))
+        })
+    }
+    let length = match op {
+        WalOp::UpsertNode(n) => sum(&[
+            1 + 8 + 1 + 8 + 8 + 4 + 4 + 1,
+            n.label_ids.len() * 4,
+            string_len(&n.key)?,
+            props_len(&n.props, limit)?,
+            vector_len(n.dense_vector.as_ref().map(Vec::len), 4)?,
+            vector_len(n.sparse_vector.as_ref().map(Vec::len), 8)?,
+        ])?,
+        WalOp::UpsertEdge(e) => sum(&[
+            1 + 8 + 8 + 8 + 4 + 8 + 8 + 4 + 4 + 8 + 8,
+            props_len(&e.props, limit)?,
+        ])?,
+        WalOp::DeleteNode { .. } | WalOp::DeleteEdge { .. } => 17,
+        WalOp::EnsureNodeLabel { label, .. } | WalOp::EnsureEdgeLabel { label, .. } => {
+            5 + string_len(label)?
+        }
+        WalOp::BeginAtomicBatch { .. } | WalOp::CommitAtomicBatch { .. } => 13,
+    };
+    if length > limit {
+        return Err(EngineError::SerializationError(
+            "WAL input exceeds admitted bytes".into(),
+        ));
+    }
+    Ok(length)
+}
+
 /// Encode a WalOp into the provided buffer (clears first, reuses allocation).
 pub(crate) fn encode_wal_op_into(op: &WalOp, buf: &mut Vec<u8>) -> Result<(), EngineError> {
+    encode_wal_op_with_props(op, buf, write_wal_props)
+}
+
+/// The governed route shares every field/tag with the existing encoder, while
+/// nested property traversal uses the charged iterative continuation substrate.
+#[allow(dead_code)] // Private candidate adapter; public engine wiring remains gated.
+pub(crate) fn encode_wal_op_bounded(op: &WalOp, buf: &mut Vec<u8>) -> Result<(), EngineError> {
+    encode_wal_op_with_props(op, buf, |buf, props| {
+        let prefix = buf.len();
+        write_u32(buf, 0);
+        crate::engine::payload::write_properties_checked(props, buf).map_err(wal_property_error)?;
+        let length = buf.len() - prefix - 4;
+        validate_bytes_len(length)?;
+        let length = u32::try_from(length).map_err(|_| {
+            EngineError::SerializationError("WAL properties exceed u32 length".into())
+        })?;
+        buf[prefix..prefix + 4].copy_from_slice(&length.to_le_bytes());
+        Ok(())
+    })
+}
+
+/// Encode once with an allowance for this operation's complete payload. Fixed
+/// fields (including vector suffixes) are checked before any property growth.
+#[cfg(feature = "production-concurrency")]
+pub(crate) fn encode_wal_op_to_limit(
+    op: &WalOp,
+    buf: &mut Vec<u8>,
+    maximum: usize,
+) -> Result<(), EngineError> {
+    buf.clear();
+    let fixed = wal_fixed_bytes(op)?;
+    if fixed > maximum {
+        return Err(wal_byte_limit(fixed as u64, maximum));
+    }
+    let property_allowance = maximum - fixed;
+    encode_wal_op_with_props(op, buf, |buf, props| {
+        let prefix = buf.len();
+        write_u32(buf, 0);
+        let mut writer = LimitedWalProperties {
+            buf,
+            remaining: property_allowance,
+            written: 0,
+            exceeded: None,
+        };
+        let result = crate::engine::payload::write_properties_checked(props, &mut writer);
+        if let Some(encountered) = writer.exceeded {
+            let requested = (fixed as u64).saturating_add(encountered);
+            return Err(wal_byte_limit(requested, maximum));
+        }
+        result.map_err(wal_property_error)?;
+        let length = writer.written;
+        validate_bytes_len(length)?;
+        let length = u32::try_from(length).map_err(|_| {
+            EngineError::SerializationError("WAL properties exceed u32 length".into())
+        })?;
+        writer.buf[prefix..prefix + 4].copy_from_slice(&length.to_le_bytes());
+        Ok(())
+    })?;
+    assert!(
+        buf.len() <= maximum,
+        "bounded WAL encoder exceeded its allowance"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "production-concurrency")]
+struct LimitedWalProperties<'a> {
+    buf: &'a mut Vec<u8>,
+    remaining: usize,
+    written: usize,
+    exceeded: Option<u64>,
+}
+#[cfg(feature = "production-concurrency")]
+impl std::io::Write for LimitedWalProperties<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.remaining {
+            self.exceeded = Some((self.written as u64).saturating_add(bytes.len() as u64));
+            return Err(std::io::Error::other("request frame limit"));
+        }
+        self.buf.extend_from_slice(bytes);
+        self.written += bytes.len();
+        self.remaining -= bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "production-concurrency")]
+pub(crate) fn wal_byte_limit(requested: u64, maximum: usize) -> EngineError {
+    EngineError::ResourceLimit {
+        resource: "max_batch_bytes",
+        requested,
+        limit: maximum as u64,
+        retryable: false,
+    }
+}
+
+// Raw/fixed fields only: no property traversal, serialization or allocation.
+#[cfg(feature = "production-concurrency")]
+fn wal_fixed_bytes(op: &WalOp) -> Result<usize, EngineError> {
+    fn string_bytes(s: &str) -> Result<usize, EngineError> {
+        if s.len() > u16::MAX as usize {
+            return Err(EngineError::SerializationError(format!(
+                "string too long: {} bytes (max {})",
+                s.len(),
+                u16::MAX
+            )));
+        }
+        Ok(2 + s.len())
+    }
+    fn vector_bytes(n: Option<usize>, width: usize) -> Result<usize, EngineError> {
+        n.map_or(Ok(0), |n| {
+            n.checked_mul(width)
+                .and_then(|v| v.checked_add(4))
+                .ok_or_else(|| EngineError::SerializationError("WAL vector size overflow".into()))
+        })
+    }
+    let (base, key, dense, sparse) = match op {
+        WalOp::UpsertNode(n) => (
+            1 + 8 + 1 + n.label_ids.len() * 4 + 8 + 8 + 4 + 4 + 1,
+            string_bytes(&n.key)?,
+            vector_bytes(n.dense_vector.as_ref().map(Vec::len), 4)?,
+            vector_bytes(n.sparse_vector.as_ref().map(Vec::len), 8)?,
+        ),
+        WalOp::UpsertEdge(_) => (69, 0, 0, 0),
+        WalOp::DeleteNode { .. } | WalOp::DeleteEdge { .. } => (17, 0, 0, 0),
+        WalOp::EnsureNodeLabel { label, .. } | WalOp::EnsureEdgeLabel { label, .. } => {
+            (5, string_bytes(label)?, 0, 0)
+        }
+        WalOp::BeginAtomicBatch { .. } | WalOp::CommitAtomicBatch { .. } => (13, 0, 0, 0),
+    };
+    [key, dense, sparse]
+        .into_iter()
+        .try_fold(base, |n, v| n.checked_add(v))
+        .ok_or_else(|| EngineError::SerializationError("WAL fixed size overflow".into()))
+}
+
+fn wal_property_error(error: crate::engine::payload::PayloadError) -> EngineError {
+    match error {
+        crate::engine::payload::PayloadError::Resource {
+            resource,
+            requested,
+            limit,
+            retryable,
+        } => EngineError::ResourceLimit {
+            resource,
+            requested: requested as u64,
+            limit: limit as u64,
+            retryable,
+        },
+        crate::engine::payload::PayloadError::Closed => {
+            EngineError::InvalidOperation("closed property scratch".into())
+        }
+        _ => EngineError::SerializationError("invalid governed WAL property encoding".into()),
+    }
+}
+
+fn encode_wal_op_with_props(
+    op: &WalOp,
+    buf: &mut Vec<u8>,
+    mut properties: impl FnMut(&mut Vec<u8>, &BTreeMap<String, PropValue>) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
     buf.clear();
 
     match op {
@@ -189,9 +444,7 @@ pub(crate) fn encode_wal_op_into(op: &WalOp, buf: &mut Vec<u8>) -> Result<(), En
             write_i64(buf, node.created_at);
             write_i64(buf, node.updated_at);
             write_f32(buf, node.weight);
-            let props_bytes = rmp_serde::to_vec(&node.props)
-                .map_err(|e| EngineError::SerializationError(e.to_string()))?;
-            write_bytes(buf, &props_bytes)?;
+            properties(buf, &node.props)?;
             let mut flags = 0u8;
             if node.dense_vector.is_some() {
                 flags |= 0b0000_0001;
@@ -222,9 +475,7 @@ pub(crate) fn encode_wal_op_into(op: &WalOp, buf: &mut Vec<u8>) -> Result<(), En
             write_i64(buf, edge.created_at);
             write_i64(buf, edge.updated_at);
             write_f32(buf, edge.weight);
-            let props_bytes = rmp_serde::to_vec(&edge.props)
-                .map_err(|e| EngineError::SerializationError(e.to_string()))?;
-            write_bytes(buf, &props_bytes)?;
+            properties(buf, &edge.props)?;
             // Temporal fields are decoded from the trailing payload when present.
             write_i64(buf, edge.valid_from);
             write_i64(buf, edge.valid_to);
@@ -267,6 +518,25 @@ pub(crate) fn encode_wal_op_into(op: &WalOp, buf: &mut Vec<u8>) -> Result<(), En
         }
     }
 
+    Ok(())
+}
+
+// Same MessagePack serializer/options as rmp_serde::to_vec, written directly
+// into the caller's registered encode buffer. No substantial temporary property
+// byte vector crosses a fallible encoder operation or foreground scope exit.
+fn write_wal_props(
+    buf: &mut Vec<u8>,
+    props: &std::collections::BTreeMap<String, crate::types::PropValue>,
+) -> Result<(), EngineError> {
+    let prefix = buf.len();
+    write_u32(buf, 0);
+    serde::Serialize::serialize(props, &mut rmp_serde::Serializer::new(&mut *buf))
+        .map_err(|e| EngineError::SerializationError(e.to_string()))?;
+    let length = buf.len() - prefix - 4;
+    validate_bytes_len(length)?;
+    let length = u32::try_from(length)
+        .map_err(|_| EngineError::SerializationError("WAL properties exceed u32 length".into()))?;
+    buf[prefix..prefix + 4].copy_from_slice(&length.to_le_bytes());
     Ok(())
 }
 
@@ -317,6 +587,14 @@ pub(crate) fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
 
                 let dense_vector = if flags & 0b0000_0001 != 0 {
                     let len = read_u32(&mut cursor)? as usize;
+                    if len
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .is_none_or(|bytes| bytes > remaining_bytes(&cursor))
+                    {
+                        return Err(EngineError::CorruptRecord(
+                            "unexpected EOF reading f32".into(),
+                        ));
+                    }
                     let mut values = Vec::with_capacity(len);
                     for _ in 0..len {
                         values.push(read_f32(&mut cursor)?);
@@ -328,6 +606,19 @@ pub(crate) fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
 
                 let sparse_vector = if flags & 0b0000_0010 != 0 {
                     let len = read_u32(&mut cursor)? as usize;
+                    let remaining = remaining_bytes(&cursor);
+                    if len.checked_mul(8).is_none_or(|bytes| bytes > remaining) {
+                        // Preserve which primitive the original loop reaches
+                        // first in a partial (u32 dimension, f32 weight) pair.
+                        return Err(EngineError::CorruptRecord(
+                            if remaining % 8 < 4 {
+                                "unexpected EOF reading u32"
+                            } else {
+                                "unexpected EOF reading f32"
+                            }
+                            .into(),
+                        ));
+                    }
                     let mut values = Vec::with_capacity(len);
                     for _ in 0..len {
                         let dimension_id = read_u32(&mut cursor)?;
@@ -440,6 +731,78 @@ pub(crate) fn decode_wal_op(data: &[u8]) -> Result<WalOp, EngineError> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    fn node_with_untrusted_vector_hint(flags: u8, count: u32, tail: &[u8]) -> Vec<u8> {
+        let mut encoded = encode_wal_op(&WalOp::UpsertNode(NodeRecord {
+            id: 1,
+            label_ids: NodeLabelSet::single(1).unwrap(),
+            key: String::new(),
+            props: BTreeMap::new(),
+            created_at: 0,
+            updated_at: 0,
+            weight: 1.0,
+            dense_vector: None,
+            sparse_vector: None,
+            last_write_seq: 0,
+        }))
+        .unwrap();
+        assert_eq!(encoded.last(), Some(&0));
+        *encoded.last_mut().unwrap() = flags;
+        encoded.extend_from_slice(&count.to_le_bytes());
+        encoded.extend_from_slice(tail);
+        encoded
+    }
+
+    fn assert_corrupt_eof<T: std::fmt::Debug>(result: Result<T, EngineError>, expected: &str) {
+        match result {
+            Err(EngineError::CorruptRecord(message)) => assert_eq!(message, expected),
+            other => panic!("expected {expected:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p45a2_wal_decode_hints_check_available_extent_and_preserve_eof_errors() {
+        let mut encoded = (MAX_BYTES_LEN as u32).to_le_bytes().to_vec();
+        encoded.push(0x80);
+        assert_corrupt_eof(
+            read_bytes(&mut Cursor::new(&encoded)),
+            "unexpected EOF reading bytes",
+        );
+        let encoded = u16::MAX.to_le_bytes();
+        assert_corrupt_eof(
+            read_str(&mut Cursor::new(&encoded)),
+            "unexpected EOF reading string",
+        );
+        assert_corrupt_eof(
+            decode_wal_op(&node_with_untrusted_vector_hint(1, u32::MAX, &[])),
+            "unexpected EOF reading f32",
+        );
+        assert_corrupt_eof(
+            decode_wal_op(&node_with_untrusted_vector_hint(2, u32::MAX, &[])),
+            "unexpected EOF reading u32",
+        );
+        // Sparse pairs preserve the first missing primitive for every byte cut.
+        let entry = [3_u32.to_le_bytes(), 0.5_f32.to_le_bytes()].concat();
+        for present in 0..8 {
+            assert_corrupt_eof(
+                decode_wal_op(&node_with_untrusted_vector_hint(2, 1, &entry[..present])),
+                if present < 4 {
+                    "unexpected EOF reading u32"
+                } else {
+                    "unexpected EOF reading f32"
+                },
+            );
+        }
+        let dense = node_with_untrusted_vector_hint(1, 1, &0.5_f32.to_le_bytes());
+        assert!(matches!(decode_wal_op(&dense), Ok(WalOp::UpsertNode(node))
+            if node.dense_vector == Some(vec![0.5])));
+        let sparse = node_with_untrusted_vector_hint(2, 1, &entry);
+        assert!(matches!(decode_wal_op(&sparse), Ok(WalOp::UpsertNode(node))
+            if node.sparse_vector == Some(vec![(3, 0.5)])));
+        for flags in [1, 2] {
+            assert!(decode_wal_op(&node_with_untrusted_vector_hint(flags, 0, &[])).is_ok());
+        }
+    }
 
     #[test]
     fn test_roundtrip_upsert_node() {
@@ -939,6 +1302,24 @@ mod tests {
             WalOp::DeleteNode { id, .. } => assert_eq!(id, 2),
             _ => panic!("expected DeleteNode"),
         }
+    }
+
+    #[test]
+    fn test_wal_props_wire_compatibility_and_size_limit() {
+        let props = BTreeMap::from([
+            ("bytes".into(), PropValue::Bytes(vec![0, 255])),
+            ("integer".into(), PropValue::Int(-42)),
+            ("text".into(), PropValue::String("hello".into())),
+        ]);
+        let legacy = rmp_serde::to_vec(&props).unwrap();
+        let mut expected = vec![7, 8];
+        write_bytes(&mut expected, &legacy).unwrap();
+        let mut direct = vec![7, 8];
+        write_wal_props(&mut direct, &props).unwrap();
+        assert_eq!(direct, expected);
+        assert!(validate_bytes_len(MAX_BYTES_LEN).is_ok());
+        let error = validate_bytes_len(MAX_BYTES_LEN + 1).unwrap_err();
+        assert!(error.to_string().contains("bytes payload too large"));
     }
 
     #[test]

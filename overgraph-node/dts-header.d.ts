@@ -40,3 +40,71 @@ export type {
   SparseVectorSchema,
   StringFieldSchema,
 } from './schema-types'
+
+// Retained public contracts that the Rust wire representations cannot express.
+// Keep these here so ordinary napi generation preserves aliases and narrowing.
+export type SecondaryIndexKind = 'equality' | 'range'
+export type NodeMetadataIndexField = 'id' | 'key' | 'weight' | 'created_at' | 'updated_at'
+export type EdgeMetadataIndexField =
+  | 'id' | 'from' | 'to' | 'weight' | 'created_at' | 'updated_at' | 'valid_from' | 'valid_to'
+export interface SecondaryIndexPropertyField {
+  source: 'property'
+  key: string
+}
+export interface SecondaryIndexMetadataField {
+  source: 'metadata'
+  field: NodeMetadataIndexField | EdgeMetadataIndexField
+}
+export type SecondaryIndexField = SecondaryIndexPropertyField | SecondaryIndexMetadataField
+export interface SecondaryIndexSpec {
+  fields: Array<SecondaryIndexField>
+  kind: SecondaryIndexKind
+}
+export type DatabaseScrubFindingType =
+  | 'ManifestMissing' | 'ManifestFileInvalid' | 'ManifestFallbackUsed'
+  | 'ManifestChangedDuringScrub' | 'WalMissing' | 'WalCorrupt' | 'WalTrailingBytes'
+  | 'OrphanSegment' | 'OrphanWal' | 'OrphanSegmentUnpinned' | 'OrphanSegmentScrubSkipped'
+export type DatabaseScrubSeverity = 'info' | 'warning' | 'error'
+export type ManifestScrubSource = 'Current' | 'Tmp' | 'Prev'
+export type WalScrubRole = 'Active' | 'FrozenPendingFlush' | 'PublishedPendingRetire'
+
+/** Candidate logical limits. Explicit configuration requires a candidate artifact. */
+export interface ConcurrencyOptions {
+  maxBatchOperations?: number
+  maxBatchBytes?: number
+  generationOperationLimit?: number
+  generationWalBytes?: number
+  admissionTimeoutMs?: number
+}
+export type DiagnosticAmount = number | bigint
+export interface ReclamationHistogram {
+  buckets: DiagnosticAmount[]
+  samples: DiagnosticAmount
+  maxUs: DiagnosticAmount | null
+}
+export interface ReclamationStats {
+  registeredObjects: DiagnosticAmount
+  retiredObjects: DiagnosticAmount
+  droppingObjects: DiagnosticAmount
+  activeGenerations: DiagnosticAmount
+  frozenGenerations: DiagnosticAmount
+  leasedParticipants: DiagnosticAmount
+  participantLimit: DiagnosticAmount
+  processParticipants: DiagnosticAmount
+  activeSessions: DiagnosticAmount
+  drainingSessions: DiagnosticAmount
+  closeState: 'open' | 'draining' | 'drained'
+  oldestRetirementAgeUs: DiagnosticAmount | null
+  scanLagUs: DiagnosticAmount | null
+  releaseToEligibilityUs: ReclamationHistogram
+  eligibilityToDropUs: ReclamationHistogram
+  workerWallUs: DiagnosticAmount | null
+  workerCpuUs: DiagnosticAmount | null
+}
+export interface OverGraphConcurrencyError extends Error {
+  code: 'resource_limit' | 'commit_committed' | 'commit_indeterminate'
+  resource?: string
+  requested?: DiagnosticAmount
+  limit?: DiagnosticAmount
+  retryable?: boolean
+}

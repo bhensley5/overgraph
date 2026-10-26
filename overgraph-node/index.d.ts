@@ -40,6 +40,74 @@ export type {
   SparseVectorSchema,
   StringFieldSchema,
 } from './schema-types'
+
+// Retained public contracts that the Rust wire representations cannot express.
+// Keep these here so ordinary napi generation preserves aliases and narrowing.
+export type SecondaryIndexKind = 'equality' | 'range'
+export type NodeMetadataIndexField = 'id' | 'key' | 'weight' | 'created_at' | 'updated_at'
+export type EdgeMetadataIndexField =
+  | 'id' | 'from' | 'to' | 'weight' | 'created_at' | 'updated_at' | 'valid_from' | 'valid_to'
+export interface SecondaryIndexPropertyField {
+  source: 'property'
+  key: string
+}
+export interface SecondaryIndexMetadataField {
+  source: 'metadata'
+  field: NodeMetadataIndexField | EdgeMetadataIndexField
+}
+export type SecondaryIndexField = SecondaryIndexPropertyField | SecondaryIndexMetadataField
+export interface SecondaryIndexSpec {
+  fields: Array<SecondaryIndexField>
+  kind: SecondaryIndexKind
+}
+export type DatabaseScrubFindingType =
+  | 'ManifestMissing' | 'ManifestFileInvalid' | 'ManifestFallbackUsed'
+  | 'ManifestChangedDuringScrub' | 'WalMissing' | 'WalCorrupt' | 'WalTrailingBytes'
+  | 'OrphanSegment' | 'OrphanWal' | 'OrphanSegmentUnpinned' | 'OrphanSegmentScrubSkipped'
+export type DatabaseScrubSeverity = 'info' | 'warning' | 'error'
+export type ManifestScrubSource = 'Current' | 'Tmp' | 'Prev'
+export type WalScrubRole = 'Active' | 'FrozenPendingFlush' | 'PublishedPendingRetire'
+
+/** Candidate logical limits. Explicit configuration requires a candidate artifact. */
+export interface ConcurrencyOptions {
+  maxBatchOperations?: number
+  maxBatchBytes?: number
+  generationOperationLimit?: number
+  generationWalBytes?: number
+  admissionTimeoutMs?: number
+}
+export type DiagnosticAmount = number | bigint
+export interface ReclamationHistogram {
+  buckets: DiagnosticAmount[]
+  samples: DiagnosticAmount
+  maxUs: DiagnosticAmount | null
+}
+export interface ReclamationStats {
+  registeredObjects: DiagnosticAmount
+  retiredObjects: DiagnosticAmount
+  droppingObjects: DiagnosticAmount
+  activeGenerations: DiagnosticAmount
+  frozenGenerations: DiagnosticAmount
+  leasedParticipants: DiagnosticAmount
+  participantLimit: DiagnosticAmount
+  processParticipants: DiagnosticAmount
+  activeSessions: DiagnosticAmount
+  drainingSessions: DiagnosticAmount
+  closeState: 'open' | 'draining' | 'drained'
+  oldestRetirementAgeUs: DiagnosticAmount | null
+  scanLagUs: DiagnosticAmount | null
+  releaseToEligibilityUs: ReclamationHistogram
+  eligibilityToDropUs: ReclamationHistogram
+  workerWallUs: DiagnosticAmount | null
+  workerCpuUs: DiagnosticAmount | null
+}
+export interface OverGraphConcurrencyError extends Error {
+  code: 'resource_limit' | 'commit_committed' | 'commit_indeterminate'
+  resource?: string
+  requested?: DiagnosticAmount
+  limit?: DiagnosticAmount
+  retryable?: boolean
+}
 export declare class EdgePageResult {
   get items(): Array<EdgeView>
   get nextCursor(): number | null
@@ -91,6 +159,7 @@ export declare class NodeView {
 export declare class OverGraph {
   static open(path: string, options?: DbOptions | undefined | null): OverGraph
   close(options?: CloseOptions | undefined | null): void
+  reclamationStats(): ReclamationStats
   ensureNodeLabel(label: string): number
   ensureEdgeLabel(label: string): number
   getNodeLabelId(label: string): number | null
@@ -237,7 +306,6 @@ export declare class OverGraph {
   compactWithProgress(callback: (progress: CompactionProgress) => boolean): CompactionStats | null
   stats(): DbStats
   scrub(): ScrubReport
-  closeAsync(options?: CloseOptions | undefined | null): Promise<void>
   statsAsync(): Promise<DbStats>
   scrubAsync(): Promise<ScrubReport>
   ensureNodeLabelAsync(label: string): Promise<number>
@@ -347,6 +415,7 @@ export declare class OverGraph {
    * instance will block until compaction completes. The JS event loop remains responsive.
    */
   compactWithProgressAsync(callback: (progress: CompactionProgress) => void): Promise<CompactionStats | null>
+  closeAsync(options?: CloseOptions | undefined | null): Promise<void>
 }
 
 export declare class SubgraphResult {
@@ -471,21 +540,6 @@ export interface DatabaseScrubFinding {
   detail: string
 }
 
-export type DatabaseScrubFindingType =
-  | 'ManifestMissing'
-  | 'ManifestFileInvalid'
-  | 'ManifestFallbackUsed'
-  | 'ManifestChangedDuringScrub'
-  | 'WalMissing'
-  | 'WalCorrupt'
-  | 'WalTrailingBytes'
-  | 'OrphanSegment'
-  | 'OrphanWal'
-  | 'OrphanSegmentUnpinned'
-  | 'OrphanSegmentScrubSkipped'
-
-export type DatabaseScrubSeverity = 'info' | 'warning' | 'error'
-
 export interface DatabaseScrubReport {
   manifest: ManifestScrubSummary | null
   findings: Array<DatabaseScrubFinding>
@@ -502,6 +556,7 @@ export interface DatabaseScrubReport {
 }
 
 export interface DbOptions {
+  concurrency?: ConcurrencyOptions | null
   createIfMissing?: boolean
   edgeUniqueness?: boolean
   memtableFlushThreshold?: number
@@ -692,8 +747,6 @@ export interface ManifestScrubSummary {
   nextWalGenerationId: number
 }
 
-export type ManifestScrubSource = 'Current' | 'Tmp' | 'Prev'
-
 export interface NamedPrunePolicy {
   name: string
   policy: PrunePolicy
@@ -870,33 +923,7 @@ export interface ScrubReport {
   durationMs: number
 }
 
-export type SecondaryIndexKind = 'equality' | 'range'
-export type NodeMetadataIndexField = 'id' | 'key' | 'weight' | 'created_at' | 'updated_at'
-export type EdgeMetadataIndexField =
-  | 'id'
-  | 'from'
-  | 'to'
-  | 'weight'
-  | 'created_at'
-  | 'updated_at'
-  | 'valid_from'
-  | 'valid_to'
-export interface SecondaryIndexPropertyField {
-  source: 'property'
-  key: string
-}
-export interface SecondaryIndexMetadataField {
-  source: 'metadata'
-  field: NodeMetadataIndexField | EdgeMetadataIndexField
-}
-export type SecondaryIndexField =
-  | SecondaryIndexPropertyField
-  | SecondaryIndexMetadataField
 
-export interface SecondaryIndexSpec {
-  fields: Array<SecondaryIndexField>
-  kind: SecondaryIndexKind
-}
 
 export interface SegmentScrubResult {
   segmentId: number
@@ -1077,5 +1104,3 @@ export interface WalScrubResult {
   bytesChecked: number
   findings: Array<DatabaseScrubFinding>
 }
-
-export type WalScrubRole = 'Active' | 'FrozenPendingFlush' | 'PublishedPendingRetire'

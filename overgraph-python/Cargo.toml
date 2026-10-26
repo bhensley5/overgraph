@@ -1,6 +1,6 @@
 [package]
 name = "overgraph-python"
-version = "0.17.1"
+version = "0.18.0"
 edition = "2021"
 description = "Python bindings for OverGraph"
 
@@ -9,6 +9,11 @@ name = "overgraph"
 crate-type = ["cdylib"]
 
 [dependencies]
-eg = { package = "overgraph", path = ".." }
+eg = { package = "overgraph", path = "..", default-features = false }
 pyo3 = { version = "0.23", features = ["extension-module"] }
 serde_json = "1"
+
+[features]
+default = ["production-concurrency"]
+production-concurrency = ["eg/production-concurrency"]
+binding-test-hooks = ["production-concurrency", "eg/binding-test-hooks"]

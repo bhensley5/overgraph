@@ -36,7 +36,7 @@ fn test_write_txn_staged_reads_and_rollback_leave_no_trace() {
         engine.close().unwrap();
     }
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     assert!(reopened.get_node_by_key("Person", "alice").unwrap().is_none());
     reopened.close().unwrap();
 }
@@ -431,7 +431,7 @@ fn test_write_txn_commit_create_and_connect_local_refs() {
     );
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     assert_eq!(reopened.get_edge(edge_id).unwrap().unwrap().from, alice_id);
     reopened.close().unwrap();
 }
@@ -489,8 +489,18 @@ fn test_write_txn_first_use_tokens_precede_dependent_wal_ops() {
     assert!(node_token_pos < first_node_pos);
     assert!(edge_token_pos < edge_pos);
 
+    #[cfg(feature = "production-concurrency")]
+    let stats = engine.runtime.candidate.as_ref().unwrap().stats.clone();
     drop(engine);
-    let reopened = DatabaseEngine::open(&db_path, &opts).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(stats.read_full().unwrap().close_state, ReclamationCloseState::Drained) {
+            assert!(std::time::Instant::now() < until);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    let reopened = open_after_native_shutdown(&db_path, &opts).unwrap();
     assert_eq!(
         reopened
             .get_node(alice_id)

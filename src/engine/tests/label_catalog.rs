@@ -74,11 +74,11 @@ fn test_published_label_catalog_snapshot_rebuilds_only_for_token_creation() {
     let initial = engine.published_label_catalog_snapshot_for_test();
     assert_eq!(engine.ensure_node_label("Person").unwrap(), 1);
     let after_node_label = engine.published_label_catalog_snapshot_for_test();
-    assert!(!std::sync::Arc::ptr_eq(&initial, &after_node_label));
+    assert!(!crate::engine::shared::SharedArc::ptr_eq(&initial, &after_node_label));
 
     assert_eq!(engine.ensure_node_label("Person").unwrap(), 1);
     let after_existing_ensure = engine.published_label_catalog_snapshot_for_test();
-    assert!(std::sync::Arc::ptr_eq(
+    assert!(crate::engine::shared::SharedArc::ptr_eq(
         &after_node_label,
         &after_existing_ensure
     ));
@@ -87,14 +87,14 @@ fn test_published_label_catalog_snapshot_rebuilds_only_for_token_creation() {
         .upsert_node("Person", "alice", UpsertNodeOptions::default())
         .unwrap();
     let after_existing_node_write = engine.published_label_catalog_snapshot_for_test();
-    assert!(std::sync::Arc::ptr_eq(
+    assert!(crate::engine::shared::SharedArc::ptr_eq(
         &after_existing_ensure,
         &after_existing_node_write
     ));
 
     assert_eq!(engine.ensure_edge_label("KNOWS").unwrap(), 1);
     let after_edge_label = engine.published_label_catalog_snapshot_for_test();
-    assert!(!std::sync::Arc::ptr_eq(
+    assert!(!crate::engine::shared::SharedArc::ptr_eq(
         &after_existing_node_write,
         &after_edge_label
     ));
@@ -103,7 +103,7 @@ fn test_published_label_catalog_snapshot_rebuilds_only_for_token_creation() {
         .upsert_edge(alice, alice, "KNOWS", UpsertEdgeOptions::default())
         .unwrap();
     let after_existing_edge_write = engine.published_label_catalog_snapshot_for_test();
-    assert!(std::sync::Arc::ptr_eq(
+    assert!(crate::engine::shared::SharedArc::ptr_eq(
         &after_edge_label,
         &after_existing_edge_write
     ));
@@ -112,7 +112,7 @@ fn test_published_label_catalog_snapshot_rebuilds_only_for_token_creation() {
         .upsert_node("Company", "acme", UpsertNodeOptions::default())
         .unwrap();
     let after_first_use_node_write = engine.published_label_catalog_snapshot_for_test();
-    assert!(!std::sync::Arc::ptr_eq(
+    assert!(!crate::engine::shared::SharedArc::ptr_eq(
         &after_existing_edge_write,
         &after_first_use_node_write
     ));
@@ -363,7 +363,7 @@ fn test_core_point_named_apis_return_hydrated_views_across_sources() {
     assert_eq!(engine.get_edge(knows).unwrap().unwrap().label, "KNOWS");
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &opts).unwrap();
     assert_eq!(
         reopened.get_node(alice).unwrap().unwrap().labels.as_slice(),
         ["Person"]
@@ -422,7 +422,7 @@ fn test_core_point_first_use_tokens_share_wal_batch_with_records() {
     assert!(disk_manifest.edge_label_tokens.is_empty());
 
     drop(engine);
-    let reopened = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &opts).unwrap();
     assert_eq!(reopened.get_node_label_id("Person").unwrap(), Some(1));
     assert_eq!(reopened.get_edge_label_id("KNOWS").unwrap(), Some(1));
     assert_eq!(
@@ -1407,7 +1407,7 @@ fn test_explicit_ensure_is_wal_durable_without_foreground_manifest_write() {
     assert!(disk_manifest.edge_label_tokens.is_empty());
 
     drop(engine);
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     assert_eq!(reopened.get_node_label_id("Person").unwrap(), Some(1));
     assert_eq!(reopened.get_edge_label_id("KNOWS").unwrap(), Some(1));
     reopened.close().unwrap();
@@ -1417,7 +1417,7 @@ fn test_explicit_ensure_is_wal_durable_without_foreground_manifest_write() {
 fn test_metadata_writes_checkpoint_existing_wal_tokens() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("catalog_db");
-    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     assert_eq!(db.ensure_node_label("Article").unwrap(), 1);
     assert_eq!(db.ensure_edge_label("MENTIONS").unwrap(), 1);
@@ -1467,7 +1467,7 @@ fn test_metadata_writes_checkpoint_existing_wal_tokens() {
     );
 
     db.close().unwrap();
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     assert_eq!(reopened.get_node_label_id("Article").unwrap(), Some(1));
     assert_eq!(reopened.get_node_label_id("Expiring").unwrap(), Some(2));
     assert_eq!(reopened.get_edge_label_id("MENTIONS").unwrap(), Some(1));
@@ -1500,7 +1500,7 @@ fn test_flush_persists_label_tokens_before_wal_retirement() {
     let disk_manifest = load_manifest_readonly(&db_path).unwrap().unwrap();
     assert_eq!(disk_manifest.node_label_tokens.get("Person"), Some(&1));
     assert_eq!(disk_manifest.edge_label_tokens.get("KNOWS"), Some(&1));
-    assert!(!wal_generation_path(&db_path, 0).exists());
+    assert_wal_retirement_matches_recovery_authority(&db_path,0);
 
     engine.close().unwrap();
 }
@@ -1534,10 +1534,7 @@ fn test_background_publish_does_not_checkpoint_active_group_commit_token() {
         Some(&1)
     );
     assert_eq!(disk_manifest.node_label_tokens.get("ActiveOnly"), None);
-    assert!(
-        !wal_generation_path(&db_path, 0).exists(),
-        "retired WAL generation should be removable after its token is checkpointed"
-    );
+    assert_wal_retirement_matches_recovery_authority(&db_path,0);
 
     engine.close().unwrap();
     let closed_manifest = load_manifest_readonly(&db_path).unwrap().unwrap();
@@ -2063,7 +2060,7 @@ fn test_property_index_apis_use_names_and_persist_metadata() {
     let db_path = dir.path().join("catalog_db");
 
     {
-        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let node_info = db
             .ensure_node_property_index("Article", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
@@ -2098,7 +2095,7 @@ fn test_property_index_apis_use_names_and_persist_metadata() {
     }
 
     {
-        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         assert_eq!(db.get_node_label_id("Article").unwrap(), Some(1));
         assert_eq!(db.get_edge_label_id("MENTIONS").unwrap(), Some(1));
         assert_eq!(
@@ -2127,7 +2124,7 @@ fn test_field_list_property_index_contract_routes_lists_and_drops() {
     let db_path = dir.path().join("catalog_db");
 
     {
-        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let single_property_spec =
             SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("status")]);
@@ -2245,7 +2242,7 @@ fn test_field_list_property_index_contract_routes_lists_and_drops() {
     }
 
     {
-        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let node_indexes = db.list_node_property_indexes().unwrap();
         assert_eq!(node_indexes.len(), 2);
         assert!(node_indexes.iter().any(|info| {
@@ -2271,7 +2268,7 @@ fn test_field_list_property_index_contract_routes_lists_and_drops() {
 fn test_property_index_drop_unknown_label_is_read_only() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("catalog_db");
-    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     assert!(!db
         .drop_node_property_index("Missing", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -2316,7 +2313,7 @@ fn test_prune_policy_apis_use_names_and_persist_metadata() {
     }
 
     {
-        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
         assert_eq!(db.get_node_label_id("Article").unwrap(), Some(1));
         let policies = db.list_prune_policies().unwrap();
         assert_eq!(policies.len(), 1);
@@ -2412,4 +2409,80 @@ fn test_prune_unknown_label_scope_creates_token_without_deleting() {
     assert_eq!(result.nodes_pruned, 0);
     assert_eq!(result.edges_pruned, 0);
     assert_eq!(db.get_node_label_id("MissingButValid").unwrap(), Some(1));
+}
+
+#[test]
+fn post45_write_publication_constructs_one_current_catalog() {
+    let dir = TempDir::new().unwrap();
+    let db = DatabaseEngine::open(
+        dir.path(),
+        &DbOptions {
+            compact_after_n_flushes: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.ensure_node_label("Before").unwrap();
+    let old = db.runtime.published.load_full();
+    let mut guard = db.runtime.core.lock().unwrap();
+    let core = guard.as_mut().unwrap();
+    core.post45_work = [0; 5];
+    core.label_catalog
+        .write()
+        .unwrap()
+        .apply_node_label("After".into(), 2, None)
+        .unwrap();
+    core.manifest.next_schema_id += 1;
+    core.schema_snapshot_dirty = true;
+    db.runtime
+        .publish_locked(core, PublishImpact::RebuildSources, false)
+        .unwrap();
+    let rebuilt = core.post45_work[0];
+    let current = db.runtime.published.load_full();
+    assert_eq!(current.label_catalog.node_label(2), Some("After"));
+    assert_eq!(old.label_catalog.node_label(2), None);
+    assert_eq!(
+        current.schema_catalog.next_schema_id,
+        core.manifest.next_schema_id
+    );
+    assert_ne!(
+        current.schema_catalog.next_schema_id,
+        old.schema_catalog.next_schema_id
+    );
+    assert_eq!(current.view.snapshot_seq, core.engine_seq);
+    core.post45_work[0] = 0;
+    db.runtime
+        .publish_locked(core, PublishImpact::SnapshotWithLabelCatalog, false)
+        .unwrap();
+    assert_eq!(core.post45_work[0], 1);
+    core.post45_work[0] = 0;
+    let catalog = core.read_label_catalog_snapshot();
+    core.manifest.next_schema_id += 1;
+    core.schema_snapshot_dirty = true;
+    db.runtime
+        .publish_locked(core, PublishImpact::SnapshotOnly, false)
+        .unwrap();
+    db.runtime
+        .publish_locked(core, PublishImpact::NoPublish, false)
+        .unwrap();
+    assert_eq!(core.post45_work[0], 0);
+    assert!(crate::engine::shared::SharedArc::ptr_eq(
+        &catalog,
+        &db.runtime.published.load_full().label_catalog
+    ));
+    assert_eq!(
+        db.runtime
+            .published
+            .load_full()
+            .schema_catalog
+            .next_schema_id,
+        core.manifest.next_schema_id
+    );
+    core.rebuild_published_read_sources().unwrap();
+    assert_eq!(core.post45_work[0], 1, "direct rebuild owns refresh");
+    drop(guard);
+    drop(current);
+    drop(old);
+    db.close().unwrap();
+    assert_eq!(rebuilt, 1, "RebuildSources clones exactly once");
 }

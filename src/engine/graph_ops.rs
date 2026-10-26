@@ -65,7 +65,7 @@ struct TraversalTombstoneView<'a> {
     memtable: &'a Memtable,
     snapshot_seq: u64,
     immutable_memtables: &'a [ImmutableEpoch],
-    segments: &'a [Arc<SegmentReader>],
+    segments: &'a [SharedArc<SegmentReader>],
     deleted_nodes: Option<IdSet>,
     deleted_edges: Option<IdSet>,
     node_cache: IdMap<bool>,
@@ -79,7 +79,7 @@ impl<'a> TraversalTombstoneView<'a> {
     fn new(
         memtable: &'a Memtable,
         immutable_memtables: &'a [ImmutableEpoch],
-        segments: &'a [Arc<SegmentReader>],
+        segments: &'a [SharedArc<SegmentReader>],
         snapshot_seq: u64,
     ) -> Self {
         Self {
@@ -95,69 +95,27 @@ impl<'a> TraversalTombstoneView<'a> {
         }
     }
 
-    fn is_node_deleted(&mut self, id: u64) -> bool {
-        if let Some(deleted_nodes) = self.deleted_nodes.as_ref() {
-            return deleted_nodes.contains(&id);
-        }
-        if let Some(&deleted) = self.node_cache.get(&id) {
-            return deleted;
-        }
-
-        let deleted = self.memtable.is_node_deleted_at(id, self.snapshot_seq)
-            || self
-                .immutable_memtables
-                .iter()
-                .any(|epoch| epoch.memtable.is_node_deleted_at(id, self.snapshot_seq))
-            || self.segments.iter().any(|seg| seg.is_node_deleted(id));
-        self.node_cache.insert(id, deleted);
-        self.membership_checks += 1;
-        self.maybe_materialize();
-        deleted
+    fn is_node_deleted(&mut self,id:u64)->Result<bool,EngineError>{
+        if let Some(deleted)=self.deleted_nodes.as_ref(){return Ok(deleted.contains(&id));}
+        if let Some(&deleted)=self.node_cache.get(&id){return Ok(deleted);}
+        let sources=crate::source_list::SourceList{active:self.memtable,immutable:self.immutable_memtables,segments:self.segments,snapshot_seq:self.snapshot_seq,#[cfg(test)] selected_field_read_counters:None};
+        let deleted=sources.is_node_deleted(id)?;
+        self.node_cache.insert(id,deleted);self.membership_checks+=1;self.maybe_materialize()?;Ok(deleted)
     }
 
-    fn is_edge_deleted(&mut self, id: u64) -> bool {
-        if let Some(deleted_edges) = self.deleted_edges.as_ref() {
-            return deleted_edges.contains(&id);
-        }
-        if let Some(&deleted) = self.edge_cache.get(&id) {
-            return deleted;
-        }
-
-        let deleted = self.memtable.is_edge_deleted_at(id, self.snapshot_seq)
-            || self
-                .immutable_memtables
-                .iter()
-                .any(|epoch| epoch.memtable.is_edge_deleted_at(id, self.snapshot_seq))
-            || self.segments.iter().any(|seg| seg.is_edge_deleted(id));
-        self.edge_cache.insert(id, deleted);
-        self.membership_checks += 1;
-        self.maybe_materialize();
-        deleted
+    fn is_edge_deleted(&mut self,id:u64)->Result<bool,EngineError>{
+        if let Some(deleted)=self.deleted_edges.as_ref(){return Ok(deleted.contains(&id));}
+        if let Some(&deleted)=self.edge_cache.get(&id){return Ok(deleted);}
+        let sources=crate::source_list::SourceList{active:self.memtable,immutable:self.immutable_memtables,segments:self.segments,snapshot_seq:self.snapshot_seq,#[cfg(test)] selected_field_read_counters:None};
+        let deleted=sources.is_edge_deleted(id)?;
+        self.edge_cache.insert(id,deleted);self.membership_checks+=1;self.maybe_materialize()?;Ok(deleted)
     }
 
-    fn maybe_materialize(&mut self) {
-        if self.deleted_nodes.is_some()
-            || self.membership_checks < Self::MATERIALIZE_THRESHOLD
-            || (self.segments.is_empty() && self.immutable_memtables.is_empty())
-        {
-            return;
-        }
-
-        let mut deleted_nodes = self.memtable.collect_deleted_nodes_at(self.snapshot_seq);
-        let mut deleted_edges = self.memtable.collect_deleted_edges_at(self.snapshot_seq);
-        for epoch in self.immutable_memtables {
-            deleted_nodes.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq));
-            deleted_edges.extend(epoch.memtable.collect_deleted_edges_at(self.snapshot_seq));
-        }
-        for seg in self.segments {
-            deleted_nodes.extend(seg.deleted_node_ids().iter().copied());
-            deleted_edges.extend(seg.deleted_edge_ids().iter().copied());
-        }
-
-        self.deleted_nodes = Some(deleted_nodes);
-        self.deleted_edges = Some(deleted_edges);
-        self.node_cache.clear();
-        self.edge_cache.clear();
+    fn maybe_materialize(&mut self)->Result<(),EngineError>{
+        if self.deleted_nodes.is_some()||self.membership_checks<Self::MATERIALIZE_THRESHOLD||(self.segments.is_empty()&&self.immutable_memtables.is_empty()){return Ok(());}
+        let sources=crate::source_list::SourceList{active:self.memtable,immutable:self.immutable_memtables,segments:self.segments,snapshot_seq:self.snapshot_seq,#[cfg(test)] selected_field_read_counters:None};
+        let nodes=sources.collect_deleted_nodes()?;let edges=sources.collect_deleted_edges()?;
+        self.deleted_nodes=Some(nodes);self.deleted_edges=Some(edges);self.node_cache.clear();self.edge_cache.clear();Ok(())
     }
 }
 
@@ -292,11 +250,11 @@ impl ReadView {
 
     fn collect_unconstrained_node_ids_from_sources(&self) -> Result<Vec<u64>, EngineError> {
         let mut node_set = IdSet::default();
-        for node_id in self.memtable.visible_node_ids_at(self.snapshot_seq) {
+        for node_id in self.memtable.visible_node_ids_at(self.snapshot_seq)? {
             node_set.insert(node_id);
         }
         for epoch in &self.immutable_epochs {
-            for node_id in epoch.memtable.visible_node_ids_at(self.snapshot_seq) {
+            for node_id in epoch.memtable.visible_node_ids_at(self.snapshot_seq)? {
                 node_set.insert(node_id);
             }
         }
@@ -329,9 +287,9 @@ impl ReadView {
                 }
 
                 let mut label_ids: HashSet<u32> =
-                    self.memtable.visible_node_label_ids(self.snapshot_seq).into_iter().collect();
+                    self.memtable.visible_node_label_ids(self.snapshot_seq)?.into_iter().collect();
                 for epoch in &self.immutable_epochs {
-                    label_ids.extend(epoch.memtable.visible_node_label_ids(self.snapshot_seq));
+                    label_ids.extend(epoch.memtable.visible_node_label_ids(self.snapshot_seq)?);
                 }
                 for seg in &self.segments {
                     for label_id in seg.node_label_ids()? {
@@ -489,7 +447,7 @@ impl ReadView {
         label_filter_ids: Option<&[u32]>,
         reference_time: i64,
     ) -> Result<(u64, f64), EngineError> {
-        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
+        let (deleted_nodes, deleted_edges) = self.collect_tombstones()?;
         let mut seen_edges = IdSet::with_capacity_and_hasher(32, Default::default());
         self.degree_stats_raw_walk_inner(
             node_id,
@@ -520,31 +478,17 @@ impl ReadView {
 
         seen_edges.clear();
 
-        // Memtable (local tombstone filtering handled inside).
-        // Shadow first: always record edge_id so segment versions can't leak.
-        let _ = self.memtable.for_each_adj_entry_at(
-            node_id,
-            direction,
-            label_filter_ids,
-            self.snapshot_seq,
-            &mut |edge_id, _neighbor_id, weight, valid_from, valid_to| {
-                seen_edges.insert(edge_id);
-                if !is_edge_valid_at(valid_from, valid_to, reference_time) {
-                    return ControlFlow::Continue(());
-                }
-                count += 1;
-                weight_sum += weight as f64;
-                ControlFlow::Continue(())
-            },
-        );
+        // The active source is authoritative at S. Older candidates below are batch-verified
+        // against newest primary, including moved or invalid active opinions.
+        let active=self.memtable.adj_stats_at(node_id,direction,label_filter_ids,self.snapshot_seq,reference_time)?;
+        count+=active.0;weight_sum+=active.1;
 
         // Immutable memtables (newest-first).
         for epoch in &self.immutable_epochs {
-            let _ = epoch.memtable.for_each_adj_entry_at(
+            let _ = self.sources().graph_adj_memtable(&epoch.memtable,
                 node_id,
                 direction,
                 label_filter_ids,
-                self.snapshot_seq,
                 &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                     if !seen_edges.insert(edge_id) {
                         return ControlFlow::Continue(());
@@ -562,14 +506,14 @@ impl ReadView {
                     weight_sum += weight as f64;
                     ControlFlow::Continue(())
                 },
-            );
+            )?;
         }
 
         // Segments newest-to-oldest (segment-local + global tombstone filtering).
         // Version shadowing (seen_edges) before temporal filter. A newer invalid
         // version must still shadow older valid versions with the same edge_id.
         for seg in &self.segments {
-            let _ = seg.for_each_adj_posting(
+            let _ = self.sources().graph_adj_segment(seg,
                 node_id,
                 direction,
                 label_filter_ids,
@@ -633,15 +577,14 @@ impl ReadView {
             *wsum += weight as f64;
         };
 
-        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
+        let (deleted_nodes, deleted_edges) = self.collect_tombstones()?;
 
         let mut seen_edges: IdSet = IdSet::with_capacity_and_hasher(32, Default::default());
 
-        let _ = self.memtable.for_each_adj_entry_at(
+        let _ = self.sources().graph_adj_memtable(&self.memtable,
             node_id,
             direction,
             label_filter_ids,
-            self.snapshot_seq,
             &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                 seen_edges.insert(edge_id);
                 if !is_edge_valid_at(valid_from, valid_to, reference_time) {
@@ -656,15 +599,14 @@ impl ReadView {
                 );
                 ControlFlow::Continue(())
             },
-        );
+        )?;
 
         // Immutable memtables (newest-first).
         for epoch in &self.immutable_epochs {
-            let _ = epoch.memtable.for_each_adj_entry_at(
+            let _ = self.sources().graph_adj_memtable(&epoch.memtable,
                 node_id,
                 direction,
                 label_filter_ids,
-                self.snapshot_seq,
                 &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                     if !seen_edges.insert(edge_id) {
                         return ControlFlow::Continue(());
@@ -687,11 +629,11 @@ impl ReadView {
                     );
                     ControlFlow::Continue(())
                 },
-            );
+            )?;
         }
 
         for seg in &self.segments {
-            let _ = seg.for_each_adj_posting(
+            let _ = self.sources().graph_adj_segment(seg,
                 node_id,
                 direction,
                 label_filter_ids,
@@ -952,18 +894,17 @@ impl ReadView {
             IdMap::with_capacity_and_hasher(sorted_ids.len(), IdBuildHasher::default());
         let mut all_neighbor_ids: IdSet = IdSet::default();
 
-        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
+        let (deleted_nodes, deleted_edges) = self.collect_tombstones()?;
 
         let mut seen_edges: HashSet<(u64, u64)> = HashSet::new();
 
         for &nid in &sorted_ids {
             let mut count: u64 = 0;
             let mut nbr_map: IdMap<u64> = IdMap::default();
-            let _ = self.memtable.for_each_adj_entry_at(
+            let _ = self.sources().graph_adj_memtable(&self.memtable,
                 nid,
                 direction,
                 label_filter_ids,
-                self.snapshot_seq,
                 &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                     seen_edges.insert((nid, edge_id));
                     if !is_edge_valid_at(valid_from, valid_to, reference_time) {
@@ -974,7 +915,7 @@ impl ReadView {
                     all_neighbor_ids.insert(neighbor_id);
                     ControlFlow::Continue(())
                 },
-            );
+            )?;
             if count > 0 {
                 counts.insert(nid, count);
                 per_node_nbr.insert(nid, nbr_map);
@@ -985,11 +926,10 @@ impl ReadView {
         for epoch in &self.immutable_epochs {
             for &nid in &sorted_ids {
                 let mut count: u64 = 0;
-                let _ = epoch.memtable.for_each_adj_entry_at(
+                let _ = self.sources().graph_adj_memtable(&epoch.memtable,
                     nid,
                     direction,
                     label_filter_ids,
-                    self.snapshot_seq,
                     &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                         if !seen_edges.insert((nid, edge_id)) {
                             return ControlFlow::Continue(());
@@ -1012,7 +952,7 @@ impl ReadView {
                         all_neighbor_ids.insert(neighbor_id);
                         ControlFlow::Continue(())
                     },
-                );
+                )?;
                 if count > 0 {
                     *counts.entry(nid).or_default() += count;
                 }
@@ -1020,7 +960,7 @@ impl ReadView {
         }
 
         for seg in &self.segments {
-            let _ = seg.for_each_adj_posting_batch(
+            let _ = self.sources().graph_adj_segment_batch(seg,
                 &sorted_ids,
                 direction,
                 label_filter_ids,
@@ -1104,7 +1044,7 @@ impl ReadView {
             NodeIdMap::with_capacity_and_hasher(sorted_ids.len(), IdBuildHasher::default());
 
         // Collect global tombstones once
-        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
+        let (deleted_nodes, deleted_edges) = self.collect_tombstones()?;
 
         // Flat (node_id, edge_id) set for cross-source dedup. Single allocation
         // instead of one HashSet per node
@@ -1113,11 +1053,10 @@ impl ReadView {
         // Memtable pass: shadow first, then temporal filter
         for &nid in &sorted_ids {
             let mut count: u64 = 0;
-            let _ = self.memtable.for_each_adj_entry_at(
+            let _ = self.sources().graph_adj_memtable(&self.memtable,
                 nid,
                 direction,
                 label_filter_ids,
-                self.snapshot_seq,
                 &mut |edge_id, _neighbor_id, _weight, valid_from, valid_to| {
                     seen_edges.insert((nid, edge_id));
                     if !is_edge_valid_at(valid_from, valid_to, reference_time) {
@@ -1126,7 +1065,7 @@ impl ReadView {
                     count += 1;
                     ControlFlow::Continue(())
                 },
-            );
+            )?;
             if count > 0 {
                 counts.insert(nid, count);
             }
@@ -1136,11 +1075,10 @@ impl ReadView {
         for epoch in &self.immutable_epochs {
             for &nid in &sorted_ids {
                 let mut count: u64 = 0;
-                let _ = epoch.memtable.for_each_adj_entry_at(
+                let _ = self.sources().graph_adj_memtable(&epoch.memtable,
                     nid,
                     direction,
                     label_filter_ids,
-                    self.snapshot_seq,
                     &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                         if !seen_edges.insert((nid, edge_id)) {
                             return ControlFlow::Continue(());
@@ -1157,7 +1095,7 @@ impl ReadView {
                         count += 1;
                         ControlFlow::Continue(())
                     },
-                );
+                )?;
                 if count > 0 {
                     *counts.entry(nid).or_default() += count;
                 }
@@ -1167,7 +1105,7 @@ impl ReadView {
         // Segment pass (one adaptive cursor walk per segment).
         // Version shadowing before temporal filter.
         for seg in &self.segments {
-            let _ = seg.for_each_adj_posting_batch(
+            let _ = self.sources().graph_adj_segment_batch(seg,
                 &sorted_ids,
                 direction,
                 label_filter_ids,
@@ -1577,12 +1515,7 @@ impl ReadView {
     }
 
     /// Collect global tombstones once for use across BFS/Dijkstra iterations.
-    fn collect_tombstones(&self) -> (IdSet, IdSet) {
-        (
-            self.sources().collect_deleted_nodes(),
-            self.sources().collect_deleted_edges(),
-        )
-    }
+    fn collect_tombstones(&self)->Result<(IdSet,IdSet),EngineError>{Ok((self.sources().collect_deleted_nodes()?,self.sources().collect_deleted_edges()?))}
 
     fn traversal_after_cursor(cursor: Option<&TraversalCursor>, depth: u32, node_id: u64) -> bool {
         match cursor {
@@ -1661,8 +1594,10 @@ impl ReadView {
     where
         F: FnMut(u64, u64, u64) -> ControlFlow<()>, // (source_node, neighbor_node, edge_id)
     {
+        let mut callback_error=None;
         if frontier.is_empty() {
-            return Ok(ControlFlow::Continue(()));
+            if let Some(error)=callback_error.take(){return Err(error);}
+                return Ok(ControlFlow::Continue(()));
         }
         // Frontier never contains duplicates (enforced by visited sets in callers),
         // but must be sorted for batch segment reads.
@@ -1676,13 +1611,10 @@ impl ReadView {
 
         // Active memtable first (wins over immutable + segments)
         for &nid in &sorted_ids {
-            if self
-                .memtable
-                .for_each_adj_entry_at(
+            if self.sources().graph_adj_memtable(&self.memtable,
                     nid,
                     direction,
                     edge_label_filter,
-                    self.snapshot_seq,
                     &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                         seen_edges.insert((nid, edge_id));
                         if !is_edge_valid_at(valid_from, valid_to, reference_time) {
@@ -1690,9 +1622,10 @@ impl ReadView {
                         }
                         on_neighbor(nid, neighbor_id, edge_id)
                     },
-                )
+                )?
                 .is_break()
             {
+                if let Some(error)=callback_error.take(){return Err(error);}
                 return Ok(ControlFlow::Break(()));
             }
         }
@@ -1700,13 +1633,10 @@ impl ReadView {
         // Immutable memtables (newest-first)
         for epoch in &self.immutable_epochs {
             for &nid in &sorted_ids {
-                if epoch
-                    .memtable
-                    .for_each_adj_entry_at(
+                if self.sources().graph_adj_memtable(&epoch.memtable,
                         nid,
                         direction,
                         edge_label_filter,
-                        self.snapshot_seq,
                         &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                             if !seen_edges.insert((nid, edge_id)) {
                                 return ControlFlow::Continue(());
@@ -1714,30 +1644,30 @@ impl ReadView {
                             if !is_edge_valid_at(valid_from, valid_to, reference_time) {
                                 return ControlFlow::Continue(());
                             }
-                            if tombstones.is_edge_deleted(edge_id) {
+                            if match tombstones.is_edge_deleted(edge_id) {Ok(value)=>value,Err(error)=>{callback_error=Some(error);return ControlFlow::Break(());}} {
                                 return ControlFlow::Continue(());
                             }
                             // nid check needed: immutable memtable's for_each_adj_entry
                             // only sees its own tombstones, not active memtable's.
-                            if tombstones.is_node_deleted(neighbor_id)
-                                || tombstones.is_node_deleted(nid)
+                            if match tombstones.is_node_deleted(neighbor_id) {Ok(value)=>value,Err(error)=>{callback_error=Some(error);return ControlFlow::Break(());}}
+                                || match tombstones.is_node_deleted(nid) {Ok(value)=>value,Err(error)=>{callback_error=Some(error);return ControlFlow::Break(());}}
                             {
                                 return ControlFlow::Continue(());
                             }
                             on_neighbor(nid, neighbor_id, edge_id)
                         },
-                    )
+                    )?
                     .is_break()
                 {
-                    return Ok(ControlFlow::Break(()));
+                    if let Some(error)=callback_error.take(){return Err(error);}
+                return Ok(ControlFlow::Break(()));
                 }
             }
         }
 
         // Segments newest-to-oldest
         for seg in &self.segments {
-            if seg
-                .for_each_adj_posting_batch(
+            if self.sources().graph_adj_segment_batch(seg,
                     &sorted_ids,
                     direction,
                     edge_label_filter,
@@ -1748,12 +1678,12 @@ impl ReadView {
                         if !is_edge_valid_at(valid_from, valid_to, reference_time) {
                             return ControlFlow::Continue(());
                         }
-                        if tombstones.is_edge_deleted(edge_id) {
+                        if match tombstones.is_edge_deleted(edge_id) {Ok(value)=>value,Err(error)=>{callback_error=Some(error);return ControlFlow::Break(());}} {
                             return ControlFlow::Continue(());
                         }
                         // Skip both deleted neighbors AND deleted frontier nodes
-                        if tombstones.is_node_deleted(neighbor_id)
-                            || tombstones.is_node_deleted(queried_nid)
+                        if match tombstones.is_node_deleted(neighbor_id) {Ok(value)=>value,Err(error)=>{callback_error=Some(error);return ControlFlow::Break(());}}
+                            || match tombstones.is_node_deleted(queried_nid) {Ok(value)=>value,Err(error)=>{callback_error=Some(error);return ControlFlow::Break(());}}
                         {
                             return ControlFlow::Continue(());
                         }
@@ -1762,9 +1692,12 @@ impl ReadView {
                 )?
                 .is_break()
             {
+                if let Some(error)=callback_error.take(){return Err(error);}
                 return Ok(ControlFlow::Break(()));
             }
         }
+
+        if let Some(error)=callback_error.take(){return Err(error);}
 
         Ok(ControlFlow::Continue(()))
     }
@@ -2969,13 +2902,10 @@ impl ReadView {
         scratch.seen_edges.clear();
         let mut callback_error: Option<EngineError> = None;
 
-        if self
-            .memtable
-            .for_each_adj_entry_at(
+        if self.sources().graph_adj_memtable(&self.memtable,
                 node_id,
                 direction,
                 edge_label_filter,
-                self.snapshot_seq,
                 &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
                     scratch.seen_edges.insert(edge_id);
                     if !is_edge_valid_at(valid_from, valid_to, reference_time) {
@@ -2995,13 +2925,14 @@ impl ReadView {
                     }
                     on_neighbor(neighbor_id, edge_id, weight)
                 },
-            )
+            )?
             .is_break()
         {
             if let Some(err) = callback_error {
                 return Err(err);
             }
-            return Ok(ControlFlow::Break(()));
+            if let Some(error)=callback_error.take(){return Err(error);}
+                return Ok(ControlFlow::Break(()));
         }
         if let Some(err) = callback_error {
             return Err(err);
@@ -3010,57 +2941,7 @@ impl ReadView {
         // Immutable memtables (newest-first)
         for epoch in &self.immutable_epochs {
             callback_error = None;
-            if epoch
-                .memtable
-                .for_each_adj_entry_at(
-                    node_id,
-                    direction,
-                    edge_label_filter,
-                    self.snapshot_seq,
-                    &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
-                        if !scratch.seen_edges.insert(edge_id) {
-                            return ControlFlow::Continue(());
-                        }
-                        if !is_edge_valid_at(valid_from, valid_to, reference_time) {
-                            return ControlFlow::Continue(());
-                        }
-                        if tombstones.is_edge_deleted(edge_id)
-                            || tombstones.is_node_deleted(node_id)
-                            || tombstones.is_node_deleted(neighbor_id)
-                        {
-                            return ControlFlow::Continue(());
-                        }
-                        match self.node_visible_for_search(
-                            neighbor_id,
-                            policy_cutoffs,
-                            &mut scratch.visible_cache,
-                        ) {
-                            Ok(true) => {}
-                            Ok(false) => return ControlFlow::Continue(()),
-                            Err(err) => {
-                                callback_error = Some(err);
-                                return ControlFlow::Break(());
-                            }
-                        }
-                        on_neighbor(neighbor_id, edge_id, weight)
-                    },
-                )
-                .is_break()
-            {
-                if let Some(err) = callback_error {
-                    return Err(err);
-                }
-                return Ok(ControlFlow::Break(()));
-            }
-            if let Some(err) = callback_error {
-                return Err(err);
-            }
-        }
-
-        for seg in &self.segments {
-            callback_error = None;
-            if seg
-                .for_each_adj_posting(
+            if self.sources().graph_adj_memtable(&epoch.memtable,
                     node_id,
                     direction,
                     edge_label_filter,
@@ -3071,9 +2952,9 @@ impl ReadView {
                         if !is_edge_valid_at(valid_from, valid_to, reference_time) {
                             return ControlFlow::Continue(());
                         }
-                        if tombstones.is_edge_deleted(edge_id)
-                            || tombstones.is_node_deleted(node_id)
-                            || tombstones.is_node_deleted(neighbor_id)
+                        if match tombstones.is_edge_deleted(edge_id) {Ok(value)=>value,Err(error)=>{callback_error=Some(error);return ControlFlow::Break(());}}
+                            || match tombstones.is_node_deleted(node_id) {Ok(value)=>value,Err(error)=>{callback_error=Some(error);return ControlFlow::Break(());}}
+                            || match tombstones.is_node_deleted(neighbor_id) {Ok(value)=>value,Err(error)=>{callback_error=Some(error);return ControlFlow::Break(());}}
                         {
                             return ControlFlow::Continue(());
                         }
@@ -3097,12 +2978,62 @@ impl ReadView {
                 if let Some(err) = callback_error {
                     return Err(err);
                 }
+                if let Some(error)=callback_error.take(){return Err(error);}
                 return Ok(ControlFlow::Break(()));
             }
             if let Some(err) = callback_error {
                 return Err(err);
             }
         }
+
+        for seg in &self.segments {
+            callback_error = None;
+            if self.sources().graph_adj_segment(seg,
+                    node_id,
+                    direction,
+                    edge_label_filter,
+                    &mut |edge_id, neighbor_id, weight, valid_from, valid_to| {
+                        if !scratch.seen_edges.insert(edge_id) {
+                            return ControlFlow::Continue(());
+                        }
+                        if !is_edge_valid_at(valid_from, valid_to, reference_time) {
+                            return ControlFlow::Continue(());
+                        }
+                        if match tombstones.is_edge_deleted(edge_id) {Ok(value)=>value,Err(error)=>{callback_error=Some(error);return ControlFlow::Break(());}}
+                            || match tombstones.is_node_deleted(node_id) {Ok(value)=>value,Err(error)=>{callback_error=Some(error);return ControlFlow::Break(());}}
+                            || match tombstones.is_node_deleted(neighbor_id) {Ok(value)=>value,Err(error)=>{callback_error=Some(error);return ControlFlow::Break(());}}
+                        {
+                            return ControlFlow::Continue(());
+                        }
+                        match self.node_visible_for_search(
+                            neighbor_id,
+                            policy_cutoffs,
+                            &mut scratch.visible_cache,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => return ControlFlow::Continue(()),
+                            Err(err) => {
+                                callback_error = Some(err);
+                                return ControlFlow::Break(());
+                            }
+                        }
+                        on_neighbor(neighbor_id, edge_id, weight)
+                    },
+                )?
+                .is_break()
+            {
+                if let Some(err) = callback_error {
+                    return Err(err);
+                }
+                if let Some(error)=callback_error.take(){return Err(error);}
+                return Ok(ControlFlow::Break(()));
+            }
+            if let Some(err) = callback_error {
+                return Err(err);
+            }
+        }
+
+        if let Some(error)=callback_error.take(){return Err(error);}
 
         Ok(ControlFlow::Continue(()))
     }
@@ -5003,7 +4934,7 @@ impl ReadView {
         let (deleted_nodes, deleted_edges) = match tombstones {
             Some((dn, de)) => (dn, de),
             None => {
-                owned_tombstones = self.collect_tombstones();
+                owned_tombstones = self.collect_tombstones()?;
                 (&owned_tombstones.0, &owned_tombstones.1)
             }
         };
@@ -5013,15 +4944,12 @@ impl ReadView {
 
         // Start with memtable results (fetch without limit to allow for temporal filtering)
         let mut results =
-            self.memtable
-                .neighbors_at(node_id, direction, label_filter_ids, 0, self.snapshot_seq);
+            self.sources().graph_neighbors_memtable(&self.memtable,node_id, direction, label_filter_ids, 0)?;
         let mut seen_edges: IdSet = results.iter().map(|e| e.edge_id).collect();
 
         // Immutable memtables (newest-first)
         for epoch in &self.immutable_epochs {
-            let mt_results = epoch
-                .memtable
-                .neighbors_at(node_id, direction, label_filter_ids, 0, self.snapshot_seq);
+            let mt_results = self.sources().graph_neighbors_memtable(&epoch.memtable,node_id, direction, label_filter_ids, 0)?;
             for entry in mt_results {
                 if !seen_edges.insert(entry.edge_id) {
                     continue;
@@ -5038,7 +4966,7 @@ impl ReadView {
 
         // Add segment results
         for seg in &self.segments {
-            let seg_results = seg.neighbors(node_id, direction, label_filter_ids, 0)?;
+            let seg_results = self.sources().graph_neighbors_segment(seg,node_id, direction, label_filter_ids, 0)?;
             for entry in seg_results {
                 if !seen_edges.insert(entry.edge_id) {
                     continue;
@@ -5276,15 +5204,13 @@ impl ReadView {
         };
 
         // Collect all tombstoned node and edge IDs ONCE
-        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
+        let (deleted_nodes, deleted_edges) = self.collect_tombstones()?;
 
         let now = now_millis();
         let reference_time = at_epoch.unwrap_or(now);
 
         // Start with memtable results.
-        let mut results = self
-            .memtable
-            .neighbors_batch_at(&sorted_ids, direction, label_filter_ids, self.snapshot_seq);
+        let mut results = self.sources().graph_neighbors_batch_memtable(&self.memtable,&sorted_ids, direction, label_filter_ids)?;
 
         // Track seen edge IDs per node for dedup (memtable/newer segment wins)
         let mut seen_edges: NodeIdMap<NodeIdSet> = NodeIdMap::default();
@@ -5297,12 +5223,11 @@ impl ReadView {
 
         // Immutable memtables (newest-first)
         for epoch in &self.immutable_epochs {
-            let mt_results = epoch.memtable.neighbors_batch_at(
+            let mt_results = self.sources().graph_neighbors_batch_memtable(&epoch.memtable,
                 &sorted_ids,
                 direction,
                 label_filter_ids,
-                self.snapshot_seq,
-            );
+            )?;
             for (nid, mt_entries) in mt_results {
                 let seen = seen_edges.entry(nid).or_default();
                 let node_entries = results.entry(nid).or_default();
@@ -5323,7 +5248,7 @@ impl ReadView {
 
         // Merge segment results (newest-to-oldest, one cursor walk per segment)
         for seg in &self.segments {
-            let seg_results = seg.neighbors_batch(&sorted_ids, direction, label_filter_ids)?;
+            let seg_results = self.sources().graph_neighbors_batch_segment(seg,&sorted_ids, direction, label_filter_ids)?;
             for (nid, seg_entries) in seg_results {
                 let seen = seen_edges.entry(nid).or_default();
                 let node_entries = results.entry(nid).or_default();
@@ -5419,7 +5344,7 @@ impl ReadView {
         }
 
         // Collect all tombstoned node and edge IDs across memtable + immutable memtables + segments
-        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
+        let (deleted_nodes, deleted_edges) = self.collect_tombstones()?;
 
         let now = now_millis();
         let reference_time = at_epoch.unwrap_or(now);
@@ -5429,25 +5354,21 @@ impl ReadView {
 
         // Collect sources: memtable (unsorted) + immutable memtables + segments (sorted by edge_id)
         let memtable_entries =
-            self.memtable
-                .neighbors_at(node_id, direction, label_filter_ids.as_deref(), 0, self.snapshot_seq);
+            self.sources().graph_neighbors_memtable(&self.memtable,node_id, direction, label_filter_ids.as_deref(), 0)?;
         let mut segment_entries: Vec<Vec<NeighborRecord>> =
             Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
         for epoch in &self.immutable_epochs {
             segment_entries.push(
-                epoch
-                    .memtable
-                    .neighbors_at(
+                self.sources().graph_neighbors_memtable(&epoch.memtable,
                         node_id,
                         direction,
                         label_filter_ids.as_deref(),
                         0,
-                        self.snapshot_seq,
-                    ),
+                    )?,
             );
         }
         for seg in &self.segments {
-            segment_entries.push(seg.neighbors(node_id, direction, label_filter_ids.as_deref(), 0)?);
+            segment_entries.push(self.sources().graph_neighbors_segment(seg,node_id, direction, label_filter_ids.as_deref(), 0)?);
         }
 
         if apply_decay {
@@ -5663,15 +5584,14 @@ impl ReadView {
         }
 
         // Collect all tombstoned node and edge IDs
-        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
+        let (deleted_nodes, deleted_edges) = self.collect_tombstones()?;
 
         let now = now_millis();
         let reference_time = at_epoch.unwrap_or(now);
 
         // Gather all neighbors from memtable + immutable memtables + segments with dedup + deletion filter
         let mut all_entries =
-            self.memtable
-                .neighbors_at(node_id, direction, label_filter_ids.as_deref(), 0, self.snapshot_seq);
+            self.sources().graph_neighbors_memtable(&self.memtable,node_id, direction, label_filter_ids.as_deref(), 0)?;
         // Filter memtable results against deleted sets (M2 fix)
         all_entries
             .retain(|e| !deleted_edges.contains(&e.edge_id) && !deleted_nodes.contains(&e.node_id));
@@ -5679,9 +5599,7 @@ impl ReadView {
 
         // Immutable memtables (newest-first)
         for epoch in &self.immutable_epochs {
-            let mt_results = epoch
-                .memtable
-                .neighbors_at(node_id, direction, label_filter_ids.as_deref(), 0, self.snapshot_seq);
+            let mt_results = self.sources().graph_neighbors_memtable(&epoch.memtable,node_id, direction, label_filter_ids.as_deref(), 0)?;
             for entry in mt_results {
                 if !seen_edges.insert(entry.edge_id) {
                     continue;
@@ -5697,7 +5615,7 @@ impl ReadView {
         }
 
         for seg in &self.segments {
-            let seg_results = seg.neighbors(node_id, direction, label_filter_ids.as_deref(), 0)?;
+            let seg_results = self.sources().graph_neighbors_segment(seg,node_id, direction, label_filter_ids.as_deref(), 0)?;
             for entry in seg_results {
                 if !seen_edges.insert(entry.edge_id) {
                     continue;
@@ -6030,17 +5948,16 @@ impl ReadView {
         //    unions endpoints inline during the cursor walk.
         let reference_time = at_epoch.unwrap_or_else(now_millis);
 
-        let (deleted_nodes, deleted_edges) = self.collect_tombstones();
+        let (deleted_nodes, deleted_edges) = self.collect_tombstones()?;
 
         let mut seen_edges: HashSet<(u64, u64)> = HashSet::new();
 
         // Memtable pass (per-node callback).
         for &nid in &node_ids {
-            let _ = self.memtable.for_each_adj_entry_at(
+            let _ = self.sources().graph_adj_memtable(&self.memtable,
                 nid,
                 Direction::Outgoing,
                 edge_label_filter.as_deref(),
-                self.snapshot_seq,
                 &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                     seen_edges.insert((nid, edge_id));
                     if !is_edge_valid_at(valid_from, valid_to, reference_time) {
@@ -6051,17 +5968,16 @@ impl ReadView {
                     }
                     ControlFlow::Continue(())
                 },
-            );
+            )?;
         }
 
         // Immutable memtable passes (newest-first).
         for epoch in &self.immutable_epochs {
             for &nid in &node_ids {
-                let _ = epoch.memtable.for_each_adj_entry_at(
+                let _ = self.sources().graph_adj_memtable(&epoch.memtable,
                     nid,
                     Direction::Outgoing,
                     edge_label_filter.as_deref(),
-                    self.snapshot_seq,
                     &mut |edge_id, neighbor_id, _weight, valid_from, valid_to| {
                         if !seen_edges.insert((nid, edge_id)) {
                             return ControlFlow::Continue(());
@@ -6080,13 +5996,13 @@ impl ReadView {
                         }
                         ControlFlow::Continue(())
                     },
-                );
+                )?;
             }
         }
 
         // Segment passes (batch callback, one cursor walk per segment).
         for seg in &self.segments {
-            let _ = seg.for_each_adj_posting_batch(
+            let _ = self.sources().graph_adj_segment_batch(seg,
                 &node_ids,
                 Direction::Outgoing,
                 edge_label_filter.as_deref(),

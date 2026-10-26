@@ -1169,7 +1169,37 @@ class GqlExecutionResult(TypedDict):
 # Exception
 # ============================================================
 
-class OverGraphError(Exception): ...
+class OverGraphError(Exception):
+    code: str
+    resource: str
+    requested: int
+    limit: int
+    retryable: bool
+
+class ReclamationHistogram:
+    buckets: list[int]
+    samples: int
+    max_us: int | None
+
+class ReclamationStats:
+    registered_objects: int
+    retired_objects: int
+    dropping_objects: int
+    active_generations: int
+    frozen_generations: int
+    leased_participants: int
+    participant_limit: int
+    process_participants: int
+    active_sessions: int
+    draining_sessions: int
+    close_state: Literal["open", "draining", "drained"]
+    oldest_retirement_age_us: int | None
+    scan_lag_us: int | None
+    release_to_eligibility_us: ReclamationHistogram
+    eligibility_to_drop_us: ReclamationHistogram
+    worker_wall_us: int | None
+    worker_cpu_us: int | None
+
 
 # ============================================================
 # Sync API
@@ -1193,7 +1223,7 @@ async def async_scrub_path(
 
 class OverGraph:
     @staticmethod
-    def open(path: str, **kwargs: Any) -> OverGraph: ...
+    def open(path: str, *, concurrency_options: Mapping[str, int] | None = None, **kwargs: Any) -> OverGraph: ...
     def close(self, force: bool = False) -> None: ...
     def __enter__(self) -> OverGraph: ...
     def __exit__(
@@ -1202,6 +1232,7 @@ class OverGraph:
         exc_val: BaseException | None = None,
         exc_tb: Any = None,
     ) -> bool: ...
+    def reclamation_stats(self) -> ReclamationStats: ...
     def stats(self) -> DbStats: ...
     def scrub(self) -> ScrubReport: ...
 
@@ -1673,7 +1704,7 @@ class WriteTxn:
 
 class AsyncOverGraph:
     @staticmethod
-    async def open(path: str, **kwargs: Any) -> AsyncOverGraph: ...
+    async def open(path: str, *, concurrency_options: Mapping[str, int] | None = None, **kwargs: Any) -> AsyncOverGraph: ...
     async def close(self, force: bool = False) -> None: ...
     async def __aenter__(self) -> AsyncOverGraph: ...
     async def __aexit__(
@@ -1682,6 +1713,7 @@ class AsyncOverGraph:
         exc_val: BaseException | None,
         exc_tb: Any,
     ) -> None: ...
+    async def reclamation_stats(self) -> ReclamationStats: ...
     async def stats(self) -> DbStats: ...
     async def scrub(self) -> ScrubReport: ...
 

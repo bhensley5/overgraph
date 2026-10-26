@@ -162,7 +162,7 @@ describe('scrubPath', () => {
   });
 
   it('uses the standalone path scrub task and core path API', () => {
-    const source = readFileSync(join(__dirname, '..', 'src', 'lib.rs'), 'utf8');
+    const source = readFileSync(process.env.OVERGRAPH_TEST_NATIVE_SOURCE ?? join(__dirname, '..', 'src', 'lib.rs'), 'utf8');
 
     assert.match(source, /pub fn scrub_path\(/);
     assert.match(source, /pub fn scrub_path_async\(/);
@@ -171,7 +171,7 @@ describe('scrubPath', () => {
 
     const syncStart = source.indexOf('pub fn scrub_path(');
     const asyncStart = source.indexOf('pub fn scrub_path_async(');
-    const wrapperStart = source.indexOf('#[napi]\npub struct OverGraph');
+    const wrapperStart = source.indexOf('pub struct OverGraph');
     const pathApiSource = source.slice(syncStart, wrapperStart);
     assert(!pathApiSource.includes('DatabaseEngine::open'));
     assert(!pathApiSource.includes('EngineReadOp'));

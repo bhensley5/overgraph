@@ -1,3 +1,5 @@
+mod support;
+
 use overgraph::types::{FlushEpochMeta, FlushEpochState};
 use overgraph::{
     scrub_path, scrub_path_with_options, DatabaseEngine, DatabaseScrubFindingType,
@@ -14,7 +16,7 @@ fn open_test_db(dir: &std::path::Path) -> DatabaseEngine {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    DatabaseEngine::open(dir, &opts).unwrap()
+    support::open(dir, &opts).unwrap()
 }
 
 fn populate_and_flush(db: &DatabaseEngine) {
@@ -920,8 +922,24 @@ fn test_scrub_handles_missing_segment_gracefully() {
     let seg_dir = db_path.join("segments").join("seg_0001");
     std::fs::remove_dir_all(&seg_dir).unwrap();
 
-    let db = open_test_db(&db_path);
-    let report = db.scrub().unwrap();
+    #[cfg(not(feature = "production-concurrency"))]
+    let report = {
+        let db = open_test_db(&db_path);
+        db.scrub().unwrap()
+    };
+    #[cfg(feature = "production-concurrency")]
+    let report = {
+        // Validated candidate startup rejects required missing data; true
+        // path-level scrub remains available without opening/mutating the DB.
+        let manifest = std::fs::read(db_path.join("manifest.current")).unwrap();
+        assert!(matches!(support::open(&db_path, &DbOptions::default()),
+            Err(overgraph::EngineError::IoError(error)) if error.kind() == std::io::ErrorKind::NotFound));
+        assert_eq!(
+            std::fs::read(db_path.join("manifest.current")).unwrap(),
+            manifest
+        );
+        scrub_path(&db_path).unwrap()
+    };
     assert!(report.total_components_failed > 0);
 
     let has_missing = report

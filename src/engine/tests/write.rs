@@ -90,7 +90,7 @@ use crate::secondary_index_key::{
     fn test_multi_label_upsert_replaces_and_queries_memberships() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         engine
             .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -542,7 +542,7 @@ use crate::secondary_index_key::{
     fn test_stale_label_memberships_are_suppressed_from_immutable_memtable() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         engine
             .ensure_node_property_index("ImmFreshB", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -835,7 +835,7 @@ use crate::secondary_index_key::{
             engine.close().unwrap();
         }
 
-        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &opts).unwrap();
         let node = engine.get_node(node_id).unwrap().unwrap();
         assert_eq!(node.dense_vector, Some(vec![0.1, 0.2, 0.3]));
         assert_eq!(node.sparse_vector, Some(vec![(2, 2.0), (4, 1.5)]));
@@ -1625,7 +1625,7 @@ use crate::secondary_index_key::{
     fn test_node_property_index_ensure_drop_list_and_reuses_range_declaration() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let eq = engine
             .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -1670,7 +1670,7 @@ use crate::secondary_index_key::{
     fn test_node_property_index_retry_failed_clears_error_and_preserves_id() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let created = engine
             .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -1705,7 +1705,7 @@ use crate::secondary_index_key::{
     fn test_ensure_node_property_index_seeds_active_and_immutable_memtables() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let mut frozen_props = BTreeMap::new();
         frozen_props.insert("status".to_string(), PropValue::String("active".to_string()));
@@ -1757,9 +1757,24 @@ use crate::secondary_index_key::{
             .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("age").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
 
+        #[cfg(feature = "production-concurrency")]
+        {
+            wait_for_property_index_state(&engine, eq.index_id, SecondaryIndexState::Ready);
+            wait_for_property_index_state(&engine, range.index_id, SecondaryIndexState::Ready);
+            assert_eq!(engine.find_nodes("Person", "status", &PropValue::String("active".into())).unwrap(), vec![frozen_id, active_id, bad_id]);
+            assert_eq!(engine.find_nodes_range("Person", "age", Some(&PropertyRangeBound::Included(PropValue::Int(0))), None).unwrap(), vec![frozen_id, active_id]);
+            let active = engine.active_memtable();
+            let eq_rows = active.secondary_eq_state().unwrap(); let hash = hash_prop_equality_key(&PropValue::String("active".into()));
+            assert!(eq_rows[&eq.index_id][&hash].contains(&active_id)); assert!(eq_rows[&eq.index_id][&hash].contains(&bad_id));
+            let ranges = active.secondary_range_state().unwrap(); assert!(ranges[&range.index_id].contains(&(numeric_range_sort_key_for_value(&PropValue::Int(35)).unwrap(), active_id))); assert!(!ranges[&range.index_id].iter().any(|(_, id)| *id == bad_id));
+            assert_eq!(engine.immutable_epoch_count(), 0, "essential pending flush precedes DDL capture");
+            engine.close().unwrap();
+        }
+        #[cfg(not(feature = "production-concurrency"))]
+        {
         let status_hash = hash_prop_equality_key(&PropValue::String("active".to_string()));
         let active_memtable = engine.active_memtable();
-        let active_eq_state = active_memtable.secondary_eq_state();
+        let active_eq_state = active_memtable.secondary_eq_state().unwrap();
         let active_eq_ids = active_eq_state
             .get(&eq.index_id)
             .unwrap()
@@ -1769,7 +1784,7 @@ use crate::secondary_index_key::{
         assert!(active_eq_ids.contains(&bad_id));
 
         let frozen_memtable = engine.immutable_memtable(0);
-        let frozen_eq_state = frozen_memtable.secondary_eq_state();
+        let frozen_eq_state = frozen_memtable.secondary_eq_state().unwrap();
         let frozen_eq_ids = frozen_eq_state
             .get(&eq.index_id)
             .unwrap()
@@ -1778,7 +1793,7 @@ use crate::secondary_index_key::{
         assert!(frozen_eq_ids.contains(&frozen_id));
 
         let active_memtable = engine.active_memtable();
-        let active_range_state = active_memtable.secondary_range_state();
+        let active_range_state = active_memtable.secondary_range_state().unwrap();
         let active_range = active_range_state
             .get(&range.index_id)
             .unwrap();
@@ -1787,7 +1802,7 @@ use crate::secondary_index_key::{
         assert!(!active_range.iter().any(|&(_, node_id)| node_id == bad_id));
 
         let frozen_memtable = engine.immutable_memtable(0);
-        let frozen_range_state = frozen_memtable.secondary_range_state();
+        let frozen_range_state = frozen_memtable.secondary_range_state().unwrap();
         let frozen_range = frozen_range_state
             .get(&range.index_id)
             .unwrap();
@@ -1795,13 +1810,14 @@ use crate::secondary_index_key::{
         assert!(frozen_range.contains(&(age_30, frozen_id)));
 
         engine.close().unwrap();
+        }
     }
 
     #[test]
     fn test_secondary_index_seeding_refreshes_immutable_memtable_bytes_cache() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("status".to_string(), PropValue::String("active".to_string()));
@@ -1827,7 +1843,10 @@ use crate::secondary_index_key::{
             .map(|idx| engine.immutable_memtable(idx).estimated_size())
             .sum();
         assert_eq!(after, actual_after);
+        #[cfg(not(feature = "production-concurrency"))]
         assert!(after >= before);
+        #[cfg(feature = "production-concurrency")]
+        { let _ = before; wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready); }
 
         engine
             .drop_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -1851,7 +1870,7 @@ use crate::secondary_index_key::{
     fn test_edge_property_index_ensure_drop_list_and_reuses_range_declaration() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let eq = engine
             .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("label").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -1896,7 +1915,7 @@ use crate::secondary_index_key::{
     fn test_edge_property_index_retry_failed_clears_error_and_preserves_id() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let created = engine
             .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("label").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -1931,7 +1950,7 @@ use crate::secondary_index_key::{
     fn test_ensure_edge_property_index_seeds_active_and_immutable_memtables() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let node_a = engine
             .upsert_node("Person", "a", UpsertNodeOptions::default())
@@ -1981,9 +2000,23 @@ use crate::secondary_index_key::{
             .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
 
+        #[cfg(feature = "production-concurrency")]
+        {
+            wait_for_edge_property_index_state(&engine, eq.index_id, SecondaryIndexState::Ready);
+            wait_for_edge_property_index_state(&engine, range.index_id, SecondaryIndexState::Ready);
+            let eq_query = EdgeQuery { label: Some("RELATES_TO".into()), filter: Some(EdgeFilterExpr::PropertyEquals { key: "status".into(), value: PropValue::String("active".into()) }), ..Default::default() };
+            assert_eq!(engine.query_edge_ids(&eq_query).unwrap().edge_ids, vec![frozen_edge_id, active_edge_id]);
+            let range_query = EdgeQuery { label: Some("RELATES_TO".into()), filter: Some(EdgeFilterExpr::PropertyRange { key: "score".into(), lower: Some(PropertyRangeBound::Included(PropValue::Int(0))), upper: None }), ..Default::default() };
+            assert_eq!(engine.query_edge_ids(&range_query).unwrap().edge_ids, vec![frozen_edge_id, active_edge_id]);
+            let active = engine.active_memtable(); let eq_rows = active.secondary_eq_state().unwrap(); let hash = hash_prop_equality_key(&PropValue::String("active".into())); assert!(eq_rows[&eq.index_id][&hash].contains(&active_edge_id));
+            let ranges = active.secondary_range_state().unwrap(); assert!(ranges[&range.index_id].contains(&(numeric_range_sort_key_for_value(&PropValue::Int(50)).unwrap(), active_edge_id)));
+            assert_eq!(engine.immutable_epoch_count(), 0); engine.close().unwrap();
+        }
+        #[cfg(not(feature = "production-concurrency"))]
+        {
         let status_hash = hash_prop_equality_key(&PropValue::String("active".to_string()));
         let active_memtable = engine.active_memtable();
-        let active_eq_state = active_memtable.secondary_eq_state();
+        let active_eq_state = active_memtable.secondary_eq_state().unwrap();
         let active_eq_ids = active_eq_state
             .get(&eq.index_id)
             .unwrap()
@@ -1992,7 +2025,7 @@ use crate::secondary_index_key::{
         assert!(active_eq_ids.contains(&active_edge_id));
 
         let frozen_memtable = engine.immutable_memtable(0);
-        let frozen_eq_state = frozen_memtable.secondary_eq_state();
+        let frozen_eq_state = frozen_memtable.secondary_eq_state().unwrap();
         let frozen_eq_ids = frozen_eq_state
             .get(&eq.index_id)
             .unwrap()
@@ -2000,17 +2033,18 @@ use crate::secondary_index_key::{
             .unwrap();
         assert!(frozen_eq_ids.contains(&frozen_edge_id));
 
-        let active_range_state = active_memtable.secondary_range_state();
+        let active_range_state = active_memtable.secondary_range_state().unwrap();
         let active_range = active_range_state.get(&range.index_id).unwrap();
         let score_50 = numeric_range_sort_key_for_value(&PropValue::Int(50)).unwrap();
         assert!(active_range.contains(&(score_50, active_edge_id)));
 
-        let frozen_range_state = frozen_memtable.secondary_range_state();
+        let frozen_range_state = frozen_memtable.secondary_range_state().unwrap();
         let frozen_range = frozen_range_state.get(&range.index_id).unwrap();
         let score_30 = numeric_range_sort_key_for_value(&PropValue::Int(30)).unwrap();
         assert!(frozen_range.contains(&(score_30, frozen_edge_id)));
 
         engine.close().unwrap();
+        }
     }
 
     fn compound_prefix_for_entry(
@@ -2062,7 +2096,7 @@ use crate::secondary_index_key::{
     fn test_compound_index_ensure_seeds_active_and_immutable_memtables_and_drop_unregisters() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let mut frozen_props = BTreeMap::new();
         frozen_props.insert("tenant".to_string(), PropValue::String("acme".to_string()));
@@ -2106,6 +2140,8 @@ use crate::secondary_index_key::{
         assert_eq!(info.state, SecondaryIndexState::Building);
         assert!(info.compound);
 
+        #[cfg(feature = "production-concurrency")]
+        wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
         let active_memtable = engine.active_memtable();
         let active_entry = active_memtable
             .secondary_index_declarations()
@@ -2118,15 +2154,24 @@ use crate::secondary_index_key::{
             &[CompoundFieldValue::Property(Some(&tenant))],
         );
         assert_eq!(
-            active_memtable.find_node_compound_prefix_at(info.index_id, &prefix, u64::MAX),
+            active_memtable.find_node_compound_prefix_at(info.index_id, &prefix, u64::MAX).unwrap(),
             vec![active_id]
         );
 
+        #[cfg(not(feature = "production-concurrency"))]
+        {
         let frozen_memtable = engine.immutable_memtable(0);
         assert_eq!(
-            frozen_memtable.find_node_compound_prefix_at(info.index_id, &prefix, u64::MAX),
+            frozen_memtable.find_node_compound_prefix_at(info.index_id, &prefix, u64::MAX).unwrap(),
             vec![frozen_id]
         );
+
+        }
+        #[cfg(feature = "production-concurrency")]
+        {
+            let segment = engine.segments_for_test()[0].clone();
+            assert_eq!(segment.compound_prefix_candidates_if_present(&active_entry, &prefix).unwrap().unwrap(), vec![frozen_id]);
+        }
 
         let left = engine
             .upsert_node("Person", "left", UpsertNodeOptions::default())
@@ -2162,6 +2207,8 @@ use crate::secondary_index_key::{
             )
             .unwrap();
         assert!(edge_info.compound);
+        #[cfg(feature = "production-concurrency")]
+        wait_for_edge_property_index_state(&engine, edge_info.index_id, SecondaryIndexState::Ready);
         let active_memtable = engine.active_memtable();
         let edge_entry = active_memtable
             .secondary_index_declarations()
@@ -2182,7 +2229,7 @@ use crate::secondary_index_key::{
                 edge_info.index_id,
                 &edge_prefix,
                 u64::MAX
-            ),
+            ).unwrap(),
             vec![edge_id]
         );
 
@@ -2200,11 +2247,12 @@ use crate::secondary_index_key::{
             .unwrap());
         assert!(!engine
             .active_memtable()
-            .compound_secondary_state()
+            .compound_secondary_state().unwrap()
             .contains_key(&info.index_id));
+        #[cfg(not(feature = "production-concurrency"))]
         assert!(!engine
             .immutable_memtable(0)
-            .compound_secondary_state()
+            .compound_secondary_state().unwrap()
             .contains_key(&info.index_id));
 
         engine.close().unwrap();
@@ -2214,7 +2262,7 @@ use crate::secondary_index_key::{
     fn test_compound_index_failed_retry_reseeds_tuple_state_and_clears_error() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("tenant".to_string(), PropValue::String("acme".to_string()));
@@ -2238,30 +2286,49 @@ use crate::secondary_index_key::{
         let created = engine
             .ensure_node_property_index("Person", spec.clone())
             .unwrap();
-        engine
-            .with_core_mut(|core| {
-                core.remove_secondary_index_entry_from_memtables(created.index_id)?;
-                Ok(())
-            })
-            .unwrap();
-        assert!(!engine
-            .active_memtable()
-            .compound_secondary_state()
-            .contains_key(&created.index_id));
+        #[cfg(feature="production-concurrency")]
+        wait_for_property_index_state(&engine,created.index_id,SecondaryIndexState::Ready);
+        #[cfg(not(feature="production-concurrency"))]
+        {
+            engine
+                .with_core_mut(|core| {
+                    core.remove_secondary_index_entry_from_memtables(created.index_id)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(!engine
+                .active_memtable()
+                .compound_secondary_state().unwrap()
+                .contains_key(&created.index_id));
 
-        engine
-            .with_runtime_manifest_write(|manifest| {
-                let entry = manifest
-                    .secondary_indexes
-                    .iter_mut()
-                    .find(|entry| entry.index_id == created.index_id)
-                    .unwrap();
-                entry.state = SecondaryIndexState::Failed;
-                entry.last_error = Some("compound secondary index unavailable: boom".to_string());
-                Ok(())
-            })
-            .unwrap();
-        engine.rebuild_secondary_index_catalog().unwrap();
+            engine
+                .with_runtime_manifest_write(|manifest| {
+                    let entry = manifest
+                        .secondary_indexes
+                        .iter_mut()
+                        .find(|entry| entry.index_id == created.index_id)
+                        .unwrap();
+                    entry.state = SecondaryIndexState::Failed;
+                    entry.last_error = Some("compound secondary index unavailable: boom".to_string());
+                    Ok(())
+                })
+                .unwrap();
+            engine.rebuild_secondary_index_catalog().unwrap();
+        }
+        #[cfg(feature="production-concurrency")]
+        let prior=engine.runtime.published.load_full().view.clone();
+        #[cfg(feature="production-concurrency")]
+        {
+            // Candidate facades are immutable: fail via the real read-followup
+            // route instead of mutating the legacy state behind a fixed facade.
+            engine.runtime.enqueue_secondary_index_read_followup(
+                SecondaryIndexReadFollowup::CompoundEqualitySidecarFailure {
+                    index_id:created.index_id,
+                    error:Some(EngineError::CorruptRecord("boom".into())),
+                }, &prior.sources);
+            let failed=wait_for_property_index_state(&engine,created.index_id,SecondaryIndexState::Failed);
+            assert!(failed.last_error.as_deref().is_some_and(|error|error.contains("boom")));
+        }
 
         let retried = engine
             .ensure_node_property_index("Person", spec)
@@ -2270,6 +2337,8 @@ use crate::secondary_index_key::{
         assert_eq!(retried.state, SecondaryIndexState::Building);
         assert!(retried.last_error.is_none());
 
+        #[cfg(feature = "production-concurrency")]
+        wait_for_property_index_state(&engine, retried.index_id, SecondaryIndexState::Ready);
         let active_memtable = engine.active_memtable();
         let entry = active_memtable
             .secondary_index_declarations()
@@ -2279,10 +2348,15 @@ use crate::secondary_index_key::{
         let tenant = PropValue::String("acme".to_string());
         let prefix = compound_prefix_for_entry(&entry, &[CompoundFieldValue::Property(Some(&tenant))]);
         assert_eq!(
-            active_memtable.find_node_compound_prefix_at(retried.index_id, &prefix, u64::MAX),
+            active_memtable.find_node_compound_prefix_at(retried.index_id, &prefix, u64::MAX).unwrap(),
             vec![node_id]
         );
 
+        #[cfg(feature="production-concurrency")]
+        {
+            assert_eq!(prior.sources.memtable.find_node_compound_prefix_at(retried.index_id,&prefix,u64::MAX).unwrap(),vec![node_id]);
+            drop(prior);
+        }
         engine.close().unwrap();
     }
 
@@ -2290,7 +2364,7 @@ use crate::secondary_index_key::{
     fn test_compound_index_node_batch_graph_patch_and_txn_writes_populate_tuple_state() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let spec = SecondaryIndexSpec {
             fields: vec![
@@ -2335,7 +2409,7 @@ use crate::secondary_index_key::{
             .unwrap()
             .clone();
         let prefix = compound_prefix_for_entry(&entry, &[CompoundFieldValue::Property(Some(&tenant))]);
-        let mut ids = active_memtable.find_node_compound_prefix_at(info.index_id, &prefix, u64::MAX);
+        let mut ids = active_memtable.find_node_compound_prefix_at(info.index_id, &prefix, u64::MAX).unwrap();
         ids.sort_unstable();
         let mut expected = batch_ids;
         expected.extend(patch_result.node_ids);
@@ -2343,7 +2417,7 @@ use crate::secondary_index_key::{
         expected.sort_unstable();
         assert_eq!(ids, expected);
         assert_eq!(
-            active_memtable.count_node_compound_prefix_at(info.index_id, &prefix, u64::MAX),
+            active_memtable.count_node_compound_prefix_at(info.index_id, &prefix, u64::MAX).unwrap(),
             expected.len()
         );
 
@@ -2358,7 +2432,7 @@ use crate::secondary_index_key::{
             edge_uniqueness: true,
             ..Default::default()
         };
-        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &opts).unwrap();
 
         let endpoints = engine
             .batch_upsert_nodes(vec![
@@ -2449,7 +2523,7 @@ use crate::secondary_index_key::{
             compound_prefix_for_entry(&entry, &[CompoundFieldValue::Property(Some(&draft))]);
 
         let mut ids =
-            active_memtable.find_edge_compound_prefix_at(info.index_id, &open_prefix, u64::MAX);
+            active_memtable.find_edge_compound_prefix_at(info.index_id, &open_prefix, u64::MAX).unwrap();
         ids.sort_unstable();
         let mut expected = batch_ids;
         expected.extend(patch_result.edge_ids);
@@ -2459,12 +2533,12 @@ use crate::secondary_index_key::{
         expected.dedup();
         assert_eq!(ids, expected);
         assert_eq!(
-            active_memtable.count_edge_compound_prefix_at(info.index_id, &open_prefix, u64::MAX),
+            active_memtable.count_edge_compound_prefix_at(info.index_id, &open_prefix, u64::MAX).unwrap(),
             expected.len()
         );
         assert!(
             active_memtable
-                .find_edge_compound_prefix_at(info.index_id, &draft_prefix, u64::MAX)
+                .find_edge_compound_prefix_at(info.index_id, &draft_prefix, u64::MAX).unwrap()
                 .is_empty(),
             "transaction update must remove the superseded draft tuple"
         );
@@ -2476,7 +2550,7 @@ use crate::secondary_index_key::{
     fn test_single_property_declaration_stays_out_of_compound_memtable_state_and_flush_sidecars() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("tenant".to_string(), PropValue::String("acme".to_string()));
@@ -2499,17 +2573,19 @@ use crate::secondary_index_key::{
                 },
             )
             .unwrap();
+        #[cfg(feature="production-concurrency")]
+        wait_for_property_index_state(&engine,single.index_id,SecondaryIndexState::Ready);
         assert!(!single.compound);
         assert!(engine
             .active_memtable()
-            .secondary_eq_state()
+            .secondary_eq_state().unwrap()
             .get(&single.index_id)
             .is_some_and(|groups| groups
                 .get(&hash_prop_equality_key(&PropValue::String("acme".to_string())))
                 .is_some_and(|ids| ids.contains(&node_id))));
         assert!(!engine
             .active_memtable()
-            .compound_secondary_state()
+            .compound_secondary_state().unwrap()
             .contains_key(&single.index_id));
 
         let compound = engine
@@ -2545,7 +2621,7 @@ use crate::secondary_index_key::{
     fn test_edge_property_index_foreground_maintenance() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(
+        let engine = open_index_protocol_fixture(
             &db_path,
             &DbOptions {
                 edge_uniqueness: true,
@@ -2585,14 +2661,14 @@ use crate::secondary_index_key::{
 
         let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         let mem = engine.active_memtable();
-        let eq_state = mem.secondary_eq_state();
+        let eq_state = mem.secondary_eq_state().unwrap();
         assert!(eq_state
             .get(&eq.index_id)
             .unwrap()
             .get(&red_hash)
             .unwrap()
             .contains(&edge_id));
-        let range_state = mem.secondary_range_state();
+        let range_state = mem.secondary_range_state().unwrap();
         let weight_10 = numeric_range_sort_key_for_value(&PropValue::Int(10)).unwrap();
         assert!(range_state
             .get(&range.index_id)
@@ -2616,7 +2692,7 @@ use crate::secondary_index_key::{
 
         let blue_hash = hash_prop_equality_key(&PropValue::String("blue".to_string()));
         let mem = engine.active_memtable();
-        let eq_state = mem.secondary_eq_state();
+        let eq_state = mem.secondary_eq_state().unwrap();
         let red_ids = eq_state
             .get(&eq.index_id)
             .unwrap()
@@ -2628,7 +2704,7 @@ use crate::secondary_index_key::{
             .get(&blue_hash)
             .unwrap()
             .contains(&edge_id));
-        let range_state = mem.secondary_range_state();
+        let range_state = mem.secondary_range_state().unwrap();
         let weight_20 = numeric_range_sort_key_for_value(&PropValue::Int(20)).unwrap();
         assert!(range_state
             .get(&range.index_id)
@@ -2641,14 +2717,14 @@ use crate::secondary_index_key::{
 
         engine.delete_edge(edge_id).unwrap();
         let mem = engine.active_memtable();
-        let eq_state = mem.secondary_eq_state();
+        let eq_state = mem.secondary_eq_state().unwrap();
         let blue_gone = eq_state
             .get(&eq.index_id)
             .and_then(|groups| groups.get(&blue_hash))
             .is_none_or(|ids| !ids.contains(&edge_id));
         assert!(blue_gone);
         let range_gone = mem
-            .secondary_range_state()
+            .secondary_range_state().unwrap()
             .get(&range.index_id)
             .is_none_or(|entries| !entries.contains(&(weight_20, edge_id)));
         assert!(range_gone);
@@ -2660,7 +2736,7 @@ use crate::secondary_index_key::{
     fn test_node_and_edge_property_indexes_coexist() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(
+        let engine = open_index_protocol_fixture(
             &db_path,
             &DbOptions {
                 edge_uniqueness: true,
@@ -2717,7 +2793,7 @@ use crate::secondary_index_key::{
 
         let score_hash = hash_prop_equality_key(&PropValue::Int(42));
         let mem = engine.active_memtable();
-        let eq_state = mem.secondary_eq_state();
+        let eq_state = mem.secondary_eq_state().unwrap();
 
         let node_ids = eq_state
             .get(&node_eq.index_id)
@@ -2748,7 +2824,7 @@ use crate::secondary_index_key::{
     fn test_edge_property_index_shared_id_sequence() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let node_idx = engine
             .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("x").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -2767,7 +2843,7 @@ use crate::secondary_index_key::{
         let db_path = dir.path().join("testdb");
 
         let (color_index_id, weight_index_id) = {
-            let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+            let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
             let color_info = engine
                 .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
                 .unwrap();
@@ -2779,7 +2855,7 @@ use crate::secondary_index_key::{
             index_ids
         };
 
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let color = wait_for_edge_property_index_state(
             &engine,
             color_index_id,
@@ -2809,7 +2885,7 @@ use crate::secondary_index_key::{
     fn test_edge_property_background_build_writes_sidecar_and_publishes_ready() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let node_a = engine
             .upsert_node("Person", "a", UpsertNodeOptions::default())
@@ -2885,7 +2961,7 @@ use crate::secondary_index_key::{
     fn test_node_property_background_build_writes_targeted_planner_stats() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         for (key, color, score) in [("a", "red", 10), ("b", "red", 20), ("c", "blue", 30)] {
             let mut props = BTreeMap::new();
@@ -2977,7 +3053,7 @@ use crate::secondary_index_key::{
     fn test_edge_property_background_build_writes_targeted_planner_stats() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let node_a = engine
             .upsert_node("Person", "a", UpsertNodeOptions::default())
@@ -3076,7 +3152,7 @@ use crate::secondary_index_key::{
     fn test_node_edge_range_declarations_are_scoped_to_target() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         engine
             .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
@@ -3099,7 +3175,7 @@ use crate::secondary_index_key::{
         let range_index_id;
         let edge_id;
         {
-            let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+            let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
             let eq = engine
                 .ensure_edge_property_index("RELATES_TO", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("color").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -3138,13 +3214,13 @@ use crate::secondary_index_key::{
             engine.close_fast().unwrap();
         }
 
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
         let indexes = engine.list_edge_property_indexes().unwrap();
         assert_eq!(indexes.len(), 2);
 
         let mem = engine.active_memtable();
-        let eq_state = mem.secondary_eq_state();
+        let eq_state = mem.secondary_eq_state().unwrap();
         let color_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         let eq_ids = eq_state
             .get(&eq_index_id)
@@ -3153,7 +3229,7 @@ use crate::secondary_index_key::{
             .expect("color hash group should exist after WAL recovery");
         assert!(eq_ids.contains(&edge_id));
 
-        let range_state = mem.secondary_range_state();
+        let range_state = mem.secondary_range_state().unwrap();
         let range_entries = range_state
             .get(&range_index_id)
             .expect("range index should exist after WAL recovery");

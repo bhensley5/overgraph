@@ -57,7 +57,7 @@ impl WalReadAtomicBatch {
     }
 }
 
-fn write_wal_header(writer: &mut impl Write) -> Result<(), EngineError> {
+pub(crate) fn write_wal_header(writer: &mut impl Write) -> Result<(), EngineError> {
     writer.write_all(&WAL_MAGIC)?;
     writer.write_all(&WAL_VERSION.to_le_bytes())?;
     Ok(())
@@ -85,6 +85,252 @@ fn validate_wal_header(header: &[u8; WAL_HEADER_SIZE]) -> Result<(), EngineError
 pub struct WalWriter {
     writer: BufWriter<File>,
     encode_buf: Vec<u8>,
+    #[cfg(all(test, feature = "production-concurrency"))]
+    fault: Option<WalFault>,
+}
+
+#[cfg(all(test, feature = "production-concurrency"))]
+#[derive(Clone, Copy)]
+pub(crate) enum WalFault {
+    AppendPrefix(usize),
+    SyncBeforeFlush,
+    SyncAfterFlush,
+    SyncAfterFsync,
+}
+
+pub(crate) fn encode_v3_frame_into(
+    encode_buf: &mut Vec<u8>,
+    seq: u64,
+    op: &WalOp,
+    batch_buf: &mut Vec<u8>,
+) -> Result<(), EngineError> {
+    encode_wal_op_into(op, encode_buf)?;
+    append_encoded_frame(encode_buf, seq, batch_buf)
+}
+
+fn append_encoded_frame(
+    encoded: &[u8],
+    seq: u64,
+    batch_buf: &mut Vec<u8>,
+) -> Result<(), EngineError> {
+    let seq_bytes = seq.to_le_bytes();
+    let len = encoded
+        .len()
+        .checked_add(8)
+        .and_then(|len| u32::try_from(len).ok())
+        .ok_or_else(|| EngineError::SerializationError("WAL frame exceeds u32 length".into()))?;
+
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&seq_bytes);
+    hasher.update(encoded);
+    let crc = hasher.finalize();
+
+    batch_buf.extend_from_slice(&len.to_le_bytes());
+    batch_buf.extend_from_slice(&crc.to_le_bytes());
+    batch_buf.extend_from_slice(&seq_bytes);
+    batch_buf.extend_from_slice(encoded);
+    Ok(())
+}
+
+pub(crate) fn prepare_v3_batch_into(
+    ops: &[(u64, WalOp)],
+    encode_buf: &mut Vec<u8>,
+    batch_buf: &mut Vec<u8>,
+) -> Result<(), EngineError> {
+    prepare_v3_batch_with(ops, encode_buf, batch_buf, encode_v3_frame_into)
+}
+
+#[allow(dead_code)] // Private candidate adapter; public engine wiring remains gated.
+pub(crate) fn prepare_v3_batch_bounded(
+    ops: &[(u64, WalOp)],
+    encode_buf: &mut Vec<u8>,
+    batch_buf: &mut Vec<u8>,
+) -> Result<(), EngineError> {
+    prepare_v3_batch_with(ops, encode_buf, batch_buf, |encoded, seq, op, batch| {
+        crate::encoding::encode_wal_op_bounded(op, encoded)?;
+        append_encoded_frame(encoded, seq, batch)
+    })
+}
+
+#[cfg(feature = "production-concurrency")]
+pub(crate) fn prepare_v3_operations_bounded(
+    ops: &[WalOp],
+    first: u64,
+    encode: &mut Vec<u8>,
+    frames: &mut Vec<u8>,
+    maximum: usize,
+) -> Result<(), EngineError> {
+    use crate::encoding::{encode_wal_op_to_limit, wal_byte_limit};
+    frames.clear();
+    encode.clear();
+    let count = u32::try_from(ops.len())
+        .map_err(|_| EngineError::InvalidOperation("atomic WAL op count exceeds u32".into()))?;
+    if let Some(last) = ops.len().checked_sub(1) {
+        first
+            .checked_add(last as u64)
+            .ok_or_else(|| EngineError::InvalidOperation("WAL sequence range overflow".into()))?;
+    }
+    // Every frame has a 16-byte envelope; each atomic marker has 13 payload bytes.
+    let _overhead = request_frame_overhead(ops.len(), maximum)?;
+    if ops.len() > 1 {
+        encode_v3_frame_into(
+            encode,
+            first,
+            &WalOp::BeginAtomicBatch {
+                first_seq: first,
+                op_count: count,
+            },
+            frames,
+        )?;
+    }
+    for (i, op) in ops.iter().enumerate() {
+        // Reserve this and all later envelopes plus the final marker before encoding.
+        let remaining_overhead = (ops.len() - i) * 16 + if ops.len() > 1 { 29 } else { 0 };
+        let committed = frames
+            .len()
+            .checked_add(remaining_overhead)
+            .ok_or_else(|| wal_byte_limit(u64::MAX, maximum))?;
+        let allowance = maximum
+            .checked_sub(committed)
+            .ok_or_else(|| wal_byte_limit(committed as u64, maximum))?;
+        encode_wal_op_to_limit(op, encode, allowance).map_err(|error| match error {
+            EngineError::ResourceLimit {
+                resource: "max_batch_bytes",
+                requested,
+                ..
+            } => wal_byte_limit((committed as u64).saturating_add(requested), maximum),
+            other => other,
+        })?;
+        let frame_size = encode
+            .len()
+            .checked_add(16)
+            .and_then(|n| frames.len().checked_add(n))
+            .ok_or_else(|| wal_byte_limit(u64::MAX, maximum))?;
+        if frame_size > maximum {
+            return Err(wal_byte_limit(frame_size as u64, maximum));
+        }
+        append_encoded_frame(encode, first + i as u64, frames)?;
+    }
+    if ops.len() > 1 {
+        encode_v3_frame_into(
+            encode,
+            first,
+            &WalOp::CommitAtomicBatch {
+                first_seq: first,
+                op_count: count,
+            },
+            frames,
+        )?;
+    }
+    assert!(
+        frames.len() <= maximum,
+        "bounded WAL frames exceeded request limit"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "production-concurrency")]
+fn request_frame_overhead(count: usize, maximum: usize) -> Result<usize, EngineError> {
+    let markers = if count > 1 { 58 } else { 0 };
+    let overhead = count
+        .checked_mul(16)
+        .and_then(|n| n.checked_add(markers))
+        .ok_or_else(|| crate::encoding::wal_byte_limit(u64::MAX, maximum))?;
+    if overhead > maximum {
+        return Err(crate::encoding::wal_byte_limit(overhead as u64, maximum));
+    }
+    Ok(overhead)
+}
+
+fn prepare_v3_batch_with(
+    ops: &[(u64, WalOp)],
+    encode_buf: &mut Vec<u8>,
+    batch_buf: &mut Vec<u8>,
+    mut frame: impl FnMut(&mut Vec<u8>, u64, &WalOp, &mut Vec<u8>) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    batch_buf.clear();
+    match ops {
+        [] => {}
+        [(seq, op)] => frame(encode_buf, *seq, op, batch_buf)?,
+        _ => {
+            let first_seq = ops[0].0;
+            let op_count = u32::try_from(ops.len()).map_err(|_| {
+                EngineError::InvalidOperation(
+                    "atomic WAL batch op_count exceeds u32::MAX".to_string(),
+                )
+            })?;
+            if first_seq == 0 {
+                return Err(EngineError::InvalidOperation(
+                    "atomic WAL batch first sequence must be nonzero".to_string(),
+                ));
+            }
+            for (idx, (seq, _)) in ops.iter().enumerate() {
+                let expected_seq = first_seq.checked_add(idx as u64).ok_or_else(|| {
+                    EngineError::InvalidOperation(
+                        "atomic WAL batch sequence range overflows u64".to_string(),
+                    )
+                })?;
+                if *seq != expected_seq {
+                    return Err(EngineError::InvalidOperation(
+                        "atomic WAL batch sequences must be contiguous".to_string(),
+                    ));
+                }
+            }
+            let begin = WalOp::BeginAtomicBatch {
+                first_seq,
+                op_count,
+            };
+            frame(encode_buf, first_seq, &begin, batch_buf)?;
+            for (seq, op) in ops {
+                frame(encode_buf, *seq, op, batch_buf)?;
+            }
+            let commit = WalOp::CommitAtomicBatch {
+                first_seq,
+                op_count,
+            };
+            frame(encode_buf, first_seq, &commit, batch_buf)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Exact allocation-free admission for the same frames as prepare_v3_batch_into.
+#[cfg(feature = "production-concurrency")]
+pub(crate) fn v3_batches_encoded_len(
+    batches: &[&[(u64, WalOp)]],
+    limit: usize,
+) -> Result<usize, EngineError> {
+    let mut bytes = WAL_HEADER_SIZE;
+    if bytes > limit {
+        return Err(EngineError::InvalidOperation(
+            "WAL input exceeds admitted bytes".into(),
+        ));
+    }
+    for batch in batches {
+        if batch.len() > 1 {
+            bytes = bytes
+                .checked_add(2 * (16 + 13))
+                .ok_or_else(|| EngineError::InvalidOperation("WAL size overflow".into()))?;
+        }
+        for (_, op) in *batch {
+            let remaining = limit
+                .checked_sub(bytes)
+                .and_then(|n| n.checked_sub(16))
+                .ok_or_else(|| {
+                    EngineError::InvalidOperation("WAL input exceeds admitted bytes".into())
+                })?;
+            bytes = bytes
+                .checked_add(16 + crate::encoding::wal_op_encoded_len(op, remaining)?)
+                .ok_or_else(|| EngineError::InvalidOperation("WAL size overflow".into()))?;
+        }
+        if bytes > limit {
+            return Err(EngineError::InvalidOperation(
+                "WAL input exceeds admitted bytes".into(),
+            ));
+        }
+    }
+    Ok(bytes)
 }
 
 impl WalWriter {
@@ -123,6 +369,8 @@ impl WalWriter {
         Ok(WalWriter {
             writer,
             encode_buf: Vec::new(),
+            #[cfg(all(test, feature = "production-concurrency"))]
+            fault: None,
         })
     }
 
@@ -150,83 +398,64 @@ impl WalWriter {
         Ok(8 + total_payload)
     }
 
-    fn encode_frame_into(
-        &mut self,
-        seq: u64,
-        op: &WalOp,
-        batch_buf: &mut Vec<u8>,
-    ) -> Result<(), EngineError> {
-        encode_wal_op_into(op, &mut self.encode_buf)?;
-        let seq_bytes = seq.to_le_bytes();
-        let total_payload = 8 + self.encode_buf.len();
-        let len = total_payload as u32;
-
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&seq_bytes);
-        hasher.update(&self.encode_buf);
-        let crc = hasher.finalize();
-
-        batch_buf.extend_from_slice(&len.to_le_bytes());
-        batch_buf.extend_from_slice(&crc.to_le_bytes());
-        batch_buf.extend_from_slice(&seq_bytes);
-        batch_buf.extend_from_slice(&self.encode_buf);
-        Ok(())
-    }
-
-    /// Append multiple (engine_seq, WalOp) pairs as a single atomic buffer write.
-    /// Multi-op batches are wrapped in begin/commit control frames.
-    /// All ops are pre-encoded before any I/O, so encoding failures
-    /// don't leave partial data in the write buffer.
-    /// Returns total bytes written (framing + payload).
+    /// Append multiple records through the shared production V3 encoder.
     pub(crate) fn append_batch(&mut self, ops: &[(u64, WalOp)]) -> Result<usize, EngineError> {
         let mut batch_buf = Vec::new();
-        match ops {
-            [] => {}
-            [(seq, op)] => self.encode_frame_into(*seq, op, &mut batch_buf)?,
-            _ => {
-                let first_seq = ops[0].0;
-                let op_count = u32::try_from(ops.len()).map_err(|_| {
-                    EngineError::InvalidOperation(
-                        "atomic WAL batch op_count exceeds u32::MAX".to_string(),
-                    )
-                })?;
-                if first_seq == 0 {
-                    return Err(EngineError::InvalidOperation(
-                        "atomic WAL batch first sequence must be nonzero".to_string(),
-                    ));
-                }
-                for (idx, (seq, _)) in ops.iter().enumerate() {
-                    let expected_seq = first_seq.checked_add(idx as u64).ok_or_else(|| {
-                        EngineError::InvalidOperation(
-                            "atomic WAL batch sequence range overflows u64".to_string(),
-                        )
-                    })?;
-                    if *seq != expected_seq {
-                        return Err(EngineError::InvalidOperation(
-                            "atomic WAL batch sequences must be contiguous".to_string(),
-                        ));
-                    }
-                }
-                let begin = WalOp::BeginAtomicBatch {
-                    first_seq,
-                    op_count,
-                };
-                self.encode_frame_into(first_seq, &begin, &mut batch_buf)?;
-                for (seq, op) in ops {
-                    self.encode_frame_into(*seq, op, &mut batch_buf)?;
-                }
-                let commit = WalOp::CommitAtomicBatch {
-                    first_seq,
-                    op_count,
-                };
-                self.encode_frame_into(first_seq, &commit, &mut batch_buf)?;
-            }
-        }
+        self.prepare_batch_into(ops, &mut batch_buf)?;
+        self.append_prepared(&batch_buf)
+    }
 
-        let total = batch_buf.len();
-        // Single write_all for the entire batch
-        self.writer.write_all(&batch_buf)?;
-        Ok(total)
+    pub(crate) fn prepare_batch_into(
+        &mut self,
+        ops: &[(u64, WalOp)],
+        batch_buf: &mut Vec<u8>,
+    ) -> Result<(), EngineError> {
+        prepare_v3_batch_into(ops, &mut self.encode_buf, batch_buf)
+    }
+
+    #[allow(dead_code)] // Private candidate adapter; public engine wiring remains gated.
+    pub(crate) fn prepare_batch_bounded(
+        &mut self,
+        ops: &[(u64, WalOp)],
+        batch_buf: &mut Vec<u8>,
+    ) -> Result<(), EngineError> {
+        prepare_v3_batch_bounded(ops, &mut self.encode_buf, batch_buf)
+    }
+
+    /// The actual acceptance write. A returned error may leave real bytes in the
+    /// buffer/file; callers must not infer rollback from this result.
+    pub(crate) fn append_prepared(&mut self, batch_buf: &[u8]) -> Result<usize, EngineError> {
+        #[cfg(all(test, feature = "production-concurrency"))]
+        if let Some(WalFault::AppendPrefix(bytes)) = self.fault {
+            self.fault = None;
+            self.writer
+                .write_all(&batch_buf[..bytes.min(batch_buf.len())])?;
+            self.writer.flush()?;
+            return Err(std::io::Error::other("injected WAL partial append").into());
+        }
+        self.writer.write_all(batch_buf)?;
+        Ok(batch_buf.len())
+    }
+
+    /// Candidate shutdown closes the OS handle on its coordinator without a
+    /// hidden BufWriter Drop flush. Already-accounted buffers remain registered
+    /// until their guardian's worker destroys them, including on sync error.
+    #[cfg(feature = "production-concurrency")]
+    pub(crate) fn close_retaining_buffers(self) -> (Vec<u8>, Vec<u8>) {
+        let Self {
+            writer, encode_buf, ..
+        } = self;
+        let (file, buffered) = writer.into_parts();
+        drop(file);
+        (
+            encode_buf,
+            buffered.unwrap_or_else(|panicked| panicked.into_inner()),
+        )
+    }
+
+    #[cfg(all(test, feature = "production-concurrency"))]
+    pub(crate) fn inject_fault(&mut self, fault: WalFault) {
+        self.fault = Some(fault);
     }
 
     #[cfg(test)]
@@ -237,8 +466,23 @@ impl WalWriter {
 
     /// Sync the WAL to disk (flush + fsync).
     pub fn sync(&mut self) -> Result<(), EngineError> {
+        #[cfg(all(test, feature = "production-concurrency"))]
+        if matches!(self.fault, Some(WalFault::SyncBeforeFlush)) {
+            self.fault = None;
+            return Err(std::io::Error::other("injected WAL sync before flush").into());
+        }
         self.writer.flush()?;
+        #[cfg(all(test, feature = "production-concurrency"))]
+        if matches!(self.fault, Some(WalFault::SyncAfterFlush)) {
+            self.fault = None;
+            return Err(std::io::Error::other("injected WAL sync after flush").into());
+        }
         self.writer.get_ref().sync_all()?;
+        #[cfg(all(test, feature = "production-concurrency"))]
+        if matches!(self.fault, Some(WalFault::SyncAfterFsync)) {
+            self.fault = None;
+            return Err(std::io::Error::other("injected WAL sync after fsync").into());
+        }
         Ok(())
     }
 }
@@ -840,6 +1084,186 @@ mod tests {
             sparse_vector: None,
             last_write_seq: 0,
         })
+    }
+
+    #[test]
+    fn p45a2_wal_iterative_preparation_preserves_fields_crc_and_atomic_frames() {
+        let mut node = make_test_node(7, "wire-parity");
+        if let WalOp::UpsertNode(node) = &mut node {
+            node.props.insert(
+                "mixed".into(),
+                PropValue::Array(vec![
+                    PropValue::Bytes(vec![0, 128, 255]),
+                    PropValue::Map(BTreeMap::from([("n".into(), PropValue::UInt(u64::MAX))])),
+                    PropValue::Float(-0.0),
+                ]),
+            );
+            node.dense_vector = Some(vec![0.0, 0.5]);
+            node.sparse_vector = Some(vec![(2, 0.75)]);
+        }
+        let ops = [
+            (1, node),
+            (2, make_test_edge(8, 7, 9)),
+            (
+                3,
+                WalOp::DeleteNode {
+                    id: 9,
+                    deleted_at: 123,
+                },
+            ),
+            (
+                4,
+                WalOp::EnsureNodeLabel {
+                    label: "wire".into(),
+                    label_id: 3,
+                },
+            ),
+        ];
+        for input in [&ops[..1], &ops[..]] {
+            let mut original = Vec::new();
+            let mut governed = Vec::new();
+            prepare_v3_batch_into(input, &mut Vec::new(), &mut original).unwrap();
+            prepare_v3_batch_bounded(input, &mut Vec::new(), &mut governed).unwrap();
+            assert_eq!(governed, original);
+            let directory = TempDir::new().unwrap();
+            let mut writer = WalWriter::open_generation(directory.path(), 0).unwrap();
+            writer.append_prepared(&governed).unwrap();
+            writer.sync().unwrap();
+            // read_all retains atomic markers as part of the existing codec.
+            assert_eq!(
+                WalReader::new(directory.path()).read_all().unwrap().len(),
+                input.len() + if input.len() > 1 { 2 } else { 0 }
+            );
+        }
+    }
+
+    #[cfg(feature = "production-concurrency")]
+    #[test]
+    fn post_p45b_wal_cumulative_limit_matches_all_fields_and_atomic_envelopes() {
+        let mut n = make_test_node(1, "byte-parity");
+        if let WalOp::UpsertNode(n) = &mut n {
+            n.props.insert(
+                "nested".into(),
+                PropValue::Array(vec![
+                    PropValue::Bytes(vec![0, 128, 255]),
+                    PropValue::Map(BTreeMap::from([("float".into(), PropValue::Float(-0.0))])),
+                ]),
+            );
+            n.dense_vector = Some(vec![1.0, 2.0]);
+            n.sparse_vector = Some(vec![(7, 0.5)]);
+        }
+        let all = [
+            n,
+            make_test_edge(2, 1, 3),
+            WalOp::DeleteNode {
+                id: 3,
+                deleted_at: 8,
+            },
+            WalOp::DeleteEdge {
+                id: 4,
+                deleted_at: 9,
+            },
+            WalOp::EnsureNodeLabel {
+                label: "N".into(),
+                label_id: 1,
+            },
+            WalOp::EnsureEdgeLabel {
+                label: "E".into(),
+                label_id: 2,
+            },
+        ];
+        for ops in [&all[..0], &all[..1], &all[..2], &all[..]] {
+            let old: Vec<_> = ops
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(i, op)| (i as u64 + 1, op))
+                .collect();
+            let mut expected = Vec::new();
+            prepare_v3_batch_into(&old, &mut Vec::new(), &mut expected).unwrap();
+            let mut encoded = vec![1, 2, 3];
+            let mut actual = vec![4, 5, 6];
+            prepare_v3_operations_bounded(ops, 1, &mut encoded, &mut actual, expected.len())
+                .unwrap();
+            assert_eq!(actual, expected);
+            if !expected.is_empty() {
+                let limit = expected.len() - 1;
+                let err = prepare_v3_operations_bounded(ops, 1, &mut encoded, &mut actual, limit)
+                    .unwrap_err();
+                assert!(
+                    matches!(err,EngineError::ResourceLimit{resource:"max_batch_bytes",requested,limit:l,retryable:false}if requested>l&&l==limit as u64)
+                );
+                assert!(actual.len() <= limit);
+                assert!(encoded.len() <= limit);
+            }
+        }
+        assert!(matches!(
+            request_frame_overhead(usize::MAX, 1024),
+            Err(EngineError::ResourceLimit {
+                resource: "max_batch_bytes",
+                ..
+            })
+        ));
+        let ops = [
+            WalOp::DeleteNode {
+                id: 1,
+                deleted_at: 0,
+            },
+            WalOp::DeleteNode {
+                id: 2,
+                deleted_at: 0,
+            },
+        ];
+        let mut frames = Vec::new();
+        let mut scratch = Vec::new();
+        prepare_v3_operations_bounded(&ops, 9, &mut scratch, &mut frames, 124).unwrap();
+        assert_eq!(frames.len(), 58 + 2 * (16 + 17));
+        assert!(
+            prepare_v3_operations_bounded(&ops, u64::MAX, &mut scratch, &mut frames, 1000).is_err()
+        );
+        assert!(frames.is_empty());
+    }
+    #[cfg(feature = "production-concurrency")]
+    #[test]
+    fn post_p45b_wal_large_operation_stops_before_rejected_output_is_built() {
+        let mut op = make_test_node(1, "small");
+        if let WalOp::UpsertNode(n) = &mut op {
+            // The first admitted chunk fits; a large later nested chunk must not append.
+            n.props.insert("a".into(), PropValue::Int(1));
+            n.props.insert(
+                "z".into(),
+                PropValue::Array(vec![PropValue::Bytes(vec![42; 2 * 1024 * 1024])]),
+            );
+            n.dense_vector = Some(vec![1.0; 100]);
+            n.sparse_vector = Some(vec![(2, 0.5); 100]);
+        }
+        let mut scratch = Vec::new();
+        let mut frames = Vec::new();
+        let err =
+            prepare_v3_operations_bounded(&[op], 1, &mut scratch, &mut frames, 4096).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::ResourceLimit {
+                resource: "max_batch_bytes",
+                ..
+            }
+        ));
+        assert!(scratch.len() < 4096);
+        assert!(frames.is_empty());
+        assert!(scratch.capacity() < 8192);
+        let key = make_test_node(2, &"k".repeat(65000));
+        scratch.clear();
+        let err =
+            prepare_v3_operations_bounded(&[key], 1, &mut scratch, &mut frames, 1024).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::ResourceLimit {
+                resource: "max_batch_bytes",
+                ..
+            }
+        ));
+        assert!(scratch.is_empty());
+        assert!(frames.is_empty());
     }
 
     fn make_test_edge(id: u64, from: u64, to: u64) -> WalOp {

@@ -1,9 +1,11 @@
 use crate::error::EngineError;
 use crate::schema::{normalize_schema_manifest, validate_schema_manifest};
+use crate::schema::{validate_schema_manifest_with_scratch, SchemaManifestScratch};
 use crate::segment_writer::SEGMENT_FORMAT_VERSION;
 use crate::types::{
     secondary_index_logical_identity, validate_label_token_name, validate_secondary_index_target,
-    ManifestState, SecondaryIndexTarget, LABEL_TOKEN_SCHEMA_VERSION, SCHEMA_CATALOG_VERSION,
+    ManifestState, SecondaryIndexLogicalIdentity, SecondaryIndexTarget, LABEL_TOKEN_SCHEMA_VERSION,
+    SCHEMA_CATALOG_VERSION,
 };
 use std::fs;
 use std::io::Write;
@@ -19,31 +21,52 @@ pub(crate) const MANIFEST_PREV: &str = "manifest.prev";
 /// 3. Rename manifest.tmp → manifest.current
 /// 4. fsync the directory to make the rename durable
 pub(crate) fn write_manifest(db_dir: &Path, state: &ManifestState) -> Result<(), EngineError> {
+    let json = serde_json::to_string_pretty(state)
+        .map_err(|e| EngineError::ManifestError(format!("serialize: {}", e)))?;
+    write_manifest_encoded(db_dir, json.as_bytes())
+}
+
+/// Shared actual atomic persistence sequence. Candidate callers serialize into
+/// registered storage before acquiring durable authority.
+pub(crate) fn write_manifest_encoded(db_dir: &Path, json: &[u8]) -> Result<(), EngineError> {
+    #[cfg(all(test, feature = "production-concurrency"))]
+    crate::persistence_fault::check(crate::persistence_fault::Boundary::BeforeTmp)?;
     let tmp_path = db_dir.join(MANIFEST_TMP);
     let current_path = db_dir.join(MANIFEST_CURRENT);
     let prev_path = db_dir.join(MANIFEST_PREV);
 
-    // 1. Write to tmp + fsync
-    let json = serde_json::to_string_pretty(state)
-        .map_err(|e| EngineError::ManifestError(format!("serialize: {}", e)))?;
     let mut file = fs::File::create(&tmp_path)?;
-    file.write_all(json.as_bytes())?;
+    #[cfg(all(test, feature = "production-concurrency"))]
+    crate::persistence_fault::check(crate::persistence_fault::Boundary::TmpCreate)?;
+    file.write_all(json)?;
+    #[cfg(all(test, feature = "production-concurrency"))]
+    crate::persistence_fault::check(crate::persistence_fault::Boundary::TmpWrite)?;
     file.sync_all()?;
+    #[cfg(all(test, feature = "production-concurrency"))]
+    crate::persistence_fault::check(crate::persistence_fault::Boundary::TmpSync)?;
     drop(file);
 
     // 2. If current exists, rename to prev (for rollback safety)
     if current_path.exists() {
         if prev_path.exists() {
             fs::remove_file(&prev_path)?;
+            #[cfg(all(test, feature = "production-concurrency"))]
+            crate::persistence_fault::check(crate::persistence_fault::Boundary::PrevRemove)?;
         }
         fs::rename(&current_path, &prev_path)?;
+        #[cfg(all(test, feature = "production-concurrency"))]
+        crate::persistence_fault::check(crate::persistence_fault::Boundary::CurrentToPrev)?;
     }
 
     // 3. Atomic rename tmp → current
     fs::rename(&tmp_path, &current_path)?;
+    #[cfg(all(test, feature = "production-concurrency"))]
+    crate::persistence_fault::check(crate::persistence_fault::Boundary::TmpToCurrent)?;
 
     // 4. fsync the directory to make the rename durable
     fsync_dir(db_dir)?;
+    #[cfg(all(test, feature = "production-concurrency"))]
+    crate::persistence_fault::check(crate::persistence_fault::Boundary::DirSync)?;
 
     Ok(())
 }
@@ -114,8 +137,37 @@ fn try_load_manifest_file_for_write(
 
 pub(crate) fn validate_manifest_identity(state: &ManifestState) -> Result<(), EngineError> {
     validate_label_token_manifest(state)?;
+    validate_manifest_body_identity(state)
+}
+
+// Candidate callers validate token namespaces with registered scratch. Reuse
+// the exact remaining schema, declaration and physical-format identity rules.
+pub(crate) fn validate_manifest_body_identity(state: &ManifestState) -> Result<(), EngineError> {
+    // Preserve the ordinary loader's independent schema/index scratch lifetimes.
     validate_schema_manifest(state)?;
-    validate_secondary_index_manifest(state)?;
+    validate_manifest_body_rest(state, &mut ManifestBodyScratch::default())
+}
+
+#[derive(Default)]
+pub(crate) struct ManifestBodyScratch {
+    schema: SchemaManifestScratch,
+    index_ids: std::collections::HashSet<u64>,
+    index_identities: std::collections::HashSet<SecondaryIndexLogicalIdentity>,
+}
+
+pub(crate) fn validate_manifest_body_identity_with_scratch(
+    state: &ManifestState,
+    scratch: &mut ManifestBodyScratch,
+) -> Result<(), EngineError> {
+    validate_schema_manifest_with_scratch(state, &mut scratch.schema)?;
+    validate_manifest_body_rest(state, scratch)
+}
+
+fn validate_manifest_body_rest(
+    state: &ManifestState,
+    scratch: &mut ManifestBodyScratch,
+) -> Result<(), EngineError> {
+    validate_secondary_index_manifest(state, scratch)?;
     for segment in &state.segments {
         if segment.segment_format_version != SEGMENT_FORMAT_VERSION
             || segment.segment_data_id == [0; 32]
@@ -129,9 +181,14 @@ pub(crate) fn validate_manifest_identity(state: &ManifestState) -> Result<(), En
     Ok(())
 }
 
-fn validate_secondary_index_manifest(state: &ManifestState) -> Result<(), EngineError> {
-    let mut seen_ids = std::collections::HashSet::new();
-    let mut seen_identities = std::collections::HashSet::new();
+fn validate_secondary_index_manifest(
+    state: &ManifestState,
+    scratch: &mut ManifestBodyScratch,
+) -> Result<(), EngineError> {
+    let seen_ids = &mut scratch.index_ids;
+    let seen_identities = &mut scratch.index_identities;
+    seen_ids.clear();
+    seen_identities.clear();
     for entry in &state.secondary_indexes {
         if !seen_ids.insert(entry.index_id) {
             return Err(EngineError::ManifestError(format!(
@@ -262,6 +319,43 @@ pub fn load_manifest_readonly(db_dir: &Path) -> Result<Option<ManifestState>, En
         return Ok(Some(state));
     }
     Ok(None)
+}
+
+/// All valid recovery authorities protect their referenced files until a later
+/// durable manifest replaces them. Selection priority does not make fallback
+/// inputs or an unadopted output safe to unlink.
+#[derive(Default)]
+pub(crate) struct RecoveryFileReferences {
+    pub segments: crate::types::NodeIdSet,
+    pub wal_generations: crate::types::NodeIdSet,
+    pub secondary_indexes:
+        std::collections::HashMap<u64, crate::types::SecondaryIndexManifestEntry>,
+}
+pub(crate) fn recovery_file_references(
+    db_dir: &Path,
+) -> Result<RecoveryFileReferences, EngineError> {
+    let mut refs = RecoveryFileReferences::default();
+    for name in [MANIFEST_CURRENT, MANIFEST_TMP, MANIFEST_PREV] {
+        if let Some(manifest) = try_load_manifest_file(&db_dir.join(name))? {
+            refs.segments.extend(manifest.segments.iter().map(|s| s.id));
+            refs.secondary_indexes.extend(
+                manifest
+                    .secondary_indexes
+                    .iter()
+                    .map(|e| (e.index_id, e.clone())),
+            );
+            refs.wal_generations
+                .insert(manifest.active_wal_generation_id);
+            refs.wal_generations.extend(
+                manifest
+                    .pending_flush_epochs
+                    .iter()
+                    .filter(|e| e.state == crate::types::FlushEpochState::FrozenPendingFlush)
+                    .map(|e| e.wal_generation_id),
+            );
+        }
+    }
+    Ok(refs)
 }
 
 /// Create a fresh default manifest state.

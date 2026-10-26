@@ -222,7 +222,7 @@ fn node_projection_segment_reopen_compaction_and_full_props_parity() {
     assert_eq!(counters.node_sparse_vector_projection_reads, 0);
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     let rows = reopened
         .project_node_id_rows(&[node_id], &prop_plan, false)
         .unwrap();

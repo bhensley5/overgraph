@@ -109,7 +109,7 @@ enum AdjacencyCursorState {
 
 enum AdjacencyPhysicalSource {
     Immutable {
-        memtable: Arc<Memtable>,
+        memtable: SharedArc<Memtable>,
         owner_bound: std::ops::Bound<(u64, u32)>,
         posting_bound: std::ops::Bound<u64>,
         refill_seek_debt: u64,
@@ -136,7 +136,7 @@ struct AdjacencyPhysicalCursor {
 impl AdjacencyPhysicalCursor {
     fn immutable(
         layer: AdjacencySourceLayer,
-        memtable: Arc<Memtable>,
+        memtable: SharedArc<Memtable>,
         direction: Direction,
         seek_owner: Option<u64>,
     ) -> Self {
@@ -350,7 +350,7 @@ impl ReadView {
                 }
                 cursors.push(AdjacencyPhysicalCursor::immutable(
                     AdjacencySourceLayer::Immutable(immutable_index),
-                    Arc::clone(&epoch.memtable),
+                    Clone::clone(&epoch.memtable),
                     physical_direction,
                     inclusive_seek_owner,
                 ));
@@ -361,7 +361,7 @@ impl ReadView {
                 if segment.adjacency_group_count(physical_direction)? == 0 {
                     continue;
                 }
-                let cursor = segment.adjacency_group_cursor(
+                let cursor = SegmentReader::adjacency_group_cursor(segment,
                     physical_direction,
                     normalized_labels.as_deref(),
                     inclusive_seek_owner,
@@ -522,7 +522,7 @@ impl PreparedAdjacencyPullSource {
                     snapshot_seq,
                     *owner_bound,
                     1,
-                );
+                )?;
                 counters.add_index(refill.examined)?;
                 self.advanced = true;
                 if let Some(owner) = refill.owner_head {
@@ -1079,7 +1079,7 @@ impl PreparedAdjacencyPullSource {
                             *posting_bound,
                             refill_max,
                             scratch,
-                        );
+                        )?;
                         counters.add_raw(refill.examined)?;
                         self.advanced = true;
                         if let Some(last) = refill.last_edge_id_examined {
@@ -1195,7 +1195,7 @@ impl PreparedAdjacencyPullSource {
                         snapshot_seq,
                         *owner_bound,
                         remaining,
-                    );
+                    )?;
                     counters.add_index(refill.examined)?;
                     self.advanced = true;
                     if let Some(next_owner) = refill.owner_head {

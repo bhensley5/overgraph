@@ -2403,7 +2403,14 @@ mod tests {
     fn create_declared_node_property_scrub_db() -> (TempDir, PathBuf, DatabaseEngine, u64, u64) {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let db = open_test_db(&db_path);
+        let db = crate::engine::open_index_protocol_fixture(
+            &db_path,
+            &DbOptions {
+                compact_after_n_flushes: 0,
+                ..DbOptions::default()
+            },
+        )
+        .unwrap();
         let eq = db
             .ensure_node_property_index(
                 "Researcher",
@@ -3019,7 +3026,14 @@ mod tests {
     fn scrub_does_not_require_missing_building_declared_node_property_sidecar() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let db = open_test_db(&db_path);
+        let db = crate::engine::open_index_protocol_fixture(
+            &db_path,
+            &DbOptions {
+                compact_after_n_flushes: 0,
+                ..DbOptions::default()
+            },
+        )
+        .unwrap();
         let mut props = BTreeMap::new();
         props.insert(
             "status".to_string(),

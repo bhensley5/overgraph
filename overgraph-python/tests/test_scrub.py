@@ -1,3 +1,4 @@
+from conftest import drain_after_close
 import os
 
 from overgraph import OverGraph
@@ -20,8 +21,7 @@ def test_scrub_healthy_database(tmp_dir):
     assert report.segments[0].components_ok > 0
     assert len(report.segments[0].findings) == 0
     db.close()
-
-
+    drain_after_close(db)
 def test_scrub_detects_corruption(tmp_dir):
     db_path = os.path.join(tmp_dir, "scrub_corrupt_db")
     db = OverGraph.open(db_path)
@@ -29,7 +29,7 @@ def test_scrub_detects_corruption(tmp_dir):
         db.upsert_node("Person", f"node_{i}")
     db.flush()
     db.close()
-
+    drain_after_close(db)
     core_path = os.path.join(db_path, "segments", "seg_0001", "segment.core")
     data = bytearray(open(core_path, "rb").read())
     data[len(data) // 2] ^= 0xFF
@@ -44,8 +44,7 @@ def test_scrub_detects_corruption(tmp_dir):
     assert findings[0].component_kind != ""
     assert findings[0].detail != ""
     db.close()
-
-
+    drain_after_close(db)
 def test_scrub_repr(tmp_dir):
     db_path = os.path.join(tmp_dir, "scrub_repr_db")
     db = OverGraph.open(db_path)
@@ -57,3 +56,4 @@ def test_scrub_repr(tmp_dir):
     assert "ScrubReport" in r
     assert "segments=1" in r
     db.close()
+    drain_after_close(db)

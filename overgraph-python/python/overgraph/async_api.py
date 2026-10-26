@@ -73,6 +73,27 @@ class AsyncWriteTxn:
     def __repr__(self) -> str:
         return f"AsyncWriteTxn(txn={self._txn!r})"
 
+    async def _run(self, function: Any, *args: Any, **kwargs: Any) -> Any:
+        # Cancellation while acquiring the lock submits no work. Once submitted,
+        # shield the same worker through repeated cancellation before unlocking.
+        async with self._lock:
+            worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+            cancelled: asyncio.CancelledError | None = None
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError as error:
+                    if cancelled is None:
+                        cancelled = error
+                except BaseException:
+                    break
+            if cancelled is not None:
+                # Retrieve even a failing worker: no unobserved background error.
+                if not worker.cancelled():
+                    worker.exception()
+                raise cancelled
+            return worker.result()
+
     async def upsert_node(
         self,
         labels: str | list[str] | tuple[str, ...],
@@ -83,16 +104,15 @@ class AsyncWriteTxn:
         dense_vector: list[float] | None = None,
         sparse_vector: list[tuple[int, float]] | None = None,
     ) -> dict[str, Any]:
-        async with self._lock:
-            return await asyncio.to_thread(
-                self._txn.upsert_node,
-                labels,
-                key,
-                props=props,
-                weight=weight,
-                dense_vector=dense_vector,
-                sparse_vector=sparse_vector,
-            )
+        return await self._run(
+            self._txn.upsert_node,
+            labels,
+            key,
+            props=props,
+            weight=weight,
+            dense_vector=dense_vector,
+            sparse_vector=sparse_vector,
+        )
 
     async def upsert_node_as(
         self,
@@ -105,25 +125,22 @@ class AsyncWriteTxn:
         dense_vector: list[float] | None = None,
         sparse_vector: list[tuple[int, float]] | None = None,
     ) -> dict[str, Any]:
-        async with self._lock:
-            return await asyncio.to_thread(
-                self._txn.upsert_node_as,
-                alias,
-                labels,
-                key,
-                props=props,
-                weight=weight,
-                dense_vector=dense_vector,
-                sparse_vector=sparse_vector,
-            )
+        return await self._run(
+            self._txn.upsert_node_as,
+            alias,
+            labels,
+            key,
+            props=props,
+            weight=weight,
+            dense_vector=dense_vector,
+            sparse_vector=sparse_vector,
+        )
 
     async def add_node_label(self, target: dict[str, Any], label: str) -> bool:
-        async with self._lock:
-            return await asyncio.to_thread(self._txn.add_node_label, target, label)
+        return await self._run(self._txn.add_node_label, target, label)
 
     async def remove_node_label(self, target: dict[str, Any], label: str) -> bool:
-        async with self._lock:
-            return await asyncio.to_thread(self._txn.remove_node_label, target, label)
+        return await self._run(self._txn.remove_node_label, target, label)
 
     async def upsert_edge(
         self,
@@ -136,17 +153,16 @@ class AsyncWriteTxn:
         valid_from: int | None = None,
         valid_to: int | None = None,
     ) -> dict[str, Any]:
-        async with self._lock:
-            return await asyncio.to_thread(
-                self._txn.upsert_edge,
-                from_ref,
-                to_ref,
-                label,
-                props=props,
-                weight=weight,
-                valid_from=valid_from,
-                valid_to=valid_to,
-            )
+        return await self._run(
+            self._txn.upsert_edge,
+            from_ref,
+            to_ref,
+            label,
+            props=props,
+            weight=weight,
+            valid_from=valid_from,
+            valid_to=valid_to,
+        )
 
     async def upsert_edge_as(
         self,
@@ -160,46 +176,38 @@ class AsyncWriteTxn:
         valid_from: int | None = None,
         valid_to: int | None = None,
     ) -> dict[str, Any]:
-        async with self._lock:
-            return await asyncio.to_thread(
-                self._txn.upsert_edge_as,
-                alias,
-                from_ref,
-                to_ref,
-                label,
-                props=props,
-                weight=weight,
-                valid_from=valid_from,
-                valid_to=valid_to,
-            )
+        return await self._run(
+            self._txn.upsert_edge_as,
+            alias,
+            from_ref,
+            to_ref,
+            label,
+            props=props,
+            weight=weight,
+            valid_from=valid_from,
+            valid_to=valid_to,
+        )
 
     async def delete_node(self, target: dict[str, Any]) -> None:
-        async with self._lock:
-            await asyncio.to_thread(self._txn.delete_node, target)
+        await self._run(self._txn.delete_node, target)
 
     async def delete_edge(self, target: dict[str, Any]) -> None:
-        async with self._lock:
-            await asyncio.to_thread(self._txn.delete_edge, target)
+        await self._run(self._txn.delete_edge, target)
 
     async def invalidate_edge(self, target: dict[str, Any], valid_to: int) -> None:
-        async with self._lock:
-            await asyncio.to_thread(self._txn.invalidate_edge, target, valid_to)
+        await self._run(self._txn.invalidate_edge, target, valid_to)
 
     async def stage(self, operations: list[dict[str, Any]]) -> None:
-        async with self._lock:
-            await asyncio.to_thread(self._txn.stage, operations)
+        await self._run(self._txn.stage, operations)
 
     async def get_node(self, target: dict[str, Any]) -> dict[str, Any] | None:
-        async with self._lock:
-            return await asyncio.to_thread(self._txn.get_node, target)
+        return await self._run(self._txn.get_node, target)
 
     async def get_edge(self, target: dict[str, Any]) -> dict[str, Any] | None:
-        async with self._lock:
-            return await asyncio.to_thread(self._txn.get_edge, target)
+        return await self._run(self._txn.get_edge, target)
 
     async def get_node_by_key(self, label: str, key: str) -> dict[str, Any] | None:
-        async with self._lock:
-            return await asyncio.to_thread(self._txn.get_node_by_key, label, key)
+        return await self._run(self._txn.get_node_by_key, label, key)
 
     async def get_edge_by_triple(
         self,
@@ -207,19 +215,15 @@ class AsyncWriteTxn:
         to_ref: dict[str, Any],
         label: str,
     ) -> dict[str, Any] | None:
-        async with self._lock:
-            return await asyncio.to_thread(
-                self._txn.get_edge_by_triple, from_ref, to_ref, label
-            )
+        return await self._run(
+            self._txn.get_edge_by_triple, from_ref, to_ref, label
+        )
 
     async def commit(self) -> TxnCommitResult:
-        async with self._lock:
-            return await asyncio.to_thread(self._txn.commit)
+        return await self._run(self._txn.commit)
 
     async def rollback(self) -> None:
-        async with self._lock:
-            await asyncio.to_thread(self._txn.rollback)
-
+        await self._run(self._txn.rollback)
 
 class AsyncOverGraph:
     """Async wrapper around OverGraph. All methods release the GIL via to_thread()."""
@@ -250,6 +254,9 @@ class AsyncOverGraph:
         exc_tb: Any,
     ) -> None:
         await self.close()
+
+    async def reclamation_stats(self) -> Any:
+        return await asyncio.to_thread(self._db.reclamation_stats)
 
     async def stats(self) -> DbStats:
         return await asyncio.to_thread(self._db.stats)

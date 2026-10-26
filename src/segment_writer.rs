@@ -8,6 +8,7 @@ use crate::dense_hnsw::{
 };
 use crate::dense_hnsw::{DENSE_HNSW_GRAPH_FILENAME, DENSE_HNSW_META_FILENAME};
 use crate::edge_metadata::EdgeMetadataIndexEntries;
+use crate::engine::shared::SharedArc;
 use crate::error::EngineError;
 use crate::memtable::{AdjEntry, Memtable};
 use crate::parallel::{engine_cpu_join, engine_cpu_try_join};
@@ -55,7 +56,6 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // --- Binary write helpers (little-endian) ---
@@ -943,7 +943,10 @@ pub(crate) fn remove_secondary_index_component_records(
         return Ok(removed_paths);
     }
 
-    manifest.generation = manifest.generation.saturating_add(1);
+    manifest.generation = manifest
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| EngineError::InvalidOperation("component generation exhausted".into()))?;
     manifest.built_at_ms = current_time_millis();
     manifest.build_kind = SegmentComponentBuildKind::OptionalRefresh;
     write_segment_component_manifest(seg_dir, &manifest)?;
@@ -1151,17 +1154,16 @@ pub(crate) fn planner_stats_component_fingerprint(
         .filter(|entry| entry.state == SecondaryIndexState::Ready)
         .collect();
     entries.sort_by_key(|entry| entry.index_id);
-    let mut fields = Vec::with_capacity(entries.len() * 2 + 1);
-    fields.push(entries.len() as u64);
-    for entry in entries {
-        fields.push(entry.index_id);
-        if let ComponentDependencyV1::SecondaryIndexDeclaration { fingerprint, .. } =
-            secondary_declaration_dependency(entry)
-        {
-            fields.push(fingerprint);
-        }
-    }
-    component_fingerprint("flush.planner_stats", &fields)
+    crate::segment_components::component_build_fingerprint_iter(
+        SEGMENT_FORMAT_VERSION,
+        "flush.planner_stats",
+        std::iter::once(entries.len() as u64).chain(entries.iter().flat_map(|entry| {
+            [
+                entry.index_id,
+                secondary_index_declaration_fingerprint_for_entry(entry),
+            ]
+        })),
+    )
 }
 
 #[cfg(test)]
@@ -1190,96 +1192,61 @@ pub(crate) fn publish_planner_stats_component_payload(
     )
 }
 
-pub(crate) fn publish_planner_stats_component_payload_from_latest(
+pub(crate) fn prepare_planner_stats_component_payload_from_latest(
     seg_dir: &Path,
     ready_secondary_indexes: &[SecondaryIndexManifestEntry],
     build_payload: impl FnOnce(Option<&[u8]>, u64, u64, u64) -> Result<Option<Vec<u8>>, EngineError>,
-) -> Result<bool, EngineError> {
-    let captured_manifest = read_segment_component_manifest(seg_dir)?;
-    let source_groups = segment_source_groups_from_records(
-        captured_manifest.segment_id,
-        captured_manifest.node_count,
-        captured_manifest.edge_count,
-        &captured_manifest.components,
+) -> Result<Option<PreparedOptionalComponent>, EngineError> {
+    let captured = read_segment_component_manifest(seg_dir)?;
+    let source = segment_source_groups_from_records(
+        captured.segment_id,
+        captured.node_count,
+        captured.edge_count,
+        &captured.components,
     )?;
-    if source_groups.segment_data_id != captured_manifest.segment_data_id {
-        return Err(EngineError::CorruptRecord(format!(
-            "segment {} source identity changed before optional publication",
-            captured_manifest.segment_id
-        )));
+    if source.segment_data_id != captured.segment_data_id {
+        return Err(EngineError::CorruptRecord(
+            "planner statistics source identity changed".into(),
+        ));
     }
-    let current_payload = read_external_component_payload_from_manifest(
+    let old = read_external_component_payload_from_manifest(
         seg_dir,
-        &captured_manifest,
+        &captured,
         SegmentComponentKind::PlannerStats,
     )?;
     let Some(payload) = build_payload(
-        current_payload.as_deref(),
-        captured_manifest.segment_id,
-        captured_manifest.node_count,
-        captured_manifest.edge_count,
+        old.as_deref(),
+        captured.segment_id,
+        captured.node_count,
+        captured.edge_count,
     )?
     else {
-        return Ok(false);
+        return Ok(None);
     };
-
-    let generation = captured_manifest.generation.saturating_add(1);
-    let final_relative_path = optional_generation_relative_path(PLANNER_STATS_FILENAME, generation);
-    let tmp_relative_path = optional_refresh_tmp_relative_path(PLANNER_STATS_FILENAME, generation);
-    let tmp_path = seg_dir.join(&tmp_relative_path);
-    if let Some(parent) = tmp_path.parent() {
-        fs::create_dir_all(parent)?;
+    let current = read_segment_component_manifest(seg_dir)?;
+    if current.segment_data_id != captured.segment_data_id
+        || current.generation != captured.generation
+    {
+        return Err(EngineError::CorruptRecord(format!(
+            "segment {} {}",
+            captured.segment_id, OPTIONAL_COMPONENT_PUBLICATION_CONFLICT_MESSAGE
+        )));
     }
-
-    let dependencies = planner_stats_component_dependencies(
-        captured_manifest.segment_data_id,
-        ready_secondary_indexes,
-    );
-    let mut writer = ComponentIdentityWriter::create(
-        &tmp_path,
-        final_relative_path.clone(),
-        SEGMENT_FORMAT_VERSION,
-        captured_manifest.segment_id,
+    Ok(Some(prepare_optional_component_with_writer(
+        seg_dir,
         SegmentComponentKind::PlannerStats,
-        FLUSH_COMPONENT_LOGICAL_FORMAT_VERSION,
-        generation,
+        PLANNER_STATS_FILENAME,
         ComponentRequirement::Optional {
             fallback: ComponentFallbackClass::PlannerStatsUnavailable,
         },
         ComponentTrustClass::OptionalAdvisoryStats,
+        planner_stats_component_dependencies(captured.segment_data_id, ready_secondary_indexes),
         planner_stats_component_fingerprint(ready_secondary_indexes),
-        true,
-    )?;
-    writer.write_all(&payload)?;
-    let record = writer.finish(dependencies)?;
-
-    let current_manifest = read_segment_component_manifest(seg_dir)?;
-    if current_manifest.segment_id != captured_manifest.segment_id
-        || current_manifest.segment_data_id != captured_manifest.segment_data_id
-        || current_manifest.generation != captured_manifest.generation
-    {
-        return Err(EngineError::CorruptRecord(format!(
-            "segment {} {}",
-            captured_manifest.segment_id, OPTIONAL_COMPONENT_PUBLICATION_CONFLICT_MESSAGE
-        )));
-    }
-
-    let final_path = seg_dir.join(&final_relative_path);
-    fs::rename(&tmp_path, &final_path)?;
-    if let Some(parent) = final_path.parent() {
-        fsync_dir(parent)?;
-    }
-
-    let mut replacement = current_manifest;
-    replacement.generation = generation;
-    replacement.built_at_ms = current_time_millis();
-    replacement.build_kind = SegmentComponentBuildKind::OptionalRefresh;
-    replacement
-        .components
-        .retain(|existing| existing.kind != SegmentComponentKind::PlannerStats);
-    replacement.components.push(record);
-    write_segment_component_manifest(seg_dir, &replacement)?;
-    Ok(true)
+        |writer| {
+            writer.write_all(&payload)?;
+            Ok(())
+        },
+    )?))
 }
 
 fn read_external_component_payload_from_manifest(
@@ -1439,10 +1406,22 @@ fn write_segment_inner(
     degree_overlay: Option<&DegreeOverlaySnapshot>,
     secondary_indexes: &[SecondaryIndexManifestEntry],
 ) -> Result<SegmentInfo, EngineError> {
+    #[cfg(feature = "production-concurrency")]
+    if memtable.is_candidate() {
+        return streaming::write_segment(
+            seg_dir,
+            segment_id,
+            memtable,
+            dense_config,
+            degree_overlay,
+            secondary_indexes,
+            memtable.sealed_export()?,
+        );
+    }
     fs::create_dir_all(seg_dir)?;
 
-    let nodes = memtable.nodes();
-    let edges = memtable.edges();
+    let nodes = crate::engine::payload::Owned::new(memtable.nodes()?);
+    let edges = crate::engine::payload::Owned::new(memtable.edges()?);
     let degree_entries = degree_overlay.map(DegreeOverlaySnapshot::sorted_entries);
 
     let (flush_result, stats_core_result) = engine_cpu_join(
@@ -1503,8 +1482,8 @@ fn write_segment_inner(
                 |writer| {
                     write_tombstones_payload(
                         writer,
-                        &memtable.deleted_nodes(),
-                        &memtable.deleted_edges(),
+                        &memtable.deleted_nodes()?,
+                        &memtable.deleted_edges()?,
                     )
                 },
             )?;
@@ -1705,7 +1684,7 @@ fn write_flush_dependent_components(
 ) -> Result<(Vec<SegmentComponentRecordV1>, DeclaredIndexStatsEvidence), EngineError> {
     let partitions = partition_secondary_indexes(secondary_indexes);
     let compound_flush_state =
-        memtable.compound_secondary_state_for_indexes(&compound_flush_index_ids(&partitions));
+        memtable.compound_secondary_state_for_indexes(&compound_flush_index_ids(&partitions))?;
     let (((node_output, edge_output), sparse_posting_records), built_hnsw) = engine_cpu_try_join(
         || {
             engine_cpu_try_join(
@@ -1716,7 +1695,7 @@ fn write_flush_dependent_components(
                                 seg_dir,
                                 segment_id,
                                 memtable,
-                                nodes,
+                                prepare_key_index_payload(nodes)?,
                                 &partitions.node_eq,
                                 &partitions.node_range,
                                 &compound_flush_state,
@@ -1728,7 +1707,10 @@ fn write_flush_dependent_components(
                                 seg_dir,
                                 segment_id,
                                 memtable,
-                                edges,
+                                (
+                                    prepare_edge_triple_index_payload(edges),
+                                    prepare_flush_edge_metadata_index_components(edges),
+                                ),
                                 degree_entries,
                                 &partitions.edge_eq,
                                 &partitions.edge_range,
@@ -1771,16 +1753,15 @@ fn write_flush_node_index_components<'a>(
     seg_dir: &Path,
     segment_id: u64,
     memtable: &Memtable,
-    nodes: &'a NodeIdMap<NodeRecord>,
+    key_index: KeyIndexPayloadPlan<'a>,
     node_eq_indexes: &[&SecondaryIndexManifestEntry],
     node_range_indexes: &[&SecondaryIndexManifestEntry],
     compound_state: &CompoundFlushState,
     source_groups: SegmentComponentSourceGroups,
 ) -> Result<FlushNodeIndexOutput<'a>, EngineError> {
     let mut records = Vec::with_capacity(node_eq_indexes.len() + node_range_indexes.len());
-    let key_index = prepare_key_index_payload(nodes)?;
     let node_label_index = LabelPostingIndexPayloadPlan {
-        groups: memtable.node_label_posting_groups_current(),
+        groups: memtable.node_label_posting_groups_current()?,
     };
 
     let mut evidence = write_flush_declared_equality_components(
@@ -1816,7 +1797,7 @@ fn write_flush_node_index_components<'a>(
         &mut records,
     )?);
 
-    let time_node_index = memtable.time_node_index();
+    let time_node_index = memtable.time_node_index()?;
     let timestamp_index = prepare_timestamp_index_payload(&time_node_index);
 
     evidence.sort();
@@ -1883,7 +1864,7 @@ fn write_flush_declared_equality_components(
         return Ok(DeclaredIndexStatsEvidence::default());
     }
 
-    let secondary_eq_state = memtable.secondary_eq_state();
+    let secondary_eq_state = memtable.secondary_eq_state()?;
     let mut evidence = DeclaredIndexStatsEvidence::default();
     for entry in eq_entries {
         if !matches!(&entry.target, SecondaryIndexTarget::NodeProperty { .. }) {
@@ -1951,7 +1932,7 @@ fn write_flush_declared_range_components(
         return Ok(DeclaredIndexStatsEvidence::default());
     }
 
-    let secondary_range_state = memtable.secondary_range_state();
+    let secondary_range_state = memtable.secondary_range_state()?;
     let mut evidence = DeclaredIndexStatsEvidence::default();
     for entry in range_entries {
         if !matches!(&entry.target, SecondaryIndexTarget::NodeProperty { .. }) {
@@ -2143,7 +2124,7 @@ fn write_flush_edge_index_components(
     seg_dir: &Path,
     segment_id: u64,
     memtable: &Memtable,
-    edges: &NodeIdMap<EdgeRecord>,
+    edge_plans: (EdgeTripleIndexPayloadPlan, EdgeMetadataIndexEntries),
     degree_entries: Option<&[(u64, DegreeDelta)]>,
     edge_eq_indexes: &[&SecondaryIndexManifestEntry],
     edge_range_indexes: &[&SecondaryIndexManifestEntry],
@@ -2155,12 +2136,11 @@ fn write_flush_edge_index_components(
             + edge_eq_indexes.len()
             + edge_range_indexes.len(),
     );
-    let adj_out = prepare_adjacency_payloads(memtable.adj_out());
-    let adj_in = prepare_adjacency_payloads(memtable.adj_in());
-    let label_edge_index = memtable.label_edge_index();
+    let adj_out = prepare_adjacency_payloads(memtable.adj_out()?);
+    let adj_in = prepare_adjacency_payloads(memtable.adj_in()?);
+    let label_edge_index = memtable.label_edge_index()?;
     let edge_label_index = prepare_label_posting_index_payload(&label_edge_index);
-    let edge_triple_index = prepare_edge_triple_index_payload(edges);
-    let edge_metadata_indexes = prepare_flush_edge_metadata_index_components(edges);
+    let (edge_triple_index, edge_metadata_indexes) = edge_plans;
 
     if let Some(entries) = degree_entries {
         let dependencies = vec![source_group_dependency(
@@ -2246,7 +2226,7 @@ fn write_flush_declared_edge_equality_components(
         return Ok(DeclaredIndexStatsEvidence::default());
     }
 
-    let secondary_eq_state = memtable.secondary_eq_state();
+    let secondary_eq_state = memtable.secondary_eq_state()?;
     let mut evidence = DeclaredIndexStatsEvidence::default();
     for entry in eq_entries {
         if !matches!(&entry.target, SecondaryIndexTarget::EdgeProperty { .. }) {
@@ -2314,7 +2294,7 @@ fn write_flush_declared_edge_range_components(
         return Ok(DeclaredIndexStatsEvidence::default());
     }
 
-    let secondary_range_state = memtable.secondary_range_state();
+    let secondary_range_state = memtable.secondary_range_state()?;
     let mut evidence = DeclaredIndexStatsEvidence::default();
     for entry in range_entries {
         if !matches!(&entry.target, SecondaryIndexTarget::EdgeProperty { .. }) {
@@ -2559,6 +2539,14 @@ fn write_flush_sparse_posting_components(
     source_groups: SegmentComponentSourceGroups,
 ) -> Result<Vec<SegmentComponentRecordV1>, EngineError> {
     let groups = sparse_posting_groups_from_nodes(nodes)?;
+    write_flush_sparse_posting_groups(seg_dir, segment_id, &groups, source_groups)
+}
+fn write_flush_sparse_posting_groups(
+    seg_dir: &Path,
+    segment_id: u64,
+    groups: &BTreeMap<u32, Vec<(u64, f32)>>,
+    source_groups: SegmentComponentSourceGroups,
+) -> Result<Vec<SegmentComponentRecordV1>, EngineError> {
     if groups.is_empty() {
         return Ok(Vec::new());
     }
@@ -2586,7 +2574,7 @@ fn write_flush_sparse_posting_components(
         ComponentTrustClass::OptionalApproximateAccelerator,
         dependencies,
         |index_writer, postings_writer| {
-            write_sparse_posting_files_to_writers(index_writer, postings_writer, &groups)
+            write_sparse_posting_files_to_writers(index_writer, postings_writer, groups)
         },
     )?;
     Ok(vec![index_record, postings_record])
@@ -2610,6 +2598,14 @@ pub(crate) fn publish_node_prop_eq_sidecar_component(
     entry: &SecondaryIndexManifestEntry,
     groups: &BTreeMap<u64, Vec<u64>>,
 ) -> Result<(), EngineError> {
+    prepare_node_prop_eq_sidecar_component(seg_dir, entry, groups)?.publish()
+}
+
+pub(crate) fn prepare_node_prop_eq_sidecar_component(
+    seg_dir: &Path,
+    entry: &SecondaryIndexManifestEntry,
+    groups: &BTreeMap<u64, Vec<u64>>,
+) -> Result<PreparedOptionalComponent, EngineError> {
     let manifest = read_segment_component_manifest(seg_dir)?;
     let source_groups = segment_source_groups_from_records(
         manifest.segment_id,
@@ -2624,7 +2620,7 @@ pub(crate) fn publish_node_prop_eq_sidecar_component(
         ),
         secondary_declaration_dependency(entry),
     ];
-    refresh_optional_component_with_writer(
+    prepare_optional_component_with_writer(
         seg_dir,
         SegmentComponentKind::NodePropertyEqualityIndex {
             index_id: entry.index_id,
@@ -2686,6 +2682,14 @@ pub(crate) fn publish_node_prop_range_sidecar_component(
     entry: &SecondaryIndexManifestEntry,
     entries: &[(NumericRangeSortKey, u64)],
 ) -> Result<(), EngineError> {
+    prepare_node_prop_range_sidecar_component(seg_dir, entry, entries)?.publish()
+}
+
+pub(crate) fn prepare_node_prop_range_sidecar_component(
+    seg_dir: &Path,
+    entry: &SecondaryIndexManifestEntry,
+    entries: &[(NumericRangeSortKey, u64)],
+) -> Result<PreparedOptionalComponent, EngineError> {
     let manifest = read_segment_component_manifest(seg_dir)?;
     let source_groups = segment_source_groups_from_records(
         manifest.segment_id,
@@ -2700,7 +2704,7 @@ pub(crate) fn publish_node_prop_range_sidecar_component(
         ),
         secondary_declaration_dependency(entry),
     ];
-    refresh_optional_component_with_writer(
+    prepare_optional_component_with_writer(
         seg_dir,
         SegmentComponentKind::NodePropertyRangeIndex {
             index_id: entry.index_id,
@@ -2724,6 +2728,14 @@ pub(crate) fn publish_edge_prop_eq_sidecar_component(
     entry: &SecondaryIndexManifestEntry,
     groups: &BTreeMap<u64, Vec<u64>>,
 ) -> Result<(), EngineError> {
+    prepare_edge_prop_eq_sidecar_component(seg_dir, entry, groups)?.publish()
+}
+
+pub(crate) fn prepare_edge_prop_eq_sidecar_component(
+    seg_dir: &Path,
+    entry: &SecondaryIndexManifestEntry,
+    groups: &BTreeMap<u64, Vec<u64>>,
+) -> Result<PreparedOptionalComponent, EngineError> {
     let manifest = read_segment_component_manifest(seg_dir)?;
     let source_groups = segment_source_groups_from_records(
         manifest.segment_id,
@@ -2738,7 +2750,7 @@ pub(crate) fn publish_edge_prop_eq_sidecar_component(
         ),
         secondary_declaration_dependency(entry),
     ];
-    refresh_optional_component_with_writer(
+    prepare_optional_component_with_writer(
         seg_dir,
         SegmentComponentKind::EdgePropertyEqualityIndex {
             index_id: entry.index_id,
@@ -2762,6 +2774,14 @@ pub(crate) fn publish_edge_prop_range_sidecar_component(
     entry: &SecondaryIndexManifestEntry,
     entries: &[(NumericRangeSortKey, u64)],
 ) -> Result<(), EngineError> {
+    prepare_edge_prop_range_sidecar_component(seg_dir, entry, entries)?.publish()
+}
+
+pub(crate) fn prepare_edge_prop_range_sidecar_component(
+    seg_dir: &Path,
+    entry: &SecondaryIndexManifestEntry,
+    entries: &[(NumericRangeSortKey, u64)],
+) -> Result<PreparedOptionalComponent, EngineError> {
     let manifest = read_segment_component_manifest(seg_dir)?;
     let source_groups = segment_source_groups_from_records(
         manifest.segment_id,
@@ -2776,7 +2796,7 @@ pub(crate) fn publish_edge_prop_range_sidecar_component(
         ),
         secondary_declaration_dependency(entry),
     ];
-    refresh_optional_component_with_writer(
+    prepare_optional_component_with_writer(
         seg_dir,
         SegmentComponentKind::EdgePropertyRangeIndex {
             index_id: entry.index_id,
@@ -2800,6 +2820,14 @@ pub(crate) fn publish_compound_sidecar_component(
     entry: &SecondaryIndexManifestEntry,
     entries: &[(Vec<u8>, u64)],
 ) -> Result<(), EngineError> {
+    prepare_compound_sidecar_component(seg_dir, entry, entries)?.publish()
+}
+
+pub(crate) fn prepare_compound_sidecar_component(
+    seg_dir: &Path,
+    entry: &SecondaryIndexManifestEntry,
+    entries: &[(Vec<u8>, u64)],
+) -> Result<PreparedOptionalComponent, EngineError> {
     let manifest = read_segment_component_manifest(seg_dir)?;
     let source_groups = segment_source_groups_from_records(
         manifest.segment_id,
@@ -2842,7 +2870,7 @@ pub(crate) fn publish_compound_sidecar_component(
                     .to_string(),
             )
         })?;
-    refresh_optional_component_with_writer(
+    prepare_optional_component_with_writer(
         seg_dir,
         kind,
         &relative_path,
@@ -3364,7 +3392,10 @@ fn write_tombstones_payload(
 
 // --- Record encoding helpers ---
 
-fn encode_node_record_into(buf: &mut Vec<u8>, node: &NodeRecord) -> Result<(), EngineError> {
+pub(crate) fn encode_node_record_into(
+    buf: &mut Vec<u8>,
+    node: &NodeRecord,
+) -> Result<(), EngineError> {
     buf.clear();
     // Note: node.id is NOT written here. It's already in the index.
     buf.push(node.label_ids.len() as u8);
@@ -3383,14 +3414,20 @@ fn encode_node_record_into(buf: &mut Vec<u8>, node: &NodeRecord) -> Result<(), E
     buf.extend_from_slice(&node.created_at.to_le_bytes());
     buf.extend_from_slice(&node.updated_at.to_le_bytes());
     buf.extend_from_slice(&node.weight.to_le_bytes());
-    let props_bytes = rmp_serde::to_vec(&node.props)
+    let prefix = buf.len();
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    serde::Serialize::serialize(&node.props, &mut rmp_serde::Serializer::new(&mut *buf))
         .map_err(|e| EngineError::SerializationError(e.to_string()))?;
-    buf.extend_from_slice(&(props_bytes.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&props_bytes);
+    let length = u32::try_from(buf.len() - prefix - 4)
+        .map_err(|_| EngineError::SerializationError("segment property length overflow".into()))?;
+    buf[prefix..prefix + 4].copy_from_slice(&length.to_le_bytes());
     Ok(())
 }
 
-fn encode_edge_record_into(buf: &mut Vec<u8>, edge: &EdgeRecord) -> Result<(), EngineError> {
+pub(crate) fn encode_edge_record_into(
+    buf: &mut Vec<u8>,
+    edge: &EdgeRecord,
+) -> Result<(), EngineError> {
     buf.clear();
     // Note: edge.id is NOT written here. It's already in the index.
     buf.extend_from_slice(&edge.from.to_le_bytes());
@@ -3401,10 +3438,13 @@ fn encode_edge_record_into(buf: &mut Vec<u8>, edge: &EdgeRecord) -> Result<(), E
     buf.extend_from_slice(&edge.weight.to_le_bytes());
     buf.extend_from_slice(&edge.valid_from.to_le_bytes());
     buf.extend_from_slice(&edge.valid_to.to_le_bytes());
-    let props_bytes = rmp_serde::to_vec(&edge.props)
+    let prefix = buf.len();
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    serde::Serialize::serialize(&edge.props, &mut rmp_serde::Serializer::new(&mut *buf))
         .map_err(|e| EngineError::SerializationError(e.to_string()))?;
-    buf.extend_from_slice(&(props_bytes.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&props_bytes);
+    let length = u32::try_from(buf.len() - prefix - 4)
+        .map_err(|_| EngineError::SerializationError("segment property length overflow".into()))?;
+    buf[prefix..prefix + 4].copy_from_slice(&length.to_le_bytes());
     Ok(())
 }
 
@@ -3859,11 +3899,21 @@ fn write_segment_component_manifest(
     let data = encode_manifest_envelope(manifest)?;
     {
         let mut file = File::create(&tmp_path)?;
+        #[cfg(all(test, feature = "production-concurrency"))]
+        crate::persistence_fault::check(crate::persistence_fault::Boundary::ComponentCreate)?;
         file.write_all(&data)?;
+        #[cfg(all(test, feature = "production-concurrency"))]
+        crate::persistence_fault::check(crate::persistence_fault::Boundary::ComponentWrite)?;
         file.sync_all()?;
+        #[cfg(all(test, feature = "production-concurrency"))]
+        crate::persistence_fault::check(crate::persistence_fault::Boundary::ComponentSync)?;
     }
     fs::rename(&tmp_path, &final_path)?;
+    #[cfg(all(test, feature = "production-concurrency"))]
+    crate::persistence_fault::check(crate::persistence_fault::Boundary::ComponentRename)?;
     fsync_dir(seg_dir)?;
+    #[cfg(all(test, feature = "production-concurrency"))]
+    crate::persistence_fault::check(crate::persistence_fault::Boundary::ComponentDirSync)?;
     Ok(())
 }
 
@@ -3875,25 +3925,90 @@ fn read_segment_component_manifest(
     decode_manifest_envelope(&data)
 }
 
-pub(crate) fn cleanup_orphan_optional_component_files(seg_dir: &Path) {
-    let Ok(manifest) = read_segment_component_manifest(seg_dir) else {
-        return;
-    };
-
-    let mut referenced = HashSet::new();
-    for record in &manifest.components {
-        if let ComponentHandleV1::ExternalFile { relative_path, .. } = &record.handle {
-            referenced.insert(PathBuf::from(relative_path));
+pub(crate) fn recoverable_optional_component_paths(
+    seg_dir: &Path,
+) -> Result<HashSet<PathBuf>, EngineError> {
+    let current = read_segment_component_manifest(seg_dir)?;
+    let mut paths = HashSet::new();
+    let mut add = |manifest: &SegmentComponentManifestV1| {
+        for record in &manifest.components {
+            if let ComponentHandleV1::ExternalFile { relative_path, .. } = &record.handle {
+                paths.insert(seg_dir.join(relative_path));
+            }
         }
+        for record in &manifest.unknown_optional_components {
+            if record.wire.handle.handle_tag == 1 {
+                if let Some(relative) = &record.wire.handle.relative_path {
+                    paths.insert(seg_dir.join(relative));
+                }
+            }
+        }
+    };
+    add(&current);
+    match fs::read(seg_dir.join(SEGMENT_COMPONENT_MANIFEST_TMP_FILENAME)) {
+        Ok(data) => {
+            if let Ok(temporary) = decode_manifest_envelope(&data) {
+                if temporary.segment_id == current.segment_id
+                    && temporary.segment_data_id == current.segment_data_id
+                {
+                    add(&temporary);
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
-    for record in &manifest.unknown_optional_components {
-        if record.wire.handle.handle_tag == 1 {
-            if let Some(relative_path) = &record.wire.handle.relative_path {
-                referenced.insert(PathBuf::from(relative_path));
+    Ok(paths)
+}
+
+// Collect once at component/DDL settlement. Keep pinned candidates in the
+// caller's deferred set so their final release does not require another reopen.
+#[cfg(feature = "production-concurrency")]
+pub(crate) fn optional_orphan_component_paths(seg_dir: &Path) -> Result<Vec<PathBuf>, EngineError> {
+    let referenced = recoverable_optional_component_paths(seg_dir)?;
+    let mut pending = vec![seg_dir.to_owned()];
+    let mut orphans = Vec::new();
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let path = entry.path();
+            if kind.is_dir() {
+                pending.push(path);
+            } else if kind.is_file()
+                && !referenced.contains(&path)
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| {
+                        is_optional_refresh_tmp_file_name(name)
+                            || is_optional_generation_file_name(name)
+                            || is_compound_secondary_index_base_file_name(name)
+                    })
+            {
+                orphans.push(path);
             }
         }
     }
+    Ok(orphans)
+}
 
+pub(crate) fn cleanup_orphan_optional_component_files(seg_dir: &Path) {
+    cleanup_orphan_optional_component_files_with_pins(seg_dir, &HashSet::new());
+}
+pub(crate) fn cleanup_orphan_optional_component_files_with_pins(
+    seg_dir: &Path,
+    pins: &HashSet<PathBuf>,
+) {
+    let Ok(authority) = recoverable_optional_component_paths(seg_dir) else {
+        return;
+    };
+    let mut referenced = HashSet::new();
+    for path in authority.iter().chain(pins) {
+        if let Ok(relative) = path.strip_prefix(seg_dir) {
+            referenced.insert(relative.to_owned());
+        }
+    }
     let mut dirty_dirs = HashSet::new();
     cleanup_orphan_optional_component_files_in_dir(seg_dir, seg_dir, &referenced, &mut dirty_dirs);
     for dir in dirty_dirs {
@@ -3975,7 +4090,9 @@ fn is_optional_generation_file_name(file_name: &str) -> bool {
     let generation = generation
         .split_once('.')
         .map_or(generation, |(generation, _)| generation);
-    generation.len() == 16 && generation.bytes().all(|byte| byte.is_ascii_digit())
+    (16..=20).contains(&generation.len())
+        && generation.bytes().all(|byte| byte.is_ascii_digit())
+        && generation.parse::<u64>().is_ok()
 }
 
 fn optional_generation_relative_path(base_relative_path: &str, generation: u64) -> String {
@@ -4013,6 +4130,7 @@ fn optional_refresh_tmp_relative_path(base_relative_path: &str, generation: u64)
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn refresh_optional_component_with_writer(
     seg_dir: &Path,
@@ -4024,6 +4142,30 @@ fn refresh_optional_component_with_writer(
     build_fingerprint: u64,
     write_payload: impl FnOnce(&mut ComponentIdentityWriter) -> Result<(), EngineError>,
 ) -> Result<(), EngineError> {
+    prepare_optional_component_with_writer(
+        seg_dir,
+        kind,
+        base_relative_path,
+        requirement,
+        trust_class,
+        dependencies,
+        build_fingerprint,
+        write_payload,
+    )?
+    .publish()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_optional_component_with_writer(
+    seg_dir: &Path,
+    kind: SegmentComponentKind,
+    base_relative_path: &str,
+    requirement: ComponentRequirement,
+    trust_class: ComponentTrustClass,
+    dependencies: Vec<ComponentDependencyV1>,
+    build_fingerprint: u64,
+    write_payload: impl FnOnce(&mut ComponentIdentityWriter) -> Result<(), EngineError>,
+) -> Result<PreparedOptionalComponent, EngineError> {
     if !is_refreshable_external_component_kind(&kind) {
         return Err(EngineError::CorruptRecord(format!(
             "component {kind:?} is not eligible for optional external refresh"
@@ -4048,7 +4190,21 @@ fn refresh_optional_component_with_writer(
             captured_manifest.segment_id
         )));
     }
-    let generation = captured_manifest.generation.saturating_add(1);
+    let mut generation = captured_manifest
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| EngineError::InvalidOperation("component generation exhausted".into()))?;
+    while seg_dir
+        .join(optional_generation_relative_path(
+            base_relative_path,
+            generation,
+        ))
+        .exists()
+    {
+        generation = generation.checked_add(1).ok_or_else(|| {
+            EngineError::InvalidOperation("component generation exhausted".into())
+        })?;
+    }
     let final_relative_path = optional_generation_relative_path(base_relative_path, generation);
     let tmp_relative_path = optional_refresh_tmp_relative_path(base_relative_path, generation);
     let tmp_path = seg_dir.join(&tmp_relative_path);
@@ -4072,32 +4228,80 @@ fn refresh_optional_component_with_writer(
     write_payload(&mut writer)?;
     let record = writer.finish(dependencies)?;
 
-    let current_manifest = read_segment_component_manifest(seg_dir)?;
-    if current_manifest.segment_id != captured_manifest.segment_id
-        || current_manifest.segment_data_id != captured_manifest.segment_data_id
-        || current_manifest.generation != captured_manifest.generation
-    {
-        return Err(EngineError::CorruptRecord(format!(
-            "segment {} {}",
-            captured_manifest.segment_id, OPTIONAL_COMPONENT_PUBLICATION_CONFLICT_MESSAGE
-        )));
+    Ok(PreparedOptionalComponent {
+        seg_dir: seg_dir.to_owned(),
+        captured_manifest,
+        generation,
+        kind,
+        record,
+        tmp_path,
+        final_relative_path,
+    })
+}
+pub(crate) struct PreparedOptionalComponent {
+    seg_dir: PathBuf,
+    captured_manifest: SegmentComponentManifestV1,
+    generation: u64,
+    kind: SegmentComponentKind,
+    record: SegmentComponentRecordV1,
+    tmp_path: PathBuf,
+    final_relative_path: String,
+}
+impl PreparedOptionalComponent {
+    pub(crate) fn obsolete_paths(&self) -> Vec<PathBuf> {
+        self.captured_manifest
+            .components
+            .iter()
+            .filter(|r| r.kind == self.kind)
+            .filter_map(|record| match &record.handle {
+                ComponentHandleV1::ExternalFile { relative_path, .. } => {
+                    Some(self.seg_dir.join(relative_path))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
-    let final_path = seg_dir.join(&final_relative_path);
-    fs::rename(&tmp_path, &final_path)?;
-    if let Some(parent) = final_path.parent() {
-        fsync_dir(parent)?;
+    pub(crate) fn publish(self) -> Result<(), EngineError> {
+        let Self {
+            seg_dir,
+            captured_manifest,
+            generation,
+            kind,
+            record,
+            tmp_path,
+            final_relative_path,
+        } = self;
+        let current_manifest = read_segment_component_manifest(&seg_dir)?;
+        if current_manifest.segment_id != captured_manifest.segment_id
+            || current_manifest.segment_data_id != captured_manifest.segment_data_id
+            || current_manifest.generation != captured_manifest.generation
+        {
+            return Err(EngineError::CorruptRecord(format!(
+                "segment {} {}",
+                captured_manifest.segment_id, OPTIONAL_COMPONENT_PUBLICATION_CONFLICT_MESSAGE
+            )));
+        }
+        let final_path = seg_dir.join(&final_relative_path);
+        if final_path.exists() {
+            return Err(EngineError::InvalidOperation(
+                "component output identity already exists".into(),
+            ));
+        }
+        fs::rename(&tmp_path, &final_path)?;
+        if let Some(parent) = final_path.parent() {
+            fsync_dir(parent)?;
+        }
+        let mut replacement = current_manifest;
+        replacement.generation = generation;
+        replacement.built_at_ms = current_time_millis();
+        replacement.build_kind = SegmentComponentBuildKind::OptionalRefresh;
+        replacement
+            .components
+            .retain(|existing| existing.kind != kind);
+        replacement.components.push(record);
+        write_segment_component_manifest(&seg_dir, &replacement)
     }
-
-    let mut replacement = current_manifest;
-    replacement.generation = generation;
-    replacement.built_at_ms = current_time_millis();
-    replacement.build_kind = SegmentComponentBuildKind::OptionalRefresh;
-    replacement
-        .components
-        .retain(|existing| existing.kind != kind);
-    replacement.components.push(record);
-    write_segment_component_manifest(seg_dir, &replacement)
 }
 
 /// Fsync the directory to ensure metadata (file creation) is durable.
@@ -4146,7 +4350,7 @@ pub(crate) struct FastMergeCopyInfo {
 /// merged `data_offset` values directly from sidecars without a second data scan.
 pub(crate) fn write_merged_nodes_dat(
     core_writer: &mut PackedCoreWriter,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
 ) -> Result<(SegmentComponentRecordV1, Vec<FastMergeCopyInfo>), EngineError> {
     let mut seg_info: Vec<(u64, usize, usize)> = Vec::with_capacity(segments.len());
     let mut total_count: u64 = 0;
@@ -4287,7 +4491,7 @@ pub(crate) fn write_merged_nodes_dat(
 /// merged `data_offset` values directly from sidecars without a second data scan.
 pub(crate) fn write_merged_edges_dat(
     core_writer: &mut PackedCoreWriter,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
 ) -> Result<(SegmentComponentRecordV1, Vec<FastMergeCopyInfo>), EngineError> {
     let mut seg_info: Vec<(u64, usize, usize)> = Vec::with_capacity(segments.len());
     let mut total_count: u64 = 0;
@@ -4433,7 +4637,7 @@ pub(crate) fn write_merged_edges_dat(
 /// for metadata writing.
 pub(crate) fn write_v3_nodes_dat(
     core_writer: &mut PackedCoreWriter,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     winners: &[(u64, usize, u64, u32)],
 ) -> Result<CompactionDatOutput, EngineError> {
     core_writer.write_component(
@@ -4496,7 +4700,7 @@ pub(crate) fn write_v3_nodes_dat(
 /// Returns Vec of `(edge_id, new_data_offset, data_len)` matching the output payload.
 pub(crate) fn write_v3_edges_dat(
     core_writer: &mut PackedCoreWriter,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     winners: &[(u64, usize, u64, u32)],
 ) -> Result<CompactionDatOutput, EngineError> {
     core_writer.write_component(
@@ -4589,7 +4793,7 @@ pub(crate) struct CompactEdgeMeta {
 pub(crate) fn write_compaction_source_components(
     segment_id: u64,
     core_writer: &mut PackedCoreWriter,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_record: SegmentComponentRecordV1,
     edge_record: SegmentComponentRecordV1,
     node_metas: &[CompactNodeMeta],
@@ -4727,7 +4931,7 @@ fn write_compact_edge_meta_payload(
 }
 
 fn prepare_key_index_payload_from_meta<'a>(
-    segments: &'a [Arc<SegmentReader>],
+    segments: &'a [SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
 ) -> Result<KeyIndexPayloadPlan<'a>, EngineError> {
     let entry_count = node_metas
@@ -4768,7 +4972,7 @@ fn prepare_key_index_payload_from_meta<'a>(
 }
 
 fn raw_node_key_bytes_from_meta<'a>(
-    segments: &'a [Arc<SegmentReader>],
+    segments: &'a [SharedArc<SegmentReader>],
     nm: &CompactNodeMeta,
 ) -> Result<&'a [u8], EngineError> {
     let src_mmap = segments[nm.src_seg_idx].raw_nodes_mmap();
@@ -4979,7 +5183,7 @@ pub(crate) fn write_indexes_from_metadata_with_secondary_indexes(
     segment_id: u64,
     seg_dir: &Path,
     core_writer: &mut PackedCoreWriter,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     edge_metas: &[CompactEdgeMeta],
     dense_config: Option<&DenseVectorConfig>,
@@ -5280,7 +5484,7 @@ pub(crate) fn write_indexes_from_metadata_with_secondary_indexes(
 }
 
 fn degree_sidecars_for_segments(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
 ) -> Option<Vec<&crate::degree_cache::DegreeSidecar>> {
     segments
         .iter()
@@ -5364,7 +5568,7 @@ fn write_compaction_prebuilt_dense_hnsw_components(
 }
 
 fn build_secondary_eq_groups_from_source_sidecars(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     index_id: u64,
     target_label_id: u32,
@@ -5397,7 +5601,7 @@ fn build_secondary_eq_groups_from_source_sidecars(
 }
 
 fn build_edge_secondary_eq_groups_from_source_sidecars(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     edge_metas: &[CompactEdgeMeta],
     entry: &SecondaryIndexManifestEntry,
     target_label_id: u32,
@@ -5430,7 +5634,7 @@ fn build_edge_secondary_eq_groups_from_source_sidecars(
 }
 
 fn build_secondary_eq_groups_from_targeted_decode(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     target_label_id: u32,
     prop_key: &str,
@@ -5474,7 +5678,7 @@ fn sidecar_unavailable_failure_reason(
 }
 
 fn build_secondary_range_entries_from_source_sidecars(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     index_id: u64,
     target_label_id: u32,
@@ -5501,7 +5705,7 @@ fn build_secondary_range_entries_from_source_sidecars(
 }
 
 fn build_edge_secondary_range_entries_from_source_sidecars(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     edge_metas: &[CompactEdgeMeta],
     entry: &SecondaryIndexManifestEntry,
     target_label_id: u32,
@@ -5528,7 +5732,7 @@ fn build_edge_secondary_range_entries_from_source_sidecars(
 }
 
 fn build_secondary_range_entries_from_targeted_decode(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     target_label_id: u32,
     prop_key: &str,
@@ -5559,7 +5763,7 @@ fn build_secondary_range_entries_from_targeted_decode(
 }
 
 fn build_edge_secondary_eq_groups_from_targeted_decode(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     edge_metas: &[CompactEdgeMeta],
     label_id: u32,
     prop_key: &str,
@@ -5588,7 +5792,7 @@ fn build_edge_secondary_eq_groups_from_targeted_decode(
 }
 
 fn build_edge_secondary_range_entries_from_targeted_decode(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     edge_metas: &[CompactEdgeMeta],
     label_id: u32,
     prop_key: &str,
@@ -5778,7 +5982,7 @@ fn replicate_decode_error(error: &EngineError) -> EngineError {
 }
 
 fn build_node_compound_entries_from_source_sidecars(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     entry: &SecondaryIndexManifestEntry,
 ) -> CompoundSidecarBuildResult {
@@ -5811,7 +6015,7 @@ fn build_node_compound_entries_from_source_sidecars(
 }
 
 fn build_edge_compound_entries_from_source_sidecars(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     edge_metas: &[CompactEdgeMeta],
     entry: &SecondaryIndexManifestEntry,
 ) -> CompoundSidecarBuildResult {
@@ -5947,7 +6151,7 @@ fn selected_edge_field_value<'a>(
 }
 
 pub(crate) fn build_node_compound_entries_from_metadata(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     entry: &SecondaryIndexManifestEntry,
 ) -> CompoundSidecarBuildResult {
@@ -5965,7 +6169,7 @@ pub(crate) fn build_node_compound_entries_from_metadata(
 /// every declaration in that label group that reads record fields;
 /// metadata-only declarations are unaffected.
 pub(crate) fn build_node_compound_entries_grouped_from_metadata(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     entries: &[&SecondaryIndexManifestEntry],
 ) -> Vec<CompoundSidecarBuildResult> {
@@ -6070,7 +6274,7 @@ fn node_compound_entries_for_decoded(
 }
 
 pub(crate) fn build_edge_compound_entries_from_metadata(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     edge_metas: &[CompactEdgeMeta],
     entry: &SecondaryIndexManifestEntry,
 ) -> CompoundSidecarBuildResult {
@@ -6081,7 +6285,7 @@ pub(crate) fn build_edge_compound_entries_from_metadata(
 
 /// Edge counterpart of [`build_node_compound_entries_grouped_from_metadata`].
 pub(crate) fn build_edge_compound_entries_grouped_from_metadata(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     edge_metas: &[CompactEdgeMeta],
     entries: &[&SecondaryIndexManifestEntry],
 ) -> Vec<CompoundSidecarBuildResult> {
@@ -6182,7 +6386,7 @@ fn edge_compound_entries_for_decoded(
 }
 
 fn compound_source_sidecar_reuse_status(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     entry: &SecondaryIndexManifestEntry,
 ) -> (bool, Option<String>) {
     let kind = secondary_index_component_kind_for_entry(entry);
@@ -6215,7 +6419,7 @@ fn compound_source_sidecar_reuse_status(
 fn write_declared_node_compound_sidecars_from_metadata(
     seg_dir: &Path,
     segment_id: u64,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     entries: &[&SecondaryIndexManifestEntry],
     source_groups: SegmentComponentSourceGroups,
@@ -6352,7 +6556,7 @@ fn write_declared_node_compound_sidecars_from_metadata(
 fn write_declared_edge_compound_sidecars_from_metadata(
     seg_dir: &Path,
     segment_id: u64,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     edge_metas: &[CompactEdgeMeta],
     entries: &[&SecondaryIndexManifestEntry],
     source_groups: SegmentComponentSourceGroups,
@@ -6485,7 +6689,7 @@ fn write_declared_edge_compound_sidecars_from_metadata(
 fn write_declared_equality_sidecars_from_metadata(
     seg_dir: &Path,
     segment_id: u64,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     eq_entries: &[&SecondaryIndexManifestEntry],
     source_groups: SegmentComponentSourceGroups,
@@ -6599,7 +6803,7 @@ fn write_declared_equality_sidecars_from_metadata(
 fn write_declared_range_sidecars_from_metadata(
     seg_dir: &Path,
     segment_id: u64,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     range_entries: &[&SecondaryIndexManifestEntry],
     source_groups: SegmentComponentSourceGroups,
@@ -6716,7 +6920,7 @@ fn write_declared_range_sidecars_from_metadata(
 fn write_declared_edge_equality_sidecars_from_metadata(
     seg_dir: &Path,
     segment_id: u64,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     edge_metas: &[CompactEdgeMeta],
     eq_entries: &[&SecondaryIndexManifestEntry],
     source_groups: SegmentComponentSourceGroups,
@@ -6826,7 +7030,7 @@ fn write_declared_edge_equality_sidecars_from_metadata(
 fn write_declared_edge_range_sidecars_from_metadata(
     seg_dir: &Path,
     segment_id: u64,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     edge_metas: &[CompactEdgeMeta],
     range_entries: &[&SecondaryIndexManifestEntry],
     source_groups: SegmentComponentSourceGroups,
@@ -6940,7 +7144,7 @@ fn write_declared_edge_range_sidecars_from_metadata(
 
 fn write_node_vector_source_components_from_meta(
     core_writer: &mut PackedCoreWriter,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     node_source: [u8; 32],
 ) -> Result<(Vec<SegmentComponentRecordV1>, Vec<DensePointInput>), EngineError> {
@@ -6988,7 +7192,7 @@ fn write_node_vector_source_components_from_meta(
 }
 
 fn prepare_node_vector_source_plan_from_meta(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
 ) -> Result<NodeVectorSourcePlan, EngineError> {
     let mut rows = Vec::with_capacity(node_metas.len());
@@ -7110,7 +7314,7 @@ fn checked_compaction_vector_range(
 
 fn write_node_dense_vector_blob_payload_from_meta(
     w: &mut impl Write,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
 ) -> Result<(), EngineError> {
     for nm in node_metas {
@@ -7133,7 +7337,7 @@ fn write_node_dense_vector_blob_payload_from_meta(
 
 fn write_node_sparse_vector_blob_payload_from_meta(
     w: &mut impl Write,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
 ) -> Result<(), EngineError> {
     for nm in node_metas {
@@ -7176,7 +7380,7 @@ fn sparse_posting_groups_from_nodes(
 fn write_sparse_posting_index_from_meta(
     seg_dir: &Path,
     segment_id: u64,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     source_groups: SegmentComponentSourceGroups,
 ) -> Result<Vec<SegmentComponentRecordV1>, EngineError> {
@@ -7261,8 +7465,6 @@ mod tests {
     use super::*;
     use crate::degree_cache::DegreeDelta;
     use crate::property_value_semantics::NUMERIC_RANGE_KEY_BYTES;
-    use std::sync::Arc;
-
     fn write_segment(
         seg_dir: &Path,
         segment_id: u64,
@@ -7824,7 +8026,7 @@ mod tests {
     }
 
     fn compact_copy_segment_for_test(
-        source: Arc<SegmentReader>,
+        source: SharedArc<SegmentReader>,
         out_dir: &Path,
         out_segment_id: u64,
         secondary_indexes: &[SecondaryIndexManifestEntry],
@@ -8223,7 +8425,7 @@ mod tests {
 
         write_segment(&flush_dir, 1, &memtable, None).unwrap();
         let flush_reader =
-            Arc::new(SegmentReader::open_unpinned_for_test(&flush_dir, 1, None).unwrap());
+            SharedArc::new(SegmentReader::open_unpinned_for_test(&flush_dir, 1, None).unwrap());
         let compacted_reader =
             compact_copy_segment_for_test(flush_reader.clone(), &compacted_dir, 2, &[]);
 
@@ -8536,7 +8738,8 @@ mod tests {
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "bob")), 2);
         mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 7)), 3);
         write_segment(&source_dir, 1, &mt, None).unwrap();
-        let source = Arc::new(SegmentReader::open_unpinned_for_test(&source_dir, 1, None).unwrap());
+        let source =
+            SharedArc::new(SegmentReader::open_unpinned_for_test(&source_dir, 1, None).unwrap());
         let reader = compact_copy_segment_for_test(source, &out_dir, 2, &[]);
 
         assert_ne!(reader.segment_data_id(), [0; 32]);
@@ -9263,7 +9466,8 @@ mod tests {
         mt.apply_op(&WalOp::UpsertEdge(edge_b), 2);
 
         write_segment(&source_dir, 1, &mt, None).unwrap();
-        let source = Arc::new(SegmentReader::open_unpinned_for_test(&source_dir, 1, None).unwrap());
+        let source =
+            SharedArc::new(SegmentReader::open_unpinned_for_test(&source_dir, 1, None).unwrap());
         compact_copy_segment_for_test(source, &out_dir, 2, &[]);
 
         assert_eq!(
@@ -9474,7 +9678,8 @@ mod tests {
         node.sparse_vector = Some(vec![(2, 1.5)]);
         let (_source_dir_guard, source_dir) =
             write_packed_segment_from_ops(vec![WalOp::UpsertNode(node)], None);
-        let source = Arc::new(SegmentReader::open_unpinned_for_test(&source_dir, 1, None).unwrap());
+        let source =
+            SharedArc::new(SegmentReader::open_unpinned_for_test(&source_dir, 1, None).unwrap());
         let out_dir = tempfile::tempdir().unwrap();
         let metas = vec![CompactNodeMeta {
             node_id: 1,
@@ -9889,7 +10094,7 @@ mod tests {
             state: SecondaryIndexState::Building,
             last_error: None,
         };
-        mt.register_secondary_index(&entry);
+        mt.register_secondary_index(&entry).unwrap();
 
         let info = write_segment_with_secondary_indexes(
             &seg_dir,
@@ -9978,8 +10183,8 @@ mod tests {
             state: SecondaryIndexState::Building,
             last_error: None,
         };
-        mt.register_secondary_index(&eq_entry);
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&eq_entry).unwrap();
+        mt.register_secondary_index(&range_entry).unwrap();
         let indexes = vec![eq_entry.clone(), range_entry.clone()];
 
         let info = write_segment_with_secondary_indexes(&seg_dir, 1, &mt, None, &indexes).unwrap();
@@ -10174,13 +10379,13 @@ mod tests {
             state: SecondaryIndexState::Building,
             last_error: None,
         };
-        mt.register_secondary_index(&eq_entry);
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&eq_entry).unwrap();
+        mt.register_secondary_index(&range_entry).unwrap();
         let indexes = vec![eq_entry.clone(), range_entry.clone()];
 
         let source_info =
             write_segment_with_secondary_indexes(&source_seg, 1, &mt, None, &indexes).unwrap();
-        let source = Arc::new(
+        let source = SharedArc::new(
             SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
         );
         let compact_reader = compact_copy_segment_for_test(source, &compact_seg, 2, &indexes);
@@ -10313,8 +10518,8 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&node_entry);
-        mt.register_secondary_index(&edge_entry);
+        mt.register_secondary_index(&node_entry).unwrap();
+        mt.register_secondary_index(&edge_entry).unwrap();
         let indexes = vec![node_entry.clone(), edge_entry.clone()];
 
         let source_info =
@@ -10342,7 +10547,7 @@ mod tests {
             &BTreeMap::from([(raw_edge_hash, vec![10])]),
         );
 
-        let source = Arc::new(
+        let source = SharedArc::new(
             SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
         );
         assert!(matches!(
@@ -10509,8 +10714,8 @@ mod tests {
             state: SecondaryIndexState::Building,
             last_error: None,
         };
-        mt.register_secondary_index(&node_entry);
-        mt.register_secondary_index(&edge_entry);
+        mt.register_secondary_index(&node_entry).unwrap();
+        mt.register_secondary_index(&edge_entry).unwrap();
         let indexes = vec![node_entry.clone(), edge_entry.clone()];
 
         let info = write_segment_with_secondary_indexes(&seg_dir, 1, &mt, None, &indexes).unwrap();
@@ -10806,8 +11011,8 @@ mod tests {
                 id,
             );
         }
-        mt.register_secondary_index(&eq_entry);
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&eq_entry).unwrap();
+        mt.register_secondary_index(&range_entry).unwrap();
 
         let info = write_segment_with_secondary_indexes(&seg_dir, 1, &mt, None, &indexes).unwrap();
         assert!(node_compound_eq_sidecar_path(&seg_dir, eq_entry.index_id).exists());
@@ -10873,8 +11078,8 @@ mod tests {
                 .insert("status".to_string(), PropValue::String(status.to_string()));
             mt.apply_op(&WalOp::UpsertEdge(edge), id);
         }
-        mt.register_secondary_index(&eq_entry);
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&eq_entry).unwrap();
+        mt.register_secondary_index(&range_entry).unwrap();
 
         let info = write_segment_with_secondary_indexes(&seg_dir, 1, &mt, None, &indexes).unwrap();
         assert!(edge_compound_eq_sidecar_path(&seg_dir, eq_entry.index_id).exists());
@@ -10940,11 +11145,11 @@ mod tests {
                 id,
             );
         }
-        mt.register_secondary_index(&eq_entry);
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&eq_entry).unwrap();
+        mt.register_secondary_index(&range_entry).unwrap();
         let source_info =
             write_segment_with_secondary_indexes(&source_seg, 1, &mt, None, &indexes).unwrap();
-        let source_reader = Arc::new(
+        let source_reader = SharedArc::new(
             SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
         );
 
@@ -10961,7 +11166,7 @@ mod tests {
 
         remove_secondary_index_component_records(&source_seg, &eq_entry).unwrap();
         remove_secondary_index_component_records(&source_seg, &range_entry).unwrap();
-        let source_without_compound = Arc::new(
+        let source_without_compound = SharedArc::new(
             SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
         );
         let rebuilt_reader =
@@ -11005,11 +11210,11 @@ mod tests {
                 .insert("status".to_string(), PropValue::String(status.to_string()));
             mt.apply_op(&WalOp::UpsertEdge(edge), id);
         }
-        mt.register_secondary_index(&eq_entry);
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&eq_entry).unwrap();
+        mt.register_secondary_index(&range_entry).unwrap();
         let source_info =
             write_segment_with_secondary_indexes(&source_seg, 1, &mt, None, &indexes).unwrap();
-        let source_reader = Arc::new(
+        let source_reader = SharedArc::new(
             SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
         );
 
@@ -11026,7 +11231,7 @@ mod tests {
 
         remove_secondary_index_component_records(&source_seg, &eq_entry).unwrap();
         remove_secondary_index_component_records(&source_seg, &range_entry).unwrap();
-        let source_without_compound = Arc::new(
+        let source_without_compound = SharedArc::new(
             SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
         );
         let rebuilt_reader =
@@ -11057,11 +11262,12 @@ mod tests {
             &WalOp::UpsertNode(make_node_with_custom_props(1, 1, "old", left_props, 100)),
             1,
         );
-        left_mt.register_secondary_index(&entry);
+        left_mt.register_secondary_index(&entry).unwrap();
         let left_info =
             write_segment_with_secondary_indexes(&left_seg, 1, &left_mt, None, &indexes).unwrap();
-        let left_reader =
-            Arc::new(SegmentReader::open_with_info(&left_seg, &left_info, None, &indexes).unwrap());
+        let left_reader = SharedArc::new(
+            SegmentReader::open_with_info(&left_seg, &left_info, None, &indexes).unwrap(),
+        );
 
         let right_mt = Memtable::new();
         let mut right_props = BTreeMap::new();
@@ -11070,10 +11276,10 @@ mod tests {
             &WalOp::UpsertNode(make_node_with_custom_props(1, 1, "new", right_props, 200)),
             1,
         );
-        right_mt.register_secondary_index(&entry);
+        right_mt.register_secondary_index(&entry).unwrap();
         let right_info =
             write_segment_with_secondary_indexes(&right_seg, 2, &right_mt, None, &indexes).unwrap();
-        let right_reader = Arc::new(
+        let right_reader = SharedArc::new(
             SegmentReader::open_with_info(&right_seg, &right_info, None, &indexes).unwrap(),
         );
 
@@ -11118,11 +11324,12 @@ mod tests {
             &WalOp::UpsertNode(make_node_with_custom_props(1, 1, "absent", props, 100)),
             1,
         );
-        mt.register_secondary_index(&entry);
+        mt.register_secondary_index(&entry).unwrap();
         let info = write_segment_with_secondary_indexes(&seg, 1, &mt, None, &indexes).unwrap();
 
         remove_secondary_index_component_records(&seg, &entry).unwrap();
-        let reader = Arc::new(SegmentReader::open_with_info(&seg, &info, None, &indexes).unwrap());
+        let reader =
+            SharedArc::new(SegmentReader::open_with_info(&seg, &info, None, &indexes).unwrap());
 
         let meta = reader.node_meta_at(0).unwrap();
         let node_metas = vec![CompactNodeMeta {
@@ -11223,11 +11430,11 @@ mod tests {
             );
         }
         for entry in &indexes {
-            mt.register_secondary_index(entry);
+            mt.register_secondary_index(entry).unwrap();
         }
         let source_info =
             write_segment_with_secondary_indexes(&source_seg, 1, &mt, None, &indexes).unwrap();
-        let source_reader = Arc::new(
+        let source_reader = SharedArc::new(
             SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
         );
 
@@ -11236,7 +11443,7 @@ mod tests {
         for entry in &indexes {
             remove_secondary_index_component_records(&source_seg, entry).unwrap();
         }
-        let source_without_compound = Arc::new(
+        let source_without_compound = SharedArc::new(
             SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
         );
         let rebuilt_reader =
@@ -11345,8 +11552,8 @@ mod tests {
             state: SecondaryIndexState::Building,
             last_error: None,
         };
-        mt.register_secondary_index(&eq_entry);
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&eq_entry).unwrap();
+        mt.register_secondary_index(&range_entry).unwrap();
         let indexes = vec![eq_entry.clone(), range_entry.clone()];
         write_segment_with_secondary_indexes(&seg_dir, 1, &mt, None, &indexes).unwrap();
 
@@ -11390,6 +11597,63 @@ mod tests {
     }
 
     #[test]
+    fn p45c2_orphan_cleanup_preserves_unknown_optional_temporary_authority() {
+        use crate::segment_components::{
+            ComponentHandleWireV1, SegmentComponentRecordWireV1, UnknownOptionalComponentRecordV1,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        write_segment(&seg_dir, 1, &Memtable::new(), None).unwrap();
+        let relative = "future.g0000000000000012.dat";
+        let payload = seg_dir.join(relative);
+        fs::write(&payload, b"future").unwrap();
+        let mut temporary = read_segment_component_manifest(&seg_dir).unwrap();
+        temporary.generation += 1;
+        temporary
+            .unknown_optional_components
+            .push(UnknownOptionalComponentRecordV1 {
+                wire: SegmentComponentRecordWireV1 {
+                    component_id: [7; 32],
+                    kind_tag: 9999,
+                    logical_format_version: 1,
+                    created_generation: temporary.generation,
+                    requirement_tag: 2,
+                    fallback_tag: 4,    // RecordScan wire tag
+                    trust_class_tag: 4, // OptionalCandidateIndex wire tag
+                    handle: ComponentHandleWireV1 {
+                        handle_tag: 1,
+                        relative_path: Some(relative.into()),
+                        payload_len: 6,
+                        ..Default::default()
+                    },
+                    payload_len: 6,
+                    dependency_digest: crate::segment_components::dependency_digest(&[]),
+                    ..Default::default()
+                },
+            });
+        let temporary_path = seg_dir.join(SEGMENT_COMPONENT_MANIFEST_TMP_FILENAME);
+        fs::write(
+            &temporary_path,
+            crate::segment_components::encode_manifest_envelope(&temporary).unwrap(),
+        )
+        .unwrap();
+        assert!(recoverable_optional_component_paths(&seg_dir)
+            .unwrap()
+            .contains(&payload));
+        cleanup_orphan_optional_component_files(&seg_dir);
+        assert!(
+            payload.exists(),
+            "valid temporary optional authority was deleted"
+        );
+        fs::remove_file(temporary_path).unwrap();
+        cleanup_orphan_optional_component_files(&seg_dir);
+        assert!(
+            !payload.exists(),
+            "unreachable generation was not eventually removed"
+        );
+    }
+
+    #[test]
     fn test_orphan_cleanup_removes_unreferenced_compound_base_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
@@ -11410,8 +11674,8 @@ mod tests {
             )),
             1,
         );
-        mt.register_secondary_index(&eq_entry);
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&eq_entry).unwrap();
+        mt.register_secondary_index(&range_entry).unwrap();
         write_segment_with_secondary_indexes(&seg_dir, 1, &mt, None, &indexes).unwrap();
 
         let eq_sidecar_path = node_compound_eq_sidecar_path(&seg_dir, eq_entry.index_id);
@@ -11528,8 +11792,8 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&eq_entry);
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&eq_entry).unwrap();
+        mt.register_secondary_index(&range_entry).unwrap();
         let indexes = vec![eq_entry, range_entry];
 
         let info = write_segment_with_secondary_indexes(&seg_dir, 1, &mt, None, &indexes).unwrap();
@@ -11542,8 +11806,8 @@ mod tests {
         let reference_stats = crate::planner_stats::build_flush_stats(
             1,
             &seg_dir,
-            &mt.nodes(),
-            &mt.edges(),
+            &mt.nodes().unwrap(),
+            &mt.edges().unwrap(),
             &indexes,
         )
         .unwrap();
@@ -11650,21 +11914,21 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&eq_entry);
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&eq_entry).unwrap();
+        mt.register_secondary_index(&range_entry).unwrap();
         let indexes = vec![eq_entry.clone(), range_entry.clone()];
 
         let source_info =
             write_segment_with_secondary_indexes(&source_seg, 1, &mt, None, &indexes).unwrap();
-        let source_reader = Arc::new(
+        let source_reader = SharedArc::new(
             SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
         );
         let flush_stats = source_reader.planner_stats().unwrap();
         let reference_stats = crate::planner_stats::build_flush_stats(
             1,
             &source_seg,
-            &mt.nodes(),
-            &mt.edges(),
+            &mt.nodes().unwrap(),
+            &mt.edges().unwrap(),
             &indexes,
         )
         .unwrap();
@@ -11765,7 +12029,7 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&declared);
+        mt.register_secondary_index(&declared).unwrap();
 
         let info = write_segment_with_secondary_indexes(
             &seg_dir,
@@ -11876,7 +12140,7 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&absent_declared);
+        mt.register_secondary_index(&absent_declared).unwrap();
 
         let source_info = write_segment_with_secondary_indexes(
             &source_seg,
@@ -11886,7 +12150,7 @@ mod tests {
             std::slice::from_ref(&absent_declared),
         )
         .unwrap();
-        let source_reader = Arc::new(
+        let source_reader = SharedArc::new(
             SegmentReader::open_with_info(
                 &source_seg,
                 &source_info,
@@ -11969,13 +12233,13 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&eq_entry);
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&eq_entry).unwrap();
+        mt.register_secondary_index(&range_entry).unwrap();
         let indexes = vec![eq_entry, range_entry];
 
         let source_info =
             write_segment_with_secondary_indexes(&source_seg, 1, &mt, None, &indexes).unwrap();
-        let source_reader = Arc::new(
+        let source_reader = SharedArc::new(
             SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
         );
         let compact_reader =
@@ -12057,13 +12321,13 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&eq_entry);
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&eq_entry).unwrap();
+        mt.register_secondary_index(&range_entry).unwrap();
         let indexes = vec![eq_entry.clone(), range_entry.clone()];
 
         let source_info =
             write_segment_with_secondary_indexes(&source_seg, 1, &mt, None, &indexes).unwrap();
-        let source_reader = Arc::new(
+        let source_reader = SharedArc::new(
             SegmentReader::open_with_info(&source_seg, &source_info, None, &indexes).unwrap(),
         );
         let compact_reader =
@@ -12207,7 +12471,7 @@ mod tests {
         }
         write_segment(&source_seg, 1, &mt, None).unwrap();
         let source_reader =
-            Arc::new(SegmentReader::open_unpinned_for_test(&source_seg, 1, None).unwrap());
+            SharedArc::new(SegmentReader::open_unpinned_for_test(&source_seg, 1, None).unwrap());
         let compact_reader = compact_copy_segment_for_test(source_reader, &compact_seg, 2, &[]);
         let stats = compact_reader.planner_stats().unwrap();
 
@@ -12242,3 +12506,9 @@ mod tests {
         assert!(reader.planner_stats_available());
     }
 }
+
+#[cfg(feature = "production-concurrency")]
+mod streaming;
+
+#[cfg(feature = "production-concurrency")]
+pub(crate) use streaming::SealedExport;

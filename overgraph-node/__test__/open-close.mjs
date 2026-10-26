@@ -1,3 +1,4 @@
+import { drainAfterClose } from './helpers/native-lifecycle.mjs';
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -21,6 +22,7 @@ describe('OverGraph open/close', () => {
     const db = OverGraph.open(dbPath);
     assert.ok(db instanceof OverGraph);
     db.close();
+    drainAfterClose(db);
   });
 
   it('should open with custom options', () => {
@@ -31,23 +33,27 @@ describe('OverGraph open/close', () => {
       memtableFlushThreshold: 1024 * 1024,
     });
     db.close();
+    drainAfterClose(db);
   });
 
   it('should reopen an existing database', () => {
     const dbPath = join(tmpDir, 'db3');
     const db1 = OverGraph.open(dbPath);
     db1.close();
-
+    drainAfterClose(db1);
     const db2 = OverGraph.open(dbPath);
     db2.close();
+    drainAfterClose(db2);
   });
 
   it('should be a no-op on double close', () => {
     const dbPath = join(tmpDir, 'db4');
     const db = OverGraph.open(dbPath);
     db.close();
+    drainAfterClose(db);
     // Second close should be a no-op (inner is None), not throw
     db.close();
+    drainAfterClose(db);
   });
 
   it('should fail to open non-existent path without create', () => {

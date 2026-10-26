@@ -1022,7 +1022,7 @@ fn schema_management_bulk_publish_reopen_parity_after_success_and_failure() {
         engine.close().unwrap();
     }
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
         assert!(engine.get_node_schema("Person").unwrap().is_some());
         assert!(engine.get_edge_schema("KNOWS").unwrap().is_some());
         assert!(engine.get_node_schema("FutureNoToken").unwrap().is_none());
@@ -1793,7 +1793,7 @@ fn schema_management_drop_get_list_sorted_and_reopen_parity() {
         engine.close().unwrap();
     }
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
         assert!(engine.get_node_schema("Alpha").unwrap().is_some());
         assert!(engine.get_edge_schema("A_EDGE").unwrap().is_some());
         assert!(engine.drop_node_schema("Alpha").unwrap());

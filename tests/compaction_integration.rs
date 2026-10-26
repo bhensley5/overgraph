@@ -1,3 +1,5 @@
+mod support;
+
 use overgraph::{
     DatabaseEngine, DbOptions, NeighborOptions, PropValue, UpsertEdgeOptions, UpsertNodeOptions,
 };
@@ -13,7 +15,7 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = support::open(&db_path, &DbOptions::default()).unwrap();
 
     // --- Step 1: Insert 5k nodes ---
     let mut node_ids = Vec::with_capacity(5_000);
@@ -69,6 +71,12 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
     engine.flush().unwrap();
     assert_eq!(engine.segment_count().unwrap(), 1);
 
+    // A flush retains the previous manifest's WAL. Close/reopen advances
+    // fallback authority and settles native pins before measuring disk usage.
+    engine.close().unwrap();
+    wait_candidate_native_close(&engine);
+    let engine = support::open(&db_path, &DbOptions::default()).unwrap();
+
     // Measure disk size after first flush
     let size_before = dir_size(&db_path);
 
@@ -96,6 +104,12 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
         size_before
     );
 
+    #[cfg(feature = "production-concurrency")]
+    let obsolete_dirs = std::fs::read_dir(db_path.join("segments"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
     // --- Step 3: Compact ---
     let stats = engine
         .compact()
@@ -120,6 +134,24 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
         "Kept more nodes than inserted: {}",
         stats.nodes_kept
     );
+
+    // Compaction keeps fallback inputs until durable authority advances.
+    // Exercise normal close/reopen before expecting eligible physical cleanup.
+    engine.close().unwrap();
+    wait_candidate_native_close(&engine);
+    let engine = support::open(&db_path, &DbOptions::default()).unwrap();
+
+    #[cfg(feature = "production-concurrency")]
+    {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while obsolete_dirs.iter().any(|path| path.exists()) {
+            assert!(
+                std::time::Instant::now() < until,
+                "obsolete guarded segment directories did not drain"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
 
     // Disk should shrink compared to pre-compaction (two segments -> one, minus tombstoned data)
     let size_after_compact = dir_size(&db_path);
@@ -209,9 +241,10 @@ fn test_compaction_removes_deleted_records_and_shrinks_disk() {
     }
 
     engine.close().unwrap();
+    wait_candidate_native_close(&engine);
 
     // --- Step 5: Reopen and verify persistence ---
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = support::open(&db_path, &DbOptions::default()).unwrap();
     assert_eq!(engine.segment_count().unwrap(), 1);
 
     // Spot-check a few surviving nodes
@@ -235,7 +268,7 @@ fn test_reads_consistent_through_compaction_lifecycle() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let engine = support::open(&db_path, &opts).unwrap();
 
     // --- Build a graph across 3 segments + memtable ---
 
@@ -498,7 +531,8 @@ fn test_reads_consistent_through_compaction_lifecycle() {
 
     // --- Reopen and verify persistence ---
     engine.close().unwrap();
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    wait_candidate_native_close(&engine);
+    let engine = support::open(&db_path, &DbOptions::default()).unwrap();
     assert_eq!(engine.segment_count().unwrap(), 1);
 
     // Spot checks after reopen
@@ -548,4 +582,20 @@ fn dir_size(path: &std::path::Path) -> u64 {
         }
     }
     total
+}
+
+fn wait_candidate_native_close(engine: &DatabaseEngine) {
+    #[cfg(feature = "production-concurrency")]
+    {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(
+            engine.reclamation_stats().unwrap().close_state,
+            overgraph::ReclamationCloseState::Drained
+        ) {
+            assert!(std::time::Instant::now() < until);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    #[cfg(not(feature = "production-concurrency"))]
+    let _ = engine;
 }

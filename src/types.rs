@@ -2948,11 +2948,57 @@ pub(crate) fn validate_secondary_index_target(
     target: &SecondaryIndexTarget,
 ) -> Result<(), EngineError> {
     let target_kind = target.target_kind();
-    validate_secondary_index_fields(&target.public_fields(), target_kind)
+    match target {
+        SecondaryIndexTarget::NodeProperty { prop_key, .. }
+        | SecondaryIndexTarget::EdgeProperty { prop_key, .. } => {
+            validate_secondary_index_field_refs(
+                std::iter::once(IndexFieldRef::Property(prop_key)),
+                target_kind,
+            )
+        }
+        SecondaryIndexTarget::NodeFieldIndex { fields, .. }
+        | SecondaryIndexTarget::EdgeFieldIndex { fields, .. } => {
+            validate_secondary_index_field_refs(
+                fields.iter().map(|field| match field {
+                    SecondaryIndexFieldManifest::Property { key } => IndexFieldRef::Property(key),
+                    SecondaryIndexFieldManifest::NodeMetadata { field } => {
+                        IndexFieldRef::Node((*field).into())
+                    }
+                    SecondaryIndexFieldManifest::EdgeMetadata { field } => {
+                        IndexFieldRef::Edge((*field).into())
+                    }
+                }),
+                target_kind,
+            )
+        }
+    }
 }
 
 pub(crate) fn validate_secondary_index_fields(
     fields: &[SecondaryIndexField],
+    target_kind: SecondaryIndexTargetKind,
+) -> Result<(), EngineError> {
+    validate_secondary_index_field_refs(
+        fields.iter().map(|field| match field {
+            SecondaryIndexField::Property { key } => IndexFieldRef::Property(key),
+            SecondaryIndexField::NodeMetadata(field) => IndexFieldRef::Node(*field),
+            SecondaryIndexField::EdgeMetadata(field) => IndexFieldRef::Edge(*field),
+        }),
+        target_kind,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexFieldRef<'a> {
+    Property(&'a str),
+    Node(NodeMetadataIndexField),
+    Edge(EdgeMetadataIndexField),
+}
+
+// The public limit is eight fields. Borrowed fixed scratch avoids cloning
+// arbitrarily large property keys just to validate a manifest declaration.
+fn validate_secondary_index_field_refs<'a>(
+    fields: impl ExactSizeIterator<Item = IndexFieldRef<'a>>,
     target_kind: SecondaryIndexTargetKind,
 ) -> Result<(), EngineError> {
     match fields.len() {
@@ -2969,33 +3015,34 @@ pub(crate) fn validate_secondary_index_fields(
         }
     }
 
-    let mut seen = HashSet::with_capacity(fields.len());
-    for field in fields {
+    let mut seen = [None; MAX_SECONDARY_INDEX_FIELDS];
+    for (index, field) in fields.enumerate() {
         match (target_kind, field) {
-            (_, SecondaryIndexField::Property { key }) => {
+            (_, IndexFieldRef::Property(key)) => {
                 if key.is_empty() {
                     return Err(invalid_secondary_index("property key must not be empty"));
                 }
             }
-            (SecondaryIndexTargetKind::Node, SecondaryIndexField::NodeMetadata(_)) => {}
-            (SecondaryIndexTargetKind::Edge, SecondaryIndexField::EdgeMetadata(_)) => {}
-            (SecondaryIndexTargetKind::Node, SecondaryIndexField::EdgeMetadata(_)) => {
+            (SecondaryIndexTargetKind::Node, IndexFieldRef::Node(_)) => {}
+            (SecondaryIndexTargetKind::Edge, IndexFieldRef::Edge(_)) => {}
+            (SecondaryIndexTargetKind::Node, IndexFieldRef::Edge(_)) => {
                 return Err(invalid_secondary_index(
                     "node indexes cannot include edge metadata fields",
                 ));
             }
-            (SecondaryIndexTargetKind::Edge, SecondaryIndexField::NodeMetadata(_)) => {
+            (SecondaryIndexTargetKind::Edge, IndexFieldRef::Node(_)) => {
                 return Err(invalid_secondary_index(
                     "edge indexes cannot include node metadata fields",
                 ));
             }
         }
-        if !seen.insert(field.clone()) {
+        if seen[..index].contains(&Some(field)) {
             return Err(invalid_secondary_index(format!(
                 "duplicate field {}",
-                secondary_index_field_display(field)
+                secondary_index_field_ref_display(field)
             )));
         }
+        seen[index] = Some(field);
     }
 
     Ok(())
@@ -3005,14 +3052,14 @@ fn invalid_secondary_index(message: impl Into<String>) -> EngineError {
     EngineError::InvalidOperation(format!("invalid secondary index: {}", message.into()))
 }
 
-fn secondary_index_field_display(field: &SecondaryIndexField) -> String {
+fn secondary_index_field_ref_display(field: IndexFieldRef<'_>) -> String {
     match field {
-        SecondaryIndexField::Property { key } => format!("property `{key}`"),
-        SecondaryIndexField::NodeMetadata(field) => {
-            format!("node metadata `{}`", node_metadata_index_field_name(*field))
+        IndexFieldRef::Property(key) => format!("property `{key}`"),
+        IndexFieldRef::Node(field) => {
+            format!("node metadata `{}`", node_metadata_index_field_name(field))
         }
-        SecondaryIndexField::EdgeMetadata(field) => {
-            format!("edge metadata `{}`", edge_metadata_index_field_name(*field))
+        IndexFieldRef::Edge(field) => {
+            format!("edge metadata `{}`", edge_metadata_index_field_name(field))
         }
     }
 }
@@ -4497,6 +4544,150 @@ impl Default for WalSyncMode {
     }
 }
 
+/// Whether an accepted operation is known to have committed.
+///
+/// Neither state is a preacceptance rejection. An indeterminate operation may
+/// have committed; retrying it does not provide exactly-once semantics.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitOutcomeState {
+    /// Aggregate publication completed, even if subsequent work or the reply failed.
+    Committed,
+    /// Recovery-visible changes may exist, but complete commitment is unproven.
+    Indeterminate,
+}
+
+/// Logical request and generation limits; these do not bound aggregate memory or RSS.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct ConcurrencyOptions {
+    pub max_batch_operations: usize,
+    pub max_batch_bytes: usize,
+    pub generation_operation_limit: usize,
+    pub generation_wal_bytes: usize,
+    pub admission_timeout_ms: u64,
+}
+impl Default for ConcurrencyOptions {
+    fn default() -> Self {
+        Self {
+            max_batch_operations: 65_536,
+            max_batch_bytes: 16 * 1024 * 1024,
+            generation_operation_limit: 1_048_576,
+            generation_wal_bytes: 512 * 1024 * 1024,
+            admission_timeout_ms: 1_000,
+        }
+    }
+}
+macro_rules! concurrency_setter {
+    ($name:ident, $field:ident, $ty:ty) => {
+        pub fn $name(mut self, value: $ty) -> Self {
+            self.$field = value;
+            self
+        }
+    };
+}
+impl ConcurrencyOptions {
+    concurrency_setter!(with_max_batch_operations, max_batch_operations, usize);
+    concurrency_setter!(with_max_batch_bytes, max_batch_bytes, usize);
+    concurrency_setter!(
+        with_generation_operation_limit,
+        generation_operation_limit,
+        usize
+    );
+    concurrency_setter!(with_generation_wal_bytes, generation_wal_bytes, usize);
+    concurrency_setter!(with_admission_timeout_ms, admission_timeout_ms, u64);
+    pub fn validate(&self) -> Result<(), EngineError> {
+        crate::engine::validate_concurrency_options(self)
+    }
+    pub(crate) fn same_configuration(&self, other: &Self) -> bool {
+        self.max_batch_operations == other.max_batch_operations
+            && self.max_batch_bytes == other.max_batch_bytes
+            && self.generation_operation_limit == other.generation_operation_limit
+            && self.generation_wal_bytes == other.generation_wal_bytes
+            && self.admission_timeout_ms == other.admission_timeout_ms
+    }
+}
+
+/// A bounded base-two histogram of microsecond observations.
+///
+/// Bucket 0 includes 0 and 1 us. Bucket i includes `[2^i, 2^(i+1)-1]`
+/// us; bucket 63 includes the remaining u64 range. Counters saturate rather
+/// than wrapping. `max_us` is None precisely when no sample has been observed.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub struct ReclamationHistogram {
+    pub buckets: [u64; 64],
+    pub samples: u64,
+    pub max_us: Option<u64>,
+}
+
+impl ReclamationHistogram {
+    // Final bounded telemetry primitive; authoritative ledger counters do not
+    // use this saturating arithmetic. Domain observation wiring follows a2's
+    // completed ledger, without introducing a second accounting authority.
+    #[allow(dead_code)]
+    pub(crate) const fn empty() -> Self {
+        Self {
+            buckets: [0; 64],
+            samples: 0,
+            max_us: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_us(&mut self, duration_us: u64) {
+        let bucket = if duration_us == 0 {
+            0
+        } else {
+            (u64::BITS - 1 - duration_us.leading_zeros()) as usize
+        };
+        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+        self.samples = self.samples.saturating_add(1);
+        self.max_us = Some(self.max_us.map_or(duration_us, |old| old.max(duration_us)));
+    }
+}
+
+/// Close state of the shared directory domain, rather than one client wrapper.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub enum ReclamationCloseState {
+    Open,
+    Draining,
+    Drained,
+}
+
+/// Root-free sampled guardian counts and lifetime diagnostics. No aggregate memory guarantee.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct ReclamationStats {
+    pub registered_objects: u64,
+    pub retired_objects: u64,
+    pub dropping_objects: u64,
+    pub active_generations: u64,
+    pub frozen_generations: u64,
+    pub leased_participants: u64,
+    pub participant_limit: u64,
+    pub process_participants: u64,
+    pub active_sessions: u64,
+    pub draining_sessions: u64,
+    pub close_state: ReclamationCloseState,
+    pub oldest_retirement_age_us: Option<u64>,
+    /// None before the first scan; then age of the oldest unfinished complete scan,
+    /// or observed zero when no scan is pending.
+    pub scan_lag_us: Option<u64>,
+    /// Producer retirement to the worker's first exclusive-ownership observation.
+    /// This does not measure the exact instant the last passive pin was released.
+    pub release_to_eligibility_us: ReclamationHistogram,
+    pub eligibility_to_drop_us: ReclamationHistogram,
+    /// Cumulative active worker wall time, excluding parked time. None before work
+    /// is observed or when the clock is unavailable; zero is an observed value.
+    pub worker_wall_us: Option<u64>,
+    /// Cumulative active worker CPU time. None before observation or when the
+    /// platform clock is unavailable. The current substrate does not install a
+    /// thread-CPU clock and returns None; wall time is never substituted for CPU time.
+    pub worker_cpu_us: Option<u64>,
+}
+
 /// Options for opening a database.
 #[derive(Debug, Clone)]
 pub struct DbOptions {
@@ -4540,6 +4731,50 @@ impl Default for DbOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p45a2_histogram_bucket_edges_and_saturating_lifetime_counts() {
+        let mut histogram = ReclamationHistogram::empty();
+        assert_eq!(histogram.max_us, None);
+        histogram.record_us(0);
+        histogram.record_us(1);
+        assert_eq!(histogram.buckets[0], 2);
+        for exponent in 1..64 {
+            let lower = 1_u64 << exponent;
+            let upper = if exponent == 63 {
+                u64::MAX
+            } else {
+                (1_u64 << (exponent + 1)) - 1
+            };
+            histogram.record_us(lower);
+            histogram.record_us(upper);
+            assert_eq!(histogram.buckets[exponent], 2);
+        }
+        assert_eq!(histogram.samples, 128);
+        assert_eq!(histogram.max_us, Some(u64::MAX));
+        assert_eq!(histogram.buckets.iter().sum::<u64>(), 128);
+
+        histogram.samples = u64::MAX;
+        histogram.buckets[0] = u64::MAX;
+        histogram.record_us(0);
+        assert_eq!(histogram.samples, u64::MAX);
+        assert_eq!(histogram.buckets[0], u64::MAX);
+        assert_eq!(histogram.max_us, Some(u64::MAX));
+
+        let mut observed_zero = ReclamationHistogram::empty();
+        observed_zero.record_us(0);
+        assert_eq!(observed_zero.samples, 1);
+        assert_eq!(observed_zero.max_us, Some(0));
+    }
+
+    #[test]
+    fn p45a2_public_stats_schema_is_root_free_and_fixed_size() {
+        // No destructor-bearing owner may enter these diagnostics. Static
+        // resource identifiers and numeric fixed arrays keep Clone root-free.
+        assert!(!std::mem::needs_drop::<crate::ReclamationStats>());
+        assert!(!std::mem::needs_drop::<crate::ReclamationHistogram>());
+        assert!(std::mem::size_of::<crate::ReclamationStats>() < 64 * 1024);
+    }
 
     fn assert_invalid_secondary_index(result: Result<(), EngineError>, expected: &str) {
         let err = result.expect_err("secondary index spec should be invalid");
@@ -5121,5 +5356,43 @@ mod tests {
         };
         assert_eq!(result.items.len(), 3);
         assert_eq!(result.next_cursor, Some(3));
+    }
+}
+
+#[cfg(test)]
+mod practical_option_tests {
+    use super::*;
+    #[test]
+    fn p45a3_options_five_positive_limits_check_zero_overflow_and_batch_generation_fit() {
+        let options = ConcurrencyOptions::default();
+        assert_eq!(options.max_batch_operations, 65_536);
+        assert_eq!(options.max_batch_bytes, 16 * 1024 * 1024);
+        assert_eq!(options.generation_operation_limit, 1_048_576);
+        assert_eq!(options.generation_wal_bytes, 512 * 1024 * 1024);
+        assert_eq!(options.admission_timeout_ms, 1_000);
+        options.validate().unwrap();
+        for invalid in [
+            options.clone().with_max_batch_operations(0),
+            options.clone().with_max_batch_bytes(0),
+            options.clone().with_generation_operation_limit(0),
+            options.clone().with_generation_wal_bytes(0),
+            options.clone().with_admission_timeout_ms(0),
+            options.clone().with_max_batch_bytes(usize::MAX),
+            options.clone().with_max_batch_operations(usize::MAX),
+            options.clone().with_generation_wal_bytes(1),
+            options.clone().with_generation_operation_limit(1),
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+        options
+            .clone()
+            .with_max_batch_operations(8)
+            .with_generation_operation_limit(8)
+            .with_max_batch_bytes(1024)
+            .with_generation_wal_bytes(1024)
+            .validate()
+            .unwrap();
+        assert!(std::mem::size_of::<ReclamationStats>() < 4096);
+        assert!(!std::mem::needs_drop::<ReclamationStats>());
     }
 }

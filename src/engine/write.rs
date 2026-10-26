@@ -475,9 +475,10 @@ impl EngineCore {
     fn commit_core_write_plan(
         &mut self,
         planned: PlannedCoreWrite,
+        #[cfg(feature = "production-concurrency")] install: &mut PrimaryInstall<'_>,
     ) -> (Result<CoreWriteReply, EngineError>, PublishImpact) {
         let PlannedCoreWrite {
-            plan,
+            mut plan,
             id_counter_snapshot,
         } = planned;
         let mut publish_impact = PublishImpact::NoPublish;
@@ -490,10 +491,28 @@ impl EngineCore {
                 return Err(error);
             }
 
+            #[cfg(feature = "production-concurrency")]
+            if let Err(error) = self.prepare_candidate_frames(&plan.ops, id_counter_snapshot) {
+                id_counter_snapshot.restore(self);
+                return Err(error);
+            }
             match plan.ops.as_slice() {
                 [] => {}
-                [op] => self.append_and_apply_one_normalized(op)?,
-                _ => self.append_and_apply_normalized(&plan.ops)?,
+                [op] => self.append_and_apply_one_normalized(
+                    op,
+                    #[cfg(feature = "production-concurrency")]
+                    install,
+                )?,
+                _ => self.append_and_apply_normalized(
+                    &plan.ops,
+                    #[cfg(feature = "production-concurrency")]
+                    install,
+                )?,
+            }
+            #[cfg(feature = "production-concurrency")]
+            if let Some(candidate) = &mut self.candidate {
+                candidate.generation_operations += plan.ops.len();
+                candidate.generation_bytes += candidate.prepared_frames.len();
             }
             if !plan.ops.is_empty() {
                 publish_impact = if plan.label_catalog_changed {
@@ -515,18 +534,59 @@ impl EngineCore {
                 self.update_next_edge_id_seen();
             }
 
-            if plan.auto_flush {
+            #[cfg(feature = "production-concurrency")]
+            if self.candidate.is_some() {
+                install.postcommit_maintenance = plan.auto_flush;
+            }
+            if plan.auto_flush && {
+                #[cfg(feature = "production-concurrency")]
+                {
+                    self.candidate.is_none()
+                }
+                #[cfg(not(feature = "production-concurrency"))]
+                {
+                    true
+                }
+            } {
                 let (auto_flush_result, auto_flush_impact) = self.maybe_auto_flush();
                 publish_impact = publish_impact.combine(auto_flush_impact);
                 auto_flush_result?;
             }
 
-            Ok(plan.reply)
+            Ok(std::mem::replace(&mut plan.reply, CoreWriteReply::Unit))
         })();
 
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_some()
+            && self
+                .published_read_sources
+                .as_ref()
+                .is_some_and(|sources| !SharedArc::ptr_eq(&sources.memtable, &self.memtable))
+        {
+            // Logical generation rotation changed sources before the request's
+            // append/refusal; publish the complete replacement graph in either case.
+            publish_impact = publish_impact.combine(PublishImpact::RebuildSources);
+        }
+
+        #[cfg(feature = "production-concurrency")]
+        if result.is_err() && self.candidate.as_ref().is_some_and(|c| !c.accepted) {
+            id_counter_snapshot.restore(self);
+        }
+        #[cfg(feature = "production-concurrency")]
+        let result = if result.is_err() && self.candidate.as_ref().is_some_and(|c| c.accepted) {
+            self.manifest_write_lock.establish();
+            Err(EngineError::CommitOutcome {
+                state: CommitOutcomeState::Indeterminate,
+                message: format!(
+                    "accepted write did not complete publication: {}",
+                    result.err().expect("failed accepted write")
+                ),
+            })
+        } else {
+            result
+        };
         (result, publish_impact)
     }
-
     fn plan_core_write(
         &mut self,
         request: &CoreWriteRequest,
@@ -1663,7 +1723,7 @@ impl EngineCore {
         let patch_tombstones = if patch.delete_node_ids.is_empty() {
             None
         } else {
-            Some(self.collect_tombstones())
+            Some(self.collect_tombstones()?)
         };
         for &nid in &patch.delete_node_ids {
             let ts = patch_tombstones.as_ref().map(|(dn, de)| (dn, de));
@@ -1742,7 +1802,7 @@ impl EngineCore {
         }
 
         let mut edges_seen = NodeIdSet::default();
-        let prune_tombstones = self.collect_tombstones();
+        let prune_tombstones = self.collect_tombstones()?;
 
         for &nid in &targets {
             let incident = self.neighbors_raw(
@@ -1803,7 +1863,7 @@ impl EngineCore {
             let mut candidates = Vec::new();
 
             // Active memtable nodes (freshest)
-            for node_id in self.memtable.visible_node_ids_at(self.engine_seq) {
+            for node_id in self.memtable.visible_node_ids_at(self.engine_seq)? {
                 if seen.insert(node_id) {
                     candidates.push(node_id);
                 }
@@ -1811,7 +1871,7 @@ impl EngineCore {
 
             // Immutable memtable nodes (newest-first)
             for epoch in &self.immutable_epochs {
-                for node_id in epoch.memtable.visible_node_ids_at(self.engine_seq) {
+                for node_id in epoch.memtable.visible_node_ids_at(self.engine_seq)? {
                     if seen.insert(node_id) {
                         candidates.push(node_id);
                     }
@@ -2001,6 +2061,12 @@ impl EngineCore {
         label: &str,
         spec: SecondaryIndexSpec,
     ) -> Result<(NodePropertyIndexInfo, PublishImpact), EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_some() {
+            let (entry, impact) = self.candidate_ensure_index(label, spec, false)?;
+            let catalog = self.label_catalog.read().unwrap();
+            return Ok((Self::node_property_index_info(&entry, &*catalog)?, impact));
+        }
         enum EnsureOutcome {
             Existing,
             New,
@@ -2085,6 +2151,8 @@ impl EngineCore {
         label: &str,
         spec: SecondaryIndexSpec,
     ) -> Result<(bool, PublishImpact), EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_some() { return self.candidate_drop_index(label, spec, false); }
         spec.validate_for_node()?;
         let label_id = {
             let catalog = self.label_catalog.read().unwrap();
@@ -2122,6 +2190,12 @@ impl EngineCore {
         label: &str,
         spec: SecondaryIndexSpec,
     ) -> Result<(EdgePropertyIndexInfo, PublishImpact), EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_some() {
+            let (entry, impact) = self.candidate_ensure_index(label, spec, true)?;
+            let catalog = self.label_catalog.read().unwrap();
+            return Ok((Self::edge_property_index_info(&entry, &*catalog)?, impact));
+        }
         enum EnsureOutcome {
             Existing,
             New,
@@ -2206,6 +2280,8 @@ impl EngineCore {
         label: &str,
         spec: SecondaryIndexSpec,
     ) -> Result<(bool, PublishImpact), EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_some() { return self.candidate_drop_index(label, spec, true); }
         spec.validate_for_edge()?;
         let label_id = {
             let catalog = self.label_catalog.read().unwrap();

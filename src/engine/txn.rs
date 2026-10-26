@@ -181,6 +181,8 @@ struct TxnOverlay {
 /// A transaction stages logical graph intents locally. Staging, rollback, and bounded
 /// reads do not append WAL records or mutate live engine state.
 pub struct WriteTxn {
+    #[cfg(feature = "production-concurrency")]
+    client: Option<concurrency_lifecycle::RuntimeOwnerPermit>,
     runtime: Arc<DbRuntime>,
     snapshot: Arc<ReadView>,
     snapshot_seq: u64,
@@ -198,6 +200,8 @@ impl DatabaseEngine {
     pub fn begin_write_txn(&self) -> Result<WriteTxn, EngineError> {
         let (_guard, published) = self.runtime.published_snapshot()?;
         Ok(WriteTxn {
+            #[cfg(feature = "production-concurrency")]
+            client: self.client.clone(),
             runtime: Arc::clone(&self.runtime),
             snapshot: Arc::clone(&published.view),
             snapshot_seq: published.view.snapshot_seq,
@@ -313,6 +317,10 @@ fn txn_committed_edge_merge_triple(
 }
 
 impl WriteTxn {
+    #[cfg(feature="binding-test-hooks")]
+    #[doc(hidden)]
+    pub fn binding_test_handle(&self)->super::BindingTestHandle {self.runtime.binding_hooks.clone()}
+
     #[allow(dead_code)]
     pub(crate) fn gql_snapshot(&self) -> Result<Arc<ReadView>, EngineError> {
         self.ensure_open()?;
@@ -609,12 +617,13 @@ impl WriteTxn {
     where
         L: IntoNodeLabels,
     {
+        let options = payload::Owned::new(options);
         let local = self.next_slot_ref()?;
         let intent = TxnIntent::UpsertNode {
             alias: None,
             labels: labels.into_node_labels(),
             key: key.to_string(),
-            options,
+            options: options.into_inner(),
         };
         self.append_entry(intent, Some(local.clone()), None)?;
         self.advance_next_slot()?;
@@ -631,12 +640,13 @@ impl WriteTxn {
     where
         L: IntoNodeLabels,
     {
+        let options = payload::Owned::new(options);
         let local = TxnLocalRef::Alias(alias.to_string());
         let intent = TxnIntent::UpsertNode {
             alias: Some(alias.to_string()),
             labels: labels.into_node_labels(),
             key: key.to_string(),
-            options,
+            options: options.into_inner(),
         };
         self.append_entry(intent, Some(local.clone()), None)?;
         Ok(TxnNodeRef::Local(local))
@@ -718,13 +728,14 @@ impl WriteTxn {
         label: &str,
         options: UpsertEdgeOptions,
     ) -> Result<TxnEdgeRef, EngineError> {
+        let options = payload::Owned::new(options);
         let local = self.next_slot_ref()?;
         let intent = TxnIntent::UpsertEdge {
             alias: None,
             from,
             to,
             label: label.to_string(),
-            options,
+            options: options.into_inner(),
         };
         self.append_entry(intent, None, Some(local.clone()))?;
         self.advance_next_slot()?;
@@ -739,13 +750,14 @@ impl WriteTxn {
         label: &str,
         options: UpsertEdgeOptions,
     ) -> Result<TxnEdgeRef, EngineError> {
+        let options = payload::Owned::new(options);
         let local = TxnLocalRef::Alias(alias.to_string());
         let intent = TxnIntent::UpsertEdge {
             alias: Some(alias.to_string()),
             from,
             to,
             label: label.to_string(),
-            options,
+            options: options.into_inner(),
         };
         self.append_entry(intent, None, Some(local.clone()))?;
         Ok(TxnEdgeRef::Local(local))
@@ -768,12 +780,20 @@ impl WriteTxn {
     }
 
     pub fn stage_intents(&mut self, intents: Vec<TxnIntent>) -> Result<(), EngineError> {
+        let mut intents = payload::Owned::new(intents);
         self.ensure_open()?;
+        for intent in intents.iter() { self.validate_staged_input(intent)?; }
         let original_next_slot = self.next_slot;
         let mut next_slot = self.next_slot;
         let mut entries = Vec::with_capacity(intents.len());
-        for intent in intents {
-            let produced_node = match &intent {
+        for intent in intents.iter_mut() {
+            let intent = payload::Owned::new(std::mem::replace(
+                intent,
+                TxnIntent::DeleteNode {
+                    target: TxnNodeRef::Id(0),
+                },
+            ));
+            let produced_node = match &*intent {
                 TxnIntent::UpsertNode {
                     alias: Some(alias), ..
                 } => Some(TxnLocalRef::Alias(alias.clone())),
@@ -791,7 +811,7 @@ impl WriteTxn {
                 }
                 _ => None,
             };
-            let produced_edge = match &intent {
+            let produced_edge = match &*intent {
                 TxnIntent::UpsertEdge {
                     alias: Some(alias), ..
                 } => Some(TxnLocalRef::Alias(alias.clone())),
@@ -809,16 +829,18 @@ impl WriteTxn {
                 }
                 _ => None,
             };
-            if let Err(err) =
-                self.overlay
-                    .apply(&self.snapshot, &intent, produced_node.clone(), produced_edge.clone())
-            {
+            if let Err(err) = self.overlay.apply(
+                &self.snapshot,
+                &intent,
+                produced_node.clone(),
+                produced_edge.clone(),
+            ) {
                 self.next_slot = original_next_slot;
                 self.rebuild_overlay_from_entries()?;
                 return Err(err);
             }
             entries.push(StagedTxnIntent {
-                intent,
+                intent: intent.into_inner(),
                 produced_node,
                 produced_edge,
             });
@@ -903,8 +925,10 @@ impl WriteTxn {
     pub fn commit(&mut self) -> Result<TxnCommitResult, EngineError> {
         self.ensure_open()?;
         self.closed = true;
+        #[cfg(feature = "production-concurrency")]
+        let _client = self.client.take();
         let request = TxnCommitRequest {
-            snapshot: Arc::clone(&self.snapshot),
+            snapshot: self.transfer_commit_snapshot(),
             snapshot_seq: self.snapshot_seq,
             entries: std::mem::take(&mut self.entries),
             record_replacements: std::mem::take(&mut self.record_replacements),
@@ -914,11 +938,10 @@ impl WriteTxn {
         self.overlay = TxnOverlay::new(self.edge_uniqueness);
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::TxnCommit {
+            .submit_core_write_with(|| CoreWriteRequest::TxnCommit {
                 request,
                 return_read_view: false,
-            })?
-        {
+            })? {
             CoreWriteReply::TxnCommitResult(result) => Ok(result),
             _ => unreachable!("txn commit must return transaction commit results"),
         }
@@ -929,8 +952,10 @@ impl WriteTxn {
     ) -> Result<(TxnCommitResult, Arc<ReadView>), EngineError> {
         self.ensure_open()?;
         self.closed = true;
+        #[cfg(feature = "production-concurrency")]
+        let _client = self.client.take();
         let request = TxnCommitRequest {
-            snapshot: Arc::clone(&self.snapshot),
+            snapshot: self.transfer_commit_snapshot(),
             snapshot_seq: self.snapshot_seq,
             entries: std::mem::take(&mut self.entries),
             record_replacements: std::mem::take(&mut self.record_replacements),
@@ -940,11 +965,10 @@ impl WriteTxn {
         self.overlay = TxnOverlay::new(self.edge_uniqueness);
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::TxnCommit {
+            .submit_core_write_with(|| CoreWriteRequest::TxnCommit {
                 request,
                 return_read_view: true,
-            })?
-        {
+            })? {
             CoreWriteReply::TxnCommitResultWithReadView(result, view) => Ok((result, view)),
             _ => unreachable!("txn commit with read view must return transaction commit results"),
         }
@@ -953,6 +977,9 @@ impl WriteTxn {
     pub fn rollback(&mut self) -> Result<(), EngineError> {
         self.ensure_open()?;
         self.closed = true;
+        #[cfg(feature = "production-concurrency")]
+        let _client = self.client.take();
+        drop(self.transfer_commit_snapshot());
         self.entries.clear();
         self.record_replacements.clear();
         self.gql_return_read_set = TxnReturnReadSet::default();
@@ -991,7 +1018,9 @@ impl WriteTxn {
         produced_node: Option<TxnLocalRef>,
         produced_edge: Option<TxnLocalRef>,
     ) -> Result<(), EngineError> {
+        let intent = payload::Owned::new(intent);
         self.ensure_open()?;
+        self.validate_staged_input(&intent)?;
         self.overlay.apply(
             &self.snapshot,
             &intent,
@@ -999,7 +1028,7 @@ impl WriteTxn {
             produced_edge.clone(),
         )?;
         self.entries.push(StagedTxnIntent {
-            intent,
+            intent: intent.into_inner(),
             produced_node,
             produced_edge,
         });
@@ -3675,7 +3704,7 @@ impl EngineCore {
             if limit == usize::MAX {
                 let active_edge_ids = self
                     .memtable
-                    .incident_edges_at(node_id, Direction::Both, None, self.engine_seq)
+                    .incident_edges_at(node_id, Direction::Both, None, self.engine_seq)?
                     .into_iter()
                     .map(|entry| entry.edge_id)
                     .collect::<IdSet>();
@@ -3955,28 +3984,9 @@ impl EngineCore {
     }
 
     fn node_id_opinion(&self, id: u64) -> Result<TargetOpinion, EngineError> {
-        let snapshot_seq = self.engine_seq;
-        if let Some(node) = self.memtable.get_node_at(id, snapshot_seq) {
-            return Ok(TargetOpinion::Live {
-                last_write_seq: node.last_write_seq,
-            });
-        }
-        if let Some(tombstone) = self.memtable.node_tombstone_at(id, snapshot_seq) {
-            return Ok(TargetOpinion::Tombstone {
-                last_write_seq: tombstone.last_write_seq,
-            });
-        }
-        for epoch in &self.immutable_epochs {
-            if let Some(node) = epoch.memtable.get_node_at(id, snapshot_seq) {
-                return Ok(TargetOpinion::Live {
-                    last_write_seq: node.last_write_seq,
-                });
-            }
-            if let Some(tombstone) = epoch.memtable.node_tombstone_at(id, snapshot_seq) {
-                return Ok(TargetOpinion::Tombstone {
-                    last_write_seq: tombstone.last_write_seq,
-                });
-            }
+        let snapshot_seq=self.engine_seq;
+        for memtable in std::iter::once(self.memtable.as_ref()).chain(self.immutable_epochs.iter().map(|e|e.memtable.as_ref())){
+            match memtable.node_sequence_opinion_at(id,snapshot_seq)?{crate::memtable::PrimaryOpinion::Missing=>{},crate::memtable::PrimaryOpinion::Removed(t)=>return Ok(TargetOpinion::Tombstone{last_write_seq:t.last_write_seq}),crate::memtable::PrimaryOpinion::Live(last_write_seq)=>return Ok(TargetOpinion::Live{last_write_seq})}
         }
         for seg in &self.segments {
             if let Some(tombstone) = seg.deleted_node_tombstones().get(&id) {
@@ -3994,28 +4004,9 @@ impl EngineCore {
     }
 
     fn edge_id_opinion(&self, id: u64) -> Result<TargetOpinion, EngineError> {
-        let snapshot_seq = self.engine_seq;
-        if let Some(edge) = self.memtable.get_edge_at(id, snapshot_seq) {
-            return Ok(TargetOpinion::Live {
-                last_write_seq: edge.last_write_seq,
-            });
-        }
-        if let Some(tombstone) = self.memtable.edge_tombstone_at(id, snapshot_seq) {
-            return Ok(TargetOpinion::Tombstone {
-                last_write_seq: tombstone.last_write_seq,
-            });
-        }
-        for epoch in &self.immutable_epochs {
-            if let Some(edge) = epoch.memtable.get_edge_at(id, snapshot_seq) {
-                return Ok(TargetOpinion::Live {
-                    last_write_seq: edge.last_write_seq,
-                });
-            }
-            if let Some(tombstone) = epoch.memtable.edge_tombstone_at(id, snapshot_seq) {
-                return Ok(TargetOpinion::Tombstone {
-                    last_write_seq: tombstone.last_write_seq,
-                });
-            }
+        let snapshot_seq=self.engine_seq;
+        for memtable in std::iter::once(self.memtable.as_ref()).chain(self.immutable_epochs.iter().map(|e|e.memtable.as_ref())){
+            match memtable.edge_sequence_opinion_at(id,snapshot_seq)?{crate::memtable::PrimaryOpinion::Missing=>{},crate::memtable::PrimaryOpinion::Removed(t)=>return Ok(TargetOpinion::Tombstone{last_write_seq:t.last_write_seq}),crate::memtable::PrimaryOpinion::Live(last_write_seq)=>return Ok(TargetOpinion::Live{last_write_seq})}
         }
         for seg in &self.segments {
             if let Some(tombstone) = seg.deleted_edge_tombstones().get(&id) {
@@ -4030,5 +4021,88 @@ impl EngineCore {
             }
         }
         Ok(TargetOpinion::Absent)
+    }
+}
+
+impl payload::Drain for StagedTxnIntent {
+    fn drain_payload(&mut self) {
+        self.intent.drain_payload();
+    }
+}
+impl Drop for StagedTxnIntent {
+    fn drop(&mut self) {
+        payload::Drain::drain_payload(self);
+    }
+}
+impl Drop for TxnRecordReplacement {
+    fn drop(&mut self) {
+        use payload::Drain;
+        match self {
+            Self::Node(node) => node.props.drain_payload(),
+            Self::Edge(edge) => edge.props.drain_payload(),
+        }
+    }
+}
+impl Drop for NodeOverlayOpinion {
+    fn drop(&mut self) {
+        use payload::Drain;
+        match self {
+            Self::Live(view) => view.drain_payload(),
+            Self::Deleted(view) => view.drain_payload(),
+            Self::RemovedLabel => {}
+        }
+    }
+}
+impl Drop for EdgeOverlayOpinion {
+    fn drop(&mut self) {
+        use payload::Drain;
+        match self {
+            Self::Live(view) => view.drain_payload(),
+            Self::Deleted(view) => view.drain_payload(),
+        }
+    }
+}
+impl WriteTxn {
+    fn transfer_commit_snapshot(&mut self) -> Arc<ReadView> {
+        #[cfg(feature = "production-concurrency")]
+        if self.runtime.candidate.is_some() {
+            return std::mem::replace(
+                &mut self.snapshot,
+                PublishedReadState::closed_sentinel().view,
+            );
+        }
+        Arc::clone(&self.snapshot)
+    }
+    fn validate_staged_input(&self, intent: &TxnIntent) -> Result<(), EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &self.runtime.candidate {
+            let props = match intent {
+                TxnIntent::UpsertNode { options, .. } => &options.props,
+                TxnIntent::UpsertEdge { options, .. } => &options.props,
+                _ => return Ok(()),
+            };
+            let mut sink = InputWireBound {
+                bytes: 0,
+                maximum: candidate.options.max_batch_bytes,
+                exceeded: false,
+            };
+            payload::write_properties_checked(props, &mut sink).map_err(|error| {
+                if sink.exceeded {
+                    EngineError::ResourceLimit {
+                        resource: "max_batch_bytes",
+                        requested: sink.bytes as u64,
+                        limit: sink.maximum as u64,
+                        retryable: false,
+                    }
+                } else {
+                    EngineError::InvalidOperation(format!(
+                        "invalid candidate properties: {error:?}"
+                    ))
+                }
+            })?;
+        }
+        #[cfg(not(feature = "production-concurrency"))]
+        let _ = intent;
+        Ok(())
     }
 }

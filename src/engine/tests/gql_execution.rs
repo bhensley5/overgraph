@@ -1101,7 +1101,7 @@ fn gql_create_node_executes_through_transaction_and_returns_created_values() {
 
 #[test]
 fn gql_create_node_properties_are_visible_to_gql_indexed_reads() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     engine
         .ensure_node_property_index("GqlCreatedIndexed", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
@@ -1328,7 +1328,7 @@ fn gql_merge_node_creates_matches_duplicates_and_actions_are_atomic() {
 
 #[test]
 fn gql_merge_node_caps_explain_indexes_and_reopen_preserve_atomicity() {
-    let (dir, engine) = query_test_engine();
+    let (dir, engine) = query_index_protocol_fixture();
     let db_path = dir.path().join("db");
     for key in ["a", "b"] {
         insert_query_node(&engine, "GqlMergeCapSource", key, &[], 1.0);
@@ -1397,7 +1397,8 @@ fn gql_merge_node_caps_explain_indexes_and_reopen_preserve_atomicity() {
     assert!(ready.rows.is_empty());
 
     engine.flush().unwrap();
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    engine.close().unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let reopened_read = execute_gql_ok(
         &reopened,
         "MATCH (n:GqlMergeIndexed {status: 'updated'}) RETURN id(n)",
@@ -1593,6 +1594,8 @@ fn gql_merge_commit_conflicts_for_node_keys_and_edge_triples() {
     });
 
     let worker = DatabaseEngine {
+        #[cfg(feature = "production-concurrency")]
+        client: engine.client.clone(),
         runtime: std::sync::Arc::clone(&engine.runtime),
     };
     let (ready_rx, release_tx) = engine.set_gql_mutation_before_commit_pause();
@@ -1634,6 +1637,8 @@ fn gql_merge_commit_conflicts_for_node_keys_and_edge_triples() {
     let a = insert_query_node(&engine, "GqlMergeEdgeConflictNode", "a", &[], 1.0);
     let b = insert_query_node(&engine, "GqlMergeEdgeConflictNode", "b", &[], 1.0);
     let worker = DatabaseEngine {
+        #[cfg(feature = "production-concurrency")]
+        client: engine.client.clone(),
         runtime: std::sync::Arc::clone(&engine.runtime),
     };
     let (ready_rx, release_tx) = engine.set_gql_mutation_before_commit_pause();
@@ -2303,7 +2308,7 @@ fn gql_create_return_order_by_id_and_later_delete_executes() {
 
 #[test]
 fn gql_set_node_property_updates_existing_node_index_and_return() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     engine
         .ensure_node_property_index("GqlSetIndexed", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
@@ -3841,6 +3846,8 @@ fn gql_mutation_return_gql_read_set_conflicts_for_returned_and_ordered_hydration
 
     let run_paused = |source: String, engine: &DatabaseEngine| {
         let worker = DatabaseEngine {
+            #[cfg(feature = "production-concurrency")]
+            client: engine.client.clone(),
             runtime: std::sync::Arc::clone(&engine.runtime),
         };
         let (ready_rx, release_tx) = engine.set_gql_mutation_before_commit_pause();
@@ -4220,7 +4227,7 @@ fn gql_mutation_return_missing_params_and_unsupported_projection_are_atomic() {
 
 #[test]
 fn gql_set_remove_edge_index_flush_reopen_and_stale_candidates() {
-    let (dir, engine) = query_test_engine();
+    let (dir, engine) = query_index_protocol_fixture();
     let db_path = dir.path().join("db");
     engine
         .ensure_edge_property_index("Gql_EDGE_INDEX", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -4267,7 +4274,7 @@ fn gql_set_remove_edge_index_flush_reopen_and_stale_candidates() {
     assert_eq!(edge_ids_for(&engine, "new"), vec![edge_id]);
 
     drop(engine);
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     assert_eq!(edge_ids_for(&reopened, "new"), vec![edge_id]);
     let removed = reopened
         .execute_gql(
@@ -4289,7 +4296,7 @@ fn gql_set_remove_edge_index_flush_reopen_and_stale_candidates() {
 
 #[test]
 fn gql_delete_edge_dedupes_updates_indexes_and_survives_reopen() {
-    let (dir, engine) = query_test_engine();
+    let (dir, engine) = query_index_protocol_fixture();
     let db_path = dir.path().join("db");
     engine
         .ensure_edge_property_index("Gql_DELETE_EDGE", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -4332,7 +4339,7 @@ fn gql_delete_edge_dedupes_updates_indexes_and_survives_reopen() {
     assert!(stale_index_read.rows.is_empty());
 
     drop(engine);
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     assert!(reopened.get_edge(edge_id).unwrap().is_none());
 }
 
@@ -4395,7 +4402,7 @@ fn gql_detach_delete_node_cascades_active_and_segment_edges_once() {
     assert!(engine.get_edge(active_edge).unwrap().is_none());
 
     drop(engine);
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     assert!(reopened.get_node(hub).unwrap().is_none());
     assert!(reopened.get_edge(segment_edge).unwrap().is_none());
     assert!(reopened.get_edge(active_edge).unwrap().is_none());
@@ -4666,6 +4673,8 @@ fn gql_detach_delete_commit_budget_bounds_edges_added_after_snapshot() {
     let (_dir, engine) = query_test_engine();
     let hub = insert_query_node(&engine, "GqlDetachCommitCapHub", "hub", &[], 1.0);
     let worker = DatabaseEngine {
+        #[cfg(feature = "production-concurrency")]
+        client: engine.client.clone(),
         runtime: std::sync::Arc::clone(&engine.runtime),
     };
     let (ready_rx, release_tx) = engine.set_gql_mutation_before_commit_pause();
@@ -4898,7 +4907,7 @@ fn gql_create_node_survives_reopen() {
         .unwrap();
     drop(engine);
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     let node = reopened
         .get_node_by_key("GqlReopen", "persisted")
         .unwrap()
@@ -4922,7 +4931,7 @@ fn gql_create_edge_label_survives_reopen() {
     let b_id = gql_u64_column(&result, 2)[0];
     drop(engine);
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     assert_eq!(
         reopened
             .get_node_by_key("GqlEdgeReopen", "a")
@@ -6379,7 +6388,7 @@ fn gql_shortest_path_survives_flush_reopen_and_compact() {
     engine.compact().unwrap();
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     let result = execute_gql_ok(
         &reopened,
         &format!(
@@ -7073,7 +7082,7 @@ fn gql_fixed_match_uses_graph_row_relaxed_distinctness_for_self_loops() {
 
 #[test]
 fn gql_rich_graph_indexed_queries_match_native_oracles() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let fixture = seed_rich_gql_graph(&engine);
     engine.flush().unwrap();
     let _indexes = install_rich_gql_indexes(&engine);
@@ -7456,7 +7465,7 @@ fn gql_execution_rich_expressions_in_read_surfaces_use_graph_row_semantics() {
 
 #[test]
 fn gql_execution_rich_residual_preserves_simple_pushdown_and_narrow_needs() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     engine
         .ensure_node_property_index("GqlRichPushdown", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
@@ -7791,7 +7800,7 @@ fn gql_numeric_property_predicates_match_native_semantics_without_indexes() {
 fn gql_numeric_equality_uses_semantic_equality_indexes() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("gql-indexed-numeric-equality");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let node_index = engine
         .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -7929,7 +7938,7 @@ fn gql_numeric_equality_uses_semantic_equality_indexes() {
 fn gql_numeric_range_uses_domainless_indexes_for_mixed_numeric_values() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("gql-indexed-numeric-range");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let node_index = engine
         .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
@@ -8446,7 +8455,7 @@ fn gql_explain_enforces_referenced_param_caps_like_query() {
 
 #[test]
 fn gql_unsupported_features_are_rejected_by_execution_api() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let cases = [
         (
             "CREATE INDEX node_status FOR (n:User) ON (n.status)",
@@ -8982,7 +8991,7 @@ fn assert_gql_index_manifest_secondary_index_shape(db_path: &std::path::Path, ex
 
 #[test]
 fn gql_index_create_node_rows_idempotence_and_native_visibility() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let source = "CREATE PROPERTY INDEX FOR (n:GqlIndexNodeCreate) ON (n.role) KIND EQUALITY";
     assert_eq!(engine.get_node_label_id("GqlIndexNodeCreate").unwrap(), None);
 
@@ -9032,7 +9041,7 @@ fn gql_index_create_node_rows_idempotence_and_native_visibility() {
 
 #[test]
 fn gql_index_create_edge_rows_native_visibility_and_missing_label_tokens() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     assert_eq!(engine.get_edge_label_id("GQL_INDEX_EDGE_CREATE").unwrap(), None);
 
     let equality = execute_gql_ok(
@@ -9084,7 +9093,7 @@ fn gql_index_create_edge_rows_native_visibility_and_missing_label_tokens() {
 
 #[test]
 fn gql_index_create_drop_show_node_and_edge_compound_fields() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
 
     let node_fields = vec![
         SecondaryIndexField::property("tenant_id"),
@@ -9201,7 +9210,7 @@ fn gql_index_create_drop_show_node_and_edge_compound_fields() {
 
 #[test]
 fn gql_index_drop_existing_missing_and_unknown_labels() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     execute_gql_ok(
         &engine,
         "CREATE PROPERTY INDEX FOR (n:GqlIndexDropNode) ON (n.role) KIND EQUALITY",
@@ -9303,7 +9312,7 @@ fn gql_index_drop_existing_missing_and_unknown_labels() {
 
 #[test]
 fn gql_index_show_rows_order_filters_empty_and_stats() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let empty = execute_gql_ok(&engine, "SHOW PROPERTY INDEXES");
     let stats = assert_gql_index_result(&empty, "show_property_indexes");
     assert_eq!(
@@ -9432,7 +9441,7 @@ fn gql_index_show_rows_order_filters_empty_and_stats() {
 
 #[test]
 fn gql_index_show_includes_native_compound_and_metadata_declarations_sorted() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let node_single = engine
         .ensure_node_property_index(
             "GqlIndexShowFields",
@@ -9531,7 +9540,7 @@ fn gql_index_show_includes_native_compound_and_metadata_declarations_sorted() {
 
 #[test]
 fn gql_index_max_rows_cursor_readonly_profile_and_include_plan() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     execute_gql_ok(
         &engine,
         "CREATE PROPERTY INDEX FOR (n:GqlIndexCaps) ON (n.status) KIND EQUALITY",
@@ -9692,7 +9701,7 @@ fn gql_index_max_rows_cursor_readonly_profile_and_include_plan() {
 
 #[test]
 fn gql_index_explain_booleans_readonly_and_no_side_effects() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let create_source = "CREATE PROPERTY INDEX FOR (n:GqlIndexExplainCreate) ON (n.status) KIND EQUALITY";
     assert_eq!(engine.get_node_label_id("GqlIndexExplainCreate").unwrap(), None);
     let create = engine
@@ -9840,7 +9849,7 @@ fn gql_non_index_results_and_explains_keep_index_payload_absent() {
 
 #[test]
 fn gql_index_show_catalog_smoke_does_not_scan_graph_records() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     for index in 0..100 {
         engine
             .ensure_node_property_index(&format!("GqlIndexSmokeNode{index:03}"), SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -9876,7 +9885,7 @@ fn gql_index_show_catalog_smoke_does_not_scan_graph_records() {
 fn gql_index_lifecycle_create_persists_across_reopen_and_show() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let node = execute_gql_ok(
         &engine,
@@ -9892,7 +9901,7 @@ fn gql_index_lifecycle_create_persists_across_reopen_and_show() {
         assert_create_property_index_row(&edge, "edge", "GQL_INDEX_REOPEN_EDGE", "score", "range");
 
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let reopened_node = native_node_index(
         &reopened,
@@ -9944,7 +9953,7 @@ fn gql_index_lifecycle_create_persists_across_reopen_and_show() {
 fn gql_index_lifecycle_flush_reopen_queries_remain_correct_while_building() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let active = insert_query_node(
         &engine,
@@ -10003,7 +10012,7 @@ fn gql_index_lifecycle_flush_reopen_queries_remain_correct_while_building() {
     wait_for_property_index_state(&engine, index_id, SecondaryIndexState::Ready);
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     wait_for_property_index_state(&reopened, index_id, SecondaryIndexState::Ready);
     assert_eq!(
         reopened
@@ -10022,7 +10031,7 @@ fn gql_index_lifecycle_flush_reopen_queries_remain_correct_while_building() {
 fn gql_index_lifecycle_drop_persists_absence_and_fallback_queries() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let node_keep = insert_query_node(
         &engine,
@@ -10134,7 +10143,7 @@ fn gql_index_lifecycle_drop_persists_absence_and_fallback_queries() {
     );
 
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     assert!(native_node_index(
         &reopened,
         "GqlIndexDropReopenNode",
@@ -10177,7 +10186,7 @@ fn gql_index_lifecycle_drop_persists_absence_and_fallback_queries() {
 
 #[test]
 fn gql_index_lifecycle_retry_failed_declaration_matches_native_ensure() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let source = "CREATE PROPERTY INDEX FOR (n:GqlIndexRetryFailedNode) ON (n.status) KIND EQUALITY";
 
     let created = execute_gql_ok(&engine, source);
@@ -10252,7 +10261,7 @@ fn gql_index_lifecycle_retry_failed_declaration_matches_native_ensure() {
 
 #[test]
 fn gql_index_lifecycle_planner_uses_ready_declarations_and_falls_back_after_drop() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
 
     let node_eq_keep = insert_query_node(
         &engine,
@@ -10534,7 +10543,7 @@ fn gql_index_lifecycle_planner_uses_ready_declarations_and_falls_back_after_drop
 
 #[test]
 fn gql_index_created_node_metadata_compound_index_is_used_by_gql_read_predicates() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let keep = insert_query_node(
         &engine,
         "GqlIndexMetaNode",
@@ -10609,7 +10618,7 @@ fn gql_index_created_node_metadata_compound_index_is_used_by_gql_read_predicates
 
 #[test]
 fn gql_index_created_edge_metadata_compound_index_is_used_by_gql_read_predicates() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let from = insert_query_node(&engine, "GqlIndexMetaEdgeEndpoint", "from", &[], 1.0);
     let to = insert_query_node(&engine, "GqlIndexMetaEdgeEndpoint", "to", &[], 1.0);
     let keep = engine
@@ -10698,7 +10707,7 @@ fn gql_index_created_edge_metadata_compound_index_is_used_by_gql_read_predicates
 
 #[test]
 fn gql_index_compound_prefix_warning_renders_locked_message() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let node = insert_query_node(
         &engine,
         "GqlIndexPrefixWarning",
@@ -10747,7 +10756,7 @@ fn gql_index_compound_prefix_warning_renders_locked_message() {
 
 #[test]
 fn gql_streamed_selectivity_demotion_does_not_claim_buffer_overflow() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_node_property_index(
             "GqlStreamedWarning",
@@ -10821,7 +10830,7 @@ fn gql_streamed_selectivity_demotion_does_not_claim_buffer_overflow() {
 
 #[test]
 fn gql_streamed_edge_result_parity_reuses_delegated_graph_row_execution() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let label = "GQL_STREAMED_EDGE_PARITY";
     let status_info = engine
         .ensure_edge_property_index(
@@ -10935,7 +10944,7 @@ fn gql_streamed_edge_result_parity_reuses_delegated_graph_row_execution() {
 
 #[test]
 fn gql_index_lifecycle_unsupported_explain_and_unknown_drop_have_no_side_effects() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let before = gql_index_side_effect_snapshot(&engine);
 
     for source in [
@@ -10999,7 +11008,7 @@ fn gql_index_lifecycle_unsupported_explain_and_unknown_drop_have_no_side_effects
 fn gql_index_lifecycle_manifest_shape_uses_native_secondary_index_entries() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     execute_gql_ok(
         &engine,
@@ -15756,7 +15765,7 @@ fn gql_scalar_projection_survives_flush_reopen_and_tombstone_shadowing() {
     engine.delete_node(drop).unwrap();
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     let result = execute_gql_ok(
         &reopened,
         "MATCH (n:Person) WHERE elementKey(n) = 'reopen-keep' RETURN n.state ORDER BY n.state",
@@ -15812,7 +15821,7 @@ fn gql_edge_metadata_functions_and_dot_properties_survive_reopen_shadowing() {
     engine.flush().unwrap();
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     let result = execute_gql_ok(
         &reopened,
         "MATCH ()-[r:LIKES]->() RETURN id(r), type(r), r.id, r.label, id(startNode(r)), id(endNode(r))",
@@ -15836,7 +15845,7 @@ fn gql_edge_metadata_functions_and_dot_properties_survive_reopen_shadowing() {
 fn gql_indexed_and_pattern_oracles_survive_flush_reopen_with_shadows() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     seed_query_test_catalog(&engine);
     let fixture = seed_rich_gql_graph(&engine);
     engine.flush().unwrap();
@@ -15859,7 +15868,7 @@ fn gql_indexed_and_pattern_oracles_survive_flush_reopen_with_shadows() {
     engine.flush().unwrap();
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     wait_for_property_index_state(
         &reopened,
         indexes.employee_status,

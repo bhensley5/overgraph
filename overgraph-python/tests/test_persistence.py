@@ -2,6 +2,7 @@
 
 Pattern: open → write → close → reopen → verify → close
 """
+from conftest import drain_after_close
 
 import os
 import shutil
@@ -29,7 +30,7 @@ class TestWalReplay:
         n1 = db.upsert_node("Person", "alice", props={"age": 30})
         n2 = db.upsert_node("Company", "bob")
         db.close()
-
+        drain_after_close(db)
         db2 = open_db(db_dir)
         node = db2.get_node(n1)
         assert node is not None
@@ -37,14 +38,14 @@ class TestWalReplay:
         assert node.props["age"] == 30
         assert db2.get_node(n2) is not None
         db2.close()
-
+        drain_after_close(db2)
     def test_edges_survive_reopen(self, db_dir):
         db = open_db(db_dir)
         n1 = db.upsert_node("Person", "a")
         n2 = db.upsert_node("Person", "b")
         eid = db.upsert_edge(n1, n2, "RELATES_TO", props={"rel": "friend"}, weight=2.5)
         db.close()
-
+        drain_after_close(db)
         db2 = open_db(db_dir)
         edge = db2.get_edge(eid)
         assert edge is not None
@@ -54,32 +55,32 @@ class TestWalReplay:
         assert edge.props["rel"] == "friend"
         assert abs(edge.weight - 2.5) < 0.01
         db2.close()
-
+        drain_after_close(db2)
     def test_temporal_edges_survive_reopen(self, db_dir):
         db = open_db(db_dir)
         n1 = db.upsert_node("Person", "a")
         n2 = db.upsert_node("Person", "b")
         eid = db.upsert_edge(n1, n2, "RELATES_TO", valid_from=100, valid_to=200)
         db.close()
-
+        drain_after_close(db)
         db2 = open_db(db_dir)
         edge = db2.get_edge(eid)
         assert edge.valid_from == 100
         assert edge.valid_to == 200
         db2.close()
-
+        drain_after_close(db2)
     def test_deletes_persist(self, db_dir):
         db = open_db(db_dir)
         n1 = db.upsert_node("Person", "a")
         n2 = db.upsert_node("Person", "b")
         db.delete_node(n1)
         db.close()
-
+        drain_after_close(db)
         db2 = open_db(db_dir)
         assert db2.get_node(n1) is None
         assert db2.get_node(n2) is not None
         db2.close()
-
+        drain_after_close(db2)
     def test_neighbors_work_after_reopen(self, db_dir):
         db = open_db(db_dir)
         n1 = db.upsert_node("Person", "center")
@@ -89,50 +90,49 @@ class TestWalReplay:
             db.upsert_edge(n1, s, "RELATES_TO")
             spokes.append(s)
         db.close()
-
+        drain_after_close(db)
         db2 = open_db(db_dir)
         nbrs = db2.neighbors(n1, direction="outgoing")
         assert len(nbrs) == 3
         node_ids = {n.node_id for n in nbrs}
         assert node_ids == set(spokes)
         db2.close()
-
+        drain_after_close(db2)
     def test_find_nodes_works_after_reopen(self, db_dir):
         db = open_db(db_dir)
         db.upsert_node("Person", "x", props={"color": "red"})
         db.upsert_node("Person", "y", props={"color": "blue"})
         db.close()
-
+        drain_after_close(db)
         db2 = open_db(db_dir)
         ids = db2.find_nodes("Person", "color", "red")
         assert len(ids) == 1
         db2.close()
-
+        drain_after_close(db2)
     def test_key_lookup_after_reopen(self, db_dir):
         db = open_db(db_dir)
         nid = db.upsert_node("Person", "mykey")
         db.close()
-
+        drain_after_close(db)
         db2 = open_db(db_dir)
         node = db2.get_node_by_key("Person", "mykey")
         assert node is not None
         assert node.id == nid
         db2.close()
-
-
+        drain_after_close(db2)
 class TestFlushReopen:
     def test_flushed_data_survives(self, db_dir):
         db = open_db(db_dir)
         n1 = db.upsert_node("Person", "a", props={"v": 1})
         db.flush()
         db.close()
-
+        drain_after_close(db)
         db2 = open_db(db_dir)
         node = db2.get_node(n1)
         assert node is not None
         assert node.props["v"] == 1
         db2.close()
-
+        drain_after_close(db2)
     def test_compact_reopen(self, db_dir):
         db = open_db(db_dir)
         # Create two segments
@@ -144,13 +144,13 @@ class TestFlushReopen:
         db.flush()
         db.compact()
         db.close()
-
+        drain_after_close(db)
         db2 = open_db(db_dir)
         # All 20 nodes should be present
         count = db2.count_nodes_by_labels("Person")
         assert count == 20
         db2.close()
-
+        drain_after_close(db2)
     def test_multi_cycle_flush_compact_reopen(self, db_dir):
         db = open_db(db_dir)
         # Cycle 1
@@ -167,13 +167,12 @@ class TestFlushReopen:
             db.upsert_node("Person", f"c3_{i}")
         db.flush()
         db.close()
-
+        drain_after_close(db)
         db2 = open_db(db_dir)
         count = db2.count_nodes_by_labels("Person")
         assert count == 15
         db2.close()
-
-
+        drain_after_close(db2)
 class TestMixedPersistence:
     def test_wal_and_segment_merged_on_reopen(self, db_dir):
         db = open_db(db_dir)
@@ -185,12 +184,12 @@ class TestMixedPersistence:
         for i in range(3):
             db.upsert_node("Person", f"wal_{i}")
         db.close()
-
+        drain_after_close(db)
         db2 = open_db(db_dir)
         count = db2.count_nodes_by_labels("Person")
         assert count == 8
         db2.close()
-
+        drain_after_close(db2)
     def test_batch_upsert_survives(self, db_dir):
         db = open_db(db_dir)
         ids = db.batch_upsert_nodes([
@@ -199,12 +198,12 @@ class TestMixedPersistence:
             {"labels": ["Person"], "key": "c"},
         ])
         db.close()
-
+        drain_after_close(db)
         db2 = open_db(db_dir)
         for nid in ids:
             assert db2.get_node(nid) is not None
         db2.close()
-
+        drain_after_close(db2)
     def test_graph_patch_survives(self, db_dir):
         db = open_db(db_dir)
         result = db.graph_patch({
@@ -221,9 +220,10 @@ class TestMixedPersistence:
         })
         eid = result2.edge_ids[0]
         db.close()
-
+        drain_after_close(db)
         db2 = open_db(db_dir)
         assert db2.get_node(n1) is not None
         assert db2.get_node(n2) is not None
         assert db2.get_edge(eid) is not None
         db2.close()
+        drain_after_close(db2)

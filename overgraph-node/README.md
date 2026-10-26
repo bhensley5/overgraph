@@ -268,3 +268,31 @@ Licensed under either of
 - [Apache License, Version 2.0](LICENSE-APACHE)
 
 at your option.
+
+### Concurrency diagnostics
+
+Ordinary builds enable `production-concurrency` in the wrapper and Rust core by
+default, including support for explicit `options.concurrency`. The forwarding Cargo
+feature remains available. An explicit `npm run build -- --no-default-features`
+selects the separate legacy route, which rejects `options.concurrency` before opening
+files. `binding-test-hooks` remains opt-in.
+
+`OverGraph.open(path, { concurrency: { ... } })` accepts partial logical limits:
+`maxBatchOperations` (65,536), `maxBatchBytes` (16 MiB),
+`generationOperationLimit` (1,048,576), `generationWalBytes` (512 MiB), and
+`admissionTimeoutMs` (1,000). Values must be nonnegative safe integer Numbers and
+pass the core validator. These limits do not bound aggregate memory or RSS.
+
+`db.reclamationStats()` also works after close. It returns sampled guardian,
+generation, participant and session counts, `open`/`draining`/`drained`, and 64-bucket
+microsecond histograms. Unavailable observations are `null`; new diagnostic amounts
+use Number through `Number.MAX_SAFE_INTEGER`, then BigInt. Existing record IDs keep
+their established representation. A closed wrapper retains only diagnostics/completion
+metadata; passive results and open transactions retain their own legitimate data.
+
+Engine errors remain `Error` objects with their existing messages. New outcomes expose
+`code`: `resource_limit`, `commit_committed`, or `commit_indeterminate`. Resource errors
+also carry `resource`, `requested`, `limit`, and `retryable`. An accepted commit outcome
+must not be blindly retried as if no write happened. Candidate `closeAsync()` requests
+native close immediately and shares one pending Promise; native completion does not
+wait for libuv capacity or Promise delivery. The first accepted close mode wins.

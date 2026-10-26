@@ -907,7 +907,7 @@ fn adjacency_stream_inclusive_seek_is_lazy_and_reopen_equivalent() {
     drop(source);
     drop(view);
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     let reopened_view = reopened.published_read_view_for_test();
     let mut reopened_source =
         prepared_adjacency_ready(&reopened_view, Direction::Outgoing, Some(&[label]));
@@ -1357,7 +1357,7 @@ fn adjacency_stream_is_equivalent_before_after_compaction_and_reopen() {
     assert_eq!(after, before);
 
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     let reopened_edges = collect(&reopened.published_read_view_for_test());
     assert_eq!(reopened_edges, before);
 }

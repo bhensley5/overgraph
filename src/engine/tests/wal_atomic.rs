@@ -484,7 +484,7 @@ fn test_first_use_upsert_node_emits_atomic_batch_and_replays_fully() {
             (2, node_op(1, 1, "alice")),
         ],
     );
-    let replayed = DatabaseEngine::open(&replay_path, &DbOptions::default()).unwrap();
+    let replayed = open_after_native_shutdown(&replay_path, &DbOptions::default()).unwrap();
     assert_eq!(replayed.get_node_label_id("Person").unwrap(), Some(1));
     assert_eq!(
         replayed.get_node_by_key("Person", "alice").unwrap().unwrap().id,
@@ -539,7 +539,7 @@ fn test_first_use_upsert_edge_emits_atomic_batch_and_replays_fully() {
     );
     writer.sync().unwrap();
     drop(writer);
-    let replayed = DatabaseEngine::open(&replay_path, &DbOptions::default()).unwrap();
+    let replayed = open_after_native_shutdown(&replay_path, &DbOptions::default()).unwrap();
     assert_eq!(replayed.get_edge_label_id("KNOWS").unwrap(), Some(1));
     assert_eq!(replayed.get_edge(10).unwrap().unwrap().label, "KNOWS");
     replayed.close().unwrap();
@@ -641,7 +641,7 @@ fn test_batch_upsert_nodes_complete_replay_and_torn_tail_discard() {
         &[(1, node_op(1, 1, "a")), (2, node_op(2, 1, "b"))],
     );
     damage_last_atomic_commit(&torn_path, WalTailDamage::MissingCommit);
-    let engine = DatabaseEngine::open(&torn_path, &DbOptions::default()).unwrap();
+    let engine = open_after_native_shutdown(&torn_path, &DbOptions::default()).unwrap();
     assert!(engine.get_nodes_by_labels("Person").unwrap().is_empty());
     engine.close().unwrap();
 }
@@ -666,7 +666,7 @@ fn test_batch_upsert_edges_complete_replay_and_torn_tail_discard() {
         &[(1, edge_op(10, 1, 2, 1)), (2, edge_op(11, 2, 3, 1))],
     );
     damage_last_atomic_commit(&torn_path, WalTailDamage::CorruptCommit);
-    let engine = DatabaseEngine::open(&torn_path, &DbOptions::default()).unwrap();
+    let engine = open_after_native_shutdown(&torn_path, &DbOptions::default()).unwrap();
     assert!(engine.get_edges_by_label("KNOWS").unwrap().is_empty());
     engine.close().unwrap();
 }
@@ -748,7 +748,7 @@ fn test_graph_patch_complete_replay_and_torn_tail_discard() {
         ],
     );
     damage_last_atomic_commit(&torn_path, WalTailDamage::MissingCommit);
-    let engine = DatabaseEngine::open(&torn_path, &DbOptions::default()).unwrap();
+    let engine = open_after_native_shutdown(&torn_path, &DbOptions::default()).unwrap();
     assert!(engine.get_nodes_by_labels("Person").unwrap().is_empty());
     assert!(engine.get_edge(10).unwrap().is_none());
     engine.close().unwrap();
@@ -783,7 +783,7 @@ fn test_write_transaction_commit_complete_replay_and_torn_tail_discard() {
         ],
     );
     damage_last_atomic_commit(&torn_path, WalTailDamage::CorruptCommit);
-    let engine = DatabaseEngine::open(&torn_path, &DbOptions::default()).unwrap();
+    let engine = open_after_native_shutdown(&torn_path, &DbOptions::default()).unwrap();
     assert!(engine.get_nodes_by_labels("TxnNode").unwrap().is_empty());
     assert!(engine.get_edge(10).unwrap().is_none());
     engine.close().unwrap();
@@ -853,7 +853,7 @@ fn test_cascade_delete_node_complete_replay_and_torn_tail_discard() {
     writer.sync().unwrap();
     drop(writer);
     damage_last_atomic_commit(&torn_path, WalTailDamage::MissingCommit);
-    let engine = DatabaseEngine::open(&torn_path, &DbOptions::default()).unwrap();
+    let engine = open_after_native_shutdown(&torn_path, &DbOptions::default()).unwrap();
     assert!(engine.get_node(1).unwrap().is_some());
     assert!(engine.get_edge(10).unwrap().is_some());
     engine.close().unwrap();
@@ -923,7 +923,7 @@ fn test_prune_complete_replay_and_torn_tail_discard() {
     writer.sync().unwrap();
     drop(writer);
     damage_last_atomic_commit(&torn_path, WalTailDamage::CorruptCommit);
-    let engine = DatabaseEngine::open(&torn_path, &DbOptions::default()).unwrap();
+    let engine = open_after_native_shutdown(&torn_path, &DbOptions::default()).unwrap();
     assert!(engine.get_node(2).unwrap().is_some());
     assert!(engine.get_edge(10).unwrap().is_some());
     engine.close().unwrap();
@@ -1238,7 +1238,7 @@ fn test_recovered_incomplete_atomic_tail_is_truncated_before_later_appends() {
         .unwrap();
     engine.close_fast().unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &opts).unwrap();
     assert_eq!(reopened.get_node_label_id("Lost").unwrap(), None);
     assert!(reopened.get_node_by_key("Lost", "lost").unwrap().is_none());
     assert_eq!(

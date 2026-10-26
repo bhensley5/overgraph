@@ -1,8 +1,35 @@
 use overgraph::{
     DatabaseEngine, DbOptions, PrunePolicy, UpsertEdgeOptions, UpsertNodeOptions, WalSyncMode,
 };
+use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
+
+fn open_fixture(path: &Path, options: &DbOptions) -> DatabaseEngine {
+    #[cfg(not(feature = "production-concurrency"))]
+    {
+        DatabaseEngine::open(path, options).unwrap()
+    }
+    #[cfg(feature = "production-concurrency")]
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match DatabaseEngine::open(path, options) {
+                // Four fixtures can race the deliberately nonblocking, process-wide
+                // participant initializer. Only this preacceptance refusal is retried.
+                Err(overgraph::EngineError::ResourceLimit {
+                    resource: "participants",
+                    retryable: true,
+                    ..
+                }) => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                result => return result.unwrap(),
+            }
+        }
+    }
+}
 
 fn inspect_binary() -> &'static str {
     env!("CARGO_BIN_EXE_overgraph-inspect")
@@ -17,7 +44,7 @@ fn test_inspect_empty_db() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = open_fixture(dir.path(), &opts);
     db.close().unwrap();
 
     let output = Command::new(inspect_binary())
@@ -47,7 +74,7 @@ fn test_inspect_with_data() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = open_fixture(dir.path(), &opts);
 
     for i in 0..10 {
         db.upsert_node(
@@ -99,7 +126,7 @@ fn test_inspect_multiple_segments() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = open_fixture(dir.path(), &opts);
 
     for i in 0..5 {
         db.upsert_node(
@@ -146,7 +173,7 @@ fn test_inspect_with_prune_policies() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = open_fixture(dir.path(), &opts);
 
     db.set_prune_policy(
         "old_memories",
@@ -184,7 +211,7 @@ fn test_inspect_json_with_data() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = open_fixture(dir.path(), &opts);
 
     for i in 0..5 {
         db.upsert_node(
@@ -233,7 +260,7 @@ fn test_inspect_json_with_multi_label_data() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = open_fixture(dir.path(), &opts);
 
     db.upsert_node("Person", "person-only", UpsertNodeOptions::default())
         .unwrap();

@@ -27,6 +27,7 @@ def db(db_path):
     database = OverGraph.open(db_path)
     yield database
     database.close()
+    drain_after_close(database)
 
 
 @pytest_asyncio.fixture
@@ -36,6 +37,7 @@ async def async_db(tmp_dir):
     database = await AsyncOverGraph.open(path)
     yield database
     await database.close()
+    drain_after_close(database)
 
 
 def make_chain(db, n=5, label="RELATES_TO"):
@@ -60,3 +62,24 @@ def make_star(db, center_key="center", spokes=5, label="RELATES_TO"):
         db.upsert_edge(center, sid, label)
         spoke_ids.append(sid)
     return center, spoke_ids
+
+
+def drain_after_close(db):
+    """Wait for actual candidate domain exit before reopen or fixture deletion."""
+    import time
+    if isinstance(db,AsyncOverGraph):
+        db=db._db
+    method=getattr(db,"reclamation_stats",None)
+    if method is None:
+        return
+    try:
+        stats=method()
+    except ValueError as error:
+        if str(error)=="reclamation_stats requires production-concurrency":
+            return
+        raise
+    until=time.monotonic()+15
+    while stats.close_state!="drained":
+        assert time.monotonic()<until,"native fixture drain timed out"
+        time.sleep(.001)
+        stats=method()

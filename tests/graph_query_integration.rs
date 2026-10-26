@@ -1,3 +1,5 @@
+mod support;
+
 use overgraph::*;
 
 /// Build a small graph (20 nodes, 50 edges, mixed labels and relationships),
@@ -7,7 +9,7 @@ fn test_full_graph_query_patterns() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("graph_db");
 
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = support::open(&db_path, &DbOptions::default()).unwrap();
 
     // Create 20 nodes across 3 labels
     let mut node_ids = Vec::new();
@@ -200,7 +202,7 @@ fn test_graph_state_survives_restart() {
 
     // --- Build graph, delete some items, close ---
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = support::open(&db_path, &DbOptions::default()).unwrap();
 
         node_a = engine
             .upsert_node(
@@ -289,7 +291,7 @@ fn test_graph_state_survives_restart() {
 
     // --- Reopen and verify everything ---
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = support::open(&db_path, &DbOptions::default()).unwrap();
 
         // After close() flushes to segments, verify via cross-source lookups
         // d deleted (cascade-deleted c->d edge too), bc explicitly deleted
@@ -383,7 +385,7 @@ fn test_graph_state_survives_restart() {
 
     // --- Third open for stability ---
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = support::open(&db_path, &DbOptions::default()).unwrap();
         assert_eq!(engine.node_count().unwrap(), 4); // a, b, c, e (d still deleted)
         assert!(engine.get_node(node_d).unwrap().is_none());
         engine.close().unwrap();

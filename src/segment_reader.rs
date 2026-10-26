@@ -10,6 +10,7 @@ use crate::edge_metadata::{
     EDGE_VALID_FROM_INDEX_LOGICAL_NAME, EDGE_VALID_TO_INDEX_LOGICAL_NAME,
     EDGE_WEIGHT_INDEX_ENTRY_SIZE, EDGE_WEIGHT_INDEX_LOGICAL_NAME,
 };
+use crate::engine::shared::SharedArc;
 use crate::error::EngineError;
 use crate::memtable::AdjEntry;
 #[cfg(test)]
@@ -31,16 +32,14 @@ use crate::secondary_index_key::{
 };
 use crate::segment_components::{
     component_id, compound_component_kind_for_entry, decode_identity_header,
-    decode_manifest_envelope, dependency_digest, is_packed_core_component_kind,
-    packed_core_container_record, secondary_declaration_dependency,
-    secondary_index_component_dependencies_for_entry,
+    decode_manifest_envelope, is_packed_core_component_kind, packed_core_container_record,
+    secondary_declaration_dependency, secondary_index_component_dependencies_for_entry,
     secondary_index_declaration_fingerprint_for_entry, segment_source_groups_from_records,
-    source_component_dependency, source_group_dependency,
-    validate_packed_core_manifest_contract_for_open, ComponentAvailability, ComponentDependencyV1,
-    ComponentFallbackClass, ComponentHandleV1, ComponentRequirement, ComponentTrustClass,
-    SegmentComponentKind, SegmentComponentManifestV1, SegmentComponentRecordV1,
-    SegmentComponentSourceGroups, SegmentSourceGroupKind, PACKED_CORE_FILENAME,
-    SEGMENT_COMPONENT_MANIFEST_FILENAME,
+    source_component_dependency, source_group_dependency, ComponentAvailability,
+    ComponentDependencyV1, ComponentFallbackClass, ComponentHandleV1, ComponentRequirement,
+    ComponentTrustClass, SegmentComponentKind, SegmentComponentManifestV1,
+    SegmentComponentRecordV1, SegmentComponentSourceGroups, SegmentSourceGroupKind,
+    PACKED_CORE_FILENAME, SEGMENT_COMPONENT_MANIFEST_FILENAME,
 };
 use crate::segment_writer::{
     component_fingerprint, compound_component_fingerprint_for_kind_and_entry,
@@ -65,11 +64,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+// Private retirement construction permits at most four capacity-rounded path
+// buffers plus 8KiB I/O/hash scratch and fixed frames below its 64KiB ceiling.
+pub(crate) const RETIREMENT_OUTPUT_PATH_LIMIT: usize = 4 * 1024;
+
 type NodeSelectedFieldsAtOffset = (Option<String>, BTreeMap<String, PropValue>, Option<i64>);
 
 /// Segment file data, either mmap'd or an empty placeholder.
 /// Segment component payloads can be 0 bytes when empty.
 /// memmap2 can't map empty files, so we handle that case explicitly.
+#[derive(Clone)]
 enum MappedData {
     Mmap {
         mmap: Arc<Mmap>,
@@ -123,7 +127,7 @@ struct SegmentAdjacencySeekState {
 }
 
 pub(crate) struct SegmentAdjacencyGroupCursor {
-    reader: Arc<SegmentReader>,
+    reader: SharedArc<SegmentReader>,
     direction: Direction,
     normalized_labels: Option<Box<[u32]>>,
     group_count: usize,
@@ -202,6 +206,38 @@ fn secondary_range_component_kind(
     }
 }
 
+#[derive(Default)]
+struct ComponentContractScratch {
+    ready_indices: Vec<usize>,
+    dependencies: Vec<ComponentDependencyV1>,
+    canonical: Vec<[u8; 96]>,
+}
+impl ComponentContractScratch {
+    fn prepare(&mut self, indexes: &[SecondaryIndexManifestEntry]) -> Result<(), EngineError> {
+        let count = indexes.len().checked_add(2).ok_or_else(|| {
+            EngineError::CorruptRecord("component declaration count overflow".into())
+        })?;
+        self.ready_indices
+            .try_reserve_exact(indexes.len())
+            .map_err(|_| EngineError::CorruptRecord("component validation allocation".into()))?;
+        self.dependencies
+            .try_reserve_exact(count)
+            .map_err(|_| EngineError::CorruptRecord("component validation allocation".into()))?;
+        self.canonical
+            .try_reserve_exact(count)
+            .map_err(|_| EngineError::CorruptRecord("component validation allocation".into()))?;
+        self.ready_indices
+            .extend(indexes.iter().enumerate().filter_map(|(index, entry)| {
+                (entry.state == SecondaryIndexState::Ready).then_some(index)
+            }));
+        self.ready_indices
+            .sort_unstable_by_key(|index| indexes[*index].index_id);
+        Ok(())
+    }
+}
+
+macro_rules! reader_diagnostic { ($($args:tt)*) => { crate::planner_stats::bounded_stats_diagnostic(format_args!($($args)*)) }; }
+
 struct SegmentComponentRegistry {
     segment_id: u64,
     records: HashMap<SegmentComponentKind, SegmentComponentRecordV1>,
@@ -209,18 +245,6 @@ struct SegmentComponentRegistry {
 }
 
 impl SegmentComponentRegistry {
-    fn new(manifest: &SegmentComponentManifestV1) -> Self {
-        Self {
-            segment_id: manifest.segment_id,
-            records: manifest
-                .components
-                .iter()
-                .map(|record| (record.kind.clone(), record.clone()))
-                .collect(),
-            availability: Mutex::new(HashMap::new()),
-        }
-    }
-
     fn record(&self, kind: &SegmentComponentKind) -> Option<&SegmentComponentRecordV1> {
         self.records.get(kind)
     }
@@ -250,7 +274,10 @@ struct PackedCoreMapping {
     payload_len: usize,
 }
 
+#[derive(Default)]
 struct ComponentOpenContext {
+    ranges: Vec<PackedRangeForOpen>,
+    required_ranges: Vec<(u64, u64, u32, Option<u64>)>,
     packed_core: Option<PackedCoreMapping>,
     invalid_optional_packed_ranges: HashMap<SegmentComponentKind, String>,
 }
@@ -1301,12 +1328,43 @@ struct SparseScoringMeta {
     sparse_len: usize,
 }
 
+fn checked_primary_record_count(
+    data: &[u8],
+    entry_size: usize,
+    label: &str,
+) -> Result<u64, EngineError> {
+    if data.len() < 8 {
+        return Err(EngineError::CorruptRecord(reader_diagnostic!(
+            "{} count header is truncated",
+            label
+        )));
+    }
+    let count = read_u64_at(data, 0)?;
+    let count_usize = usize_from_u64(count, "primary record count")?;
+    let end = count_usize
+        .checked_mul(entry_size)
+        .and_then(|n| n.checked_add(8))
+        .ok_or_else(|| {
+            EngineError::CorruptRecord(reader_diagnostic!("{} count overflows index extent", label))
+        })?;
+    if end > data.len() {
+        return Err(EngineError::CorruptRecord(reader_diagnostic!(
+            "{} index exceeds payload extent",
+            label
+        )));
+    }
+    Ok(count)
+}
+
 pub struct SegmentReader {
     pub segment_id: u64,
     seg_dir: PathBuf,
     segment_data_id: [u8; 32],
     component_manifest_generation: u64,
     component_registry: SegmentComponentRegistry,
+    #[cfg(feature = "production-concurrency")]
+    retained_secondary_payloads:
+        OnceLock<HashMap<SegmentComponentKind, Result<Option<MappedData>, String>>>,
     nodes_mmap: MappedData,
     edges_mmap: MappedData,
     adj_out_idx: MappedData,
@@ -1365,6 +1423,69 @@ pub struct SegmentReader {
     node_ids: OnceLock<Box<[u64]>>,
     node_count: u64,
     edge_count: u64,
+}
+
+/// Registered before opening a retirement source. Every partial mapping and
+/// decoded tombstone remains here on error; only the domain worker drops it.
+#[derive(Default)]
+pub(crate) struct SegmentReaderOpen {
+    manifest_byte_limit: Option<u64>,
+    mapping_bytes: Option<u64>,
+    stats_open: crate::planner_stats::RetainedPlannerStatsOpen,
+    contracts: ComponentContractScratch,
+    planner_stats: Option<PlannerStatsAvailability>,
+    manifest: Option<SegmentComponentManifestV1>,
+    manifest_open: crate::segment_components::retained_manifest::Open,
+    registry: Option<SegmentComponentRegistry>,
+    context: Option<ComponentOpenContext>,
+    mappings: Vec<MappedData>,
+    deleted_nodes: NodeIdMap<TombstoneEntry>,
+    deleted_edges: NodeIdMap<TombstoneEntry>,
+    reader: Option<SegmentReader>,
+}
+impl SegmentReaderOpen {
+    #[allow(dead_code)] // Actual file-extent revalidation for the private retirement path.
+    pub(crate) fn open_bounded(
+        &mut self,
+        dir: &Path,
+        info: &SegmentInfo,
+        dense: Option<&DenseVectorConfig>,
+        indexes: &[SecondaryIndexManifestEntry],
+        manifest_bytes: u64,
+        mapping_bytes: u64,
+    ) -> Result<(), EngineError> {
+        self.manifest_byte_limit = Some(manifest_bytes);
+        self.mapping_bytes = Some(mapping_bytes);
+        self.open(dir, info, dense, indexes)
+    }
+
+    pub(crate) fn open(
+        &mut self,
+        dir: &Path,
+        info: &SegmentInfo,
+        dense: Option<&DenseVectorConfig>,
+        indexes: &[SecondaryIndexManifestEntry],
+    ) -> Result<(), EngineError> {
+        SegmentReader::open_retained(dir, info, dense, indexes, self, true)?;
+        Ok(())
+    }
+    pub(crate) fn into_reader(mut self) -> SegmentReader {
+        self.reader.take().expect("completed preflight reader")
+    }
+
+    pub(crate) fn reader(&self) -> &SegmentReader {
+        self.reader.as_ref().expect("completed retirement reader")
+    }
+
+    #[cfg(all(test, feature = "production-concurrency"))]
+    pub(crate) fn partial_counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.mappings.len(),
+            self.deleted_nodes.len() + self.deleted_edges.len(),
+            self.manifest_open.partial_records(),
+            self.mappings.iter().map(|m| m.len()).sum(),
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1564,223 +1685,290 @@ impl SegmentReader {
         dense_config: Option<&DenseVectorConfig>,
         secondary_indexes: &[SecondaryIndexManifestEntry],
     ) -> Result<Self, EngineError> {
-        let component_manifest = read_component_manifest(seg_dir)?;
-        let source_groups = validate_segment_manifest_identity(segment_info, &component_manifest)?;
-        let component_registry = SegmentComponentRegistry::new(&component_manifest);
+        let mut open = SegmentReaderOpen::default();
+        Self::open_retained(
+            seg_dir,
+            segment_info,
+            dense_config,
+            secondary_indexes,
+            &mut open,
+            false,
+        )?;
+        Ok(open.reader.take().unwrap())
+    }
+
+    fn open_retained(
+        seg_dir: &Path,
+        segment_info: &SegmentInfo,
+        dense_config: Option<&DenseVectorConfig>,
+        secondary_indexes: &[SecondaryIndexManifestEntry],
+        open: &mut SegmentReaderOpen,
+        registered: bool,
+    ) -> Result<(), EngineError> {
+        if registered {
+            let result = open.manifest_open.read_bounded(
+                &seg_dir.join(SEGMENT_COMPONENT_MANIFEST_FILENAME),
+                open.manifest_byte_limit,
+            );
+
+            result?;
+        }
+        if !registered {
+            open.manifest = Some(read_component_manifest(seg_dir)?);
+        }
+        let component_manifest = if registered {
+            open.manifest_open.manifest()
+        } else {
+            open.manifest.as_ref().unwrap()
+        };
+        if registered {
+            let count = component_manifest.components.len();
+
+            open.mappings
+                .try_reserve_exact(count.checked_add(1).ok_or_else(|| {
+                    EngineError::CorruptRecord("reader component count overflow".into())
+                })?)
+                .map_err(|_| EngineError::ResourceLimit {
+                    resource: "allocation_capacity",
+                    requested: count as u64,
+                    limit: isize::MAX as u64,
+                    retryable: false,
+                })?;
+        }
+        let source_groups = validate_segment_manifest_identity(segment_info, component_manifest)?;
+        open.registry = Some(SegmentComponentRegistry {
+            segment_id: component_manifest.segment_id,
+            records: HashMap::new(),
+            availability: Mutex::new(HashMap::new()),
+        });
+        let registry = open.registry.as_mut().unwrap();
+        registry
+            .records
+            .try_reserve(component_manifest.components.len())
+            .map_err(|_| EngineError::CorruptRecord("component registry allocation".into()))?;
+        registry
+            .availability
+            .get_mut()
+            .unwrap()
+            .try_reserve(
+                component_manifest
+                    .components
+                    .len()
+                    .saturating_add(16)
+                    .saturating_add(secondary_indexes.len()),
+            )
+            .map_err(|_| EngineError::CorruptRecord("component availability allocation".into()))?;
+        for record in &component_manifest.components {
+            registry.records.insert(record.kind.clone(), record.clone());
+        }
+        let component_registry = open.registry.as_ref().unwrap();
+        open.contracts.prepare(secondary_indexes)?;
         validate_manifest_component_contracts(
-            &component_registry,
+            component_registry,
             &source_groups,
             dense_config,
             secondary_indexes,
+            &mut open.contracts,
         )?;
-        let component_open_context =
-            ComponentOpenContext::open(seg_dir, segment_info.id, &component_manifest)?;
-        warm_edge_property_sidecar_availability(
-            &component_registry,
-            &component_open_context,
+        open.context = Some(ComponentOpenContext::default());
+        open.context.as_mut().unwrap().open_retained_into(
             seg_dir,
-            secondary_indexes,
-        );
-        let nodes_mmap = open_required_manifest_payload(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::NodeRecords,
+            segment_info.id,
+            component_manifest,
+            registered.then_some(&mut open.mappings),
+            &mut open.mapping_bytes,
         )?;
-        let edges_mmap = open_required_manifest_payload(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::EdgeRecords,
-        )?;
-        let adj_out_idx = open_required_manifest_payload(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::AdjOutIndex,
-        )?;
-        let adj_out_dat = open_required_manifest_payload(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::AdjOutPostings,
-        )?;
-        let adj_in_idx = open_required_manifest_payload(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::AdjInIndex,
-        )?;
-        let adj_in_dat = open_required_manifest_payload(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::AdjInPostings,
-        )?;
-        let key_index_mmap = open_required_manifest_payload(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::KeyIndex,
-        )?;
-        let node_label_index_mmap = open_required_manifest_payload(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::NodeLabelIndex,
-        )?;
-        let edge_label_index_mmap = open_required_manifest_payload(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::EdgeLabelIndex,
-        )?;
-        let edge_triple_index_mmap = open_required_manifest_payload(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::EdgeTripleIndex,
-        )?;
+        let component_open_context = open.context.as_ref().unwrap();
+        if !registered {
+            warm_edge_property_sidecar_availability(
+                component_registry,
+                component_open_context,
+                seg_dir,
+                secondary_indexes,
+            );
+        }
+        let mut payloads = OpenPayloads {
+            registry: component_registry,
+            context: component_open_context,
+            dir: seg_dir,
+            retained: registered.then_some(&mut open.mappings),
+            mapping_bytes: &mut open.mapping_bytes,
+        };
+        if registered {
+            for entry in secondary_indexes {
+                let kind = match (&entry.target, &entry.kind) {
+                    (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Equality) => {
+                        SegmentComponentKind::EdgePropertyEqualityIndex {
+                            index_id: entry.index_id,
+                        }
+                    }
+                    (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range) => {
+                        SegmentComponentKind::EdgePropertyRangeIndex {
+                            index_id: entry.index_id,
+                        }
+                    }
+                    _ => continue,
+                };
+                if component_registry.recorded_availability(&kind).is_none() {
+                    let _ = payloads.optional(kind)?;
+                }
+            }
+        }
+        let nodes_mmap = payloads.required(SegmentComponentKind::NodeRecords)?;
+        let edges_mmap = payloads.required(SegmentComponentKind::EdgeRecords)?;
+        let adj_out_idx = payloads.required(SegmentComponentKind::AdjOutIndex)?;
+        let adj_out_dat = payloads.required(SegmentComponentKind::AdjOutPostings)?;
+        let adj_in_idx = payloads.required(SegmentComponentKind::AdjInIndex)?;
+        let adj_in_dat = payloads.required(SegmentComponentKind::AdjInPostings)?;
+        let key_index_mmap = payloads.required(SegmentComponentKind::KeyIndex)?;
+        let node_label_index_mmap = payloads.required(SegmentComponentKind::NodeLabelIndex)?;
+        let edge_label_index_mmap = payloads.required(SegmentComponentKind::EdgeLabelIndex)?;
+        let edge_triple_index_mmap = payloads.required(SegmentComponentKind::EdgeTripleIndex)?;
         // Metadata payloads.
-        let node_meta_mmap = open_required_manifest_payload(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::NodeMetadata,
-        )?;
-        let edge_meta_mmap = open_required_manifest_payload(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::EdgeMetadata,
-        )?;
-        let edge_weight_index_mmap = open_optional_manifest_payload(
-            &component_registry,
-            Some(&component_open_context),
-            seg_dir,
-            SegmentComponentKind::EdgeWeightIndex,
-        )?;
+        let node_meta_mmap = payloads.required(SegmentComponentKind::NodeMetadata)?;
+        let edge_meta_mmap = payloads.required(SegmentComponentKind::EdgeMetadata)?;
+        let edge_weight_index_mmap = payloads.optional(SegmentComponentKind::EdgeWeightIndex)?;
         let edge_weight_index_count = edge_metadata_index_count_from_header(
-            &component_registry,
+            component_registry,
             SegmentComponentKind::EdgeWeightIndex,
             &edge_weight_index_mmap,
             EDGE_WEIGHT_INDEX_ENTRY_SIZE,
             EDGE_WEIGHT_INDEX_LOGICAL_NAME,
         );
-        let edge_updated_at_index_mmap = open_optional_manifest_payload(
-            &component_registry,
-            Some(&component_open_context),
-            seg_dir,
-            SegmentComponentKind::EdgeUpdatedAtIndex,
-        )?;
+        let edge_updated_at_index_mmap =
+            payloads.optional(SegmentComponentKind::EdgeUpdatedAtIndex)?;
         let edge_updated_at_index_count = edge_metadata_index_count_from_header(
-            &component_registry,
+            component_registry,
             SegmentComponentKind::EdgeUpdatedAtIndex,
             &edge_updated_at_index_mmap,
             EDGE_I64_METADATA_INDEX_ENTRY_SIZE,
             EDGE_UPDATED_AT_INDEX_LOGICAL_NAME,
         );
-        let edge_valid_from_index_mmap = open_optional_manifest_payload(
-            &component_registry,
-            Some(&component_open_context),
-            seg_dir,
-            SegmentComponentKind::EdgeValidFromIndex,
-        )?;
+        let edge_valid_from_index_mmap =
+            payloads.optional(SegmentComponentKind::EdgeValidFromIndex)?;
         let edge_valid_from_index_count = edge_metadata_index_count_from_header(
-            &component_registry,
+            component_registry,
             SegmentComponentKind::EdgeValidFromIndex,
             &edge_valid_from_index_mmap,
             EDGE_I64_METADATA_INDEX_ENTRY_SIZE,
             EDGE_VALID_FROM_INDEX_LOGICAL_NAME,
         );
-        let edge_valid_to_index_mmap = open_optional_manifest_payload(
-            &component_registry,
-            Some(&component_open_context),
-            seg_dir,
-            SegmentComponentKind::EdgeValidToIndex,
-        )?;
+        let edge_valid_to_index_mmap = payloads.optional(SegmentComponentKind::EdgeValidToIndex)?;
         let edge_valid_to_index_count = edge_metadata_index_count_from_header(
-            &component_registry,
+            component_registry,
             SegmentComponentKind::EdgeValidToIndex,
             &edge_valid_to_index_mmap,
             EDGE_I64_METADATA_INDEX_ENTRY_SIZE,
             EDGE_VALID_TO_INDEX_LOGICAL_NAME,
         );
-        let node_vector_meta_mmap = open_manifested_required_payload_or_empty(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::NodeVectorMetadata,
-        )?;
-        let node_dense_vectors_mmap = open_manifested_required_payload_or_empty(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::NodeDenseVectorBlob,
-        )?;
-        let node_sparse_vectors_mmap = open_manifested_required_payload_or_empty(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::NodeSparseVectorBlob,
-        )?;
-        let dense_hnsw_meta_mmap = open_optional_manifest_payload(
-            &component_registry,
-            Some(&component_open_context),
-            seg_dir,
-            SegmentComponentKind::DenseHnswMetadata,
-        )?;
-        let dense_hnsw_graph_mmap = open_optional_manifest_payload(
-            &component_registry,
-            Some(&component_open_context),
-            seg_dir,
-            SegmentComponentKind::DenseHnswGraph,
-        )?;
-        let mut sparse_posting_index_mmap = open_optional_manifest_payload(
-            &component_registry,
-            Some(&component_open_context),
-            seg_dir,
-            SegmentComponentKind::SparsePostingIndex,
-        )?;
-        let mut sparse_postings_mmap = open_optional_manifest_payload(
-            &component_registry,
-            Some(&component_open_context),
-            seg_dir,
-            SegmentComponentKind::SparsePostings,
-        )?;
-        let degree_delta = open_degree_delta_sidecar(&component_registry, seg_dir);
-        let timestamp_index_mmap = open_required_manifest_payload(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::TimestampIndex,
+        let node_vector_meta_mmap =
+            payloads.manifested(SegmentComponentKind::NodeVectorMetadata)?;
+        let node_dense_vectors_mmap =
+            payloads.manifested(SegmentComponentKind::NodeDenseVectorBlob)?;
+        let node_sparse_vectors_mmap =
+            payloads.manifested(SegmentComponentKind::NodeSparseVectorBlob)?;
+        let dense_hnsw_meta_mmap = payloads.optional(SegmentComponentKind::DenseHnswMetadata)?;
+        let dense_hnsw_graph_mmap = payloads.optional(SegmentComponentKind::DenseHnswGraph)?;
+        let mut sparse_posting_index_mmap =
+            payloads.optional(SegmentComponentKind::SparsePostingIndex)?;
+        let mut sparse_postings_mmap = payloads.optional(SegmentComponentKind::SparsePostings)?;
+        let degree_delta = if registered {
+            let degree = payloads.optional(SegmentComponentKind::DegreeDelta)?;
+            match degree {
+                MappedData::Mmap {
+                    mmap,
+                    payload_offset,
+                    payload_len,
+                } => match DegreeSidecar::from_mapping(mmap, payload_offset, payload_len) {
+                    Ok(sidecar) => Some(sidecar),
+                    Err(error) => {
+                        component_registry.set_availability(
+                            SegmentComponentKind::DegreeDelta,
+                            ComponentAvailability::CorruptIdentity {
+                                reason: crate::planner_stats::bounded_stats_diagnostic(
+                                    format_args!("{}", error),
+                                ),
+                            },
+                        );
+                        None
+                    }
+                },
+                MappedData::Empty => None,
+            }
+        } else {
+            open_degree_delta_sidecar(component_registry, seg_dir)
+        };
+        let timestamp_index_mmap = payloads.required(SegmentComponentKind::TimestampIndex)?;
+
+        let tombstones_mmap = payloads.required(SegmentComponentKind::Tombstones)?;
+        if registered {
+            let entries = tombstones_mmap.len().saturating_sub(8) / TOMBSTONE_ENTRY_SIZE;
+            open.deleted_nodes
+                .try_reserve(entries)
+                .map_err(|_| EngineError::CorruptRecord("tombstone allocation".into()))?;
+            open.deleted_edges
+                .try_reserve(entries)
+                .map_err(|_| EngineError::CorruptRecord("tombstone allocation".into()))?;
+        }
+        load_tombstones_into(
+            &tombstones_mmap,
+            &mut open.deleted_nodes,
+            &mut open.deleted_edges,
         )?;
 
-        let tombstones_mmap = open_required_manifest_payload(
-            &component_registry,
-            &component_open_context,
-            seg_dir,
-            SegmentComponentKind::Tombstones,
-        )?;
-        let (deleted_nodes, deleted_edges) = load_tombstones_from_bytes(&tombstones_mmap)?;
+        let node_count =
+            checked_primary_record_count(&nodes_mmap, NODE_INDEX_ENTRY_SIZE, "node records")?;
+        let edge_count =
+            checked_primary_record_count(&edges_mmap, EDGE_INDEX_ENTRY_SIZE, "edge records")?;
+        if node_count != segment_info.node_count || edge_count != segment_info.edge_count {
+            return Err(EngineError::CorruptRecord(
+                "primary record counts do not match manifest".into(),
+            ));
+        }
+        if registered {
+            let stats_data = payloads.optional(SegmentComponentKind::PlannerStats)?;
+            if stats_data.is_empty() {
+                open.planner_stats = Some(
+                    match component_registry.availability(&SegmentComponentKind::PlannerStats) {
+                        ComponentAvailability::Missing => PlannerStatsAvailability::Missing,
+                        state => PlannerStatsAvailability::Unavailable {
+                            reason: crate::planner_stats::bounded_stats_diagnostic(format_args!(
+                                "{:?}",
+                                state
+                            )),
+                        },
+                    },
+                );
+            } else {
+                let result =
+                    open.stats_open
+                        .read(&stats_data, segment_info.id, node_count, edge_count);
 
-        let node_count = if nodes_mmap.len() >= 8 {
-            read_u64_at(&nodes_mmap, 0)?
+                let valid = result?;
+                if valid {
+                    open.planner_stats = Some(PlannerStatsAvailability::Available(
+                        open.stats_open.take_stats(),
+                    ));
+                } else {
+                    let reason = open.stats_open.reason().to_owned();
+                    component_registry.set_availability(
+                        SegmentComponentKind::PlannerStats,
+                        ComponentAvailability::CorruptIdentity {
+                            reason: reason.clone(),
+                        },
+                    );
+                    open.planner_stats = Some(PlannerStatsAvailability::Unavailable { reason });
+                }
+            }
         } else {
-            0
-        };
-        let edge_count = if edges_mmap.len() >= 8 {
-            read_u64_at(&edges_mmap, 0)?
-        } else {
-            0
-        };
-        let planner_stats = open_planner_stats(
-            &component_registry,
-            seg_dir,
-            segment_info.id,
-            node_count,
-            edge_count,
-        );
+            open.planner_stats = Some(open_planner_stats(
+                component_registry,
+                seg_dir,
+                segment_info.id,
+                node_count,
+                edge_count,
+            ));
+        }
         let node_meta_count = if node_meta_mmap.len() >= 8 {
             read_u64_at(&node_meta_mmap, 0)?
         } else {
@@ -1805,7 +1993,7 @@ impl SegmentReader {
             Ok(header) => header,
             Err(error) => {
                 mark_optional_components_corrupt(
-                    &component_registry,
+                    component_registry,
                     &[
                         SegmentComponentKind::DenseHnswMetadata,
                         SegmentComponentKind::DenseHnswGraph,
@@ -1822,7 +2010,7 @@ impl SegmentReader {
         )
         .map_err(|error| {
             mark_optional_components_corrupt(
-                &component_registry,
+                component_registry,
                 &[
                     SegmentComponentKind::SparsePostingIndex,
                     SegmentComponentKind::SparsePostings,
@@ -1838,12 +2026,14 @@ impl SegmentReader {
         let sparse_postings_available =
             !sparse_posting_index_mmap.is_empty() && !sparse_postings_mmap.is_empty();
 
-        Ok(SegmentReader {
+        open.reader = Some(SegmentReader {
             segment_id: segment_info.id,
             seg_dir: seg_dir.to_path_buf(),
             segment_data_id: segment_info.segment_data_id,
             component_manifest_generation: component_manifest.generation,
-            component_registry,
+            component_registry: open.registry.take().unwrap(),
+            #[cfg(feature = "production-concurrency")]
+            retained_secondary_payloads: OnceLock::new(),
             nodes_mmap,
             edges_mmap,
             adj_out_idx,
@@ -1879,17 +2069,18 @@ impl SegmentReader {
             sparse_postings_available: AtomicBool::new(sparse_postings_available),
             sparse_posting_index_shape: OnceLock::new(),
             degree_delta,
-            planner_stats,
+            planner_stats: open.planner_stats.take().unwrap(),
             timestamp_index_mmap,
-            deleted_nodes,
-            deleted_edges,
+            deleted_nodes: std::mem::take(&mut open.deleted_nodes),
+            deleted_edges: std::mem::take(&mut open.deleted_edges),
             secondary_eq_sidecars: Mutex::new(HashMap::new()),
             secondary_range_sidecars: Mutex::new(HashMap::new()),
             declared_index_runtime_coverage: Mutex::new(HashMap::new()),
             node_ids: OnceLock::new(),
             node_count,
             edge_count,
-        })
+        });
+        Ok(())
     }
 
     /// Get a node by ID. Returns None if not found or tombstoned.
@@ -1907,6 +2098,60 @@ impl SegmentReader {
         // Hydrate last_write_seq from metadata.
         node.last_write_seq = self.node_meta_at(index)?.last_write_seq;
         Ok(Some(node))
+    }
+
+    /// Allocation-free complete record coverage check for sealed WAL retirement.
+    #[cfg(feature = "production-concurrency")]
+    pub(crate) fn covers_node_bytes(
+        &self,
+        id: u64,
+        seq: u64,
+        bytes: &[u8],
+    ) -> Result<bool, EngineError> {
+        if self.deleted_nodes.contains_key(&id) {
+            return Ok(false);
+        }
+        let Some((index, offset)) = self.binary_search_node_index(id)? else {
+            return Ok(false);
+        };
+        let meta = self.node_meta_at(index)?;
+        // The a1 coverage caller only admits WAL nodes without vectors. Their
+        // record body omits vector blobs, so compare the separate metadata too.
+        let (_, dense_len, _, sparse_len) = self.node_vector_meta_at(index)?;
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| EngineError::CorruptRecord("node span overflow".into()))?;
+        Ok(meta.node_id == id
+            && dense_len == 0
+            && sparse_len == 0
+            && meta.data_offset == offset as u64
+            && meta.last_write_seq == seq
+            && meta.data_len as usize == bytes.len()
+            && self.nodes_mmap.get(offset..end) == Some(bytes))
+    }
+
+    #[cfg(feature = "production-concurrency")]
+    pub(crate) fn covers_edge_bytes(
+        &self,
+        id: u64,
+        seq: u64,
+        bytes: &[u8],
+    ) -> Result<bool, EngineError> {
+        if self.deleted_edges.contains_key(&id) {
+            return Ok(false);
+        }
+        let Some((index, offset)) = self.binary_search_edge_index(id)? else {
+            return Ok(false);
+        };
+        let meta = self.edge_meta_at(index)?;
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| EngineError::CorruptRecord("edge span overflow".into()))?;
+        Ok(meta.0 == id
+            && meta.1 == offset as u64
+            && meta.10 == seq
+            && meta.2 as usize == bytes.len()
+            && self.edges_mmap.get(offset..end) == Some(bytes))
     }
 
     /// Get an edge by ID. Returns None if not found or tombstoned.
@@ -2927,11 +3172,6 @@ impl SegmentReader {
     /// Iterate deleted node IDs without allocating a temporary set.
     pub(crate) fn deleted_node_id_iter(&self) -> impl Iterator<Item = u64> + '_ {
         self.deleted_nodes.keys().copied()
-    }
-
-    /// Return the set of deleted edge IDs in this segment (keys only).
-    pub fn deleted_edge_ids(&self) -> NodeIdSet {
-        self.deleted_edges.keys().copied().collect()
     }
 
     /// Return all node IDs present in this segment.
@@ -4345,6 +4585,7 @@ impl SegmentReader {
 
     /// Look up an edge by (from, to, label_id) triple. Returns the edge record
     /// if found and not tombstoned, or None.
+    #[cfg(test)]
     pub fn edge_by_triple(
         &self,
         from: u64,
@@ -4392,33 +4633,7 @@ impl SegmentReader {
         Ok(None)
     }
 
-    pub fn resolve_triples_batch(
-        &self,
-        lookups: &[(usize, u64, u64, u32)],
-        results: &mut [Option<EdgeRecord>],
-    ) -> Result<Vec<usize>, EngineError> {
-        if lookups.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let resolved = self.resolve_triples_to_ids(lookups)?;
-        if resolved.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let found_indices: Vec<usize> = resolved.iter().map(|&(orig_idx, _)| orig_idx).collect();
-        let mut edge_lookups: Vec<(usize, u64)> = resolved
-            .iter()
-            .filter(|&&(_, eid)| !self.deleted_edges.contains_key(&eid))
-            .copied()
-            .collect();
-        edge_lookups.sort_unstable_by_key(|&(_, eid)| eid);
-        self.get_edges_batch(&edge_lookups, results)?;
-
-        Ok(found_indices)
-    }
-
-    fn resolve_triples_to_ids(
+    pub(crate) fn resolve_triples_to_ids(
         &self,
         lookups: &[(usize, u64, u64, u32)],
     ) -> Result<Vec<(usize, u64)>, EngineError> {
@@ -5614,17 +5829,146 @@ impl SegmentReader {
         }
     }
 
+    // Called while private, before a candidate reader can become Ready. A cold
+    // query must use the exact captured mapping, never a newer pathname.
+    #[cfg(feature = "production-concurrency")]
+    pub(crate) fn retain_secondary_payloads(&self, previous: Option<&Self>) {
+        if self.retained_secondary_payloads.get().is_some() {
+            return;
+        }
+        let mut retained = HashMap::new();
+        for (kind, record) in &self.component_registry.records {
+            if !matches!(
+                kind,
+                SegmentComponentKind::NodePropertyEqualityIndex { .. }
+                    | SegmentComponentKind::NodePropertyRangeIndex { .. }
+                    | SegmentComponentKind::EdgePropertyEqualityIndex { .. }
+                    | SegmentComponentKind::EdgePropertyRangeIndex { .. }
+                    | SegmentComponentKind::NodeCompoundEqualityIndex { .. }
+                    | SegmentComponentKind::NodeCompoundRangeIndex { .. }
+                    | SegmentComponentKind::EdgeCompoundEqualityIndex { .. }
+                    | SegmentComponentKind::EdgeCompoundRangeIndex { .. }
+            ) {
+                continue;
+            }
+            let old = previous
+                .filter(|old| {
+                    old.component_registry.record(kind).is_some_and(|r| {
+                        r.component_id == record.component_id
+                            && r.created_generation == record.created_generation
+                            && r.handle == record.handle
+                    })
+                })
+                .and_then(|old| old.retained_secondary_payloads.get())
+                .and_then(|maps| maps.get(kind));
+            let value = old.cloned().unwrap_or_else(|| {
+                try_open_optional_manifest_payload(
+                    &self.component_registry,
+                    None,
+                    &self.seg_dir,
+                    kind.clone(),
+                )
+                .map_err(|e| e.to_string())
+            });
+            retained.insert(kind.clone(), value);
+        }
+        let _ = self.retained_secondary_payloads.set(retained);
+    }
+    #[cfg(feature = "production-concurrency")]
+    pub(crate) fn discard_secondary_binding(&mut self, entry: &SecondaryIndexManifestEntry) {
+        let kind = match (&entry.target, &entry.kind) {
+            (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Equality) => {
+                SegmentComponentKind::NodePropertyEqualityIndex {
+                    index_id: entry.index_id,
+                }
+            }
+            (SecondaryIndexTarget::NodeProperty { .. }, SecondaryIndexKind::Range) => {
+                SegmentComponentKind::NodePropertyRangeIndex {
+                    index_id: entry.index_id,
+                }
+            }
+            (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Equality) => {
+                SegmentComponentKind::EdgePropertyEqualityIndex {
+                    index_id: entry.index_id,
+                }
+            }
+            (SecondaryIndexTarget::EdgeProperty { .. }, SecondaryIndexKind::Range) => {
+                SegmentComponentKind::EdgePropertyRangeIndex {
+                    index_id: entry.index_id,
+                }
+            }
+            _ => compound_component_kind_for_entry(entry).expect("compound kind"),
+        };
+        self.component_registry.records.remove(&kind);
+        if let Some(retained) = self.retained_secondary_payloads.get_mut() {
+            retained.remove(&kind);
+        }
+    }
+    #[cfg(feature = "production-concurrency")]
+    pub(crate) fn secondary_component_identity(
+        &self,
+        index: u64,
+    ) -> Option<([u8; 32], u64, ComponentHandleV1)> {
+        self.component_registry
+            .records
+            .iter()
+            .find_map(|(kind, record)| {
+                let id = match kind {
+                    SegmentComponentKind::NodePropertyEqualityIndex { index_id }
+                    | SegmentComponentKind::NodePropertyRangeIndex { index_id }
+                    | SegmentComponentKind::EdgePropertyEqualityIndex { index_id }
+                    | SegmentComponentKind::EdgePropertyRangeIndex { index_id }
+                    | SegmentComponentKind::NodeCompoundEqualityIndex { index_id }
+                    | SegmentComponentKind::NodeCompoundRangeIndex { index_id }
+                    | SegmentComponentKind::EdgeCompoundEqualityIndex { index_id }
+                    | SegmentComponentKind::EdgeCompoundRangeIndex { index_id } => *index_id,
+                    _ => return None,
+                };
+                (id == index).then(|| {
+                    (
+                        record.component_id,
+                        record.created_generation,
+                        record.handle.clone(),
+                    )
+                })
+            })
+    }
+    #[cfg(feature = "production-concurrency")]
+    pub(crate) fn component_paths(&self) -> Vec<(u64, [u8; 32], PathBuf)> {
+        self.component_registry
+            .records
+            .values()
+            .filter_map(|record| match &record.handle {
+                ComponentHandleV1::ExternalFile { relative_path, .. } => Some((
+                    self.segment_id,
+                    record.component_id,
+                    PathBuf::from(relative_path),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+    fn secondary_payload(
+        &self,
+        kind: SegmentComponentKind,
+    ) -> Result<Option<MappedData>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(retained) = self.retained_secondary_payloads.get() {
+            return retained
+                .get(&kind)
+                .cloned()
+                .unwrap_or(Ok(None))
+                .map_err(EngineError::CorruptRecord);
+        }
+        try_open_optional_manifest_payload(&self.component_registry, None, &self.seg_dir, kind)
+    }
+
     fn open_secondary_eq_sidecar_payload(
         &self,
         index_id: u64,
         target: PlannerStatsDeclaredIndexTarget,
     ) -> Result<Option<MappedData>, EngineError> {
-        try_open_optional_manifest_payload(
-            &self.component_registry,
-            None,
-            &self.seg_dir,
-            secondary_eq_component_kind(index_id, target),
-        )
+        self.secondary_payload(secondary_eq_component_kind(index_id, target))
     }
 
     fn open_secondary_range_sidecar_payload(
@@ -5632,19 +5976,14 @@ impl SegmentReader {
         index_id: u64,
         target: PlannerStatsDeclaredIndexTarget,
     ) -> Result<Option<MappedData>, EngineError> {
-        try_open_optional_manifest_payload(
-            &self.component_registry,
-            None,
-            &self.seg_dir,
-            secondary_range_component_kind(index_id, target),
-        )
+        self.secondary_payload(secondary_range_component_kind(index_id, target))
     }
 
     fn open_compound_sidecar_payload(
         &self,
         kind: SegmentComponentKind,
     ) -> Result<Option<MappedData>, EngineError> {
-        try_open_optional_manifest_payload(&self.component_registry, None, &self.seg_dir, kind)
+        self.secondary_payload(kind)
     }
 
     fn set_declared_index_runtime_coverage_state(
@@ -7792,7 +8131,7 @@ impl SegmentReader {
     }
 
     pub(crate) fn adjacency_group_cursor(
-        self: &Arc<Self>,
+        reader: &SharedArc<Self>,
         direction: Direction,
         normalized_labels: Option<&[u32]>,
         inclusive_seek_owner: Option<u64>,
@@ -7804,7 +8143,7 @@ impl SegmentReader {
                 "segment adjacency labels must be sorted ascending and unique".into(),
             ));
         }
-        let group_count = self.adjacency_group_count(direction)?;
+        let group_count = reader.adjacency_group_count(direction)?;
         let labels = normalized_labels
             .map(<[u32]>::to_vec)
             .map(Vec::into_boxed_slice);
@@ -7819,7 +8158,7 @@ impl SegmentReader {
             })
         };
         Ok(SegmentAdjacencyGroupCursor {
-            reader: self.clone(),
+            reader: reader.clone(),
             direction,
             normalized_labels: labels,
             group_count,
@@ -8325,6 +8664,7 @@ fn validate_manifest_component_contracts(
     source_groups: &SegmentComponentSourceGroups,
     dense_config: Option<&DenseVectorConfig>,
     secondary_indexes: &[SecondaryIndexManifestEntry],
+    scratch: &mut ComponentContractScratch,
 ) -> Result<(), EngineError> {
     for record in registry.records.values() {
         let result = validate_manifest_component_contract(
@@ -8333,6 +8673,7 @@ fn validate_manifest_component_contracts(
             source_groups,
             dense_config,
             secondary_indexes,
+            scratch,
         );
         if let Err(error) = result {
             match record.requirement {
@@ -8379,6 +8720,7 @@ fn validate_manifest_component_contract(
     source_groups: &SegmentComponentSourceGroups,
     dense_config: Option<&DenseVectorConfig>,
     secondary_indexes: &[SecondaryIndexManifestEntry],
+    scratch: &mut ComponentContractScratch,
 ) -> Result<(), EngineError> {
     let (expected_requirement, expected_trust_class) = expected_component_contract(&record.kind)
         .ok_or_else(|| {
@@ -8402,24 +8744,62 @@ fn validate_manifest_component_contract(
             record.kind, record.logical_format_version
         )));
     }
-    let dependencies = expected_component_dependencies(
-        &record.kind,
-        registry,
-        source_groups,
-        dense_config,
-        secondary_indexes,
-    )?;
-    if record.dependency_digest != dependency_digest(&dependencies) {
+    scratch.dependencies.clear();
+    if record.kind == SegmentComponentKind::PlannerStats {
+        scratch.dependencies.push(source_group_dependency(
+            SegmentSourceGroupKind::SegmentData,
+            source_groups.segment_data_id,
+        ));
+        for index in &scratch.ready_indices {
+            scratch
+                .dependencies
+                .push(secondary_declaration_dependency(&secondary_indexes[*index]));
+        }
+    } else {
+        // All other declaration families return at most two fixed scalar
+        // dependencies. The only catalog-sized family is filled in-place above.
+        scratch.dependencies.extend(expected_component_dependencies(
+            &record.kind,
+            registry,
+            source_groups,
+            dense_config,
+            secondary_indexes,
+        )?);
+    }
+    if record.dependency_digest
+        != crate::segment_components::dependency_digest_retained(
+            &scratch.dependencies,
+            &mut scratch.canonical,
+        )
+    {
         return Err(EngineError::CorruptRecord(format!(
             "component {:?} dependency digest does not match current source identity",
             record.kind
         )));
     }
-    if !component_build_fingerprint_matches(
-        &record.kind,
-        record.build_fingerprint,
-        secondary_indexes,
-    ) {
+    let fingerprint_matches = if record.kind == SegmentComponentKind::PlannerStats {
+        record.build_fingerprint
+            == crate::segment_components::component_build_fingerprint_iter(
+                SEGMENT_FORMAT_VERSION,
+                "flush.planner_stats",
+                std::iter::once(scratch.ready_indices.len() as u64).chain(
+                    scratch.ready_indices.iter().flat_map(|index| {
+                        let entry = &secondary_indexes[*index];
+                        [
+                            entry.index_id,
+                            secondary_index_declaration_fingerprint_for_entry(entry),
+                        ]
+                    }),
+                ),
+            )
+    } else {
+        component_build_fingerprint_matches(
+            &record.kind,
+            record.build_fingerprint,
+            secondary_indexes,
+        )
+    };
+    if !fingerprint_matches {
         return Err(EngineError::CorruptRecord(format!(
             "component {:?} build fingerprint does not match current semantics",
             record.kind
@@ -8768,17 +9148,104 @@ fn open_required_manifest_payload(
     }
 }
 
-fn open_manifested_required_payload_or_empty(
-    registry: &SegmentComponentRegistry,
-    context: &ComponentOpenContext,
-    seg_dir: &Path,
-    kind: SegmentComponentKind,
-) -> Result<MappedData, EngineError> {
-    if registry.record(&kind).is_none() {
-        registry.set_availability(kind, ComponentAvailability::Missing);
-        return Ok(MappedData::Empty);
+struct OpenPayloads<'a> {
+    registry: &'a SegmentComponentRegistry,
+    context: &'a ComponentOpenContext,
+    dir: &'a Path,
+    retained: Option<&'a mut Vec<MappedData>>,
+    mapping_bytes: &'a mut Option<u64>,
+}
+impl OpenPayloads<'_> {
+    fn required(&mut self, kind: SegmentComponentKind) -> Result<MappedData, EngineError> {
+        self.open(kind, false)
     }
-    open_required_manifest_payload(registry, context, seg_dir, kind)
+    fn optional(&mut self, kind: SegmentComponentKind) -> Result<MappedData, EngineError> {
+        self.open(kind, true)
+    }
+    fn manifested(&mut self, kind: SegmentComponentKind) -> Result<MappedData, EngineError> {
+        if self.registry.record(&kind).is_none() {
+            self.registry
+                .set_availability(kind, ComponentAvailability::Missing);
+            return Ok(MappedData::Empty);
+        }
+        self.required(kind)
+    }
+    fn open(
+        &mut self,
+        kind: SegmentComponentKind,
+        optional: bool,
+    ) -> Result<MappedData, EngineError> {
+        if self.retained.is_none() {
+            return if optional {
+                open_optional_manifest_payload(self.registry, Some(self.context), self.dir, kind)
+            } else {
+                open_required_manifest_payload(self.registry, self.context, self.dir, kind)
+            };
+        }
+        if optional
+            && self
+                .registry
+                .recorded_availability(&kind)
+                .is_some_and(|s| !s.is_available())
+        {
+            return Ok(MappedData::Empty);
+        }
+        let Some(record) = self.registry.record(&kind) else {
+            if optional {
+                self.registry
+                    .set_availability(kind, ComponentAvailability::Missing);
+                return Ok(MappedData::Empty);
+            }
+            return Err(EngineError::CorruptRecord(format!(
+                "missing required component {kind:?}"
+            )));
+        };
+        let result = match record.handle {
+            ComponentHandleV1::ExternalFile { .. } => {
+                open_external_manifest_component_record_retained(
+                    self.dir,
+                    self.registry.segment_id,
+                    record,
+                    self.retained.as_deref_mut(),
+                    self.mapping_bytes,
+                )
+            }
+            ComponentHandleV1::PackedRange { .. } => {
+                open_packed_manifest_component_record(record, Some(self.context))
+            }
+        };
+        match result {
+            Ok(data) => {
+                if matches!(record.handle, ComponentHandleV1::PackedRange { .. }) {
+                    self.retained.as_mut().unwrap().push(data.clone());
+                }
+                self.registry
+                    .set_availability(kind, ComponentAvailability::Available);
+                Ok(data)
+            }
+            Err(error @ EngineError::ResourceLimit { .. }) => Err(error),
+            Err(EngineError::IoError(e))
+                if optional && e.kind() == std::io::ErrorKind::NotFound =>
+            {
+                self.registry
+                    .set_availability(kind, ComponentAvailability::Missing);
+                Ok(MappedData::Empty)
+            }
+            Err(e) => {
+                self.registry.set_availability(
+                    kind,
+                    ComponentAvailability::CorruptIdentity {
+                        reason: e.to_string(),
+                    },
+                );
+                if optional {
+                    Ok(MappedData::Empty)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
 }
 
 fn open_optional_manifest_payload(
@@ -8916,12 +9383,23 @@ fn mark_optional_components_corrupt(
 }
 
 impl ComponentOpenContext {
-    fn open(
+    fn open_retained_into(
+        &mut self,
         seg_dir: &Path,
         segment_id: u64,
         manifest: &SegmentComponentManifestV1,
-    ) -> Result<Self, EngineError> {
-        validate_packed_core_manifest_contract_for_open(manifest)?;
+        retained: Option<&mut Vec<MappedData>>,
+        mapping_bytes: &mut Option<u64>,
+    ) -> Result<(), EngineError> {
+        self.required_ranges
+            .try_reserve_exact(manifest.components.len())
+            .map_err(|_| {
+                EngineError::CorruptRecord("packed component validation allocation".into())
+            })?;
+        crate::segment_components::validate_packed_core_manifest_contract_retained(
+            manifest,
+            &mut self.required_ranges,
+        )?;
         let has_packed_ranges = manifest
             .components
             .iter()
@@ -8931,20 +9409,20 @@ impl ComponentOpenContext {
             .iter()
             .any(|record| record.kind == SegmentComponentKind::PackedSegmentContainer);
         if !has_packed_ranges && !has_container {
-            return Ok(Self {
-                packed_core: None,
-                invalid_optional_packed_ranges: HashMap::new(),
-            });
+            return Ok(());
         }
         if !has_container {
-            return Ok(Self {
-                packed_core: None,
-                invalid_optional_packed_ranges: HashMap::new(),
-            });
+            return Ok(());
         }
 
         let container = packed_core_container_record(manifest)?;
-        let mapped = open_external_manifest_component_record(seg_dir, segment_id, container)?;
+        let mapped = open_external_manifest_component_record_retained(
+            seg_dir,
+            segment_id,
+            container,
+            retained,
+            mapping_bytes,
+        )?;
         let MappedData::Mmap {
             mmap,
             payload_offset,
@@ -8955,18 +9433,19 @@ impl ComponentOpenContext {
                 "{PACKED_CORE_FILENAME} must contain an identity header"
             )));
         };
-        let packed_core = PackedCoreMapping {
+        self.packed_core = Some(PackedCoreMapping {
             component_id: container.component_id,
             mmap,
             payload_offset,
             payload_len,
-        };
-        let invalid_optional_packed_ranges =
-            collect_invalid_optional_packed_ranges(manifest, &packed_core);
-        Ok(Self {
-            packed_core: Some(packed_core),
-            invalid_optional_packed_ranges,
-        })
+        });
+        collect_invalid_optional_packed_ranges_into(
+            manifest,
+            self.packed_core.as_ref().unwrap(),
+            &mut self.invalid_optional_packed_ranges,
+            &mut self.ranges,
+        );
+        Ok(())
     }
 }
 
@@ -8978,12 +9457,12 @@ struct PackedRangeForOpen {
     end: u64,
 }
 
-fn collect_invalid_optional_packed_ranges(
+fn collect_invalid_optional_packed_ranges_into(
     manifest: &SegmentComponentManifestV1,
     packed_core: &PackedCoreMapping,
-) -> HashMap<SegmentComponentKind, String> {
-    let mut invalid = HashMap::new();
-    let mut ranges = Vec::new();
+    invalid: &mut HashMap<SegmentComponentKind, String>,
+    ranges: &mut Vec<PackedRangeForOpen>,
+) {
     for record in &manifest.components {
         if !matches!(record.handle, ComponentHandleV1::PackedRange { .. }) {
             continue;
@@ -8998,7 +9477,7 @@ fn collect_invalid_optional_packed_ranges(
         }
     }
 
-    ranges.sort_by(|left, right| {
+    ranges.sort_unstable_by(|left, right| {
         left.start
             .cmp(&right.start)
             .then_with(|| left.end.cmp(&right.end))
@@ -9021,8 +9500,6 @@ fn collect_invalid_optional_packed_ranges(
             }
         }
     }
-
-    invalid
 }
 
 fn validate_packed_range_for_open(
@@ -9096,6 +9573,15 @@ fn open_external_manifest_component_record(
     segment_id: u64,
     record: &SegmentComponentRecordV1,
 ) -> Result<MappedData, EngineError> {
+    open_external_manifest_component_record_retained(seg_dir, segment_id, record, None, &mut None)
+}
+fn open_external_manifest_component_record_retained(
+    seg_dir: &Path,
+    segment_id: u64,
+    record: &SegmentComponentRecordV1,
+    retained: Option<&mut Vec<MappedData>>,
+    mapping_bytes: &mut Option<u64>,
+) -> Result<MappedData, EngineError> {
     let ComponentHandleV1::ExternalFile {
         relative_path,
         payload_offset,
@@ -9106,8 +9592,23 @@ fn open_external_manifest_component_record(
             "external component opener received a packed range handle".into(),
         ));
     };
+    if mapping_bytes.is_some()
+        && seg_dir
+            .as_os_str()
+            .len()
+            .checked_add(relative_path.len())
+            .and_then(|n| n.checked_add(1))
+            .is_none_or(|n| n > RETIREMENT_OUTPUT_PATH_LIMIT)
+    {
+        return Err(EngineError::CorruptRecord(
+            "retirement component path capacity".into(),
+        ));
+    }
     let path = seg_dir.join(relative_path);
-    let data = mmap_file_payload(&path, *payload_offset, *payload_len)?;
+    let data = mmap_file_payload(&path, *payload_offset, *payload_len, mapping_bytes)?;
+    if let Some(retained) = retained {
+        retained.push(data.clone()); // precedes fallible identity validation
+    }
     let MappedData::Mmap { mmap, .. } = &data else {
         return Ok(data);
     };
@@ -9124,7 +9625,7 @@ fn open_external_manifest_component_record(
         || header.build_fingerprint != record.build_fingerprint
         || header.payload_digest != record.payload_digest
     {
-        return Err(EngineError::CorruptRecord(format!(
+        return Err(EngineError::CorruptRecord(reader_diagnostic!(
             "component identity header does not match manifest for {:?}",
             record.kind
         )));
@@ -9211,7 +9712,7 @@ fn open_packed_manifest_component_record(
             ))
         })?;
     Ok(MappedData::Mmap {
-        mmap: Arc::clone(&packed_core.mmap),
+        mmap: Clone::clone(&packed_core.mmap),
         payload_offset,
         payload_len: range_len,
     })
@@ -9221,10 +9722,21 @@ fn mmap_file_payload(
     path: &Path,
     payload_offset: u64,
     payload_len: u64,
+    mapping_bytes: &mut Option<u64>,
 ) -> Result<MappedData, EngineError> {
     let file = File::open(path)?;
     let meta = file.metadata()?;
     let file_len = meta.len();
+    if let Some(remaining) = mapping_bytes {
+        *remaining = remaining
+            .checked_sub(file_len)
+            .ok_or(EngineError::ResourceLimit {
+                resource: "allocation_capacity",
+                requested: file_len,
+                limit: *remaining,
+                retryable: false,
+            })?;
+    }
     let (payload_offset, payload_len) = if payload_len == u64::MAX {
         if file_len == 0 {
             return Ok(MappedData::Empty);
@@ -9232,13 +9744,13 @@ fn mmap_file_payload(
         (0usize, file_len as usize)
     } else {
         let end = payload_offset.checked_add(payload_len).ok_or_else(|| {
-            EngineError::CorruptRecord(format!(
+            EngineError::CorruptRecord(reader_diagnostic!(
                 "component payload range overflows for {}",
                 path.display()
             ))
         })?;
         if end != file_len {
-            return Err(EngineError::CorruptRecord(format!(
+            return Err(EngineError::CorruptRecord(reader_diagnostic!(
                 "component payload range [{}, {}) does not match file length {} for {}",
                 payload_offset,
                 end,
@@ -9249,13 +9761,26 @@ fn mmap_file_payload(
         (payload_offset as usize, payload_len as usize)
     };
     if file_len == 0 {
-        return Err(EngineError::CorruptRecord(format!(
+        return Err(EngineError::CorruptRecord(reader_diagnostic!(
             "manifest component file is empty for {}",
             path.display()
         )));
     }
     // SAFETY: Segment files are immutable after write. No concurrent modification.
-    let mmap = unsafe { Mmap::map(&file).map_err(EngineError::IoError)? };
+    let mmap = unsafe {
+        if mapping_bytes.is_some() {
+            // Fix the mapping length to the just-charged extent even if an
+            // unsupported external writer appends between metadata and mmap.
+            let length = usize::try_from(file_len)
+                .map_err(|_| EngineError::CorruptRecord("retirement mapping capacity".into()))?;
+            memmap2::MmapOptions::new()
+                .len(length)
+                .map(&file)
+                .map_err(EngineError::IoError)?
+        } else {
+            Mmap::map(&file).map_err(EngineError::IoError)?
+        }
+    };
     Ok(MappedData::Mmap {
         mmap: Arc::new(mmap),
         payload_offset,
@@ -10381,7 +10906,7 @@ fn decode_node_at(data: &[u8], offset: usize, id: u64) -> Result<NodeRecord, Eng
     decode_node_at_with_end(data, offset, id).map(|(node, _)| node)
 }
 
-fn decode_node_at_with_end(
+pub(crate) fn decode_node_at_with_end(
     data: &[u8],
     offset: usize,
     id: u64,
@@ -10486,16 +11011,15 @@ fn decode_edge_at(data: &[u8], offset: usize, id: u64) -> Result<EdgeRecord, Eng
     })
 }
 
-fn load_tombstones_from_bytes(
+fn load_tombstones_into(
     data: &[u8],
-) -> Result<(NodeIdMap<TombstoneEntry>, NodeIdMap<TombstoneEntry>), EngineError> {
+    deleted_nodes: &mut NodeIdMap<TombstoneEntry>,
+    deleted_edges: &mut NodeIdMap<TombstoneEntry>,
+) -> Result<(), EngineError> {
     if data.len() < 8 {
-        return Ok((NodeIdMap::default(), NodeIdMap::default()));
+        return Ok(());
     }
     let count = read_u64_at(data, 0)? as usize;
-
-    let mut deleted_nodes = NodeIdMap::default();
-    let mut deleted_edges = NodeIdMap::default();
 
     for i in 0..count {
         let off = 8 + i * TOMBSTONE_ENTRY_SIZE;
@@ -10526,7 +11050,7 @@ fn load_tombstones_from_bytes(
         }
     }
 
-    Ok((deleted_nodes, deleted_edges))
+    Ok(())
 }
 
 /// Compute sparse dot product between a sorted query and a sparse vector
@@ -10572,6 +11096,29 @@ pub(crate) mod tests {
         write_segment_without_degree_sidecar_for_test as write_segment,
         write_segment_without_degree_sidecar_with_secondary_indexes_for_test as write_segment_with_secondary_indexes,
     };
+
+    // Refuse both primary counts before record iteration, retaining the
+    // affected component in the bounded diagnostic used by scrub.
+    #[test]
+    fn p45a2_sidecar_primary_count_refusal_preserves_component_context() {
+        for (label, width) in [
+            ("node records", NODE_INDEX_ENTRY_SIZE),
+            ("edge records", EDGE_INDEX_ENTRY_SIZE),
+        ] {
+            let error =
+                checked_primary_record_count(&u64::MAX.to_le_bytes(), width, label).unwrap_err();
+            assert!(matches!(error, EngineError::CorruptRecord(ref detail)
+                if detail.contains(label) && detail.contains("count overflows index extent")));
+            let error =
+                checked_primary_record_count(&1u64.to_le_bytes(), width, label).unwrap_err();
+            assert!(matches!(error, EngineError::CorruptRecord(ref detail)
+                if detail.contains(label) && detail.contains("index exceeds payload extent")));
+            assert_eq!(
+                checked_primary_record_count(&0u64.to_le_bytes(), width, label).unwrap(),
+                0
+            );
+        }
+    }
 
     /// Test-only wrapper to expose read_varint_at for cross-module varint tests.
     pub fn read_varint_at_pub(data: &[u8], offset: usize) -> (u64, usize) {
@@ -11181,8 +11728,8 @@ pub(crate) mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&building);
-        mt.register_secondary_index(&ready);
+        mt.register_secondary_index(&building).unwrap();
+        mt.register_secondary_index(&ready).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
@@ -11214,7 +11761,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
         let mt = mt.clone();
-        mt.register_secondary_index(entry);
+        mt.register_secondary_index(entry).unwrap();
         let info = crate::segment_writer::write_segment_without_degree_sidecar_with_secondary_indexes_for_test(
             &seg_dir,
             1,
@@ -11236,7 +11783,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
         let mt = mt.clone();
-        mt.register_secondary_index(entry);
+        mt.register_secondary_index(entry).unwrap();
         let info = crate::segment_writer::write_segment_without_degree_sidecar_with_secondary_indexes_for_test(
             &seg_dir,
             1,
@@ -11302,7 +11849,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
         let mt = mt.clone();
-        mt.register_secondary_index(&entry);
+        mt.register_secondary_index(&entry).unwrap();
         let info = crate::segment_writer::write_segment_without_degree_sidecar_with_secondary_indexes_for_test(
             &seg_dir,
             1,
@@ -11402,7 +11949,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
         let mt = mt.clone();
-        mt.register_secondary_index(&entry);
+        mt.register_secondary_index(&entry).unwrap();
         let info = crate::segment_writer::write_segment_without_degree_sidecar_with_secondary_indexes_for_test(
             &seg_dir,
             1,
@@ -11856,7 +12403,7 @@ pub(crate) mod tests {
             range_label_3.clone(),
         ];
         for entry in &indexes {
-            mt.register_secondary_index(entry);
+            mt.register_secondary_index(entry).unwrap();
         }
 
         let info = write_segment_with_secondary_indexes(&seg_dir, 1, &mt, None, &indexes).unwrap();
@@ -12277,16 +12824,20 @@ pub(crate) mod tests {
     fn adjacency_group_cursor_streams_checked_groups_labels_directions_and_extremes() {
         let empty_mt = Memtable::new();
         let (_empty_dir, empty_reader) = write_and_open(&empty_mt);
-        let empty_reader = Arc::new(empty_reader);
+        let empty_reader = SharedArc::new(empty_reader);
         assert_eq!(
             empty_reader
                 .adjacency_group_count(Direction::Outgoing)
                 .unwrap(),
             0
         );
-        let mut empty_cursor = empty_reader
-            .adjacency_group_cursor(Direction::Outgoing, None, Some(0))
-            .unwrap();
+        let mut empty_cursor = SegmentReader::adjacency_group_cursor(
+            &empty_reader,
+            Direction::Outgoing,
+            None,
+            Some(0),
+        )
+        .unwrap();
         assert_eq!(
             empty_cursor.next_group_step().unwrap(),
             SegmentAdjacencyGroupStep::Exhausted
@@ -12309,7 +12860,7 @@ pub(crate) mod tests {
         }
 
         let (_dir, reader) = write_and_open(&mt);
-        let reader = Arc::new(reader);
+        let reader = SharedArc::new(reader);
         assert_eq!(
             reader.adjacency_group_count(Direction::Outgoing).unwrap(),
             5
@@ -12319,9 +12870,9 @@ pub(crate) mod tests {
             5
         );
 
-        let mut outgoing = reader
-            .adjacency_group_cursor(Direction::Outgoing, None, None)
-            .unwrap();
+        let mut outgoing =
+            SegmentReader::adjacency_group_cursor(&reader, Direction::Outgoing, None, None)
+                .unwrap();
         assert_eq!(outgoing.direction(), Direction::Outgoing);
         assert_eq!(outgoing.group_count(), 5);
         let drained = drain_segment_adjacency_groups(&mut outgoing).unwrap();
@@ -12358,9 +12909,13 @@ pub(crate) mod tests {
         assert!(drained.probes.is_empty());
         assert!(drained.filtered.is_empty());
 
-        let mut max_seek = reader
-            .adjacency_group_cursor(Direction::Outgoing, None, Some(u64::MAX))
-            .unwrap();
+        let mut max_seek = SegmentReader::adjacency_group_cursor(
+            &reader,
+            Direction::Outgoing,
+            None,
+            Some(u64::MAX),
+        )
+        .unwrap();
         loop {
             match max_seek.next_group_step().unwrap() {
                 SegmentAdjacencyGroupStep::SeekProbe { .. } => {}
@@ -12376,9 +12931,13 @@ pub(crate) mod tests {
             }
         }
 
-        let mut incoming = reader
-            .adjacency_group_cursor(Direction::Incoming, Some(&[10, u32::MAX]), None)
-            .unwrap();
+        let mut incoming = SegmentReader::adjacency_group_cursor(
+            &reader,
+            Direction::Incoming,
+            Some(&[10, u32::MAX]),
+            None,
+        )
+        .unwrap();
         let drained = drain_segment_adjacency_groups(&mut incoming).unwrap();
         assert_eq!(
             drained.groups,
@@ -12395,9 +12954,13 @@ pub(crate) mod tests {
         assert!(drained.probes.is_empty());
         assert_eq!(drained.filtered, vec![(5, 20), (9, 0)]);
 
-        let mut known_empty = reader
-            .adjacency_group_cursor(Direction::Outgoing, Some(&[]), Some(u64::MAX))
-            .unwrap();
+        let mut known_empty = SegmentReader::adjacency_group_cursor(
+            &reader,
+            Direction::Outgoing,
+            Some(&[]),
+            Some(u64::MAX),
+        )
+        .unwrap();
         assert_eq!(
             known_empty.next_group_step().unwrap(),
             SegmentAdjacencyGroupStep::Exhausted
@@ -12415,12 +12978,16 @@ pub(crate) mod tests {
             );
         }
         let (_dir, reader) = write_and_open(&mt);
-        let reader = Arc::new(reader);
+        let reader = SharedArc::new(reader);
 
         let assert_seek = |target, expected_owner: Option<u64>, expected_probes: Vec<u64>| {
-            let mut cursor = reader
-                .adjacency_group_cursor(Direction::Outgoing, None, Some(target))
-                .unwrap();
+            let mut cursor = SegmentReader::adjacency_group_cursor(
+                &reader,
+                Direction::Outgoing,
+                None,
+                Some(target),
+            )
+            .unwrap();
             let mut probes = Vec::new();
             loop {
                 match cursor.next_group_step().unwrap() {
@@ -12492,11 +13059,12 @@ pub(crate) mod tests {
                     .copy_from_slice(&(postings_len as u64 + 1).to_le_bytes());
             },
         );
-        let reader = Arc::new(SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap());
+        let reader =
+            SharedArc::new(SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap());
 
-        let mut cursor = reader
-            .adjacency_group_cursor(Direction::Outgoing, None, None)
-            .unwrap();
+        let mut cursor =
+            SegmentReader::adjacency_group_cursor(&reader, Direction::Outgoing, None, None)
+                .unwrap();
         let first = cursor.next_group_step().unwrap();
         assert!(matches!(
             first,
@@ -12520,9 +13088,9 @@ pub(crate) mod tests {
         let err = cursor.next_raw_posting().unwrap_err();
         assert!(matches!(err, EngineError::CorruptRecord(_)));
 
-        let mut filtered = reader
-            .adjacency_group_cursor(Direction::Outgoing, Some(&[10]), None)
-            .unwrap();
+        let mut filtered =
+            SegmentReader::adjacency_group_cursor(&reader, Direction::Outgoing, Some(&[10]), None)
+                .unwrap();
         assert!(matches!(
             filtered.next_group_step().unwrap(),
             SegmentAdjacencyGroupStep::Group(_)
@@ -12549,11 +13117,13 @@ pub(crate) mod tests {
             SegmentComponentKind::AdjOutIndex,
             |payload| payload[0..8].copy_from_slice(&3u64.to_le_bytes()),
         );
-        let reader = Arc::new(SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap());
-        let err = match reader.adjacency_group_cursor(Direction::Outgoing, None, None) {
-            Ok(_) => panic!("truncated adjacency index unexpectedly prepared a cursor"),
-            Err(err) => err,
-        };
+        let reader =
+            SharedArc::new(SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap());
+        let err =
+            match SegmentReader::adjacency_group_cursor(&reader, Direction::Outgoing, None, None) {
+                Ok(_) => panic!("truncated adjacency index unexpectedly prepared a cursor"),
+                Err(err) => err,
+            };
         assert!(
             matches!(&err, EngineError::CorruptRecord(message) if message.contains("index table"))
         );
@@ -12571,10 +13141,11 @@ pub(crate) mod tests {
             SegmentComponentKind::AdjOutIndex,
             |payload| payload[28..32].copy_from_slice(&2u32.to_le_bytes()),
         );
-        let reader = Arc::new(SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap());
-        let mut cursor = reader
-            .adjacency_group_cursor(Direction::Outgoing, None, None)
-            .unwrap();
+        let reader =
+            SharedArc::new(SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap());
+        let mut cursor =
+            SegmentReader::adjacency_group_cursor(&reader, Direction::Outgoing, None, None)
+                .unwrap();
         assert!(matches!(
             cursor.next_group_step().unwrap(),
             SegmentAdjacencyGroupStep::Group(SegmentAdjacencyGroupHead {
@@ -12592,9 +13163,14 @@ pub(crate) mod tests {
         let mt = Memtable::new();
         mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 1);
         let (_dir, reader) = write_and_open(&mt);
-        let reader = Arc::new(reader);
+        let reader = SharedArc::new(reader);
         for labels in [&[20, 10][..], &[10, 10][..]] {
-            let err = match reader.adjacency_group_cursor(Direction::Outgoing, Some(labels), None) {
+            let err = match SegmentReader::adjacency_group_cursor(
+                &reader,
+                Direction::Outgoing,
+                Some(labels),
+                None,
+            ) {
                 Ok(_) => panic!("non-normalized labels unexpectedly prepared a cursor"),
                 Err(err) => err,
             };
@@ -13172,8 +13748,8 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path().join("seg_0001");
         let mt = mt.clone();
-        mt.register_secondary_index(&node_entry);
-        mt.register_secondary_index(&edge_entry);
+        mt.register_secondary_index(&node_entry).unwrap();
+        mt.register_secondary_index(&edge_entry).unwrap();
         let entries = vec![node_entry.clone(), edge_entry.clone()];
         let info = crate::segment_writer::write_segment_without_degree_sidecar_with_secondary_indexes_for_test(
             &seg_dir,
@@ -15709,6 +16285,39 @@ pub(crate) mod tests {
         assert!(selected.created_at.is_none());
         assert!(selected.dense_vector.is_none());
         assert!(selected.sparse_vector.is_none());
+    }
+
+    #[test]
+    fn targeted_q_segment_metadata_then_projection_preserves_read_errors() {
+        use crate::engine::shared::SharedArc;
+        use crate::source_list::SourceList;
+
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 7, "metadata-only")), 0);
+        let (_dir, mut reader) = write_and_open(&mt);
+        reader.nodes_mmap = MappedData::Empty;
+        let active = Memtable::new();
+        let segments = vec![SharedArc::new(reader)];
+        let sources = SourceList {
+            active: &active,
+            immutable: &[],
+            segments: &segments,
+            snapshot_seq: 0,
+            selected_field_read_counters: None,
+        };
+        let needs = NodeSelectedFieldNeeds {
+            key: true,
+            props: PropertySelection::Keys(vec!["status".into()]),
+            ..Default::default()
+        };
+        let visibility = sources.find_node_visibility_meta(&[1, 1]).unwrap();
+        assert!(visibility
+            .iter()
+            .all(|state| matches!(state, NodeVisibilityState::Live(_))));
+        assert!(matches!(
+            sources.find_node_projected_fields(&[1], &needs),
+            Err(EngineError::CorruptRecord(_))
+        ));
     }
 
     #[test]

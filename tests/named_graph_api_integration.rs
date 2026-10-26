@@ -1,3 +1,5 @@
+mod support;
+
 use overgraph::{
     AllShortestPathsOptions, ComponentOptions, DatabaseEngine, DbOptions, DegreeOptions,
     DenseMetric, DenseVectorConfig, Direction, ExportOptions, HnswConfig, IsConnectedOptions,
@@ -44,7 +46,7 @@ fn named_node_label_filter(labels: &[&str], mode: LabelMatchMode) -> NodeLabelFi
 }
 
 fn open_graph(path: &Path) -> (DatabaseEngine, GraphIds) {
-    let engine = DatabaseEngine::open(path, &DbOptions::default()).unwrap();
+    let engine = support::open(path, &DbOptions::default()).unwrap();
     let alice = engine
         .upsert_node("Person", "alice", node_options(1.0, Some(vec![(1, 1.0)])))
         .unwrap();
@@ -665,7 +667,7 @@ fn named_graph_filters_survive_flush_compaction_and_reopen() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = support::open(&db_path, &DbOptions::default()).unwrap();
         let alice = engine
             .upsert_node("Person", "alice", UpsertNodeOptions::default())
             .unwrap();
@@ -688,7 +690,7 @@ fn named_graph_filters_survive_flush_compaction_and_reopen() {
         engine.close().unwrap();
     }
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = support::open(&db_path, &DbOptions::default()).unwrap();
     let alice = reopened
         .get_node_by_key("Person", "alice")
         .unwrap()
@@ -849,7 +851,7 @@ fn vector_search_unknown_label_filter_does_not_hide_invalid_shape() {
         }),
         ..Default::default()
     };
-    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = support::open(dir.path(), &opts).unwrap();
     let unknown_label = Some(named_node_label_filter(
         &["MissingLabel"],
         LabelMatchMode::Any,

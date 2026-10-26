@@ -1,6 +1,6 @@
 use crate::error::EngineError;
 use crate::secondary_index_key::{
-    public_canonical_field_name, public_field_source, COMPOUND_INDEX_KEY_ENCODING_VERSION,
+    canonical_field_name, field_source, COMPOUND_INDEX_KEY_ENCODING_VERSION,
     COMPOUND_INDEX_METADATA_ENUM_VERSION, COMPOUND_INDEX_SENTINEL_ORDERING_VERSION,
     MAX_COMPOUND_COMPONENT_BYTES, MAX_COMPOUND_TUPLE_BYTES,
     MAX_SECONDARY_INDEX_FIELDS as MAX_COMPOUND_SECONDARY_INDEX_FIELDS,
@@ -86,7 +86,7 @@ pub(crate) struct UnknownOptionalComponentRecordV1 {
     pub wire: SegmentComponentRecordWireV1,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SegmentComponentManifestWireV1 {
     pub format_version: u32,
     pub segment_format_version: u32,
@@ -100,7 +100,7 @@ pub(crate) struct SegmentComponentManifestWireV1 {
     pub components: Vec<SegmentComponentRecordWireV1>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SegmentComponentRecordWireV1 {
     pub component_id: ComponentDigest32,
     pub kind_tag: u32,
@@ -118,7 +118,7 @@ pub(crate) struct SegmentComponentRecordWireV1 {
     pub build_fingerprint: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ComponentHandleWireV1 {
     pub handle_tag: u8,
     pub relative_path: Option<String>,
@@ -554,6 +554,16 @@ pub(crate) fn encode_manifest_envelope(
 pub(crate) fn decode_manifest_envelope(
     data: &[u8],
 ) -> Result<SegmentComponentManifestV1, EngineError> {
+    let (payload, segment_format_version) = manifest_envelope_payload(data)?;
+    let wire: SegmentComponentManifestWireV1 = rmp_serde::from_slice(payload)
+        .map_err(|error| EngineError::SerializationError(error.to_string()))?;
+    let mut manifest = manifest_from_wire(wire)?;
+    manifest.segment_format_version = segment_format_version;
+    validate_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn manifest_envelope_payload(data: &[u8]) -> Result<(&[u8], u32), EngineError> {
     if data.len() < SEGMENT_COMPONENT_MANIFEST_ENVELOPE_LEN {
         return Err(component_manifest_error(
             "segment component manifest is shorter than envelope",
@@ -594,12 +604,217 @@ pub(crate) fn decode_manifest_envelope(
             "segment component manifest payload crc mismatch",
         ));
     }
-    let wire: SegmentComponentManifestWireV1 = rmp_serde::from_slice(payload)
-        .map_err(|error| EngineError::SerializationError(error.to_string()))?;
-    let mut manifest = manifest_from_wire(wire)?;
-    manifest.segment_format_version = segment_format_version;
-    validate_manifest(&manifest)?;
-    Ok(manifest)
+    Ok((payload, segment_format_version))
+}
+
+/// The canonical writer emits tuple-shaped MessagePack. Decode its growing
+/// fields directly into registered storage, including the currently failing
+/// record. No serde-derived bulk Vec or consuming conversion owns partial state.
+pub(crate) mod retained_manifest {
+    use super::*;
+    use crate::engine::payload::json::MessagePackConstruction;
+    use std::io::Read;
+
+    #[derive(Default)]
+    pub(crate) struct Open {
+        construction: MessagePackConstruction,
+        data: Vec<u8>,
+        wire: SegmentComponentManifestWireV1,
+        manifest: Option<SegmentComponentManifestV1>,
+        ids: HashSet<ComponentDigest32>,
+        keys: HashSet<(u32, Option<u64>)>,
+        // One registered canonical scratch vector, reused without heap children.
+        canonical: Vec<[u8; 96]>,
+    }
+    impl Open {
+        pub(crate) fn read_bounded(
+            &mut self,
+            path: &std::path::Path,
+            limit: Option<u64>,
+        ) -> Result<(), EngineError> {
+            let mut file = std::fs::File::open(path)?;
+            if let Some(limit) = limit {
+                if !self.data.is_empty() || file.metadata()?.len() > limit {
+                    return Err(component_manifest_error("retirement metadata capacity"));
+                }
+                let bytes = usize::try_from(limit)
+                    .map_err(|_| component_manifest_error("retirement metadata capacity"))?;
+
+                self.data
+                    .try_reserve_exact(bytes)
+                    .map_err(|_| self.construction.allocation_error(bytes))?;
+                std::io::Read::by_ref(&mut file)
+                    .take(limit)
+                    .read_to_end(&mut self.data)?;
+                // Detect appended bytes with fixed scratch, without growing the
+                // registered wire buffer beyond the admitted envelope length.
+                if file.read(&mut [0u8; 1])? != 0 {
+                    return Err(component_manifest_error("retirement metadata capacity"));
+                }
+            } else {
+                let bytes = usize::try_from(file.metadata()?.len())
+                    .map_err(|_| component_manifest_error("component metadata extent"))?;
+
+                self.data
+                    .try_reserve_exact(bytes)
+                    .map_err(|_| self.construction.allocation_error(bytes))?;
+                std::io::Read::by_ref(&mut file)
+                    .take(bytes as u64)
+                    .read_to_end(&mut self.data)?;
+                if file.read(&mut [0u8; 1])? != 0 {
+                    return Err(component_manifest_error(
+                        "component metadata extent changed",
+                    ));
+                }
+            }
+            let (payload, version) = manifest_envelope_payload(&self.data)?;
+            self.construction
+                .component_manifest(&mut self.wire, payload)?;
+            let w = &self.wire;
+            self.manifest = Some(SegmentComponentManifestV1 {
+                format_version: w.format_version,
+                segment_format_version: version,
+                segment_id: w.segment_id,
+                generation: w.generation,
+                built_at_ms: w.built_at_ms,
+                build_kind: SegmentComponentBuildKind::from_tag(w.build_kind_tag)?,
+                segment_data_id: w.segment_data_id,
+                node_count: w.node_count,
+                edge_count: w.edge_count,
+                components: Vec::new(),
+                unknown_optional_components: Vec::new(),
+            });
+            let count = w.components.len();
+            self.ids
+                .try_reserve(count)
+                .map_err(|_| self.construction.allocation_error(count))?;
+            self.keys
+                .try_reserve(count)
+                .map_err(|_| self.construction.allocation_error(count))?;
+            let manifest = self.manifest.as_mut().unwrap();
+            if manifest.format_version != SEGMENT_COMPONENT_MANIFEST_PAYLOAD_VERSION {
+                return Err(component_manifest_error(
+                    "unsupported component payload version",
+                ));
+            }
+            for wire in &w.components {
+                if !self.ids.insert(wire.component_id)
+                    || !self.keys.insert((wire.kind_tag, wire.index_id))
+                {
+                    return Err(component_manifest_error("duplicate component identity"));
+                }
+                // Check borrowed path/range before creating any owned handle.
+                let handle_len = match wire.handle.handle_tag {
+                    1 => {
+                        validate_relative_component_path(
+                            wire.handle
+                                .relative_path
+                                .as_deref()
+                                .ok_or_else(|| component_manifest_error("missing relative path"))?,
+                        )?;
+                        wire.handle.payload_len
+                    }
+                    2 => {
+                        if wire.handle.container_component_id.is_none() {
+                            return Err(component_manifest_error("missing container id"));
+                        }
+                        wire.handle.len
+                    }
+                    _ => return Err(component_manifest_error("unknown component handle")),
+                };
+                if handle_len != wire.payload_len {
+                    return Err(component_manifest_error(
+                        "component payload length mismatch",
+                    ));
+                }
+                self.canonical.clear();
+                for dependency in &wire.dependencies {
+                    dependency_from_wire(dependency)?;
+                    self.construction.grow(&mut self.canonical)?;
+                    self.canonical.push(dependency_canonical_array(dependency));
+                }
+                self.canonical.sort_unstable();
+                let mut digest = Sha256::new();
+                digest.update(DEPENDENCY_DIGEST_DOMAIN);
+                for dependency in &self.canonical {
+                    digest.update(dependency);
+                }
+                let digest: ComponentDigest32 = digest.finalize().into();
+                if digest != wire.dependency_digest {
+                    return Err(component_manifest_error(
+                        "component dependency digest mismatch",
+                    ));
+                }
+                match SegmentComponentKind::from_tag_and_index(wire.kind_tag, wire.index_id)? {
+                    Some(kind) => {
+                        let requirement =
+                            requirement_from_wire(wire.requirement_tag, wire.fallback_tag)?;
+                        let trust_class = ComponentTrustClass::from_tag(wire.trust_class_tag)?;
+                        self.construction.grow(&mut manifest.components)?;
+                        // Scalar validation precedes the owned handle clone; no fallible
+                        // conversion occurs between its construction and registered push.
+                        manifest.components.push(SegmentComponentRecordV1 {
+                            component_id: wire.component_id,
+                            kind,
+                            logical_format_version: wire.logical_format_version,
+                            created_generation: wire.created_generation,
+                            requirement,
+                            trust_class,
+                            handle: match wire.handle.handle_tag {
+                                1 => ComponentHandleV1::ExternalFile {
+                                    relative_path: wire
+                                        .handle
+                                        .relative_path
+                                        .as_ref()
+                                        .unwrap()
+                                        .clone(),
+                                    payload_offset: wire.handle.payload_offset,
+                                    payload_len: wire.handle.payload_len,
+                                },
+                                2 => ComponentHandleV1::PackedRange {
+                                    container_component_id: wire
+                                        .handle
+                                        .container_component_id
+                                        .unwrap(),
+                                    offset: wire.handle.offset,
+                                    len: wire.handle.len,
+                                },
+                                _ => unreachable!("validated borrowed handle"),
+                            },
+                            payload_len: wire.payload_len,
+                            payload_digest: wire.payload_digest,
+                            dependency_digest: wire.dependency_digest,
+                            dependencies: Vec::new(),
+                            build_fingerprint: wire.build_fingerprint,
+                        });
+                        let record = manifest.components.last_mut().unwrap();
+                        for dependency in &wire.dependencies {
+                            self.construction.grow(&mut record.dependencies)?;
+                            record.dependencies.push(dependency_from_wire(dependency)?);
+                        }
+                    }
+                    None if requirement_from_wire(wire.requirement_tag, wire.fallback_tag)?
+                        .is_optional() =>
+                    {
+                        self.construction
+                            .grow(&mut manifest.unknown_optional_components)?;
+                        manifest
+                            .unknown_optional_components
+                            .push(UnknownOptionalComponentRecordV1 { wire: wire.clone() });
+                    }
+                    None => return Err(component_manifest_error("unknown required component")),
+                }
+            }
+            Ok(())
+        }
+        pub(crate) fn manifest(&self) -> &SegmentComponentManifestV1 {
+            self.manifest.as_ref().expect("decoded manifest")
+        }
+        #[cfg(test)]
+        pub(crate) fn partial_records(&self) -> usize {
+            self.wire.components.len()
+        }
+    }
 }
 
 pub(crate) fn encode_identity_header(
@@ -809,6 +1024,23 @@ fn dependency_digest_from_wire(
     Ok(hasher.finalize().into())
 }
 
+pub(crate) fn dependency_digest_retained(
+    dependencies: &[ComponentDependencyV1],
+    canonical: &mut Vec<[u8; 96]>,
+) -> ComponentDigest32 {
+    canonical.clear();
+    for dependency in dependencies {
+        canonical.push(dependency_canonical_array(&dependency_to_wire(dependency)));
+    }
+    canonical.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update(DEPENDENCY_DIGEST_DOMAIN);
+    for value in canonical.iter() {
+        hasher.update(value);
+    }
+    hasher.finalize().into()
+}
+
 pub(crate) fn digest_source_group(
     group: SegmentSourceGroupKind,
     digests: &[ComponentDigest32],
@@ -843,12 +1075,20 @@ pub(crate) fn digest_segment_data(
     hasher.finalize().into()
 }
 
+#[cfg(test)]
 pub(crate) fn component_semantic_fingerprint(namespace: &str, fields: &[u64]) -> u64 {
+    component_semantic_fingerprint_iter(namespace, fields.iter().copied())
+}
+
+fn component_semantic_fingerprint_iter(
+    namespace: &str,
+    fields: impl IntoIterator<Item = u64>,
+) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update(SEMANTIC_FINGERPRINT_DOMAIN);
     put_bytes_with_len(&mut hasher, namespace.as_bytes());
     for field in fields {
-        put_u64(&mut hasher, *field);
+        put_u64(&mut hasher, field);
     }
     fingerprint_from_digest(hasher.finalize().into())
 }
@@ -858,10 +1098,18 @@ pub(crate) fn component_build_fingerprint(
     namespace: &str,
     fields: &[u64],
 ) -> u64 {
-    let mut all_fields = Vec::with_capacity(fields.len() + 1);
-    all_fields.push(segment_format_version as u64);
-    all_fields.extend_from_slice(fields);
-    component_semantic_fingerprint(namespace, &all_fields)
+    component_build_fingerprint_iter(segment_format_version, namespace, fields.iter().copied())
+}
+
+pub(crate) fn component_build_fingerprint_iter(
+    segment_format_version: u32,
+    namespace: &str,
+    fields: impl IntoIterator<Item = u64>,
+) -> u64 {
+    component_semantic_fingerprint_iter(
+        namespace,
+        std::iter::once(segment_format_version as u64).chain(fields),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -975,9 +1223,8 @@ fn secondary_index_declaration_fingerprint_v2(
     put_u32(&mut hasher, target_label_id);
     put_u64(&mut hasher, fields.len() as u64);
     for field in fields {
-        let public = field.to_public();
-        put_u8(&mut hasher, public_field_source(&public).tag());
-        put_bytes_with_len(&mut hasher, public_canonical_field_name(&public).as_bytes());
+        put_u8(&mut hasher, field_source(field).tag());
+        put_bytes_with_len(&mut hasher, canonical_field_name(field).as_bytes());
     }
     put_u64(&mut hasher, COMPOUND_INDEX_KEY_ENCODING_VERSION as u64);
     put_u64(&mut hasher, COMPOUND_INDEX_SENTINEL_ORDERING_VERSION as u64);
@@ -1225,22 +1472,29 @@ pub(crate) fn validate_packed_core_manifest_contract(
     validate_packed_core_records_contract_impl(
         &manifest.components,
         PackedRangeOverlapPolicy::AllValidRanges,
+        &mut Vec::new(),
     )
 }
 
-pub(crate) fn validate_packed_core_manifest_contract_for_open(
+pub(crate) fn validate_packed_core_manifest_contract_retained(
     manifest: &SegmentComponentManifestV1,
+    ranges: &mut Vec<(u64, u64, u32, Option<u64>)>,
 ) -> Result<(), EngineError> {
     validate_packed_core_records_contract_impl(
         &manifest.components,
         PackedRangeOverlapPolicy::RequiredRangesOnly,
+        ranges,
     )
 }
 
 pub(crate) fn validate_packed_core_records_contract(
     records: &[SegmentComponentRecordV1],
 ) -> Result<(), EngineError> {
-    validate_packed_core_records_contract_impl(records, PackedRangeOverlapPolicy::AllValidRanges)
+    validate_packed_core_records_contract_impl(
+        records,
+        PackedRangeOverlapPolicy::AllValidRanges,
+        &mut Vec::new(),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -1252,6 +1506,7 @@ enum PackedRangeOverlapPolicy {
 fn validate_packed_core_records_contract_impl(
     records: &[SegmentComponentRecordV1],
     overlap_policy: PackedRangeOverlapPolicy,
+    ranges: &mut Vec<(u64, u64, u32, Option<u64>)>,
 ) -> Result<(), EngineError> {
     for record in records {
         if is_packed_core_component_kind(&record.kind)
@@ -1264,16 +1519,15 @@ fn validate_packed_core_records_contract_impl(
         }
     }
 
-    let packed_records: Vec<&SegmentComponentRecordV1> = records
+    let packed_records = records
         .iter()
-        .filter(|record| matches!(record.handle, ComponentHandleV1::PackedRange { .. }))
-        .collect();
+        .filter(|record| matches!(record.handle, ComponentHandleV1::PackedRange { .. }));
     let Some(container_record) = records
         .iter()
         .find(|record| record.kind == SegmentComponentKind::PackedSegmentContainer)
     else {
         if !packed_records
-            .iter()
+            .clone()
             .any(|record| record.requirement == ComponentRequirement::Required)
         {
             return Ok(());
@@ -1314,7 +1568,7 @@ fn validate_packed_core_records_contract_impl(
         ));
     }
 
-    let mut ranges: Vec<(u64, u64, u32, Option<u64>)> = Vec::new();
+    ranges.clear();
     for record in packed_records {
         if record.kind == SegmentComponentKind::PackedSegmentContainer {
             return Err(component_manifest_error(
@@ -1385,7 +1639,7 @@ fn validate_packed_core_records_contract_impl(
         }
     }
 
-    ranges.sort_by(|a, b| {
+    ranges.sort_unstable_by(|a, b| {
         a.0.cmp(&b.0)
             .then_with(|| a.1.cmp(&b.1))
             .then_with(|| a.2.cmp(&b.2))
@@ -2173,17 +2427,25 @@ fn dependency_from_wire(
 }
 
 fn dependency_canonical_bytes(dependency: &ComponentDependencyWireV1) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(96);
-    push_u8(&mut bytes, dependency.dependency_tag);
-    push_u32(&mut bytes, dependency.component_kind_tag.unwrap_or(0));
-    push_u64(&mut bytes, dependency.component_index_id.unwrap_or(0));
-    bytes.extend_from_slice(&dependency.component_id.unwrap_or(ZERO_DIGEST));
-    push_u8(&mut bytes, dependency.group_tag.unwrap_or(0));
-    bytes.extend_from_slice(&dependency.group_id.unwrap_or(ZERO_DIGEST));
-    push_u64(&mut bytes, dependency.index_id.unwrap_or(0));
-    push_u8(&mut bytes, dependency.target_kind_tag.unwrap_or(0));
-    push_u8(&mut bytes, dependency.secondary_index_kind_tag.unwrap_or(0));
-    push_u64(&mut bytes, dependency.fingerprint.unwrap_or(0));
+    dependency_canonical_array(dependency).to_vec()
+}
+fn dependency_canonical_array(dependency: &ComponentDependencyWireV1) -> [u8; 96] {
+    let mut bytes = [0; 96];
+    let mut pos = 0;
+    let mut push = |value: &[u8]| {
+        bytes[pos..pos + value.len()].copy_from_slice(value);
+        pos += value.len();
+    };
+    push(&[dependency.dependency_tag]);
+    push(&dependency.component_kind_tag.unwrap_or(0).to_le_bytes());
+    push(&dependency.component_index_id.unwrap_or(0).to_le_bytes());
+    push(&dependency.component_id.unwrap_or(ZERO_DIGEST));
+    push(&[dependency.group_tag.unwrap_or(0)]);
+    push(&dependency.group_id.unwrap_or(ZERO_DIGEST));
+    push(&dependency.index_id.unwrap_or(0).to_le_bytes());
+    push(&[dependency.target_kind_tag.unwrap_or(0)]);
+    push(&[dependency.secondary_index_kind_tag.unwrap_or(0)]);
+    push(&dependency.fingerprint.unwrap_or(0).to_le_bytes());
     bytes
 }
 
@@ -2206,18 +2468,6 @@ fn put_u64(hasher: &mut Sha256, value: u64) {
 fn put_bytes_with_len(hasher: &mut Sha256, bytes: &[u8]) {
     put_u64(hasher, bytes.len() as u64);
     hasher.update(bytes);
-}
-
-fn push_u8(bytes: &mut Vec<u8>, value: u8) {
-    bytes.push(value);
-}
-
-fn push_u32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_u64(bytes: &mut Vec<u8>, value: u64) {
-    bytes.extend_from_slice(&value.to_le_bytes());
 }
 
 fn component_manifest_error(message: impl Into<String>) -> EngineError {
@@ -2403,6 +2653,68 @@ mod tests {
                 kind
             );
         }
+    }
+
+    #[test]
+    fn p45a2_sidecar_component_guarded_partial_and_duplicate_diagnostics() {
+        let mut manifest = manifest_with_components(
+            vec![known_component(SegmentComponentKind::KeyIndex, digest(1))],
+            vec![],
+        );
+        manifest.components[0].handle = ComponentHandleV1::ExternalFile {
+            relative_path: "a".repeat(256 * 1024),
+            payload_offset: 0,
+            payload_len: manifest.components[0].payload_len,
+        };
+        let mut wire = manifest_to_wire(&manifest);
+        wire.components.push(wire.components[0].clone());
+        let mut root = SegmentComponentManifestWireV1::default();
+        let payload = rmp_serde::to_vec(&wire).unwrap();
+        let mut construction = crate::engine::payload::json::MessagePackConstruction::default();
+        construction
+            .component_manifest(&mut root, &payload)
+            .unwrap();
+        assert_eq!(root, wire);
+        // Wrong scalar diagnostics exclude a large string after an earlier
+        // complete heavy record has entered the registered wire root.
+        let mut value = serde_json::to_value(&wire).unwrap();
+        value["components"][1]["kind_tag"] = serde_json::Value::String("x".repeat(1024 * 1024));
+        let payload = rmp_serde::to_vec_named(&value).unwrap();
+        let mut root = SegmentComponentManifestWireV1::default();
+        let mut construction = crate::engine::payload::json::MessagePackConstruction::default();
+        let error = construction
+            .component_manifest(&mut root, &payload)
+            .unwrap_err();
+        assert!(error.to_string().len() <= 1024);
+        assert!(!error.to_string().contains("xxxx"));
+        assert_eq!(
+            root.components[0]
+                .handle
+                .relative_path
+                .as_ref()
+                .unwrap()
+                .len(),
+            256 * 1024
+        );
+        let payload = rmp_serde::to_vec(&wire).unwrap();
+        let mut crc = Crc32Hasher::new();
+        crc.update(&payload);
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&SEGMENT_COMPONENT_MANIFEST_MAGIC);
+        encoded.extend_from_slice(&SEGMENT_COMPONENT_MANIFEST_ENVELOPE_VERSION.to_le_bytes());
+        encoded.extend_from_slice(&manifest.segment_format_version.to_le_bytes());
+        encoded.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        encoded.extend_from_slice(&crc.finalize().to_le_bytes());
+        encoded.extend_from_slice(&payload);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest");
+        std::fs::write(&path, &encoded).unwrap();
+        let mut open = retained_manifest::Open::default();
+        let error = open
+            .read_bounded(&path, Some(encoded.len() as u64))
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate"));
+        assert_eq!(open.partial_records(), 2);
     }
 
     #[test]

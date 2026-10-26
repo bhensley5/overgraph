@@ -1,10 +1,39 @@
+// Owned, bounded memtable continuation shared by node and edge cursors.
+#[derive(Default)]
+pub(crate) struct MemtableIdChunk {
+    ids:std::collections::VecDeque<u64>,
+    last:Option<u64>,
+    done:bool,
+}
+impl MemtableIdChunk {
+    fn next_ge(&mut self,bound:u64,mut refill:impl FnMut(std::ops::Bound<u64>)->Result<(Vec<u64>,Option<u64>,bool),EngineError>)->Result<Option<u64>,EngineError>{
+        loop {
+            while let Some(id)=self.ids.pop_front(){if id>=bound{return Ok(Some(id));}}
+            if self.done{return Ok(None)}
+            let start=match self.last{Some(u64::MAX)=>{self.done=true;return Ok(None)},Some(last)=>std::ops::Bound::Included(bound.max(last+1)),None=>std::ops::Bound::Included(bound)};
+            let (ids,last,done)=refill(start)?;self.ids=ids.into();self.last=last.or(self.last);self.done=done;
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) type NodeStreamSet = StreamSet<NodeCandidateCursor>;
 
 #[allow(dead_code)]
 pub(crate) enum NodeCandidateCursor {
-    MemtableLabel {
-        memtable: std::sync::Arc<Memtable>,
+    MemtableEquality {        chunk: MemtableIdChunk,
+
+        memtable: crate::engine::shared::SharedArc<Memtable>,
+        index_id: u64,
+        value_hash:u64,
+        snapshot_seq: u64,
+        held: Option<u64>,
+        last_seek_bound: Option<u64>,
+        exhausted: bool,
+    },
+    MemtableLabel {        chunk: MemtableIdChunk,
+
+        memtable: crate::engine::shared::SharedArc<Memtable>,
         label_id: u32,
         snapshot_seq: u64,
         held: Option<u64>,
@@ -12,7 +41,7 @@ pub(crate) enum NodeCandidateCursor {
         exhausted: bool,
     },
     SegmentLabelPosting {
-        reader: std::sync::Arc<SegmentReader>,
+        reader: crate::engine::shared::SharedArc<SegmentReader>,
         posting: SegmentLabelPosting,
         pos: usize,
         held: Option<u64>,
@@ -20,7 +49,7 @@ pub(crate) enum NodeCandidateCursor {
         exhausted: bool,
     },
     SegmentEqualityGroup {
-        reader: std::sync::Arc<SegmentReader>,
+        reader: crate::engine::shared::SharedArc<SegmentReader>,
         index_id: u64,
         offset: usize,
         id_count: usize,
@@ -40,12 +69,31 @@ pub(crate) enum NodeCandidateCursor {
 
 #[allow(dead_code)]
 impl NodeCandidateCursor {
+    pub(crate) fn memtable_equality(
+        memtable: crate::engine::shared::SharedArc<Memtable>,
+        index_id:u64,
+        value_hash:u64,
+        snapshot_seq: u64,
+    ) -> Self {
+        Self::MemtableEquality {            chunk: MemtableIdChunk::default(),
+
+            memtable,
+            index_id,
+            value_hash,
+            snapshot_seq,
+            held: None,
+            last_seek_bound: None,
+            exhausted: false,
+        }
+    }
+
     pub(crate) fn memtable_label(
-        memtable: std::sync::Arc<Memtable>,
+        memtable: crate::engine::shared::SharedArc<Memtable>,
         label_id: u32,
         snapshot_seq: u64,
     ) -> Self {
-        Self::MemtableLabel {
+        Self::MemtableLabel {            chunk: MemtableIdChunk::default(),
+
             memtable,
             label_id,
             snapshot_seq,
@@ -56,7 +104,7 @@ impl NodeCandidateCursor {
     }
 
     pub(crate) fn segment_label_posting(
-        reader: std::sync::Arc<SegmentReader>,
+        reader: crate::engine::shared::SharedArc<SegmentReader>,
         posting: SegmentLabelPosting,
     ) -> Self {
         Self::SegmentLabelPosting {
@@ -70,7 +118,7 @@ impl NodeCandidateCursor {
     }
 
     pub(crate) fn segment_equality_group(
-        reader: std::sync::Arc<SegmentReader>,
+        reader: crate::engine::shared::SharedArc<SegmentReader>,
         index_id: u64,
         offset: usize,
         id_count: usize,
@@ -103,7 +151,40 @@ impl NodeCandidateCursor {
 
     pub(crate) fn next_ge(&mut self, bound: u64) -> Result<Option<u64>, EngineError> {
         match self {
-            Self::MemtableLabel {
+            Self::MemtableEquality {                chunk,
+
+                memtable,
+                index_id,
+                value_hash,
+                snapshot_seq,
+                held,
+                last_seek_bound,
+                exhausted,
+            } => {
+                if let Some(head) = *held {
+                    if bound <= head {
+                        return Ok(Some(head));
+                    }
+                }
+                assert_monotonic_bound(*last_seek_bound, *held, bound);
+                *last_seek_bound = Some(bound);
+                if *exhausted {
+                    return Ok(None);
+                }
+                match chunk.next_ge(bound,|start|memtable.refill_secondary_eq_ids_at(*index_id,*value_hash,*snapshot_seq,start,128))? {
+                    Some(node_id) => {
+                        *held = Some(node_id);
+                        Ok(Some(node_id))
+                    }
+                    None => {
+                        *held = None;
+                        *exhausted = true;
+                        Ok(None)
+                    }
+                }
+            }
+            Self::MemtableLabel {                chunk,
+
                 memtable,
                 label_id,
                 snapshot_seq,
@@ -121,7 +202,7 @@ impl NodeCandidateCursor {
                 if *exhausted {
                     return Ok(None);
                 }
-                match memtable.next_visible_node_by_label_id_ge(*label_id, *snapshot_seq, bound) {
+                match chunk.next_ge(bound,|start|memtable.refill_label_ids_at(false,*label_id,*snapshot_seq,start))? {
                     Some(node_id) => {
                         *held = Some(node_id);
                         Ok(Some(node_id))
@@ -529,13 +610,13 @@ impl ReadView {
         let mut cursors = Vec::new();
         for &label_id in label_ids {
             cursors.push(NodeCandidateCursor::memtable_label(
-                Arc::clone(&self.memtable),
+                Clone::clone(&self.memtable),
                 label_id,
                 self.snapshot_seq,
             ));
             for epoch in &self.immutable_epochs {
                 cursors.push(NodeCandidateCursor::memtable_label(
-                    Arc::clone(&epoch.memtable),
+                    Clone::clone(&epoch.memtable),
                     label_id,
                     self.snapshot_seq,
                 ));
@@ -543,7 +624,7 @@ impl ReadView {
             for segment in &self.segments {
                 if let Some(posting) = segment.node_label_posting(label_id)? {
                     cursors.push(NodeCandidateCursor::segment_label_posting(
-                        Arc::clone(segment),
+                        Clone::clone(segment),
                         posting,
                     ));
                 }
@@ -572,36 +653,22 @@ impl ReadView {
                 #[cfg(test)]
                 self.note_streamed_leaf_demotion();
                 followups.extend(materialization_followups(
-                    self.equality_sidecar_failure_followup(index_id, None),
+                    self.equality_sidecar_failure_followup(index_id, None)?,
                 ));
                 return Ok(NodeStreamBuildResult::Demoted { followups });
             }
         }
 
         for value_hash in value_hashes {
-            let ids = self.memtable.visible_secondary_eq_node_ids_sorted(
-                index_id,
-                value_hash,
-                self.snapshot_seq,
-            );
-            if !ids.is_empty() {
-                cursors.push(NodeCandidateCursor::sorted_buffer(ids));
-            }
-            for epoch in &self.immutable_epochs {
-                let ids = epoch.memtable.visible_secondary_eq_node_ids_sorted(
-                    index_id,
-                    value_hash,
-                    self.snapshot_seq,
-                );
-                if !ids.is_empty() {
-                    cursors.push(NodeCandidateCursor::sorted_buffer(ids));
-                }
+            for memtable in std::iter::once(&self.memtable).chain(self.immutable_epochs.iter().map(|e|&e.memtable)) {
+                if memtable.is_candidate() {cursors.push(NodeCandidateCursor::memtable_equality(Clone::clone(memtable),index_id,value_hash,self.snapshot_seq));}
+                else {let ids=memtable.visible_secondary_eq_node_ids_sorted(index_id,value_hash,self.snapshot_seq)?;if !ids.is_empty(){cursors.push(NodeCandidateCursor::sorted_buffer(ids));}}
             }
             for segment in &self.segments {
                 match segment.secondary_eq_group_span_if_present(index_id, value_hash) {
                     Ok(crate::segment_reader::SecondaryEqGroupSpanLookup::Found(span)) => {
                         cursors.push(NodeCandidateCursor::segment_equality_group(
-                            Arc::clone(segment),
+                            Clone::clone(segment),
                             index_id,
                             span.offset,
                             span.id_count,
@@ -612,7 +679,7 @@ impl ReadView {
                         #[cfg(test)]
                         self.note_streamed_leaf_demotion();
                         followups.extend(materialization_followups(
-                            self.equality_sidecar_failure_followup(index_id, None),
+                            self.equality_sidecar_failure_followup(index_id, None)?,
                         ));
                         return Ok(NodeStreamBuildResult::Demoted { followups });
                     }
@@ -620,7 +687,7 @@ impl ReadView {
                         #[cfg(test)]
                         self.note_streamed_leaf_demotion();
                         followups.extend(materialization_followups(
-                            self.equality_sidecar_failure_followup(index_id, Some(error)),
+                            self.equality_sidecar_failure_followup(index_id, Some(error))?,
                         ));
                         return Ok(NodeStreamBuildResult::Demoted { followups });
                     }
@@ -876,7 +943,7 @@ mod node_stream_tests {
 
     #[test]
     fn node_stream_memtable_label_cursor_includes_bound_and_skips_invisible_slots() {
-        let memtable = std::sync::Arc::new(Memtable::new());
+        let memtable = SharedArc::new(Memtable::new());
         memtable.apply_op(&WalOp::UpsertNode(test_node(1, &[7], "a", 100)), 1);
         memtable.apply_op(&WalOp::UpsertNode(test_node(3, &[7], "b", 100)), 2);
         memtable.apply_op(&WalOp::UpsertNode(test_node(5, &[7], "c", 100)), 3);
@@ -893,12 +960,12 @@ mod node_stream_tests {
 
     #[test]
     fn node_stream_memtable_label_cursor_contract_edges() {
-        let empty = std::sync::Arc::new(Memtable::new());
+        let empty = SharedArc::new(Memtable::new());
         let mut empty_cursor = NodeCandidateCursor::memtable_label(empty, 7, 0);
         assert_eq!(empty_cursor.next_ge(0).unwrap(), None);
         assert_eq!(empty_cursor.next_ge(u64::MAX).unwrap(), None);
 
-        let memtable = std::sync::Arc::new(Memtable::new());
+        let memtable = SharedArc::new(Memtable::new());
         memtable.apply_op(&WalOp::UpsertNode(test_node(u64::MAX, &[7], "max", 100)), 1);
         let mut max_cursor = NodeCandidateCursor::memtable_label(memtable, 7, 1);
         assert_eq!(max_cursor.next_ge(0).unwrap(), Some(u64::MAX));
@@ -915,7 +982,7 @@ mod node_stream_tests {
             );
         }
         let (_dir, reader) = write_test_segment(&memtable, &[]);
-        let reader = std::sync::Arc::new(reader);
+        let reader = SharedArc::new(reader);
         let posting = reader.node_label_posting(4).unwrap().unwrap();
         let mut cursor = NodeCandidateCursor::segment_label_posting(reader, posting);
 
@@ -943,7 +1010,7 @@ mod node_stream_tests {
             );
         }
         let (_dir, reader) = write_test_segment(&memtable, &[]);
-        let reader = std::sync::Arc::new(reader);
+        let reader = SharedArc::new(reader);
 
         let posting = reader.node_label_posting(4).unwrap().unwrap();
         let mut cursor = NodeCandidateCursor::segment_label_posting(reader.clone(), posting);
@@ -970,7 +1037,7 @@ mod node_stream_tests {
             );
         }
         let (_dir, reader) = write_test_segment(&generated, &[]);
-        let reader = std::sync::Arc::new(reader);
+        let reader = SharedArc::new(reader);
         let posting = reader.node_label_posting(9).unwrap().unwrap();
         let mut cursor = NodeCandidateCursor::segment_label_posting(reader, posting);
         let mut expected_pos = 0usize;
@@ -992,7 +1059,7 @@ mod node_stream_tests {
     fn node_stream_segment_equality_cursor_seeks_raw_group() {
         let entry = equality_entry(44, 9, "color");
         let memtable = Memtable::new();
-        memtable.register_secondary_index(&entry);
+        memtable.register_secondary_index(&entry).unwrap();
         for (seq, (id, color)) in [
             (2, "red"),
             (5, "red"),
@@ -1011,7 +1078,7 @@ mod node_stream_tests {
             );
         }
         let (_dir, reader) = write_test_segment(&memtable, std::slice::from_ref(&entry));
-        let reader = std::sync::Arc::new(reader);
+        let reader = SharedArc::new(reader);
         let red_hash = hash_prop_equality_key(&PropValue::String("red".to_string()));
         let crate::segment_reader::SecondaryEqGroupSpanLookup::Found(span) = reader
             .secondary_eq_group_span_if_present(entry.index_id, red_hash)

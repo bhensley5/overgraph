@@ -13,6 +13,7 @@
     "index.d.ts",
     "query-types.d.ts",
     "schema-types.d.ts",
-    "__test__/types/declarations.ts"
+    "__test__/types/declarations.ts",
+    "__test__/types/review-contracts.ts"
   ]
 }

@@ -39,7 +39,7 @@ Graph structure and vector similarity can live in the same engine, so you can as
 - **Truly embedded.** No separate process. No socket. Your database is a folder on disk. Copy it, move it, back it up with `cp -r`.
 - **Graph + vectors in one engine.** Dense HNSW and sparse inverted indexes live alongside graph adjacency indexes in the same storage engine. Vector search can be scoped to graph neighborhoods ("find similar nodes within 2 hops of X") without a second database or a synchronization layer.
 - **Rich graph primitives.** Weighted nodes and edges, temporal validity windows, exponential decay scoring, automatic retention policies. Model relationships that evolve over time, and let the graph clean up what's no longer relevant.
-- **Fast where it matters.** Node lookups in ~34ns. Neighbor traversal in ~2μs. Batch writes at 1.29M+ nodes/sec. The storage engine is a log-structured merge tree with mmap'd immutable segments, so reads never block writes.
+- **Concurrent reads and writes.** Readers capture consistent committed snapshots while writes commit. An ordered ID index makes node and edge lookups efficient, and older snapshots remain valid through updates and maintenance. Writes retain configured admission, resource and durability limits.
 - **Explicit write transactions.** Stage ordered node and edge mutations locally, read your own staged writes, then commit atomically with optimistic conflict detection. Available in Rust, Node.js, and Python.
 - **Three languages, one engine.** Rust core with native bindings for Node.js (napi-rs) and Python (PyO3). Not a wrapper around a REST API. Actual FFI into the same Rust engine with minimal overhead.
 - **Full queries as functions.** Use regular APIs for everything: `find_nodes` for direct property lookups, `query_node_ids` / `query_nodes` for full boolean node queries, and `query_graph_rows` for row-shaped graph patterns, optional matches, and bounded paths.
@@ -47,7 +47,7 @@ Graph structure and vector similarity can live in the same engine, so you can as
 
 ## Performance
 
-All numbers from a real benchmark suite running on the Rust core (group-commit durability mode, small profile: 10K nodes / 50K edges). Full methodology and reproducibility guide in [`docs/04-quality/Benchmark-Methodology.md`](docs/04-quality/Benchmark-Methodology.md).
+These historical launch measurements predate the v0.18 concurrent engine and are retained as a reference, not as v0.18 performance results. They came from the Rust core (group-commit durability mode, small profile: 10K nodes / 50K edges). Re-run the benchmark suite for your workload and durability settings. Full methodology and reproducibility guide in [`docs/04-quality/Benchmark-Methodology.md`](docs/04-quality/Benchmark-Methodology.md).
 
 | Operation | Latency | Throughput |
 |---|---|---|
@@ -277,16 +277,16 @@ ID-keyed collection APIs use keyset pagination with `limit` and `after`. `traver
 ### Storage engine
 - **Write-ahead log.** Every mutation hits the WAL before the memtable. Crash recovery replays the WAL on startup.
 - **Configurable durability.** `Immediate` mode fsyncs every write for maximum safety. `GroupCommit` mode (default) batches fsyncs on a 50ms timer for ~20x better write throughput with at most one timer interval of data at risk.
-- **Background compaction.** Segments are merged automatically when thresholds are met. Compaction runs on a background thread and never blocks reads or writes. Uses packed metadata payloads for fast filtered merging without full record decoding.
+- **Background compaction.** Segments are merged automatically when thresholds are met. Compaction runs on a background thread, and readers retain their captured views while outputs are adopted. Writers remain subject to resource and maintenance backpressure. Uses packed metadata payloads for fast filtered merging without full record decoding.
 - **Bulk ingest mode.** Temporarily disable auto-compaction during large write bursts with `ingest_mode()`, then call `end_ingest()` to compact accumulated segments and restore normal behavior. This favors ingest throughput over read performance during the ingest window.
-- **mmap'd reads.** Immutable segments are memory-mapped. The OS page cache handles caching. Reads never block writes.
+- **mmap'd reads.** Immutable segments are memory-mapped. The OS page cache handles caching, while captured read views preserve consistent source ownership.
 - **Portable databases.** Each database is a self-contained directory. `cp -r ./my-db /backup/my-db` and you're done.
 
 ## How it works
 
 OverGraph uses a log-structured storage engine purpose-built from scratch in pure Rust. Unlike generic LSM key-value stores, every segment is a fully indexed graph structure. Adjacency lists, label indexes, temporal indexes, declared property indexes, and vector indexes are all materialized at flush time when applicable, not just at compaction. Reads are near-optimal the moment data hits disk, while writes stay append-only and fast.
 
-**Write path:** Mutations are appended to a write-ahead log and applied to an in-memory memtable. When the memtable reaches its threshold, it's frozen and flushed to disk as an immutable segment in the background. Writes continue unblocked against a fresh memtable. Each segment ships with pre-built adjacency indexes (inbound and outbound), optional declared single-field and compound property-index sidecars, optional advisory planner statistics, optional signed degree-delta sidecars for degree/weight fast paths, and, when the segment contains vectors, HNSW and sparse posting-list indexes.
+**Write path:** Mutations are appended to a write-ahead log and applied to an in-memory memtable. When the memtable reaches its threshold, it's frozen and flushed to disk as an immutable segment in the background. Writes continue against a fresh memtable within configured admission and maintenance limits. Each segment ships with pre-built adjacency indexes (inbound and outbound), optional declared single-field and compound property-index sidecars, optional advisory planner statistics, optional signed degree-delta sidecars for degree/weight fast paths, and, when the segment contains vectors, HNSW and sparse posting-list indexes.
 
 **Read path:** Queries check the memtable first (freshest data), then merge results across immutable segments using the per-segment indexes. Because every segment carries its own adjacency index, a neighbor query is a handful of index lookups, not a scan across sorted keys. Vector search follows the same model: memtable candidates are found by exact brute-force scan, segment candidates via HNSW or posting-list indexes, then the engine merges and deduplicates across all sources. Single-property and compound property equality/range queries stay index-transparent too: if a matching optional property-index declaration is `Ready`, the engine uses the declaration-backed path, otherwise it falls back to a label-scoped scan through the same public API. Pagination uses early termination to avoid unnecessary work, and index candidates are verified against the latest visible records before results are returned.
 

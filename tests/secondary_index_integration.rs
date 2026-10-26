@@ -1,3 +1,5 @@
+mod support;
+
 use overgraph::{DatabaseEngine, DbOptions, NodeInput, PropValue, UpsertEdgeOptions};
 use std::collections::BTreeMap;
 use tempfile::TempDir;
@@ -205,7 +207,7 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
     // ---- Step 6: Close + reopen, verify persistence ----
     engine.close().unwrap();
 
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = support::open(&db_path, &DbOptions::default()).unwrap();
 
     // Same checks after reopen
     for &(label, _) in &label_categories {
