@@ -669,6 +669,7 @@ pub(super) mod allocations {
     thread_local! {
         static COUNTS: Cell<Option<(usize, usize, usize, usize)>> = const { Cell::new(None) };
         static PEAK: Cell<Option<PeakObservation>> = const { Cell::new(None) };
+        static GLOBAL_START_THREAD: Cell<bool> = const { Cell::new(false) };
     }
     #[derive(Clone, Copy, Default, Debug)]
     pub(in crate::engine) struct PeakObservation {
@@ -715,6 +716,7 @@ pub(super) mod allocations {
     static POINTERS: [AtomicUsize; TABLE_CAPACITY] =
         [const { AtomicUsize::new(0) }; TABLE_CAPACITY];
     static SIZES: [AtomicUsize; TABLE_CAPACITY] = [const { AtomicUsize::new(0) }; TABLE_CAPACITY];
+    static START_THREAD: [AtomicBool; TABLE_CAPACITY] = [const { AtomicBool::new(false) }; TABLE_CAPACITY];
     static LIVE: AtomicUsize = AtomicUsize::new(0);
     static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
     static ALLOCS: AtomicUsize = AtomicUsize::new(0);
@@ -751,6 +753,10 @@ pub(super) mod allocations {
         pub gross_bytes: usize,
         pub freed_bytes: usize,
         pub live_objects: usize,
+        pub start_thread_live_bytes: usize,
+        pub start_thread_live_objects: usize,
+        pub other_thread_live_bytes: usize,
+        pub other_thread_live_objects: usize,
         pub overflow: bool,
     }
 
@@ -786,7 +792,7 @@ pub(super) mod allocations {
             }
         }
     }
-    fn allocation(pointer: usize, size: usize) {
+    fn allocation(pointer: usize, size: usize, start_thread: bool) {
         let start = hash(pointer);
         let mut free = None;
         for offset in 0..TABLE_CAPACITY {
@@ -810,6 +816,7 @@ pub(super) mod allocations {
         };
         POINTERS[i].store(pointer, Ordering::Relaxed);
         SIZES[i].store(size, Ordering::Relaxed);
+        START_THREAD[i].store(start_thread, Ordering::Relaxed);
         let live = add(&LIVE, size);
         PEAK_BYTES.store(
             PEAK_BYTES.load(Ordering::Relaxed).max(live),
@@ -845,12 +852,21 @@ pub(super) mod allocations {
             return;
         }
         if allocated {
-            allocation(pointer as usize, size);
+            allocation(pointer as usize, size, GLOBAL_START_THREAD.try_with(Cell::get).unwrap_or(false));
         } else {
             deallocation(pointer as usize, size);
         }
     }
     fn snapshot_locked() -> GlobalObservation {
+        let mut start_thread_live_bytes = 0usize;
+        let mut start_thread_live_objects = 0usize;
+        for i in 0..TABLE_CAPACITY {
+            let pointer = POINTERS[i].load(Ordering::Relaxed);
+            if pointer != 0 && pointer != TOMBSTONE && START_THREAD[i].load(Ordering::Relaxed) {
+                start_thread_live_bytes = start_thread_live_bytes.saturating_add(SIZES[i].load(Ordering::Relaxed));
+                start_thread_live_objects += 1;
+            }
+        }
         GlobalObservation {
             live_bytes: LIVE.load(Ordering::Relaxed),
             peak_bytes: PEAK_BYTES.load(Ordering::Relaxed),
@@ -859,15 +875,21 @@ pub(super) mod allocations {
             gross_bytes: GROSS_BYTES.load(Ordering::Relaxed),
             freed_bytes: FREED_BYTES.load(Ordering::Relaxed),
             live_objects: LIVE_OBJECTS.load(Ordering::Relaxed),
+            start_thread_live_bytes,
+            start_thread_live_objects,
+            other_thread_live_bytes: LIVE.load(Ordering::Relaxed).saturating_sub(start_thread_live_bytes),
+            other_thread_live_objects: LIVE_OBJECTS.load(Ordering::Relaxed).saturating_sub(start_thread_live_objects),
             overflow: OVERFLOW.load(Ordering::Relaxed),
         }
     }
     pub(in crate::engine) fn global_start() {
+        GLOBAL_START_THREAD.with(|cell| cell.set(true));
         let _held = ObserverLock::acquire();
         assert!(!GLOBAL_ACTIVE.load(Ordering::Relaxed));
         for i in 0..TABLE_CAPACITY {
             POINTERS[i].store(0, Ordering::Relaxed);
             SIZES[i].store(0, Ordering::Relaxed);
+            START_THREAD[i].store(false, Ordering::Relaxed);
         }
         for counter in [
             &LIVE,
@@ -890,6 +912,7 @@ pub(super) mod allocations {
     pub(in crate::engine) fn global_stop() -> GlobalObservation {
         let _held = ObserverLock::acquire();
         GLOBAL_ACTIVE.store(false, Ordering::Release);
+        GLOBAL_START_THREAD.with(|cell| cell.set(false));
         snapshot_locked()
     }
 
@@ -947,8 +970,13 @@ pub(super) mod allocations {
                         ),
                         None => OVERFLOW.store(true, Ordering::Relaxed),
                     }
+                    // Reallocation preserves the original allocating-thread attribution,
+                    // even if a different thread owns the resize/free operation.
+                    let start_thread = find(p as usize)
+                        .map(|i| START_THREAD[i].load(Ordering::Relaxed))
+                        .unwrap_or_else(|| GLOBAL_START_THREAD.try_with(Cell::get).unwrap_or(false));
                     deallocation(p as usize, layout.size());
-                    allocation(result as usize, size);
+                    allocation(result as usize, size, start_thread);
                 }
                 return result;
             }

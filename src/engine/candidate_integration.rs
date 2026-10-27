@@ -1559,6 +1559,12 @@ mod real_route_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
         db.ensure_node_label("R").unwrap();
+        // All eight retained positions below must belong to these eight workers.
+        let until = Instant::now() + Duration::from_secs(5);
+        while db.runtime.candidate.as_ref().unwrap().pressure.occupied() != 0 {
+            assert!(Instant::now() < until, "setup admission did not retire");
+            std::thread::yield_now();
+        }
         let stats = db.runtime.candidate.as_ref().unwrap().stats.clone();
         let release = Arc::new(std::sync::Barrier::new(9));
         let mut workers = Vec::new();

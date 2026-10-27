@@ -544,15 +544,27 @@ fn phase44b_write_control_memtable_group_twin_upsert() {
 fn phase44b_memtable_group_twin_upsert_fixture(_trace_enabled: bool) {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("phase44b_upsert_control");
-    let preload = open_large_write_control_fixture(&db_path, &phase44b_preload_options()).unwrap();
+    // This Immediate-WAL accounting stress keeps automatic flush/compaction;
+    // admission is a functional resource allowance, not a latency assertion.
+    let preload = open_large_write_control_fixture_with_admission_timeout(
+        &db_path,
+        &phase44b_preload_options(),
+        FUNCTIONAL_MAINTENANCE_ADMISSION_TIMEOUT_MS,
+    )
+    .unwrap();
     phase44b_preload_write_labels(&preload);
     let node_ids = phase44b_preload_nodes(&preload);
     preload.close().unwrap();
 
-    // Keep the 10s admission guard; report this database's flush stages on unwind.
+    // Report this database's flush stages on unwind within the existing trace caps.
     #[cfg(feature = "production-concurrency")]
     let _trace = _trace_enabled.then(|| maintenance_diagnostic::for_database(&db_path));
-    let db = open_large_write_control_fixture(&db_path, &phase44b_control_options()).unwrap();
+    let db = open_large_write_control_fixture_with_admission_timeout(
+        &db_path,
+        &phase44b_control_options(),
+        FUNCTIONAL_MAINTENANCE_ADMISSION_TIMEOUT_MS,
+    )
+    .unwrap();
     phase44b_assert_initial_drain(&db);
     db.reset_phase44b_write_amplification_for_test();
     for call_index in 0..phase44b_workload::WRITE_CALL_COUNT {
@@ -595,7 +607,12 @@ fn phase44b_memtable_group_twin_upsert_fixture(_trace_enabled: bool) {
     phase44b_print_vector("memtable_group_twin_upsert", snapshot);
     assert!(db.active_memtable().retained_edge_record_keys_is_empty());
     db.close().unwrap();
-    let reopened = open_large_write_control_fixture(&db_path, &phase44b_control_options()).unwrap();
+    let reopened = open_large_write_control_fixture_with_admission_timeout(
+        &db_path,
+        &phase44b_control_options(),
+        FUNCTIONAL_MAINTENANCE_ADMISSION_TIMEOUT_MS,
+    )
+    .unwrap();
     assert!(reopened.active_memtable().retained_edge_record_keys_is_empty());
     reopened.close().unwrap();
 }

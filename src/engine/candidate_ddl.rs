@@ -2032,6 +2032,13 @@ mod p45c2_tests {
             peak > 12 * 1024 * 1024 && peak <= limit,
             "peak {peak}, limit {limit}"
         );
+        // A successful reply can precede the setup command's admission drop.
+        // Empty that custody before all eight slots must belong to these writers.
+        let until = Instant::now() + Duration::from_secs(5);
+        while db.runtime.candidate.as_ref().unwrap().pressure.occupied() != 0 {
+            assert!(Instant::now() < until, "setup admission did not retire");
+            std::thread::yield_now();
+        }
         let mut writers = Vec::new();
         for i in 0..8 {
             let db = db.clone();
@@ -2749,6 +2756,12 @@ mod p45c2_tests {
                 pause
             };
             seen.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Do not mistake completed setup custody for the deferred DDL below.
+            let until = Instant::now() + Duration::from_secs(5);
+            while db.runtime.candidate.as_ref().unwrap().pressure.occupied() != 0 {
+                assert!(Instant::now() < until, "setup admission did not retire");
+                std::thread::yield_now();
+            }
             let old = db.runtime.published.load_full().view.clone();
             let worker = db.clone();
             let ddl = std::thread::spawn(move || worker.ensure_node_property_index("C2", spec()));
