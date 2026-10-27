@@ -520,7 +520,7 @@ use crate::secondary_index_key::{
         }
 
         {
-            let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+            let engine = open_after_native_shutdown(&db_path, &opts).unwrap();
             assert_eq!(
                 engine.get_node_by_key("FreshA", "k").unwrap().unwrap().id,
                 id
@@ -1562,7 +1562,7 @@ use crate::secondary_index_key::{
         }
 
         {
-            let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+            let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
             assert!(engine.get_node(b).unwrap().is_none());
             assert!(engine.get_edge(eid).unwrap().is_none());
             // close() flushes to segments; use cross-source counts

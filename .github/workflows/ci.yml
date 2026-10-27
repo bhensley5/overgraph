@@ -37,10 +37,62 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build default production backend
+        id: default_build
         run: cargo build --all-targets --features cli
 
       - name: Run default production and CLI tests
         run: cargo test --features cli
+
+      # Diagnostic evidence cannot turn a failed parallel suite green.
+      - name: Diagnose isolated callback flush
+        if: ${{ always() && !cancelled() && (runner.os == 'Linux' || runner.os == 'macOS') && steps.default_build.outcome == 'success' }}
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          import re
+          import signal
+          import subprocess
+          import sys
+          import time
+
+          command = ["cargo", "test", "--locked", "--features", "cli", "--lib",
+                     "engine::post45_read_tests::vector_transport_reuses_flat_buffers_and_releases_sessions_during_callbacks",
+                     "--", "--exact", "--nocapture", "--test-threads=1"]
+          failed = False
+          for trial in (1, 2):
+              print(f"Isolated callback diagnostic trial {trial}/2", flush=True)
+              started = time.monotonic()
+              process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         text=True, start_new_session=True)
+              timed_out = False
+              try:
+                  output, _ = process.communicate(timeout=45)
+              except subprocess.TimeoutExpired:
+                  timed_out = True
+                  try:
+                      os.killpg(process.pid, signal.SIGTERM)
+                  except ProcessLookupError:
+                      pass
+                  try:
+                      output, _ = process.communicate(timeout=5)
+                  except subprocess.TimeoutExpired:
+                      try:
+                          os.killpg(process.pid, signal.SIGKILL)
+                      except ProcessLookupError:
+                          pass
+                      output, _ = process.communicate(timeout=5)
+              print(output, end="", flush=True)
+              print(f"Trial {trial}: exit={process.returncode}, timed_out={timed_out}, elapsed={time.monotonic() - started:.3f}s", flush=True)
+              text = re.sub(r"\x1b\[[0-9;]*m", "", output)
+              results = re.findall(r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", text, re.MULTILINE)
+              exact_one = len(results) == 1 and sum(map(int, results[0][:2])) == 1 and int(results[0][2]) == 0
+              if not exact_one:
+                  print(f"Expected exactly one executed, unignored test; got {results!r}", flush=True)
+              failed |= timed_out or process.returncode != 0 or not exact_one
+          sys.exit(1 if failed else 0)
+          PYTHON
 
       - name: Check legacy engine without default features
         run: cargo check --all-targets --no-default-features
