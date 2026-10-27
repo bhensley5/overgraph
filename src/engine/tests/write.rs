@@ -983,7 +983,7 @@ use crate::secondary_index_key::{
             engine.close().unwrap();
         }
 
-        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &opts).unwrap();
         let alice = engine.get_node(alice_id).unwrap().unwrap();
         assert_eq!(alice.dense_vector, Some(vec![0.1, 0.2, 0.3]));
         assert_eq!(alice.sparse_vector, Some(vec![(2, 2.0), (4, 1.25)]));
@@ -1243,7 +1243,7 @@ use crate::secondary_index_key::{
         }
 
         {
-            let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+            let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
             // close() flushes to segments; verify via cross-source lookup
             assert_eq!(engine.get_nodes_by_labels("Person").unwrap().len(), 2);
             assert_eq!(engine.get_node(id1).unwrap().unwrap().key, "alice");
@@ -1372,7 +1372,7 @@ use crate::secondary_index_key::{
         }
 
         {
-            let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+            let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
             assert!(engine.next_node_id().unwrap() >= last_node_id);
             assert!(engine.next_edge_id().unwrap() >= last_edge_id);
             engine.close().unwrap();
@@ -1600,7 +1600,7 @@ use crate::secondary_index_key::{
         }
 
         {
-            let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+            let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
             // a → b, c
             let out_a = engine
                 .neighbors(a, &NeighborOptions::default())

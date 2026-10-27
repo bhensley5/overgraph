@@ -8266,7 +8266,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
                 .unwrap();
             db.flush().unwrap();
-            db.close().unwrap();
+            close_and_wait_for_native_shutdown(db);
         }
 
         std::fs::write(

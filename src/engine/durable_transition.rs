@@ -1969,7 +1969,38 @@ mod tests {
                         wal.sync().unwrap();
                     }
                     5 => {
-                        std::fs::rename(&output_path, dir.path().join("removed-output")).unwrap();
+                        let removed = dir.path().join("removed-output");
+                        match std::fs::rename(&output_path, &removed) {
+                            Ok(()) => {} // Actual change must be refused below.
+                            #[cfg(windows)]
+                            Err(error) if error.raw_os_error() == Some(5) => {
+                                // Windows prevents renaming directories with open
+                                // children. That is protection, not an injected
+                                // change and not grounds to publish a valid ticket.
+                                assert!(output_path.is_dir());
+                                assert!(!removed.exists());
+                                for file in &ticket.get().retirements[0].seal.get().files {
+                                    assert_eq!(file_identity(&file.path, file.len).unwrap(),
+                                        (file.len, file.digest));
+                                }
+                                assert_eq!(std::fs::read(dir.path().join(
+                                    crate::manifest::MANIFEST_CURRENT)).unwrap(), authority);
+                                assert!(crate::wal::wal_generation_path(dir.path(), 1).exists());
+                                drop(ticket);
+                                domain.close();
+                                wait_exit(&stats);
+                                // Normal retirement of the unused ticket must
+                                // release the protection without publishing it.
+                                std::fs::rename(&output_path, &removed).unwrap();
+                                assert!(!output_path.exists());
+                                assert!(removed.is_dir());
+                                assert_eq!(std::fs::read(dir.path().join(
+                                    crate::manifest::MANIFEST_CURRENT)).unwrap(), authority);
+                                assert!(crate::wal::wal_generation_path(dir.path(), 1).exists());
+                                continue;
+                            }
+                            Err(error) => panic!("retirement case=5 rename injection: {error:?}"),
+                        }
                     }
                     6 => {
                         use std::io::Write;

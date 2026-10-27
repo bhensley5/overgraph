@@ -16434,6 +16434,24 @@ mod tests {
         DatabaseEngine::open(path, options)
     }
 
+    /// Offline corruption fixtures must release native mmap/file custody before
+    /// modifying persisted bytes. Keep normal close durability semantics.
+    fn close_and_wait_for_native_shutdown(db: DatabaseEngine) {
+        db.close().unwrap();
+        #[cfg(feature = "production-concurrency")]
+        {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let stats = db.reclamation_stats().unwrap();
+                if matches!(stats.close_state, ReclamationCloseState::Drained) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < until, "unfinished {stats:?}");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
     /// Exercise actual public index lifecycle in each selected engine mode.
     pub(crate) fn open_index_protocol_fixture(
         path: &Path,

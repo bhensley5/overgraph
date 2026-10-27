@@ -491,6 +491,8 @@ mod maintenance_diagnostic {
     }
     pub(super) fn admission(db: &Path, stage: &'static str, detail: String) {
         if !ENABLED.load(Ordering::Acquire) {
+            // Refusal-only test diagnostics remain available in ordinary CI too.
+            eprintln!("admission_diagnostic db={db:?} stage={stage} {detail} trace=disabled");
             return;
         }
         let mut trace = TRACE.lock().unwrap();
@@ -7378,6 +7380,9 @@ mod post45_read_tests {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let writer_db = db.clone();
+        let writer_phase = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let phase = writer_phase.clone();
+        let started = std::time::Instant::now();
         let writer = std::thread::spawn(move || {
             ready_rx
                 .recv_timeout(std::time::Duration::from_secs(10))
@@ -7387,8 +7392,9 @@ mod post45_read_tests {
             let vectorless = node(3001, n, "n3001");
             let mut updated = node(3072, n, "n3072");
             updated.dense_vector = Some(vec![2.; 64]);
-            writer_db
-                .write_op_batch(&[
+            let result = (|| {
+                phase.store(1, Ordering::Release);
+                writer_db.write_op_batch(&[
                     WalOp::UpsertNode(moved),
                     WalOp::DeleteNode {
                         id: 3000,
@@ -7396,10 +7402,15 @@ mod post45_read_tests {
                     },
                     WalOp::UpsertNode(vectorless),
                     WalOp::UpsertNode(updated),
-                ])
-                .unwrap();
-            writer_db.flush().unwrap();
-            done_tx.send(()).unwrap();
+                ])?;
+                phase.store(2, Ordering::Release);
+                eprintln!("vector callback writer batch complete at {:?}", started.elapsed());
+                writer_db.flush()?;
+                phase.store(3, Ordering::Release);
+                eprintln!("vector callback writer flush complete at {:?}", started.elapsed());
+                Ok::<_, EngineError>(())
+            })();
+            done_tx.send(result).unwrap();
         });
         seen.clear();
         let mut paused = false;
@@ -7416,6 +7427,10 @@ mod post45_read_tests {
                         ready_tx.send(()).unwrap();
                         done_rx
                             .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap_or_else(|error| panic!(
+                                "vector callback writer wait: {error:?}, phase={} (0=dispatch, 1=batch, 2=flush, 3=done), elapsed={:?}",
+                                writer_phase.load(Ordering::Acquire), started.elapsed(),
+                            ))
                             .unwrap();
                     }
                     assert_eq!(row.dense_vector.as_deref().unwrap(), &[1.; 64]);

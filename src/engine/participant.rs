@@ -1207,7 +1207,8 @@ mod tests {
             .unwrap();
         assert!(
             output.status.success(),
-            "stdout: {}\nstderr: {}",
+            "child status: {}\nstdout: {}\nstderr: {}",
+            output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -1239,14 +1240,20 @@ mod tests {
         std::panic::set_hook(Box::new(|_| {}));
         // Fixture unwind/name setup precedes the measured collector attempts.
         drop(std::panic::catch_unwind(|| panic!("fixture warmup")));
+        std::panic::set_hook(old_hook);
         let _ = std::thread::current();
         for prefix in [0, 1, 128, 255, 256] {
             INIT_FAIL_AT.store(prefix, Ordering::Release);
+            let old_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
             allocations::global_start();
             let failure = std::panic::catch_unwind(|| ParticipantAdmission::new(1));
             let failed = failure.is_err();
             drop(failure);
             let observed = allocations::global_stop();
+            // Restore diagnostics before assertions, outside the allocation window.
+            std::panic::set_hook(old_hook);
+            eprintln!("collector attempted prefix={prefix}: failed={failed} {observed:?}");
             assert!(failed);
             assert!(POOL.value.get().is_none());
             assert!(!POOL.initializing.load(Ordering::Acquire));
@@ -1258,7 +1265,6 @@ mod tests {
             println!("collector failed prefix={prefix}: {observed:?}");
         }
         INIT_FAIL_AT.store(usize::MAX, Ordering::Release);
-        std::panic::set_hook(old_hook);
         let directory = tempfile::TempDir::new().unwrap();
         let manifest_path = directory.path().join("manifest.json");
         let wal_path = directory.path().join("wal_0.log");

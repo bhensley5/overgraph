@@ -1996,6 +1996,15 @@ mod review_preflight_safety {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("db");
             let original = if case != 5 {
+                #[cfg(windows)]
+                if case == 4 {
+                    let backing = root.path().join("backing");
+                    fs::create_dir(&backing).unwrap();
+                    super::super::directory_identity::junction_for_test(&path, &backing);
+                } else {
+                    fs::create_dir(&path).unwrap();
+                }
+                #[cfg(not(windows))]
                 fs::create_dir(&path).unwrap();
                 manifest(&path);
                 let bytes = fs::read(path.join(MANIFEST_CURRENT)).unwrap();
@@ -2031,8 +2040,18 @@ mod review_preflight_safety {
                         2 => fs::remove_file(current).unwrap(),
                         3 => fs::write(current, original).unwrap(),
                         4 => {
+                            let before = super::super::directory_identity::DirectoryPin::open(&hook_path)
+                                .unwrap().identity();
+                            // On Windows unlink only the test junction, retaining
+                            // the old target and every real safety handle.
+                            #[cfg(windows)]
+                            fs::remove_dir(&hook_path).unwrap();
+                            #[cfg(not(windows))]
                             fs::rename(&hook_path, hook_root.join("old")).unwrap();
                             fs::create_dir(&hook_path).unwrap();
+                            assert_ne!(before,
+                                super::super::directory_identity::DirectoryPin::open(&hook_path)
+                                    .unwrap().identity());
                         }
                         5 => fs::create_dir(&hook_path).unwrap(),
                         _ => unreachable!(),
@@ -2046,6 +2065,10 @@ mod review_preflight_safety {
                 result.is_err(),
                 "case {case} passed final witness validation"
             );
+            if case == 4 {
+                assert!(matches!(&result, Err(EngineError::InvalidOperation(message))
+                    if message == "preflight directory identity changed before recovery"));
+            }
             drop(result);
             assert_eq!(take_preflight_work_for_test()[2], 1);
             assert_eq!(

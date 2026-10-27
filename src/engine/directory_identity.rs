@@ -46,6 +46,25 @@ pub(super) fn open_directory(path: &Path) -> io::Result<File> {
     }
 }
 
+/// Windows cannot rename a real directory containing open child handles. A
+/// junction lets a test replace the pathname while retained target handles stay
+/// valid, exercising the actual final directory-identity comparison.
+#[cfg(all(test, windows))]
+pub(super) fn junction_for_test(link: &Path, target: &Path) {
+    use std::os::windows::process::CommandExt;
+    assert!(target.is_dir());
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/D", "/C"])
+        .raw_arg(format!("mklink /J \"{}\" \"{}\"", link.display(), target.display()))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "junction: status={} stdout={} stderr={}",
+        output.status, String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr));
+    assert_eq!(DirectoryPin::open(link).unwrap().identity(),
+        DirectoryPin::open(target).unwrap().identity());
+}
+
 impl DirectoryPin {
     pub(super) fn open(path: &Path) -> io::Result<Self> {
         let file = open_directory(path)?;

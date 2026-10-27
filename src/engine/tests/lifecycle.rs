@@ -16326,7 +16326,7 @@ fn test_corrupt_range_sidecar_reopens_failed_and_queries_fallback() {
             .unwrap(),
             vec![node_id]
         );
-        db.close().unwrap();
+        close_and_wait_for_native_shutdown(db);
     }
 
     let seg_dir = segment_dir(&db_path, seg_id);
