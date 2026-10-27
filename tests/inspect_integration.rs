@@ -1,3 +1,5 @@
+#[path = "support/native_close.rs"]
+mod native_close;
 mod support;
 
 use overgraph::{
@@ -25,7 +27,7 @@ fn test_inspect_empty_db() {
         ..DbOptions::default()
     };
     let db = open_fixture(dir.path(), &opts);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let output = Command::new(inspect_binary())
         .arg(dir.path().to_str().unwrap())
@@ -74,7 +76,7 @@ fn test_inspect_with_data() {
         .unwrap();
 
     db.flush().unwrap();
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let output = Command::new(inspect_binary())
         .arg(dir.path().to_str().unwrap())
@@ -128,7 +130,7 @@ fn test_inspect_multiple_segments() {
     }
     db.flush().unwrap();
 
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let output = Command::new(inspect_binary())
         .arg(dir.path().to_str().unwrap())
@@ -165,7 +167,7 @@ fn test_inspect_with_prune_policies() {
     )
     .unwrap();
 
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let output = Command::new(inspect_binary())
         .arg(dir.path().to_str().unwrap())
@@ -202,7 +204,7 @@ fn test_inspect_json_with_data() {
         .unwrap();
     }
     db.flush().unwrap();
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let output = Command::new(inspect_binary())
         .args(["--json", dir.path().to_str().unwrap()])
@@ -251,7 +253,7 @@ fn test_inspect_json_with_multi_label_data() {
     )
     .unwrap();
     db.flush().unwrap();
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let output = Command::new(inspect_binary())
         .args(["--json", dir.path().to_str().unwrap()])

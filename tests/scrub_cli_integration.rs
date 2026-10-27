@@ -1,3 +1,5 @@
+#[path = "support/native_close.rs"]
+mod native_close;
 mod support;
 
 use overgraph::{DatabaseEngine, DbOptions, NodeInput, UpsertEdgeOptions};
@@ -51,7 +53,7 @@ fn closed_populated_db() -> (TempDir, std::path::PathBuf) {
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
     populate_and_flush(&db);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     (dir, db_path)
 }
 

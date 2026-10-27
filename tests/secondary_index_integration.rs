@@ -1,6 +1,6 @@
 mod support;
 
-use overgraph::{DatabaseEngine, DbOptions, NodeInput, PropValue, UpsertEdgeOptions};
+use overgraph::{DbOptions, NodeInput, PropValue, UpsertEdgeOptions};
 use std::collections::BTreeMap;
 use tempfile::TempDir;
 
@@ -17,7 +17,7 @@ fn test_secondary_indexes_across_flush_compact_reopen() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let engine = support::open(&db_path, &opts).unwrap();
 
     let mut all_node_ids = Vec::new();
 
