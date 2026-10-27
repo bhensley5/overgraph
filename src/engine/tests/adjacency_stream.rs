@@ -923,7 +923,8 @@ fn adjacency_stream_inclusive_seek_is_lazy_and_reopen_equivalent() {
 
 #[test]
 fn adjacency_stream_enforces_4096_output_and_physical_caps_on_parallel_edges() {
-    let (_dir, engine) = query_test_engine();
+    // Assert output/scan work caps with a functional resource allowance.
+    let (_dir, engine) = query_functional_index_protocol_fixture();
     let a = insert_query_node(&engine, "AdjCap", "adj-cap-a", &[], 1.0);
     let b = insert_query_node(&engine, "AdjCap", "adj-cap-b", &[], 1.0);
     let label = engine.ensure_edge_label("ADJ_CAP").unwrap();

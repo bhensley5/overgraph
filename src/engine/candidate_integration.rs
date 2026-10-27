@@ -7329,42 +7329,95 @@ mod post45_read_tests {
         finish(db);
     }
 
+    fn vector_transport_options() -> DbOptions {
+        DbOptions {
+            dense_vector: Some(DenseVectorConfig {
+                dimension: 64,
+                metric: DenseMetric::Cosine,
+                hnsw: HnswConfig::default(),
+            }),
+            compact_after_n_flushes: 0,
+            ..Default::default()
+        }
+    }
+
+    fn vector_transport_nodes() -> Vec<NodeInput> {
+        (1..=3072).map(|id| NodeInput {
+            labels: vec!["V".into()],
+            key: format!("n{id}"),
+            props: BTreeMap::from([("unselected".into(), PropValue::String("x".repeat(512)))]),
+            weight: 1.,
+            dense_vector: Some(vec![1.; 64]),
+            sparse_vector: Some(vec![(1, 1.0); 1]),
+        }).collect()
+    }
+
+    fn assert_vector_transport_survivors(db: &DatabaseEngine) {
+        let mut live = db.get_nodes_by_labels("V").unwrap();
+        live.extend(db.get_nodes_by_labels("Other").unwrap());
+        live.sort_by_key(|node| node.id);
+        assert_eq!(live.iter().map(|node| node.id).collect::<Vec<_>>(), [2900, 3001, 3072]);
+        assert_eq!(live.iter().filter(|node| node.dense_vector.is_some()).count(), 2);
+        assert!(db.get_node(2999).unwrap().is_none());
+    }
+
+    fn assert_large_vector_transport_segment(db: &DatabaseEngine, ids: &[u64]) {
+        let header = {
+            let segments = db.segments_for_test();
+            assert_eq!(segments.len(), 1);
+            segments[0].dense_hnsw_header().expect("full-population HNSW available")
+        };
+        assert_eq!(header.point_count, 3072);
+        assert_eq!(header.dimension, 64);
+        assert_eq!(header.metric, DenseMetric::Cosine);
+        let mut rows = db.get_nodes_by_labels("V").unwrap();
+        rows.sort_by_key(|node| node.id);
+        assert_eq!(rows.iter().map(|node| node.id).collect::<Vec<_>>(), ids);
+        let payload = PropValue::String("x".repeat(512));
+        for row in rows {
+            assert_eq!(row.key, format!("n{}", row.id));
+            assert_eq!(row.weight, 1.);
+            assert_eq!(row.props.len(), 1);
+            assert_eq!(row.props.get("unselected"), Some(&payload));
+            assert_eq!(row.dense_vector.as_deref(), Some(&[1.; 64][..]));
+            assert_eq!(row.sparse_vector.as_deref(), Some(&[(1, 1.)][..]));
+        }
+    }
+
+    // Retain the original full-population HNSW construction and persisted-data
+    // coverage without asserting that its CPU work completes within 10s.
+    #[test]
+    fn vector_transport_full_population_hnsw_flush_reopens() {
+        ready_participants_for_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let options = vector_transport_options();
+        let db = tests::open_functional_maintenance_fixture(dir.path(), &options).unwrap();
+        db.ensure_node_label("V").unwrap();
+        db.ensure_node_label("Other").unwrap();
+        let ids = db.batch_upsert_nodes(vector_transport_nodes()).unwrap();
+        assert_eq!(ids, (1..=3072).collect::<Vec<_>>());
+        let segment = db.flush().unwrap().expect("full-population flush");
+        assert_eq!(segment.node_count, 3072);
+        assert_large_vector_transport_segment(&db, &ids);
+        finish(db);
+        let reopened = DatabaseEngine::open(dir.path(), &options).unwrap();
+        assert_large_vector_transport_segment(&reopened, &ids);
+        finish(reopened);
+    }
+
     #[test]
     fn vector_transport_reuses_flat_buffers_and_releases_sessions_during_callbacks() {
         ready_participants_for_fixture();
         let dir = tempfile::tempdir().unwrap();
-        let db = DatabaseEngine::open(
-            dir.path(),
-            &DbOptions {
-                dense_vector: Some(DenseVectorConfig {
-                    dimension: 64,
-                    metric: DenseMetric::Cosine,
-                    hnsw: HnswConfig::default(),
-                }),
-                compact_after_n_flushes: 0,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        // The unchanged 10s callback guard is the progress assertion. Give the
+        // larger semantic mutation batch the existing functional allowance.
+        let db = tests::open_functional_maintenance_fixture(
+            dir.path(), &vector_transport_options(),
+        ).unwrap();
         let n = db.ensure_node_label("V").unwrap();
         let other = db.ensure_node_label("Other").unwrap();
-        let ids = db
-            .batch_upsert_nodes(
-                (1..=3072)
-                    .map(|id| NodeInput {
-                        labels: vec!["V".into()],
-                        key: format!("n{id}"),
-                        props: BTreeMap::from([(
-                            "unselected".into(),
-                            PropValue::String("x".repeat(512)),
-                        )]),
-                        weight: 1.,
-                        dense_vector: Some(vec![1.; 64]),
-                        sparse_vector: Some(vec![(1, 1.0); 1]),
-                    })
-                    .collect(),
-            )
-            .unwrap();
+        let ids = db.batch_upsert_nodes(vector_transport_nodes()).unwrap();
+        assert_eq!(ids, (1..=3072).collect::<Vec<_>>());
         let held = db.runtime.published.load_full().view.clone();
         let handle = held.memtable.participant_handle().unwrap();
         let mut seen = Vec::with_capacity(ids.len());
@@ -7411,6 +7464,7 @@ mod post45_read_tests {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let writer_db = db.clone();
+        let writer_ids = ids.clone();
         let writer_phase = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let phase = writer_phase.clone();
         let started = std::time::Instant::now();
@@ -7425,26 +7479,32 @@ mod post45_read_tests {
             updated.dense_vector = Some(vec![2.; 64]);
             let result = (|| {
                 phase.store(1, Ordering::Release);
-                writer_db.write_op_batch(&[
+                let mut ops = writer_ids.into_iter()
+                    .filter(|id| !matches!(id, 2900 | 3000 | 3001 | 3072))
+                    .map(|id| WalOp::DeleteNode { id, deleted_at: 9 })
+                    .collect::<Vec<_>>();
+                ops.extend([
                     WalOp::UpsertNode(moved),
-                    WalOp::DeleteNode {
-                        id: 3000,
-                        deleted_at: 9,
-                    },
+                    WalOp::DeleteNode { id: 3000, deleted_at: 9 },
                     WalOp::UpsertNode(vectorless),
                     WalOp::UpsertNode(updated),
-                ])?;
+                ]);
+                assert_eq!(ops.len(), 3072);
+                writer_db.write_op_batch(&ops)?;
                 phase.store(2, Ordering::Release);
                 eprintln!("vector callback writer batch complete at {:?}", started.elapsed());
-                writer_db.flush()?;
+                let segment = writer_db.flush()?.expect("real populated flush");
                 phase.store(3, Ordering::Release);
                 eprintln!("vector callback writer flush complete at {:?}", started.elapsed());
-                Ok::<_, EngineError>(())
+                Ok::<_, EngineError>(segment)
             })();
             done_tx.send(result).unwrap();
         });
         seen.clear();
         let mut paused = false;
+        let mut first_owned_prefix = 0;
+        let mut later_refill_rows = 0;
+        let mut flush_completed = false;
         held.memtable
             .visit_nodes_sorted_at(
                 &ids,
@@ -7455,8 +7515,16 @@ mod post45_read_tests {
                     assert_eq!(handle.snapshot().0, 0);
                     if !paused {
                         paused = true;
+                        let copied = held.memtable.take_vector_copy_bytes_for_test();
+                        assert_eq!(copied, [0, 0, copied[2], 0]);
+                        assert_eq!(copied[2] % (64 * 4), 0);
+                        first_owned_prefix = copied[2] / (64 * 4);
+                        assert!(first_owned_prefix > 0 && first_owned_prefix < ids.len());
+                        for changed in [2900, 3000, 3001, 3072] {
+                            assert!(ids.iter().position(|id| *id == changed).unwrap() >= first_owned_prefix);
+                        }
                         ready_tx.send(()).unwrap();
-                        done_rx
+                        let segment = done_rx
                             .recv_timeout(std::time::Duration::from_secs(10))
                             .unwrap_or_else(|error| {
                                 maintenance_diagnostic::print_pending();
@@ -7466,6 +7534,15 @@ mod post45_read_tests {
                                 )
                             })
                             .unwrap();
+                        assert_eq!(segment.node_count, 3);
+                        let published = db.runtime.published.load_full();
+                        assert!(!held.memtable.same_generation(&published.view.memtable));
+                        assert!(db.segments_for_test().iter().any(|s| s.segment_id == segment.id));
+                        flush_completed = true;
+                    }
+                    if seen.len() >= first_owned_prefix {
+                        assert!(flush_completed);
+                        later_refill_rows += 1;
                     }
                     assert_eq!(row.dense_vector.as_deref().unwrap(), &[1.; 64]);
                     seen.push(id);
@@ -7473,8 +7550,13 @@ mod post45_read_tests {
             )
             .unwrap();
         writer.join().unwrap();
+        assert!(flush_completed);
+        assert_eq!(later_refill_rows, ids.len() - first_owned_prefix);
+        assert!(later_refill_rows > 0);
+        eprintln!("owned prefix={first_owned_prefix}, later rows after completed flush={later_refill_rows}");
         assert_eq!(seen, ids);
         assert!(missing.is_empty());
+        assert_vector_transport_survivors(&db);
         let selected: NodeIdSet = [2900, 3000, 3001, 3072].into_iter().collect();
         let filter = held
             .label_catalog
@@ -7512,6 +7594,7 @@ mod post45_read_tests {
             reopened.get_node(3072).unwrap().unwrap().dense_vector,
             Some(vec![2.; 64])
         );
+        assert_vector_transport_survivors(&reopened);
         finish(reopened);
     }
 }
@@ -7750,9 +7833,14 @@ mod post45_write_tests {
     }
 
     fn fixture() -> (tempfile::TempDir, DatabaseEngine, u32, u32, u32, u32) {
+        fixture_with_open(DatabaseEngine::open)
+    }
+    fn fixture_with_open(
+        open: fn(&Path, &DbOptions) -> Result<DatabaseEngine, EngineError>,
+    ) -> (tempfile::TempDir, DatabaseEngine, u32, u32, u32, u32) {
         ready_participants_for_fixture();
         let dir = tempfile::tempdir().unwrap();
-        let db = DatabaseEngine::open(
+        let db = open(
             dir.path(),
             &DbOptions {
                 compact_after_n_flushes: 0,
@@ -8082,7 +8170,8 @@ mod post45_write_tests {
     }
     #[test]
     fn post45_write_unrelated_ready_indexes_skip_old_full_hydration() {
-        let (dir, db, n, other, e, other_e) = fixture();
+        // This is a preparation-work proof, not an admission latency test.
+        let (dir, db, n, other, e, other_e) = fixture_with_open(tests::open_functional_maintenance_fixture);
         let spec = SecondaryIndexSpec::equality(vec![SecondaryIndexField::property("indexed")]);
         db.ensure_node_property_index("Other", spec.clone())
             .unwrap();

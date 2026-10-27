@@ -18715,7 +18715,7 @@ fn query_index_protocol_fixture() -> (TempDir, DatabaseEngine) {
     (dir, engine)
 }
 
-// These two planner fixtures check routing/counters over large datasets. Use
+// These semantic planner/adjacency fixtures check routing/counters. Use
 // the existing functional resource allowance; dedicated refusal tests retain
 // their own short deadlines and no production default is changed.
 fn query_functional_index_protocol_fixture() -> (TempDir, DatabaseEngine) {

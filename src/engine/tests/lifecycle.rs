@@ -9,7 +9,7 @@ use phase44b_write_workload as phase44b_workload;
 // deadline/refusal semantics are exercised by the dedicated pressure tests.
 pub(super) const FUNCTIONAL_MAINTENANCE_ADMISSION_TIMEOUT_MS: u64 = 30_000;
 
-fn open_functional_maintenance_fixture(
+pub(super) fn open_functional_maintenance_fixture(
     path: &Path,
     options: &DbOptions,
 ) -> Result<DatabaseEngine, EngineError> {
