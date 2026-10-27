@@ -2376,6 +2376,8 @@ use crate::secondary_index_key::{
         let info = engine
             .ensure_node_property_index("Person", spec)
             .unwrap();
+        // Exercise installed-index maintenance, rather than racing its async backfill.
+        wait_for_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
         let tenant = PropValue::String("acme".to_string());
         let batch_ids = engine
             .batch_upsert_nodes(vec![
@@ -2459,6 +2461,8 @@ use crate::secondary_index_key::{
                 },
             )
             .unwrap();
+        // Exercise installed-index maintenance, rather than racing its async backfill.
+        wait_for_edge_property_index_state(&engine, info.index_id, SecondaryIndexState::Ready);
 
         let draft_id = engine
             .upsert_edge(
