@@ -2571,8 +2571,7 @@ mod p45c2_tests {
                 .map(|(id, _, p)| segment_dir(dir.path(), id).join(p))
                 .unwrap()
         };
-        db.close_fast().unwrap();
-        drop(db);
+        super::p45b1_tests::finish(db);
         std::fs::remove_file(&path).unwrap();
         let db = tests::open_after_native_shutdown(dir.path(), &opts).unwrap();
         assert_eq!(
@@ -2593,8 +2592,7 @@ mod p45c2_tests {
                 .map(|(id, _, p)| segment_dir(dir.path(), id).join(p))
                 .unwrap()
         };
-        db.close_fast().unwrap();
-        drop(db);
+        super::p45b1_tests::finish(db);
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[0] ^= 0xff;
         std::fs::write(&path, bytes).unwrap();

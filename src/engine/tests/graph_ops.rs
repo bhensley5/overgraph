@@ -8196,7 +8196,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             )
             .unwrap();
             db.flush().unwrap();
-            db.close().unwrap();
+            close_and_wait_for_native_shutdown(db);
         }
 
         let sidecar_path =
