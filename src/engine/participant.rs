@@ -717,6 +717,8 @@ pub(super) mod allocations {
         [const { AtomicUsize::new(0) }; TABLE_CAPACITY];
     static SIZES: [AtomicUsize; TABLE_CAPACITY] = [const { AtomicUsize::new(0) }; TABLE_CAPACITY];
     static START_THREAD: [AtomicBool; TABLE_CAPACITY] = [const { AtomicBool::new(false) }; TABLE_CAPACITY];
+    // Distinguish a freed allocation from a later reuse of its address.
+    static ALLOCATION_IDS: [AtomicUsize; TABLE_CAPACITY] = [const { AtomicUsize::new(0) }; TABLE_CAPACITY];
     static LIVE: AtomicUsize = AtomicUsize::new(0);
     static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
     static ALLOCS: AtomicUsize = AtomicUsize::new(0);
@@ -822,7 +824,7 @@ pub(super) mod allocations {
             PEAK_BYTES.load(Ordering::Relaxed).max(live),
             Ordering::Relaxed,
         );
-        add(&ALLOCS, 1);
+        ALLOCATION_IDS[i].store(add(&ALLOCS, 1), Ordering::Relaxed);
         add(&GROSS_BYTES, size);
         add(&LIVE_OBJECTS, 1);
     }
@@ -890,6 +892,7 @@ pub(super) mod allocations {
             POINTERS[i].store(0, Ordering::Relaxed);
             SIZES[i].store(0, Ordering::Relaxed);
             START_THREAD[i].store(false, Ordering::Relaxed);
+            ALLOCATION_IDS[i].store(0, Ordering::Relaxed);
         }
         for counter in [
             &LIVE,
@@ -904,6 +907,10 @@ pub(super) mod allocations {
         }
         OVERFLOW.store(false, Ordering::Relaxed);
         GLOBAL_ACTIVE.store(true, Ordering::Release);
+    }
+    pub(in crate::engine) fn global_identity(pointer: usize) -> Option<usize> {
+        let _held = ObserverLock::acquire();
+        find(pointer).map(|i| ALLOCATION_IDS[i].load(Ordering::Relaxed))
     }
     pub(in crate::engine) fn global_entry(pointer: usize) -> Option<(usize, bool)> {
         let _held = ObserverLock::acquire();
@@ -1475,10 +1482,16 @@ mod tests {
         assert_eq!(resized.live_bytes, resized.start_thread_live_bytes + resized.other_thread_live_bytes);
 
         // Free each allocation from the opposite thread while observation stays on.
+        let foreign_pointer = foreign.as_ptr() as usize;
+        let foreign_identity = allocations::global_identity(foreign_pointer).unwrap();
+        let owned_pointer = owned.as_ptr() as usize;
+        let owned_identity = allocations::global_identity(owned_pointer).unwrap();
         drop(foreign);
+        assert_ne!(allocations::global_identity(foreign_pointer), Some(foreign_identity));
         *control.1.lock().unwrap() = Some(owned);
         control.0.store(6, Ordering::Release);
         await_state(&control.0, 7);
+        assert_ne!(allocations::global_identity(owned_pointer), Some(owned_identity));
         let drained = allocations::global_stop();
         control.0.store(8, Ordering::Release);
         helper.join().unwrap();
