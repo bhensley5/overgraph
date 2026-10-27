@@ -538,6 +538,10 @@ fn phase44b_group_twin_survives_wal_replay_and_immutable_rotation() {
 
 #[test]
 fn phase44b_write_control_memtable_group_twin_upsert() {
+    phase44b_memtable_group_twin_upsert_fixture(true);
+}
+
+fn phase44b_memtable_group_twin_upsert_fixture(_trace_enabled: bool) {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("phase44b_upsert_control");
     let preload = open_large_write_control_fixture(&db_path, &phase44b_preload_options()).unwrap();
@@ -545,6 +549,9 @@ fn phase44b_write_control_memtable_group_twin_upsert() {
     let node_ids = phase44b_preload_nodes(&preload);
     preload.close().unwrap();
 
+    // Keep the 10s admission guard; report this database's flush stages on unwind.
+    #[cfg(feature = "production-concurrency")]
+    let _trace = _trace_enabled.then(|| maintenance_diagnostic::for_database(&db_path));
     let db = open_large_write_control_fixture(&db_path, &phase44b_control_options()).unwrap();
     phase44b_assert_initial_drain(&db);
     db.reset_phase44b_write_amplification_for_test();
@@ -555,7 +562,29 @@ fn phase44b_write_control_memtable_group_twin_upsert() {
             .collect::<Vec<_>>();
         assert_eq!(inputs.len(), phase44b_workload::WRITE_BATCH_SIZE);
         let input_count = inputs.len();
-        assert_eq!(db.batch_upsert_edges(inputs).unwrap().len(), input_count);
+        let result = db.batch_upsert_edges(inputs);
+        #[cfg(feature = "production-concurrency")]
+        if _trace_enabled && matches!(&result, Err(EngineError::ResourceLimit {
+            resource: "admission_deadline", ..
+        })) {
+            eprintln!(
+                "twin_admission_failure call_index={call_index} error={:?}; observing existing work without retry",
+                result.as_ref().unwrap_err(),
+            );
+            // Observe whether the existing job finishes late; never replace the
+            // failed write, extend its admission deadline, or override its error.
+            let until = Instant::now() + std::time::Duration::from_secs(10);
+            while maintenance_diagnostic::outstanding() != 0 && Instant::now() < until {
+                maintenance_diagnostic::print_pending();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            maintenance_diagnostic::print_pending();
+            eprintln!(
+                "twin_failure_observation_complete outstanding={}; original error follows",
+                maintenance_diagnostic::outstanding(),
+            );
+        }
+        assert_eq!(result.unwrap().len(), input_count);
     }
     let active = db.active_memtable();
     assert!(active.estimated_size() < phase44b_control_options().memtable_flush_threshold);
@@ -19425,7 +19454,8 @@ fn p45d2_worker_stage_diagnostic_cohort() {
         ),
         (
             "upsert_control",
-            phase44b_write_control_memtable_group_twin_upsert,
+            // The outer cohort owns its trace; do not start a second scope.
+            || phase44b_memtable_group_twin_upsert_fixture(false),
         ),
     ];
     maintenance_diagnostic::begin();

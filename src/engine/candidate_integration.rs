@@ -7458,9 +7458,6 @@ mod post45_read_tests {
         );
         // A writer moves the source graph after the first owned chunk. The next
         // refill must still use the held S, without holding a participant in callbacks.
-        // Reuse the bounded maintenance trace only for this database. The guard
-        // reports stages on unwind too, without tracing unrelated parallel tests.
-        let _trace = maintenance_diagnostic::for_database(dir.path());
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let writer_db = db.clone();
@@ -7527,7 +7524,6 @@ mod post45_read_tests {
                         let segment = done_rx
                             .recv_timeout(std::time::Duration::from_secs(10))
                             .unwrap_or_else(|error| {
-                                maintenance_diagnostic::print_pending();
                                 panic!(
                                     "vector callback writer wait: {error:?}, phase={} (0=dispatch, 1=batch, 2=flush, 3=done), elapsed={:?}",
                                     writer_phase.load(Ordering::Acquire), started.elapsed(),
