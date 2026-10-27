@@ -905,6 +905,13 @@ pub(super) mod allocations {
         OVERFLOW.store(false, Ordering::Relaxed);
         GLOBAL_ACTIVE.store(true, Ordering::Release);
     }
+    pub(in crate::engine) fn global_entry(pointer: usize) -> Option<(usize, bool)> {
+        let _held = ObserverLock::acquire();
+        find(pointer).map(|i| (
+            SIZES[i].load(Ordering::Relaxed),
+            START_THREAD[i].load(Ordering::Relaxed),
+        ))
+    }
     pub(in crate::engine) fn global_read() -> GlobalObservation {
         let _held = ObserverLock::acquire();
         snapshot_locked()
@@ -1397,6 +1404,92 @@ mod tests {
         assert_eq!(overflowed.live_objects, 16_384);
         drop(objects);
         println!("observer capacity failure is explicit: {overflowed:?}");
+    }
+
+    #[test]
+    fn p45a2_collector_global_observer_origins_and_cross_thread_cleanup_child() {
+        if isolated_child(
+            "engine::participant::tests::p45a2_collector_global_observer_origins_and_cross_thread_cleanup_child",
+            "OVERGRAPH_P45A2_ORIGINS_CHILD",
+        ) { return; }
+        let control = std::sync::Arc::new((AtomicUsize::new(0), Mutex::new(None::<Vec<u8>>)));
+        let worker = control.clone();
+        let helper = std::thread::spawn(move || {
+            let _ = std::thread::current();
+            worker.0.store(1, Ordering::Release);
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match worker.0.load(Ordering::Acquire) {
+                    2 => {
+                        *worker.1.lock().unwrap() = Some(Vec::with_capacity(256));
+                        worker.0.store(3, Ordering::Release);
+                    }
+                    4 => {
+                        let mut value = worker.1.lock().unwrap().take().unwrap();
+                        value.reserve_exact(512);
+                        *worker.1.lock().unwrap() = Some(value);
+                        worker.0.store(5, Ordering::Release);
+                    }
+                    6 => {
+                        drop(worker.1.lock().unwrap().take().unwrap());
+                        worker.0.store(7, Ordering::Release);
+                    }
+                    8 => break,
+                    _ => {
+                        assert!(std::time::Instant::now() < until, "observer helper timeout");
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        });
+        // The helper, handoff storage and thread identity precede observation.
+        await_state(&control.0, 1);
+        let _ = std::thread::current();
+        allocations::global_start();
+        control.0.store(2, Ordering::Release);
+        await_state(&control.0, 3);
+        let mut foreign = control.1.lock().unwrap().take().unwrap();
+        let owned = Vec::<u8>::with_capacity(128);
+        assert_eq!(allocations::global_entry(owned.as_ptr() as usize), Some((owned.capacity(), true)));
+        assert_eq!(allocations::global_entry(foreign.as_ptr() as usize), Some((foreign.capacity(), false)));
+        let held = allocations::global_read();
+        assert_eq!(held.start_thread_live_bytes, owned.capacity());
+        assert_eq!(held.start_thread_live_objects, 1);
+        assert_eq!(held.live_bytes, held.start_thread_live_bytes + held.other_thread_live_bytes);
+        assert_eq!(held.live_objects, held.start_thread_live_objects + held.other_thread_live_objects);
+
+        // A foreign allocation resized by the starter keeps its foreign origin.
+        foreign.reserve_exact(512);
+        assert_eq!(allocations::global_entry(foreign.as_ptr() as usize), Some((foreign.capacity(), false)));
+        // A starter allocation resized by the helper keeps its starter origin.
+        *control.1.lock().unwrap() = Some(owned);
+        control.0.store(4, Ordering::Release);
+        await_state(&control.0, 5);
+        let owned = control.1.lock().unwrap().take().unwrap();
+        assert_eq!(allocations::global_entry(owned.as_ptr() as usize), Some((owned.capacity(), true)));
+        let resized = allocations::global_read();
+        assert_eq!(resized.start_thread_live_bytes, owned.capacity());
+        assert_eq!(resized.start_thread_live_objects, 1);
+        assert_eq!(resized.gross_bytes - resized.freed_bytes, resized.live_bytes);
+        assert_eq!(resized.allocations - resized.deallocations, resized.live_objects);
+        assert_eq!(resized.live_bytes, resized.start_thread_live_bytes + resized.other_thread_live_bytes);
+
+        // Free each allocation from the opposite thread while observation stays on.
+        drop(foreign);
+        *control.1.lock().unwrap() = Some(owned);
+        control.0.store(6, Ordering::Release);
+        await_state(&control.0, 7);
+        let drained = allocations::global_stop();
+        control.0.store(8, Ordering::Release);
+        helper.join().unwrap();
+        assert!(!drained.overflow, "{drained:?}");
+        assert_eq!(drained.start_thread_live_bytes, 0, "{drained:?}");
+        assert_eq!(drained.start_thread_live_objects, 0, "{drained:?}");
+        assert_eq!(drained.gross_bytes - drained.freed_bytes, drained.live_bytes);
+        assert_eq!(drained.allocations - drained.deallocations, drained.live_objects);
+        assert_eq!(drained.live_bytes, drained.start_thread_live_bytes + drained.other_thread_live_bytes);
+        assert_eq!(drained.live_objects, drained.start_thread_live_objects + drained.other_thread_live_objects);
+        println!("origin/cross-thread observer: held={held:?}; resized={resized:?}; drained={drained:?}");
     }
 
     #[test]
