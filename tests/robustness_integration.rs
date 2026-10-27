@@ -1,3 +1,5 @@
+#[path = "support/native_close.rs"]
+mod native_close;
 mod support;
 
 use overgraph::{
@@ -319,7 +321,7 @@ fn test_engine_manifest_corruption_recovery() {
         db.upsert_node("Person", "b", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        db.close().unwrap();
+        native_close::close_and_wait(db);
     }
 
     // Corrupt manifest.current
@@ -371,6 +373,7 @@ fn test_engine_wal_truncated_record_recovery() {
             .unwrap();
         // Use close_fast() to preserve WAL (close() would flush + retire WAL)
         db.close_fast().unwrap();
+        native_close::wait_for_native_shutdown(&db);
     }
 
     // Append garbage to WAL (simulating crash mid-write of next record)

@@ -16426,6 +16426,18 @@ mod tests {
                         }
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
+                    Err(error @ EngineError::ResourceLimit {
+                        resource: "participants",
+                        retryable: true,
+                        ..
+                    }) => {
+                        // Functional first opens can race the process collector's
+                        // nonblocking initializer. No operation has been accepted.
+                        if std::time::Instant::now() >= until {
+                            return Err(error);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                     result => return result,
                 }
             }
@@ -16438,6 +16450,10 @@ mod tests {
     /// modifying persisted bytes. Keep normal close durability semantics.
     fn close_and_wait_for_native_shutdown(db: DatabaseEngine) {
         db.close().unwrap();
+        wait_for_native_shutdown(&db);
+    }
+
+    fn wait_for_native_shutdown(db: &DatabaseEngine) {
         #[cfg(feature = "production-concurrency")]
         {
             let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -16450,6 +16466,8 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
+        #[cfg(not(feature = "production-concurrency"))]
+        let _ = db;
     }
 
     /// Exercise actual public index lifecycle in each selected engine mode.

@@ -7297,7 +7297,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             db.flush().unwrap();
             db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
             db.flush().unwrap();
-            db.close().unwrap();
+            close_and_wait_for_native_shutdown(db);
         }
 
         std::fs::remove_file(segment_dir(&path, 1).join(crate::degree_cache::DEGREE_DELTA_FILENAME))
@@ -7678,7 +7678,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             )
             .unwrap();
             db.flush().unwrap();
-            db.close().unwrap();
+            close_and_wait_for_native_shutdown(db);
         }
         std::fs::remove_file(segment_dir(&path, 1).join(crate::degree_cache::DEGREE_DELTA_FILENAME))
             .unwrap();
@@ -8123,7 +8123,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             )
             .unwrap();
             db.flush().unwrap();
-            db.close().unwrap();
+            close_and_wait_for_native_shutdown(db);
         }
 
         let sidecar_path =

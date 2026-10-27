@@ -4,6 +4,10 @@ use overgraph::DatabaseEngine;
 // handing the directory to another process or modifying its files.
 pub fn close_and_wait(db: DatabaseEngine) {
     db.close().unwrap();
+    wait_for_native_shutdown(&db);
+}
+
+pub fn wait_for_native_shutdown(db: &DatabaseEngine) {
     #[cfg(feature = "production-concurrency")]
     {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -19,4 +23,6 @@ pub fn close_and_wait(db: DatabaseEngine) {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
+    #[cfg(not(feature = "production-concurrency"))]
+    let _ = db;
 }

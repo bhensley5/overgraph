@@ -1,3 +1,5 @@
+#[path = "support/native_close.rs"]
+mod native_close;
 mod support;
 
 use overgraph::types::{FlushEpochMeta, FlushEpochState};
@@ -171,7 +173,7 @@ fn test_scrub_path_healthy_closed_database_no_error_findings() {
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
     populate_and_flush(&db);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let report = scrub_path(&db_path).unwrap();
 
@@ -198,7 +200,7 @@ fn test_scrub_path_detects_core_corruption_without_reopen() {
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
     populate_and_flush(&db);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let core_path = db_path
         .join("segments")
@@ -239,7 +241,7 @@ fn test_scrub_path_does_not_promote_manifest_tmp() {
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
     populate_and_flush(&db);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let current = db_path.join("manifest.current");
     let tmp = db_path.join("manifest.tmp");
@@ -290,6 +292,7 @@ fn test_scrub_path_validates_close_fast_retained_wal() {
     }])
     .unwrap();
     db.close_fast().unwrap();
+    native_close::wait_for_native_shutdown(&db);
 
     let report = scrub_path(&db_path).unwrap();
 
@@ -314,7 +317,7 @@ fn test_scrub_path_missing_frozen_wal_is_error() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let mut manifest = read_manifest_state(&db_path);
     append_frozen_epoch(&mut manifest, 99);
     manifest.next_wal_generation_id = manifest.next_wal_generation_id.max(100);
@@ -335,7 +338,7 @@ fn test_scrub_path_missing_active_wal_with_frozen_epochs_is_error() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let mut manifest = read_manifest_state(&db_path);
     let retained_frozen = manifest.active_wal_generation_id;
     manifest.active_wal_generation_id = 99;
@@ -358,7 +361,7 @@ fn test_scrub_path_missing_active_wal_without_frozen_epochs_is_warning() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let mut manifest = read_manifest_state(&db_path);
     manifest.active_wal_generation_id = 99;
     manifest.next_wal_generation_id = 100;
@@ -380,7 +383,7 @@ fn test_scrub_path_validate_wal_false_skips_manifest_wal_validation() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let mut manifest = read_manifest_state(&db_path);
     manifest.active_wal_generation_id = 99;
     manifest.next_wal_generation_id = 100;
@@ -409,7 +412,7 @@ fn test_scrub_path_published_pending_retire_missing_wal_healthy_segment_is_warni
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
     populate_and_flush(&db);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let mut manifest = read_manifest_state(&db_path);
     let segment_id = manifest.segments[0].id;
     append_published_pending_retire_epoch(&mut manifest, 99, Some(segment_id));
@@ -432,7 +435,7 @@ fn test_scrub_path_published_pending_retire_missing_wal_unhealthy_segment_is_err
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
     populate_and_flush(&db);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let mut manifest = read_manifest_state(&db_path);
     let segment_id = manifest.segments[0].id;
     append_published_pending_retire_epoch(&mut manifest, 99, Some(segment_id));
@@ -456,7 +459,7 @@ fn test_scrub_path_published_pending_retire_corrupt_wal_healthy_segment_is_warni
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
     populate_and_flush(&db);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let mut manifest = read_manifest_state(&db_path);
     let segment_id = manifest.segments[0].id;
     append_published_pending_retire_epoch(&mut manifest, 99, Some(segment_id));
@@ -479,7 +482,7 @@ fn test_scrub_path_duplicate_wal_generation_roles_are_error_findings() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let mut manifest = read_manifest_state(&db_path);
     let active_generation = manifest.active_wal_generation_id;
     append_frozen_epoch(&mut manifest, active_generation);
@@ -508,7 +511,7 @@ fn test_scrub_path_zero_byte_active_wal_uses_missing_severity() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let manifest = read_manifest_state(&db_path);
     std::fs::write(wal_path(&db_path, manifest.active_wal_generation_id), []).unwrap();
 
@@ -527,7 +530,7 @@ fn test_scrub_path_corrupt_active_wal_is_error() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let manifest = read_manifest_state(&db_path);
     std::fs::write(
         wal_path(&db_path, manifest.active_wal_generation_id),
@@ -560,6 +563,7 @@ fn test_scrub_path_active_wal_trailing_bytes_are_warning_and_not_truncated() {
     }])
     .unwrap();
     db.close_fast().unwrap();
+    native_close::wait_for_native_shutdown(&db);
     let manifest = read_manifest_state(&db_path);
     let path = wal_path(&db_path, manifest.active_wal_generation_id);
     let original_len = std::fs::metadata(&path).unwrap().len();
@@ -595,7 +599,7 @@ fn test_scrub_path_orphan_segment_is_reported_and_not_deleted() {
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
     populate_and_flush(&db);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let orphan_path = db_path.join("segments").join("seg_0099");
     copy_dir_recursive(&db_path.join("segments").join("seg_0001"), &orphan_path);
 
@@ -615,7 +619,7 @@ fn test_scrub_path_orphan_wal_is_reported_and_not_deleted() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let orphan_path = wal_path(&db_path, 99);
     write_empty_wal(&orphan_path);
 
@@ -634,7 +638,7 @@ fn test_scrub_path_orphan_wal_is_not_validated() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let orphan_path = wal_path(&db_path, 99);
     std::fs::write(&orphan_path, b"BADWAL!!").unwrap();
 
@@ -686,7 +690,7 @@ fn test_scrub_path_include_orphan_segments_deep_scrubs_unpinned_segment() {
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
     populate_and_flush(&db);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let orphan_path = db_path.join("segments").join("seg_0099");
     copy_dir_recursive(&db_path.join("segments").join("seg_0001"), &orphan_path);
 
@@ -719,7 +723,7 @@ fn test_scrub_path_orphan_segment_component_failure_updates_totals() {
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
     populate_and_flush(&db);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let orphan_path = db_path.join("segments").join("seg_0099");
     copy_dir_recursive(&db_path.join("segments").join("seg_0001"), &orphan_path);
     let core_path = orphan_path.join("segment.core");
@@ -758,7 +762,7 @@ fn test_scrub_path_include_orphan_segments_reports_scrub_skipped() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     let orphan_path = db_path.join("segments").join("seg_0099");
     std::fs::create_dir_all(&orphan_path).unwrap();
 
@@ -821,7 +825,7 @@ fn test_scrub_detects_packed_range_corruption() {
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
     populate_and_flush(&db);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let seg_dir = db_path.join("segments").join("seg_0001");
     let core_path = seg_dir.join("segment.core");
@@ -850,7 +854,7 @@ fn test_scrub_detects_external_payload_corruption() {
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
     populate_and_flush(&db);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let seg_dir = db_path.join("segments").join("seg_0001");
     let sidecar_path = find_external_sidecar(&seg_dir)
@@ -881,7 +885,7 @@ fn test_scrub_detects_identity_header_tamper() {
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
     populate_and_flush(&db);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let seg_dir = db_path.join("segments").join("seg_0001");
     let sidecar_path = find_external_sidecar(&seg_dir)
@@ -917,7 +921,7 @@ fn test_scrub_handles_missing_segment_gracefully() {
     let report_before = db.scrub().unwrap();
     assert_eq!(report_before.total_components_failed, 0);
 
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let seg_dir = db_path.join("segments").join("seg_0001");
     std::fs::remove_dir_all(&seg_dir).unwrap();

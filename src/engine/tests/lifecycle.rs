@@ -1346,7 +1346,7 @@ fn create_ready_lifecycle_node_compound_index(
     wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     let segment_id = db.segments_for_test()[0].segment_id;
-    db.close().unwrap();
+    close_and_wait_for_native_shutdown(db);
     (info.index_id, segment_id, spec)
 }
 
@@ -1370,7 +1370,7 @@ fn create_ready_lifecycle_edge_compound_range_index(
     wait_for_edge_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     wait_for_published_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
     let segment_id = db.segments_for_test()[0].segment_id;
-    db.close().unwrap();
+    close_and_wait_for_native_shutdown(db);
     (info.index_id, segment_id, from_id, edge_id, spec)
 }
 
@@ -1545,8 +1545,7 @@ fn test_open_tolerates_compacted_dense_segment_missing_hnsw_graph() {
     engine.flush().unwrap();
     engine.compact().unwrap().unwrap();
     let seg_id = engine.segments_for_test()[0].segment_id;
-    engine.close().unwrap();
-    drop(engine);
+    close_and_wait_for_native_shutdown(engine);
 
     let seg_dir = crate::segment_writer::segment_dir(dir.path(), seg_id);
     std::fs::remove_file(seg_dir.join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME)).unwrap();
@@ -1596,8 +1595,7 @@ fn test_open_rejects_compacted_dense_segment_truncated_vector_blob() {
     engine.flush().unwrap();
     engine.compact().unwrap().unwrap();
     let seg_id = engine.segments_for_test()[0].segment_id;
-    engine.close().unwrap();
-    drop(engine);
+    close_and_wait_for_native_shutdown(engine);
 
     let seg_dir = crate::segment_writer::segment_dir(dir.path(), seg_id);
     let manifest = read_component_manifest_for_test(&seg_dir);
@@ -1678,8 +1676,7 @@ fn test_open_tolerates_standard_compacted_dense_segment_missing_hnsw_graph() {
 
     engine.compact().unwrap().unwrap();
     let seg_id = engine.segments_for_test()[0].segment_id;
-    engine.close().unwrap();
-    drop(engine);
+    close_and_wait_for_native_shutdown(engine);
 
     let seg_dir = crate::segment_writer::segment_dir(dir.path(), seg_id);
     std::fs::remove_file(seg_dir.join(crate::dense_hnsw::DENSE_HNSW_GRAPH_FILENAME)).unwrap();
@@ -1758,7 +1755,7 @@ fn test_open_rejects_malformed_vector_frame_from_wal_replay() {
 
     {
         let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
-        engine.close().unwrap();
+        close_and_wait_for_native_shutdown(engine);
     }
 
     // V3 WAL frame: [seq:u64][walop_bytes]. The whole thing is the CRC-protected payload.
@@ -4029,7 +4026,7 @@ fn test_orphan_segment_does_not_reuse_id() {
             .upsert_node("Person", "a", UpsertNodeOptions::default())
             .unwrap();
         engine.flush().unwrap();
-        engine.close().unwrap();
+        close_and_wait_for_native_shutdown(engine);
     }
 
     // Simulate an orphan: create a segment directory with a higher ID
@@ -6853,7 +6850,7 @@ fn test_orphan_segment_cleanup_on_open() {
     engine.flush().unwrap();
     assert_eq!(engine.segments_for_test().len(), 1);
 
-    engine.close().unwrap();
+    close_and_wait_for_native_shutdown(engine);
 
     // Create orphan segment directories (simulate crash between segment write
     // and manifest update, or between bg compact output and apply).
@@ -12160,6 +12157,7 @@ fn test_crash_after_segment_write_before_manifest_publish() {
 
         // close_fast: WAL preserved, epoch stays FrozenPendingFlush
         db.close_fast().unwrap();
+        wait_for_native_shutdown(&db);
     }
 
     // Manually create an orphan segment directory (simulating bg worker
@@ -12302,7 +12300,7 @@ fn test_crash_after_publish_before_wal_retire() {
         // Record the segment ID
         seg_id = db.manifest().unwrap().segments[0].id;
 
-        db.close().unwrap();
+        close_and_wait_for_native_shutdown(db);
     }
 
     // Now manually manipulate the manifest to simulate a crash between
@@ -12393,7 +12391,7 @@ fn test_reopen_fails_if_published_pending_retire_segment_is_missing() {
             .unwrap();
         db.flush().unwrap();
         seg_id = db.manifest().unwrap().segments[0].id;
-        db.close().unwrap();
+        close_and_wait_for_native_shutdown(db);
     }
 
     {
@@ -12473,7 +12471,7 @@ fn test_crash_after_wal_delete_before_epoch_removal() {
             .unwrap();
         db.flush().unwrap();
         seg_id = db.manifest().unwrap().segments[0].id;
-        db.close().unwrap();
+        close_and_wait_for_native_shutdown(db);
     }
 
     // Manually add a PublishedPendingRetire epoch to manifest,
@@ -12527,7 +12525,7 @@ fn test_orphan_segment_ignored_on_reopen_cp8() {
             .unwrap();
         db.flush().unwrap();
         assert_eq!(db.segment_count().unwrap(), 1);
-        db.close().unwrap();
+        close_and_wait_for_native_shutdown(db);
     }
 
     // Create an orphan segment directory with dummy data
@@ -12718,7 +12716,7 @@ fn test_published_pending_retire_not_replayed() {
         db.upsert_node("Person", "post_flush_node", UpsertNodeOptions::default())
             .unwrap();
 
-        db.close().unwrap();
+        close_and_wait_for_native_shutdown(db);
     }
 
     // Tamper with manifest: add PublishedPendingRetire for gen 0 with the
@@ -14741,7 +14739,7 @@ fn test_missing_equality_sidecar_reopens_and_repairs_to_ready() {
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
         seg_id = db.segments_for_test()[0].segment_id;
-        db.close().unwrap();
+        close_and_wait_for_native_shutdown(db);
     }
 
     let seg_dir = segment_dir(&db_path, seg_id);
@@ -14864,7 +14862,7 @@ fn test_ready_equality_sidecar_tail_corruption_does_not_full_scan_on_open() {
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
         seg_id = db.segments_for_test()[0].segment_id;
-        db.close().unwrap();
+        close_and_wait_for_native_shutdown(db);
     }
 
     let seg_dir = segment_dir(&db_path, seg_id);
@@ -16307,7 +16305,7 @@ fn test_missing_range_sidecar_reopens_and_repairs_to_ready() {
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
         seg_id = db.segments_for_test()[0].segment_id;
-        db.close().unwrap();
+        close_and_wait_for_native_shutdown(db);
     }
 
     let seg_dir = segment_dir(&db_path, seg_id);
@@ -16444,7 +16442,7 @@ fn test_ready_range_sidecar_tail_corruption_does_not_full_scan_on_open() {
         wait_for_property_index_state(&db, info.index_id, SecondaryIndexState::Ready);
         index_id = info.index_id;
         seg_id = db.segments_for_test()[0].segment_id;
-        db.close().unwrap();
+        close_and_wait_for_native_shutdown(db);
     }
 
     let seg_dir = segment_dir(&db_path, seg_id);
