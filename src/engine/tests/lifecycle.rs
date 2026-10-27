@@ -14794,7 +14794,7 @@ fn test_corrupt_equality_sidecar_reopens_failed_and_queries_fallback() {
         index_id = info.index_id;
         seg_id = db.segments_for_test()[0].segment_id;
         assert_eq!(db.find_nodes("Person", "color", &red).unwrap(), vec![node_id]);
-        db.close().unwrap();
+        close_and_wait_for_native_shutdown(db);
     }
 
     let seg_dir = segment_dir(&db_path, seg_id);
