@@ -520,8 +520,12 @@ pub(super) fn write_segment(
     let compound =
         memtable.compound_secondary_state_for_indexes(&compound_flush_index_ids(&partitions))?;
     let points = std::mem::take(&mut nodes.vectors.dense_points);
+    #[cfg(test)]
+    crate::engine::trace_flush_stage_for_test(seg_dir, segment_id, "flush_CPU_submit");
     let (((node_output, edge_output), sparse_records), hnsw) = engine_cpu_try_join(
         || {
+            #[cfg(test)]
+            crate::engine::trace_flush_stage_for_test(seg_dir, segment_id, "flush_CPU_index_enter");
             engine_cpu_try_join(
                 || {
                     engine_cpu_try_join(
@@ -567,8 +571,17 @@ pub(super) fn write_segment(
                 },
             )
         },
-        || maybe_build_dense_hnsw(points, dense_config),
+        || {
+            #[cfg(test)]
+            crate::engine::trace_flush_stage_for_test(seg_dir, segment_id, "flush_CPU_HNSW_enter");
+            let result = maybe_build_dense_hnsw(points, dense_config);
+            #[cfg(test)]
+            crate::engine::trace_flush_stage_for_test(seg_dir, segment_id, "flush_CPU_HNSW_return");
+            result
+        },
     )?;
+    #[cfg(test)]
+    crate::engine::trace_flush_stage_for_test(seg_dir, segment_id, "flush_CPU_join_return");
     emit_flush_node_index_components(&mut core, sources, &node_output)?;
     emit_flush_edge_index_components(&mut core, sources, &edge_output)?;
     let mut evidence = node_output.declared_evidence;

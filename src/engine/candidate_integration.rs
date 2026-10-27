@@ -393,6 +393,7 @@ mod maintenance_diagnostic {
     }
     struct Trace {
         started: Instant,
+        filter_db: Option<PathBuf>,
         jobs: Vec<Job>,
         events: Vec<String>,
         recorded: usize,
@@ -425,14 +426,28 @@ mod maintenance_diagnostic {
         }
     }
     pub(super) fn begin() {
+        begin_filtered(None);
+    }
+    fn begin_filtered(filter_db: Option<PathBuf>) {
         assert!(!ENABLED.swap(true, Ordering::AcqRel));
         *TRACE.lock().unwrap() = Some(Trace {
             started: Instant::now(),
+            filter_db,
             jobs: Vec::with_capacity(MAX_JOBS),
             events: Vec::with_capacity(MAX_EVENTS),
             recorded: 0,
             omitted: 0,
         });
+    }
+    pub(super) struct DatabaseTrace;
+    impl Drop for DatabaseTrace {
+        fn drop(&mut self) {
+            finish();
+        }
+    }
+    pub(super) fn for_database(db: &Path) -> DatabaseTrace {
+        begin_filtered(Some(db.to_owned()));
+        DatabaseTrace
     }
     pub(super) fn enqueue(db: &Path, output: u64) -> Option<u64> {
         if !ENABLED.load(Ordering::Acquire) {
@@ -440,6 +455,9 @@ mod maintenance_diagnostic {
         }
         let mut trace = TRACE.lock().unwrap();
         let trace = trace.as_mut()?;
+        if trace.filter_db.as_ref().is_some_and(|selected| selected != db) {
+            return None;
+        }
         if trace.jobs.len() == MAX_JOBS {
             trace.omitted += 1;
             return None;
@@ -497,6 +515,10 @@ mod maintenance_diagnostic {
         }
         let mut trace = TRACE.lock().unwrap();
         if let Some(trace) = trace.as_mut() {
+            if trace.filter_db.as_ref().is_some_and(|selected| selected != db) {
+                eprintln!("admission_diagnostic db={db:?} stage={stage} {detail} trace=other_database");
+                return;
+            }
             let outstanding = trace
                 .outstanding()
                 .filter(|job| job.db == db)
@@ -558,6 +580,7 @@ mod maintenance_diagnostic {
             let now = Instant::now();
             let mut trace = Trace {
                 started: now,
+                filter_db: None,
                 jobs: (1..=2)
                     .map(|id| Job {
                         id,
@@ -592,6 +615,11 @@ mod maintenance_diagnostic {
             assert!(late.ends_with("released=true"));
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn trace_flush_stage_for_test(path: &Path, segment_id: u64, stage: &'static str) {
+    maintenance_diagnostic::output_stage(path, segment_id, stage);
 }
 
 #[cfg(test)]
@@ -7377,6 +7405,9 @@ mod post45_read_tests {
         );
         // A writer moves the source graph after the first owned chunk. The next
         // refill must still use the held S, without holding a participant in callbacks.
+        // Reuse the bounded maintenance trace only for this database. The guard
+        // reports stages on unwind too, without tracing unrelated parallel tests.
+        let _trace = maintenance_diagnostic::for_database(dir.path());
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let writer_db = db.clone();
@@ -7427,10 +7458,13 @@ mod post45_read_tests {
                         ready_tx.send(()).unwrap();
                         done_rx
                             .recv_timeout(std::time::Duration::from_secs(10))
-                            .unwrap_or_else(|error| panic!(
-                                "vector callback writer wait: {error:?}, phase={} (0=dispatch, 1=batch, 2=flush, 3=done), elapsed={:?}",
-                                writer_phase.load(Ordering::Acquire), started.elapsed(),
-                            ))
+                            .unwrap_or_else(|error| {
+                                maintenance_diagnostic::print_pending();
+                                panic!(
+                                    "vector callback writer wait: {error:?}, phase={} (0=dispatch, 1=batch, 2=flush, 3=done), elapsed={:?}",
+                                    writer_phase.load(Ordering::Acquire), started.elapsed(),
+                                )
+                            })
                             .unwrap();
                     }
                     assert_eq!(row.dense_vector.as_deref().unwrap(), &[1.; 64]);
