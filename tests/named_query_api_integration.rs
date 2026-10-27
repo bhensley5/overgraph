@@ -1,5 +1,7 @@
+mod support;
+
 use overgraph::{
-    DatabaseEngine, DbOptions, Direction, EdgeQuery, GraphEdgePattern, GraphExpr, GraphNodePattern,
+    DbOptions, Direction, EdgeQuery, GraphEdgePattern, GraphExpr, GraphNodePattern,
     GraphOutputOptions, GraphPageRequest, GraphPatternPiece, GraphQueryOptions, GraphReturnItem,
     GraphReturnProjection, GraphRowQuery, GraphValue, LabelMatchMode, NodeFilterExpr,
     NodeLabelFilter, NodeQuery, PropValue, QueryPlanPublicName, QueryPlanWarning,
@@ -33,7 +35,7 @@ fn edge_options(entries: &[(&str, PropValue)]) -> UpsertEdgeOptions {
 fn explain_plans_surface_public_names_without_token_ids() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = support::open(&db_path, &DbOptions::default()).unwrap();
 
     let alice = engine
         .upsert_node("Person", "alice", UpsertNodeOptions::default())
@@ -92,7 +94,7 @@ fn explain_plans_surface_public_names_without_token_ids() {
 fn planner_queries_use_public_names_and_hydrate_views() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = support::open(&db_path, &DbOptions::default()).unwrap();
 
     let alice = engine
         .upsert_node(
@@ -159,7 +161,7 @@ fn planner_queries_use_public_names_and_hydrate_views() {
 fn planner_unknown_names_are_read_only_empty_constraints() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = support::open(&db_path, &DbOptions::default()).unwrap();
     let alice = engine
         .upsert_node("Person", "alice", UpsertNodeOptions::default())
         .unwrap();
@@ -219,7 +221,7 @@ fn planner_unknown_names_are_read_only_empty_constraints() {
 fn graph_rows_resolve_named_filters_without_changing_bindings() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = support::open(&db_path, &DbOptions::default()).unwrap();
     let alice = engine
         .upsert_node("Person", "alice", UpsertNodeOptions::default())
         .unwrap();

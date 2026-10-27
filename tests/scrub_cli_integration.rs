@@ -1,3 +1,5 @@
+mod support;
+
 use overgraph::{DatabaseEngine, DbOptions, NodeInput, UpsertEdgeOptions};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -15,7 +17,7 @@ fn open_test_db(path: &Path) -> DatabaseEngine {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    DatabaseEngine::open(path, &opts).unwrap()
+    support::open(path, &opts).unwrap()
 }
 
 fn populate_and_flush(db: &DatabaseEngine) {
