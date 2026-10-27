@@ -1987,6 +1987,7 @@ mod tests {
                                     crate::manifest::MANIFEST_CURRENT)).unwrap(), authority);
                                 assert!(crate::wal::wal_generation_path(dir.path(), 1).exists());
                                 drop(ticket);
+                                assert!(!fence.is_fenced());
                                 domain.close();
                                 wait_exit(&stats);
                                 // Normal retirement of the unused ticket must
