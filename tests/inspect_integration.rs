@@ -1,3 +1,5 @@
+mod support;
+
 use overgraph::{
     DatabaseEngine, DbOptions, PrunePolicy, UpsertEdgeOptions, UpsertNodeOptions, WalSyncMode,
 };
@@ -6,29 +8,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn open_fixture(path: &Path, options: &DbOptions) -> DatabaseEngine {
-    #[cfg(not(feature = "production-concurrency"))]
-    {
-        DatabaseEngine::open(path, options).unwrap()
-    }
-    #[cfg(feature = "production-concurrency")]
-    {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            match DatabaseEngine::open(path, options) {
-                // Four fixtures can race the deliberately nonblocking, process-wide
-                // participant initializer. Only this preacceptance refusal is retried.
-                Err(overgraph::EngineError::ResourceLimit {
-                    resource: "participants",
-                    retryable: true,
-                    ..
-                }) => {
-                    assert!(std::time::Instant::now() < deadline);
-                    std::thread::yield_now();
-                }
-                result => return result.unwrap(),
-            }
-        }
-    }
+    support::open(path, options).unwrap()
 }
 
 fn inspect_binary() -> &'static str {
