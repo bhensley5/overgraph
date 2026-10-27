@@ -17927,7 +17927,9 @@ fn test_compact_with_progress_waits_for_admitted_work_and_blocks_later_mutations
         compact_after_n_flushes: u32::MAX,
         ..DbOptions::default()
     };
-    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    // This fixture proves barrier ordering with its original 100ms/5s probes;
+    // its deliberately paused writes are not a 1s admission-expiry test.
+    let db = open_functional_maintenance_fixture(dir.path(), &opts).unwrap();
 
     let seg_a = db
         .upsert_node("Person", "seg-a", UpsertNodeOptions::default())
