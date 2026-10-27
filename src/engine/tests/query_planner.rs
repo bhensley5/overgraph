@@ -13180,12 +13180,15 @@ fn build_streaming_scale_test_fixture(
 ) -> StreamingScaleTestFixture {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = open_large_write_control_fixture(
+    let engine = open_large_write_control_fixture_with_admission_timeout(
         &db_path,
         &DbOptions {
             compact_after_n_flushes: 0,
             ..Default::default()
         },
+        // Stale replacement is semantic dataset setup, not a latency proof.
+        // Keep the existing 10s profile for the other scale-fixture shapes.
+        if stale_heavy { FUNCTIONAL_MAINTENANCE_ADMISSION_TIMEOUT_MS } else { 10_000 },
     )
     .unwrap();
     seed_query_test_catalog(&engine);
@@ -13393,13 +13396,16 @@ fn edge_streaming_scale_input(
 fn build_edge_streaming_scale_test_fixture(stale_heavy: bool) -> EdgeStreamingScaleTestFixture {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = open_large_write_control_fixture(
+    let engine = open_large_write_control_fixture_with_admission_timeout(
         &db_path,
         &DbOptions {
             compact_after_n_flushes: 0,
             edge_uniqueness: true,
             ..Default::default()
         },
+        // Stale replacement is semantic dataset setup, not a latency proof.
+        // Keep the existing 10s profile for the other scale-fixture shapes.
+        if stale_heavy { FUNCTIONAL_MAINTENANCE_ADMISSION_TIMEOUT_MS } else { 10_000 },
     )
     .unwrap();
     seed_query_test_catalog(&engine);
@@ -14765,7 +14771,7 @@ fn streamed_edge_selectivity_demotion_does_not_claim_buffer_overflow() {
 
 #[test]
 fn streamed_node_and_edge_input_count_and_legal_universe_demotions_are_truthful() {
-    let (_dir, engine) = query_index_protocol_fixture();
+    let (_dir, engine) = query_functional_index_protocol_fixture();
     // One more than query_plan.rs's locked STREAMED_INTERSECT_MAX_INPUTS (16).
     const INPUTS: usize = 17;
     const TOTAL: usize = 10_000;
@@ -15663,7 +15669,7 @@ fn streamed_or_and_in_plan_streamed_union_paginate_and_count() {
 
 #[test]
 fn streamed_union_composes_inside_and_and_dedups_branch_candidates() {
-    let (_dir, engine) = query_index_protocol_fixture();
+    let (_dir, engine) = query_functional_index_protocol_fixture();
     let status_info = engine
         .ensure_node_property_index(
             "Person",
@@ -18705,6 +18711,17 @@ fn query_index_protocol_fixture() -> (TempDir, DatabaseEngine) {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
     let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
+    seed_query_test_catalog(&engine);
+    (dir, engine)
+}
+
+// These two planner fixtures check routing/counters over large datasets. Use
+// the existing functional resource allowance; dedicated refusal tests retain
+// their own short deadlines and no production default is changed.
+fn query_functional_index_protocol_fixture() -> (TempDir, DatabaseEngine) {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let engine = reopen_functional_maintenance_fixture(&db_path, &DbOptions::default()).unwrap();
     seed_query_test_catalog(&engine);
     (dir, engine)
 }

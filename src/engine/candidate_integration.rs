@@ -7890,7 +7890,9 @@ mod post45_write_tests {
     fn post45_write_preparation_resolves_rotated_indexed_sources_again() {
         ready_participants_for_fixture();
         let dir = tempfile::tempdir().unwrap();
+        // This fixture proves re-resolution after rotation, not admission latency.
         let limits = ConcurrencyOptions::default()
+            .with_admission_timeout_ms(tests::FUNCTIONAL_MAINTENANCE_ADMISSION_TIMEOUT_MS)
             .with_max_batch_operations(2)
             .with_generation_operation_limit(2);
         let db = DatabaseEngine::open_with_concurrency_options(

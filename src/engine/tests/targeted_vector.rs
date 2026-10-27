@@ -3,10 +3,16 @@ use super::*;
 use crate::row_projection::VectorSelection;
 
 fn fixture() -> (TempDir, DatabaseEngine) {
+    fixture_with_open(DatabaseEngine::open)
+}
+
+fn fixture_with_open(
+    open: fn(&Path, &DbOptions) -> Result<DatabaseEngine, EngineError>,
+) -> (TempDir, DatabaseEngine) {
     #[cfg(feature = "production-concurrency")]
     crate::engine::post45_read_tests::ready_participants_for_fixture();
     let dir = TempDir::new().unwrap();
-    let db = DatabaseEngine::open(
+    let db = open(
         dir.path(),
         &DbOptions {
             dense_vector: Some(DenseVectorConfig {
@@ -368,7 +374,9 @@ fn targeted_v_scoring_preserves_newest_source_hiding_and_old_views() {
 
 #[test]
 fn targeted_v_small_dense_scope_skips_count_and_preserves_2049_five_percent_decision() {
-    let (_dir, db) = fixture();
+    // Large semantic setup has the existing functional resource allowance;
+    // the count/route thresholds below remain exact and are not latency claims.
+    let (_dir, db) = fixture_with_open(open_functional_maintenance_fixture);
     let n = db.ensure_node_label("V").unwrap();
     db.ensure_edge_label("E").unwrap();
     db.write_op_batch(

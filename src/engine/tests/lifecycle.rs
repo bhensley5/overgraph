@@ -7,7 +7,7 @@ use phase44b_write_workload as phase44b_workload;
 
 // These fixtures check maintenance progress and data integrity. Short admission
 // deadline/refusal semantics are exercised by the dedicated pressure tests.
-const FUNCTIONAL_MAINTENANCE_ADMISSION_TIMEOUT_MS: u64 = 30_000;
+pub(super) const FUNCTIONAL_MAINTENANCE_ADMISSION_TIMEOUT_MS: u64 = 30_000;
 
 fn open_functional_maintenance_fixture(
     path: &Path,
