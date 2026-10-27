@@ -10050,6 +10050,16 @@ struct RuntimeFlushDrainResult {
     completed_flushes: Vec<(u64, SegmentInfo)>,
 }
 
+impl Default for RuntimeFlushDrainResult {
+    fn default() -> Self {
+        Self {
+            progressed: false,
+            publish_impact: PublishImpact::NoPublish,
+            completed_flushes: Vec::new(),
+        }
+    }
+}
+
 /// A frozen memtable epoch awaiting (or undergoing) background flush.
 /// Stays visible to reads until the output segment is published and the
 /// epoch is retired. Single source of truth for frozen-memtable lifecycle.
@@ -10594,9 +10604,7 @@ impl EngineCore {
         }
 
         self.wait_for_bg_compact();
-        for event in self.shutdown_bg_flush() {
-            let _ = self.process_bg_flush_event(event);
-        }
+        self.settle_bg_flush_shutdown();
         self.shutdown_secondary_index_worker();
         let close_result = self.close_inner();
         match (first_error, close_result) {
@@ -10621,9 +10629,7 @@ impl EngineCore {
         }
         self.cancel_bg_compact();
         self.try_apply_all_bg_flushes();
-        for event in self.shutdown_bg_flush() {
-            let _ = self.process_bg_flush_event(event);
-        }
+        self.settle_bg_flush_shutdown();
         self.shutdown_secondary_index_worker();
         self.close_inner()?;
         self.current_flush_pipeline_error().map_or(Ok(()), Err)
@@ -10637,6 +10643,7 @@ impl EngineCore {
 
         self.cancel_bg_compact();
         self.shutdown_bg_flush(); // Never adopt any result or retire recovery sources.
+        self.reset_all_flush_in_flight();
         self.shutdown_secondary_index_worker();
         match &self.wal_sync_mode {
             WalSyncMode::Immediate => {
@@ -12541,9 +12548,7 @@ impl EngineCore {
     }
 
     fn drain_ready_bg_flush_events_for_runtime(&mut self) -> RuntimeFlushDrainResult {
-        let mut completed_flushes = Vec::new();
-        let mut progressed = false;
-        let mut publish_impact = PublishImpact::NoPublish;
+        let mut result = RuntimeFlushDrainResult::default();
         loop {
             let event = {
                 let bg = match self.bg_flush.as_ref() {
@@ -12560,30 +12565,14 @@ impl EngineCore {
                     Err(_) => break,
                 }
             };
-            progressed = true;
             if let Some(bg) = self.bg_flush.as_mut() {
                 bg.events_applied += 1;
             }
-            let completed_epoch_id = match &event {
-                BgFlushEvent::Adopt(adoption) => Some(adoption.epoch_id),
-                BgFlushEvent::Failed(_) => None,
-            };
-            match self.process_bg_flush_event(event) {
-                Ok(Some(seg_info)) => {
-                    publish_impact = publish_impact.combine(PublishImpact::RebuildSources);
-                    if let Some(epoch_id) = completed_epoch_id {
-                        completed_flushes.push((epoch_id, seg_info));
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("drain_ready_bg_flush_events_for_runtime: {}", e),
+            if let Err(error) = self.process_bg_flush_event_into(event, &mut result) {
+                eprintln!("drain_ready_bg_flush_events_for_runtime: {}", error);
             }
         }
-        RuntimeFlushDrainResult {
-            progressed,
-            publish_impact,
-            completed_flushes,
-        }
+        result
     }
 
     /// Blocking: wait for one flush result from the background worker.
@@ -12608,11 +12597,7 @@ impl EngineCore {
                 result
             }
             Err(_) => {
-                let shutdown_events = self.shutdown_bg_flush();
-                for event in shutdown_events {
-                    let _ = self.process_bg_flush_event(event);
-                }
-                self.reset_all_flush_in_flight();
+                self.settle_bg_flush_shutdown();
                 if let Some(err) = self.current_flush_pipeline_error() {
                     Err(err)
                 } else {
@@ -12626,6 +12611,15 @@ impl EngineCore {
         &mut self,
         event: BgFlushEvent,
     ) -> Result<Option<SegmentInfo>, EngineError> {
+        self.process_bg_flush_event_into(event, &mut RuntimeFlushDrainResult::default())
+    }
+
+    fn process_bg_flush_event_into(
+        &mut self,
+        event: BgFlushEvent,
+        drain: &mut RuntimeFlushDrainResult,
+    ) -> Result<Option<SegmentInfo>, EngineError> {
+        drain.progressed = true;
         if self.manifest_write_lock.fenced() {
             let error = match event {
                 BgFlushEvent::Failed(error) => error,
@@ -12640,10 +12634,13 @@ impl EngineCore {
             // Cancel/join producers and consume their remaining terminal events.
             // Dropping an adoption releases its reader/heavy lease without any
             // manifest update, source replacement or recovery-file deletion.
-            for event in self.shutdown_bg_flush() {
-                if let BgFlushEvent::Failed(error) = event {
-                    self.record_flush_pipeline_error(error);
+            if self.bg_flush.is_some() {
+                for event in self.shutdown_bg_flush() {
+                    if let BgFlushEvent::Failed(error) = event {
+                        self.record_flush_pipeline_error(error);
+                    }
                 }
+                self.reset_all_flush_in_flight();
             }
             return self.ensure_maintenance_unfenced().map(|()| None);
         }
@@ -12770,14 +12767,19 @@ impl EngineCore {
                         .and_then(|lease| lease.diagnostic_id),
                     "flush_adopted",
                 );
+                drain.publish_impact = drain.publish_impact.combine(PublishImpact::RebuildSources);
+                drain.completed_flushes.push((adoption.epoch_id, seg_info.clone()));
                 Ok(Some(seg_info))
             }
             BgFlushEvent::Failed(err) => {
                 self.record_flush_pipeline_error(err.clone());
-                self.reset_all_flush_in_flight();
-                let shutdown_events = self.shutdown_bg_flush();
-                for shutdown_event in shutdown_events {
-                    let _ = self.process_bg_flush_event(shutdown_event);
+                // An outer shutdown batch already owns all terminal events once
+                // bg_flush is gone. Do not clear custody before its next event.
+                if self.bg_flush.is_some() {
+                    let nested = self.settle_bg_flush_shutdown();
+                    drain.progressed |= nested.progressed;
+                    drain.publish_impact = drain.publish_impact.combine(nested.publish_impact);
+                    drain.completed_flushes.extend(nested.completed_flushes);
                 }
                 Err(err.to_engine_error())
             }
@@ -12852,9 +12854,22 @@ impl EngineCore {
         })
     }
 
-    /// Shut down the background flush workers, if running, and return any
-    /// already-queued completion events so callers can perform lazy adoption.
-    /// Any remaining epochs are no longer in flight once the worker is gone.
+    /// Settle joined producers' terminal events against their original custody,
+    /// then clear only residual canceled epochs. Failed-event handling cannot
+    /// recursively reset an outer batch because shutdown has taken bg_flush.
+    fn settle_bg_flush_shutdown(&mut self) -> RuntimeFlushDrainResult {
+        let events = self.shutdown_bg_flush();
+        let mut result = RuntimeFlushDrainResult::default();
+        for event in events {
+            let _ = self.process_bg_flush_event_into(event, &mut result);
+        }
+        self.reset_all_flush_in_flight();
+        result
+    }
+
+    /// Join the workers and return queued terminal events. Preserve in-flight
+    /// identity until callers settle those events; an empty batch can release
+    /// residual canceled custody immediately.
     fn shutdown_bg_flush(&mut self) -> Vec<BgFlushEvent> {
         let events = if let Some(mut bg) = self.bg_flush.take() {
             bg.cancel.store(true, Ordering::Relaxed);
@@ -12874,7 +12889,9 @@ impl EngineCore {
         } else {
             Vec::new()
         };
-        self.reset_all_flush_in_flight();
+        if events.is_empty() {
+            self.reset_all_flush_in_flight();
+        }
         events
     }
 
@@ -14152,7 +14169,7 @@ impl Drop for EngineCore {
 
         // Best-effort: drain any completed bg flush results, then shut down worker.
         self.drain_bg_flush();
-        self.shutdown_bg_flush();
+        self.settle_bg_flush_shutdown();
         self.shutdown_secondary_index_worker();
         self.retry_deferred_segment_cleanup_at(true, Instant::now);
 

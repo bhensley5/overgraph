@@ -1021,7 +1021,8 @@ fn adjacency_stream_giant_immutable_owner_uses_one_bounded_scratch_and_truthful_
 
 #[test]
 fn adjacency_stream_odd_schedule_bounds_every_reusable_batch_vector() {
-    let (_dir, engine) = query_test_engine();
+    // This 600-edge fixture asserts pull/scratch bounds, not setup latency.
+    let (_dir, engine) = query_functional_index_protocol_fixture();
     let a = insert_query_node(&engine, "AdjOdd", "adj-odd-a", &[], 1.0);
     let b = insert_query_node(&engine, "AdjOdd", "adj-odd-b", &[], 1.0);
     engine.flush().unwrap();

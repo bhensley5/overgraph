@@ -1892,7 +1892,10 @@ mod real_route_tests {
     #[test]
     fn p45a3_real_wal_only_generation_rotation_and_metadata_publication_failure() {
         let dir = tempfile::TempDir::new().unwrap();
-        let limits = ConcurrencyOptions::default().with_max_batch_operations(1).with_generation_operation_limit(1);
+        // The one-operation generation boundary is semantic; setup fsync work
+        // gets the functional allowance before the publication fault is armed.
+        let limits = ConcurrencyOptions::default().with_max_batch_operations(1).with_generation_operation_limit(1)
+            .with_admission_timeout_ms(tests::FUNCTIONAL_MAINTENANCE_ADMISSION_TIMEOUT_MS);
         let db = DatabaseEngine::open_with_concurrency_options(dir.path(), &DbOptions::default(), &limits).unwrap();
         db.ensure_node_label("first").unwrap();
         db.ensure_node_label("second").unwrap();
@@ -6551,6 +6554,209 @@ mod p45c1_storage_tests {
             .any(|l| l.label == "WalOnlyLater"));
         close_native(reopened);
     }
+    #[test]
+    fn p45c1_close_fast_settles_late_flush_adoption_before_reset() {
+        let root = tempfile::tempdir().unwrap();
+        let options = DbOptions {
+            memtable_flush_threshold: 0,
+            compact_after_n_flushes: 0,
+            ..Default::default()
+        };
+        let db = tests::open_after_native_shutdown(root.path(), &options).unwrap();
+        let id = db.upsert_node("R", "late", UpsertNodeOptions { weight: 1.0, ..Default::default() }).unwrap();
+        let old = db.runtime.published.load_full().view.clone();
+        let (ready, release) = db.set_flush_publish_pause();
+        let cancel = db.runtime.with_core_mut(|core| {
+            core.freeze_memtable()?;
+            core.ensure_bg_flush_worker();
+            core.enqueue_flush()?;
+            assert!(core.immutable_epochs[0].in_flight);
+            Ok(core.bg_flush.as_ref().unwrap().cancel.clone())
+        }).unwrap();
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let closing = db.clone();
+        let closer = std::thread::spawn(move || closing.close_fast());
+        let until = Instant::now() + Duration::from_secs(5);
+        while !cancel.load(Ordering::Acquire) {
+            assert!(Instant::now() < until, "close did not cancel flush worker");
+            std::thread::yield_now();
+        }
+        // The publisher already passed its cancellation check. Its real durable
+        // completion must settle before residual in-flight custody is reset.
+        release.send(()).unwrap();
+        let result = closer.join().unwrap();
+        assert!(result.is_ok(), "late completion close_fast failed: {result:?}");
+        assert_eq!(old.get_node(id).unwrap().unwrap().weight, 1.0);
+        drop(db);
+        let reopened = tests::open_after_native_shutdown(root.path(), &options).unwrap();
+        assert_eq!(reopened.get_node(id).unwrap().unwrap().weight, 1.0);
+        assert_eq!(reopened.segment_count().unwrap(), 1);
+        assert_eq!(reopened.upsert_node("R", "late", UpsertNodeOptions { weight: 2.0, ..Default::default() }).unwrap(), id);
+        assert_eq!(reopened.get_node(id).unwrap().unwrap().weight, 2.0);
+        assert_eq!(old.get_node(id).unwrap().unwrap().weight, 1.0);
+        drop(old);
+        close_native(reopened);
+    }
+
+    #[test]
+    fn p45c1_flush_failure_settles_other_late_completion_before_reset() {
+        let root = tempfile::tempdir().unwrap();
+        let options = DbOptions {
+            memtable_flush_threshold: 0,
+            compact_after_n_flushes: 0,
+            ..Default::default()
+        };
+        let db = tests::open_after_native_shutdown(root.path(), &options).unwrap();
+        let first = db.upsert_node("R", "first", UpsertNodeOptions::default()).unwrap();
+        db.freeze_memtable().unwrap();
+        let second = db.upsert_node("R", "second", UpsertNodeOptions::default()).unwrap();
+        db.freeze_memtable().unwrap();
+        super::p45b1_tests::finish(db);
+        // The legacy runtime supports multiple admitted epochs. Drive its real
+        // lifecycle entry point directly so the Failed event is drained first.
+        let core = EngineCore::open(root.path(), &options).unwrap();
+        assert!(core.candidate.is_none());
+        assert_eq!(core.immutable_epochs.len(), 2);
+        let db = DatabaseEngine {
+            runtime: Arc::new(DbRuntime::new(root.path().to_path_buf(), core)),
+            client: None,
+        };
+        let old = db.runtime.published.load_full().view.clone();
+        let (adopted_epoch, failed_epoch, failed_wal) = {
+            let mut guard = db.runtime.core.lock().unwrap();
+            let core = guard.as_mut().unwrap();
+            let adopted_epoch = core.immutable_epochs[1].epoch_id;
+            let failed_epoch = core.immutable_epochs[0].epoch_id;
+            let failed_wal = wal_generation_path(root.path(), core.immutable_epochs[0].wal_generation_id);
+            let (ready, release) = core.set_flush_publish_pause();
+            core.ensure_bg_flush_worker();
+            core.enqueue_flush().unwrap();
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            core.set_flush_force_error();
+            core.enqueue_flush().unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            let bg = core.bg_flush.as_ref().unwrap();
+            while bg.events_ready.load(Ordering::Acquire) <= bg.events_applied {
+                assert!(Instant::now() < until, "second builder did not report failure");
+                std::thread::yield_now();
+            }
+            assert_eq!(core.in_flight_count(), 2);
+            // Only the real Failed event is queued; the first publisher is
+            // still paused after its cancellation check. Release it for join.
+            release.send(()).unwrap();
+            (adopted_epoch, failed_epoch, failed_wal)
+        };
+        let wait = db.runtime.register_flush_wait(adopted_epoch);
+        assert!(db.runtime.run_lifecycle_batch_if_open());
+        let published = db.runtime.published.load_full();
+        assert_eq!(published.view.segments.len(), 1, "nested adoption must rebuild published sources");
+        assert_eq!(published.view.immutable_epochs.len(), 1);
+        assert_eq!(published.view.immutable_epochs[0].epoch_id, failed_epoch);
+        assert!(!published.view.immutable_epochs.iter().any(|epoch| epoch.epoch_id == adopted_epoch));
+        let segment_id = published.view.segments[0].segment_id;
+        {
+            let lifecycle = db.runtime.lifecycle.lock().unwrap();
+            assert_eq!(lifecycle.completed_flush_order.iter().filter(|&&epoch| epoch == adopted_epoch).count(), 1);
+            assert_eq!(lifecycle.completed_flushes_by_epoch.len(), 1);
+            assert_eq!(lifecycle.completed_flushes_by_epoch[&adopted_epoch].id, segment_id);
+            assert_eq!(lifecycle.awaited_flush.as_ref().unwrap().completed.as_ref().unwrap().id, segment_id);
+        }
+        assert_eq!(db.runtime.take_completed_flush_for_epoch(adopted_epoch).unwrap().id, segment_id);
+        assert!(db.runtime.take_completed_flush_for_epoch(adopted_epoch).is_none());
+        drop(wait);
+        assert!(!db.runtime.run_lifecycle_batch_if_open());
+        assert_eq!(db.runtime.lifecycle.lock().unwrap().completed_flush_order.len(), 1);
+        {
+            let guard = db.runtime.core.lock().unwrap();
+            let core = guard.as_ref().unwrap();
+            assert_eq!(core.segments.len(), 1);
+            assert_eq!(core.immutable_epochs.len(), 1);
+            assert_eq!(core.in_flight_count(), 0);
+            assert!(core.flush_pipeline_error.as_ref().unwrap().message.contains("injected test failure"));
+            assert!(!core.manifest_write_lock.fenced());
+        }
+        assert!(failed_wal.exists());
+        assert_eq!(db.get_node(first).unwrap().unwrap().key, "first");
+        assert_eq!(db.get_node(second).unwrap().unwrap().key, "second");
+        assert_eq!(old.immutable_epochs.len(), 2);
+        assert_eq!(old.get_node(first).unwrap().unwrap().key, "first");
+        assert_eq!(old.get_node(second).unwrap().unwrap().key, "second");
+        assert!(matches!(db.close_fast(),
+            Err(EngineError::InvalidOperation(message)) if message.contains("injected test failure")));
+        assert!(failed_wal.exists());
+        drop(published);
+        drop(db);
+        let reopened = tests::open_after_native_shutdown(root.path(), &options).unwrap();
+        assert_eq!(reopened.get_node(first).unwrap().unwrap().key, "first");
+        assert_eq!(reopened.get_node(second).unwrap().unwrap().key, "second");
+        assert_eq!(old.get_node(first).unwrap().unwrap().key, "first");
+        drop(old);
+        close_native(reopened);
+    }
+
+    #[test]
+    fn p45c1_stale_flush_adoption_still_fences_and_preserves_recovery() {
+        for stale in 0..4 {
+            let root = tempfile::tempdir().unwrap();
+            let options = DbOptions {
+                memtable_flush_threshold: 0,
+                compact_after_n_flushes: 0,
+                ..Default::default()
+            };
+            let db = tests::open_after_native_shutdown(root.path(), &options).unwrap();
+            db.upsert_node("R", "stale", UpsertNodeOptions::default()).unwrap();
+            let (ready, release) = db.set_flush_publish_pause();
+            db.runtime.with_core_mut(|core| {
+                core.freeze_memtable()?;
+                core.ensure_bg_flush_worker();
+                core.enqueue_flush()?;
+                Ok(())
+            }).unwrap();
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            let manifest_before;
+            let recovery_wal;
+            {
+                // Own adoption authority before letting the real publisher finish.
+                let mut guard = db.runtime.core.lock().unwrap();
+                let core = guard.as_mut().unwrap();
+                release.send(()).unwrap();
+                let mut event = core.bg_flush.as_ref().unwrap().event_rx.lock().unwrap()
+                    .recv_timeout(Duration::from_secs(5)).unwrap();
+                core.bg_flush.as_mut().unwrap().events_applied += 1;
+                recovery_wal = wal_generation_path(root.path(), core.immutable_epochs[0].wal_generation_id);
+                assert!(recovery_wal.exists());
+                manifest_before = std::fs::read(root.path().join(crate::manifest::MANIFEST_CURRENT)).unwrap();
+                let BgFlushEvent::Adopt(adoption) = &mut event else { panic!("expected real durable adoption") };
+                let output = segment_dir(root.path(), adoption.seg_info.id);
+                match stale {
+                    0 => adoption.epoch_id += 1,
+                    1 => adoption.wal_gen_to_retire += 1,
+                    2 => adoption.frozen = core.memtable.clone(),
+                    3 => core.immutable_epochs[0].in_flight = false,
+                    _ => unreachable!(),
+                }
+                assert!(matches!(core.process_bg_flush_event(event),
+                    Err(EngineError::InvalidOperation(message)) if message.contains("stale flush adoption source identity")));
+                assert!(core.manifest_write_lock.fenced());
+                assert!(core.segments.is_empty());
+                assert_eq!(core.immutable_epochs.len(), 1);
+                assert!(output.exists());
+            }
+            let stats = db.runtime.candidate.as_ref().unwrap().stats.clone();
+            assert!(matches!(db.close_fast(), Err(EngineError::CommitOutcome {
+                state: CommitOutcomeState::Indeterminate, ..
+            })));
+            assert_eq!(std::fs::read(root.path().join(crate::manifest::MANIFEST_CURRENT)).unwrap(), manifest_before);
+            assert!(recovery_wal.exists());
+            drop(db);
+            let until = Instant::now() + Duration::from_secs(10);
+            while !matches!(stats.read_full().unwrap().close_state, ReclamationCloseState::Drained) {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+        }
+    }
+
     #[test]
     fn p45c1_retirement_failure_fences_and_keeps_published_output() {
         let root = tempfile::tempdir().unwrap();
