@@ -2837,7 +2837,7 @@ fn memtable_secondary_eq_edge_count_for_filter(
     prop_key: &str,
     prop_value: &PropValue,
     snapshot_seq: u64,
-) -> usize {
+)->Result<usize,EngineError>{
     memtable.secondary_eq_edge_count_at(index_id, prop_key, prop_value, snapshot_seq)
 }
 
@@ -5065,7 +5065,7 @@ impl ReadView {
                 upper_key,
                 None,
                 self.snapshot_seq,
-            ) as u64;
+            )? as u64;
         if self.active_memtable_only_exact_estimates() {
             return Ok((Some(PlannerEstimate::exact_cheap(count)), None));
         }
@@ -5079,7 +5079,7 @@ impl ReadView {
                         upper_key,
                         None,
                         self.snapshot_seq,
-                    ) as u64,
+                    )? as u64,
             );
         }
 
@@ -5105,11 +5105,11 @@ impl ReadView {
                 upper_key,
             ) {
                 Ok(Some(entries)) => count = count.saturating_add(entries as u64),
-                Ok(None) => return Ok((None, self.range_sidecar_failure_followup(index_id, None))),
+                Ok(None) => return Ok((None, self.range_sidecar_failure_followup(index_id, None)?)),
                 Err(error) => {
                     return Ok((
                         None,
-                        self.range_sidecar_failure_followup(index_id, Some(error)),
+                        self.range_sidecar_failure_followup(index_id, Some(error))?,
                     ));
                 }
             }
@@ -5253,7 +5253,7 @@ impl ReadView {
         {
             let mut count = self
                 .memtable
-                .visible_node_time_range_count_at(label_id, lower_ms, upper_ms, self.snapshot_seq)
+                .visible_node_time_range_count_at(label_id, lower_ms, upper_ms, self.snapshot_seq)?
                 as u64;
             for epoch in &self.immutable_epochs {
                 count = count.saturating_add(
@@ -5264,7 +5264,7 @@ impl ReadView {
                             lower_ms,
                             upper_ms,
                             self.snapshot_seq,
-                        ) as u64,
+                        )? as u64,
                 );
             }
             count = count.saturating_add(stats_estimate.count);
@@ -5658,29 +5658,10 @@ impl ReadView {
         bounds: &[crate::secondary_index_key::CompoundPrefixBounds],
         matched_prefix_len: usize,
         target_label_count: u64,
-    ) -> (PlannerEstimate, u8, String) {
-        let mut count = bounds
-            .iter()
-            .map(|bound| {
-                self.memtable
-                    .count_node_compound_prefix_at(entry.index_id, bound, self.snapshot_seq)
-                    as u64
-            })
-            .sum::<u64>();
-        for epoch in &self.immutable_epochs {
-            count = count.saturating_add(
-                bounds
-                    .iter()
-                    .map(|bound| {
-                        epoch.memtable.count_node_compound_prefix_at(
-                            entry.index_id,
-                            bound,
-                            self.snapshot_seq,
-                        ) as u64
-                    })
-                    .sum::<u64>(),
-            );
-        }
+    ) -> Result<(PlannerEstimate, u8, String),EngineError> {
+        let mut count=0u64;
+        for bound in bounds {count=count.saturating_add(self.memtable.count_node_compound_prefix_at(entry.index_id,bound,self.snapshot_seq)? as u64);}
+        for epoch in &self.immutable_epochs {for bound in bounds {count=count.saturating_add(epoch.memtable.count_node_compound_prefix_at(entry.index_id,bound,self.snapshot_seq)? as u64);}}
         let mut used_stats = false;
         let mut used_fallback = false;
         let mut stats_exact = true;
@@ -5709,7 +5690,7 @@ impl ReadView {
             ));
         }
         let (coverage_rank, coverage) = Self::compound_coverage_rank_and_label(used_stats, used_fallback);
-        (
+        Ok((
             self.planner_stats_estimate_from_rollup(
                 count,
                 used_stats,
@@ -5718,7 +5699,7 @@ impl ReadView {
             ),
             coverage_rank,
             coverage,
-        )
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5732,29 +5713,10 @@ impl ReadView {
         numeric_lower: Option<(crate::planner_stats::RangeStatsKey, bool)>,
         numeric_upper: Option<(crate::planner_stats::RangeStatsKey, bool)>,
         target_label_count: u64,
-    ) -> (PlannerEstimate, u8, String) {
-        let mut count = bounds
-            .iter()
-            .map(|bound| {
-                self.memtable
-                    .count_node_compound_range_at(entry.index_id, bound, self.snapshot_seq)
-                    as u64
-            })
-            .sum::<u64>();
-        for epoch in &self.immutable_epochs {
-            count = count.saturating_add(
-                bounds
-                    .iter()
-                    .map(|bound| {
-                        epoch.memtable.count_node_compound_range_at(
-                            entry.index_id,
-                            bound,
-                            self.snapshot_seq,
-                        ) as u64
-                    })
-                    .sum::<u64>(),
-            );
-        }
+    ) -> Result<(PlannerEstimate, u8, String),EngineError> {
+        let mut count=0u64;
+        for bound in bounds {count=count.saturating_add(self.memtable.count_node_compound_range_at(entry.index_id,bound,self.snapshot_seq)? as u64);}
+        for epoch in &self.immutable_epochs {for bound in bounds {count=count.saturating_add(epoch.memtable.count_node_compound_range_at(entry.index_id,bound,self.snapshot_seq)? as u64);}}
         let mut used_stats = false;
         let mut used_fallback = false;
         let mut stats_exact = false;
@@ -5789,7 +5751,7 @@ impl ReadView {
             ));
         }
         let (coverage_rank, coverage) = Self::compound_coverage_rank_and_label(used_stats, used_fallback);
-        (
+        Ok((
             self.planner_stats_estimate_from_rollup(
                 count,
                 used_stats,
@@ -5798,7 +5760,7 @@ impl ReadView {
             ),
             coverage_rank,
             coverage,
-        )
+        ))
     }
 
     fn edge_compound_prefix_estimate(
@@ -5807,29 +5769,10 @@ impl ReadView {
         bounds: &[crate::secondary_index_key::CompoundPrefixBounds],
         matched_prefix_len: usize,
         target_label_count: u64,
-    ) -> (PlannerEstimate, u8, String) {
-        let mut count = bounds
-            .iter()
-            .map(|bound| {
-                self.memtable
-                    .count_edge_compound_prefix_at(entry.index_id, bound, self.snapshot_seq)
-                    as u64
-            })
-            .sum::<u64>();
-        for epoch in &self.immutable_epochs {
-            count = count.saturating_add(
-                bounds
-                    .iter()
-                    .map(|bound| {
-                        epoch.memtable.count_edge_compound_prefix_at(
-                            entry.index_id,
-                            bound,
-                            self.snapshot_seq,
-                        ) as u64
-                    })
-                    .sum::<u64>(),
-            );
-        }
+    ) -> Result<(PlannerEstimate, u8, String),EngineError> {
+        let mut count=0u64;
+        for bound in bounds {count=count.saturating_add(self.memtable.count_edge_compound_prefix_at(entry.index_id,bound,self.snapshot_seq)? as u64);}
+        for epoch in &self.immutable_epochs {for bound in bounds {count=count.saturating_add(epoch.memtable.count_edge_compound_prefix_at(entry.index_id,bound,self.snapshot_seq)? as u64);}}
         let mut used_stats = false;
         let mut used_fallback = false;
         let mut stats_exact = true;
@@ -5858,7 +5801,7 @@ impl ReadView {
             ));
         }
         let (coverage_rank, coverage) = Self::compound_coverage_rank_and_label(used_stats, used_fallback);
-        (
+        Ok((
             self.planner_stats_estimate_from_rollup(
                 count,
                 used_stats,
@@ -5867,7 +5810,7 @@ impl ReadView {
             ),
             coverage_rank,
             coverage,
-        )
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5881,29 +5824,10 @@ impl ReadView {
         numeric_lower: Option<(crate::planner_stats::RangeStatsKey, bool)>,
         numeric_upper: Option<(crate::planner_stats::RangeStatsKey, bool)>,
         target_label_count: u64,
-    ) -> (PlannerEstimate, u8, String) {
-        let mut count = bounds
-            .iter()
-            .map(|bound| {
-                self.memtable
-                    .count_edge_compound_range_at(entry.index_id, bound, self.snapshot_seq)
-                    as u64
-            })
-            .sum::<u64>();
-        for epoch in &self.immutable_epochs {
-            count = count.saturating_add(
-                bounds
-                    .iter()
-                    .map(|bound| {
-                        epoch.memtable.count_edge_compound_range_at(
-                            entry.index_id,
-                            bound,
-                            self.snapshot_seq,
-                        ) as u64
-                    })
-                    .sum::<u64>(),
-            );
-        }
+    ) -> Result<(PlannerEstimate, u8, String),EngineError> {
+        let mut count=0u64;
+        for bound in bounds {count=count.saturating_add(self.memtable.count_edge_compound_range_at(entry.index_id,bound,self.snapshot_seq)? as u64);}
+        for epoch in &self.immutable_epochs {for bound in bounds {count=count.saturating_add(epoch.memtable.count_edge_compound_range_at(entry.index_id,bound,self.snapshot_seq)? as u64);}}
         let mut used_stats = false;
         let mut used_fallback = false;
         let mut stats_exact = false;
@@ -5938,7 +5862,7 @@ impl ReadView {
             ));
         }
         let (coverage_rank, coverage) = Self::compound_coverage_rank_and_label(used_stats, used_fallback);
-        (
+        Ok((
             self.planner_stats_estimate_from_rollup(
                 count,
                 used_stats,
@@ -5947,7 +5871,7 @@ impl ReadView {
             ),
             coverage_rank,
             coverage,
-        )
+        ))
     }
 
     fn compound_estimate_skips_as_broad(
@@ -6164,7 +6088,7 @@ impl ReadView {
                                     &bounds,
                                     matched_prefix_len,
                                     target_label_count,
-                                );
+                                )?;
                             if Self::compound_estimate_skips_as_broad(
                                 estimate,
                                 cap_context.cheapest_legal_count(),
@@ -6227,7 +6151,7 @@ impl ReadView {
                                     numeric_lower,
                                     numeric_upper,
                                     target_label_count,
-                                );
+                                )?;
                             if Self::compound_estimate_skips_as_broad(
                                 estimate,
                                 cap_context.cheapest_legal_count(),
@@ -6290,8 +6214,8 @@ impl ReadView {
         filter: &NormalizedEdgeFilter,
         cap_context: EdgeQueryCapContext,
         warnings: &mut Vec<QueryPlanWarning>,
-    ) -> Option<CompoundEdgeCandidatePlan> {
-        let label_id = query.label_id?;
+    ) -> Result<Option<CompoundEdgeCandidatePlan>, EngineError> { Ok({
+        let Some(label_id)=query.label_id else {return Ok(None)};
         // Skip constraint-set construction (value clones plus endpoint-ID
         // vector clones, which graph-row planning can pass by the thousands)
         // when the label has no compound declarations.
@@ -6302,10 +6226,10 @@ impl ReadView {
                 .edge_field_index_entries(label_id, &SecondaryIndexKind::Range)
                 .is_empty()
         {
-            return None;
+            return Ok(None);
         }
         let constraints = edge_compound_constraints(query, filter);
-        let target_label_estimate = self.edge_label_estimate(label_id);
+        let target_label_estimate = self.edge_label_estimate(label_id)?;
         let target_label_count = target_label_estimate.known_upper_bound().unwrap_or(u64::MAX / 4);
         let mut best: Option<CompoundEdgeCandidatePlan> = None;
         let mut prefix_unsatisfied = false;
@@ -6336,7 +6260,7 @@ impl ReadView {
                                 &bounds,
                                 matched_prefix_len,
                                 target_label_count,
-                            );
+                            )?;
                         if Self::compound_estimate_skips_as_broad(
                             estimate,
                             cap_context.cheapest_legal_count(),
@@ -6399,7 +6323,7 @@ impl ReadView {
                                 numeric_lower,
                                 numeric_upper,
                                 target_label_count,
-                            );
+                            )?;
                         if Self::compound_estimate_skips_as_broad(
                             estimate,
                             cap_context.cheapest_legal_count(),
@@ -6459,19 +6383,19 @@ impl ReadView {
             add_plan_warning(warnings, QueryPlanWarning::CompoundIndexPrefixNotSatisfied);
         }
         best
-    }
+    }) }
 
     fn node_label_estimate(&self, label_id: u32) -> Result<PlannerEstimate, EngineError> {
         let mut count = self
             .memtable
-            .visible_nodes_by_label_id_count(label_id, self.snapshot_seq) as u64;
+            .visible_nodes_by_label_id_count(label_id, self.snapshot_seq)? as u64;
         if self.active_memtable_only_exact_estimates() {
             return Ok(PlannerEstimate::exact_cheap(count));
         }
         for epoch in &self.immutable_epochs {
             count += epoch
                 .memtable
-                .visible_nodes_by_label_id_count(label_id, self.snapshot_seq) as u64;
+                .visible_nodes_by_label_id_count(label_id, self.snapshot_seq)? as u64;
         }
         count = count.saturating_add(self.planner_stats.node_label_count(label_id));
         let mut used_fallback = self.planner_stats.node_label_coverage.has_uncovered();
@@ -6570,14 +6494,14 @@ impl ReadView {
         }
     }
 
-    fn full_scan_estimate(&self) -> PlannerEstimate {
-        let mut count = self.memtable.visible_node_count_at(self.snapshot_seq) as u64;
+    fn full_scan_estimate(&self) -> Result<PlannerEstimate,EngineError> {
+        let mut count = self.memtable.visible_node_count_at(self.snapshot_seq)? as u64;
         if self.active_memtable_only_exact_estimates() {
-            return PlannerEstimate::exact_cheap(count);
+            return Ok(PlannerEstimate::exact_cheap(count));
         }
         for epoch in &self.immutable_epochs {
             count = count
-                .saturating_add(epoch.memtable.visible_node_count_at(self.snapshot_seq) as u64);
+                .saturating_add(epoch.memtable.visible_node_count_at(self.snapshot_seq)? as u64);
         }
         count = count.saturating_add(self.planner_stats.full_rollup.node_count);
         let mut used_fallback = self.planner_stats.full_rollup.coverage.has_uncovered();
@@ -6593,18 +6517,18 @@ impl ReadView {
             used_fallback = true;
             count = count.saturating_add(segment.node_count());
         }
-        self.planner_stats_estimate_from_rollup(
+        Ok(self.planner_stats_estimate_from_rollup(
             count,
             self.planner_stats.full_rollup.coverage.covered_count() > 0,
             used_fallback,
             true,
-        )
+        ))
     }
 
     fn edge_full_scan_estimate(&self) -> PlannerEstimate {
-        let mut count = self.memtable.edge_count() as u64;
+        let mut count = self.memtable.retained_edge_slot_count() as u64;
         for epoch in &self.immutable_epochs {
-            count = count.saturating_add(epoch.memtable.edge_count() as u64);
+            count = count.saturating_add(epoch.memtable.retained_edge_slot_count() as u64);
         }
         for segment in &self.segments {
             count = count.saturating_add(segment.edge_count());
@@ -6612,58 +6536,50 @@ impl ReadView {
         PlannerEstimate::upper_bound(count)
     }
 
-    fn edge_label_estimate(&self, label_id: u32) -> PlannerEstimate {
+    fn edge_label_estimate(&self, label_id: u32) -> Result<PlannerEstimate, EngineError> { Ok({
         let mut count = self
             .memtable
-            .edge_label_posting_count_upper_bound(label_id) as u64;
+            .edge_label_posting_count_upper_bound(label_id)? as u64;
         for epoch in &self.immutable_epochs {
             count = count.saturating_add(
                 epoch
                     .memtable
-                    .edge_label_posting_count_upper_bound(label_id)
+                    .edge_label_posting_count_upper_bound(label_id)?
                     as u64,
             );
         }
         for segment in &self.segments {
             let Ok(segment_count) = segment.edge_label_posting_count(label_id) else {
-                return self.edge_full_scan_estimate();
+                return Ok(self.edge_full_scan_estimate());
             };
             count = count.saturating_add(segment_count as u64);
         }
         PlannerEstimate::upper_bound(count)
-    }
+    }) }
 
-    fn edge_metadata_source_estimate(&self, label_id: Option<u32>) -> PlannerEstimate {
-        label_id
-            .map(|label_id| self.edge_label_estimate(label_id))
-            .unwrap_or_else(|| self.edge_full_scan_estimate())
-    }
+    fn edge_metadata_source_estimate(&self, label_id: Option<u32>) -> Result<PlannerEstimate, EngineError> { Ok({
+        match label_id {Some(label)=>self.edge_label_estimate(label)?,None=>self.edge_full_scan_estimate()}
+    }) }
 
     fn edge_weight_range_estimate(
         &self,
         label_id: Option<u32>,
         bounds: crate::edge_metadata::RangeBoundFlags<f32>,
         indexed: bool,
-    ) -> PlannerEstimate {
+    ) -> Result<PlannerEstimate,EngineError> {
         if !indexed {
             return self.edge_metadata_source_estimate(label_id);
         }
         let mut count = 0u64;
         let add_memtable = |memtable: &Memtable| {
-            let mut local = 0u64;
-            let _ = memtable.for_each_edge_metadata_at(self.snapshot_seq, |meta| {
-                if label_id.is_none_or(|target| meta.label_id == target)
+            memtable.count_edge_metadata_at(self.snapshot_seq, |meta| {
+                label_id.is_none_or(|target| meta.label_id == target)
                     && crate::edge_metadata::weight_matches_bounds(meta.weight, bounds)
-                {
-                    local = local.saturating_add(1);
-                }
-                ControlFlow::Continue(())
-            });
-            local
+            })
         };
-        count = count.saturating_add(add_memtable(&self.memtable));
+        count = count.saturating_add(add_memtable(&self.memtable)?);
         for epoch in &self.immutable_epochs {
-            count = count.saturating_add(add_memtable(&epoch.memtable));
+            count = count.saturating_add(add_memtable(&epoch.memtable)?);
         }
         for segment in &self.segments {
             let Some(segment_count) = segment.edge_weight_range_count(label_id, bounds) else {
@@ -6671,7 +6587,7 @@ impl ReadView {
             };
             count = count.saturating_add(segment_count as u64);
         }
-        PlannerEstimate::upper_bound(count)
+        Ok(PlannerEstimate::upper_bound(count))
     }
 
     fn edge_i64_metadata_range_estimate(
@@ -6682,7 +6598,7 @@ impl ReadView {
         _validity_probe: bool,
         memtable_value: impl Fn(EdgeMetadataCandidate) -> i64,
         segment_count: impl Fn(&SegmentReader) -> Option<usize>,
-    ) -> PlannerEstimate {
+    ) -> Result<PlannerEstimate,EngineError> {
         #[cfg(test)]
         if _validity_probe {
             self.note_edge_validity_range_estimate();
@@ -6692,20 +6608,14 @@ impl ReadView {
         }
         let mut count = 0u64;
         let add_memtable = |memtable: &Memtable| {
-            let mut local = 0u64;
-            let _ = memtable.for_each_edge_metadata_at(self.snapshot_seq, |meta| {
-                if label_id.is_none_or(|target| meta.label_id == target)
+            memtable.count_edge_metadata_at(self.snapshot_seq, |meta| {
+                label_id.is_none_or(|target| meta.label_id == target)
                     && crate::edge_metadata::i64_matches_bounds(memtable_value(meta), bounds)
-                {
-                    local = local.saturating_add(1);
-                }
-                ControlFlow::Continue(())
-            });
-            local
+            })
         };
-        count = count.saturating_add(add_memtable(&self.memtable));
+        count = count.saturating_add(add_memtable(&self.memtable)?);
         for epoch in &self.immutable_epochs {
-            count = count.saturating_add(add_memtable(&epoch.memtable));
+            count = count.saturating_add(add_memtable(&epoch.memtable)?);
         }
         for segment in &self.segments {
             let Some(segment_count) = segment_count(segment) else {
@@ -6713,7 +6623,7 @@ impl ReadView {
             };
             count = count.saturating_add(segment_count as u64);
         }
-        PlannerEstimate::upper_bound(count)
+        Ok(PlannerEstimate::upper_bound(count))
     }
 
     fn edge_endpoint_planner_stats(
@@ -6721,13 +6631,13 @@ impl ReadView {
         node_ids: &[u64],
         direction: Direction,
         label_filter_ids: Option<&[u32]>,
-    ) -> EdgeEndpointPlannerStats {
+    ) -> Result<EdgeEndpointPlannerStats, EngineError> { Ok({
         if node_ids.is_empty() {
-            return EdgeEndpointPlannerStats {
+            return Ok(EdgeEndpointPlannerStats {
                 estimate: PlannerEstimate::exact_cheap(0),
                 stream_cursor_count_upper_bound: 0,
                 segment_stats_fallback: false,
-            };
+            });
         }
         let mut sorted_node_ids = node_ids.to_vec();
         sorted_node_ids.sort_unstable();
@@ -6756,14 +6666,14 @@ impl ReadView {
             direction,
             label_filter_ids,
             self.snapshot_seq,
-        ));
+        )?);
         for epoch in &self.immutable_epochs {
             add_memtable_estimate(epoch.memtable.visible_endpoint_edges_count_estimate_at(
                 &sorted_node_ids,
                 direction,
                 label_filter_ids,
                 self.snapshot_seq,
-            ));
+            )?);
         }
 
         for segment in &self.segments {
@@ -6775,12 +6685,12 @@ impl ReadView {
                         stream_cursor_count_upper_bound.saturating_add(stats.cursor_count);
                 }
                 Err(_) => {
-                    return EdgeEndpointPlannerStats {
+                    return Ok(EdgeEndpointPlannerStats {
                         estimate: self.edge_full_scan_estimate(),
                         stream_cursor_count_upper_bound: STREAMED_MAX_TOTAL_CURSORS
                             .saturating_add(1),
                         segment_stats_fallback: true,
-                    };
+                    });
                 }
             }
         }
@@ -6790,20 +6700,20 @@ impl ReadView {
             stream_cursor_count_upper_bound,
             segment_stats_fallback: false,
         }
-    }
+    }) }
 
     fn graph_row_known_id_posting_bound(
         &self,
         ids: &[u64],
         direction: Direction,
         label_filter_ids: Option<&[u32]>,
-    ) -> Option<u64> {
+    ) -> Result<Option<u64>, EngineError> { Ok({
         if ids.len() > GRAPH_ROW_KNOWN_ID_POSTING_MAX_IDS {
-            return None;
+            return Ok(None);
         }
-        let stats = self.edge_endpoint_planner_stats(ids, direction, label_filter_ids);
+        let stats = self.edge_endpoint_planner_stats(ids, direction, label_filter_ids)?;
         Self::graph_row_accepted_known_id_posting_bound(stats)
-    }
+    }) }
 
     fn graph_row_accepted_known_id_posting_bound(
         stats: EdgeEndpointPlannerStats,
@@ -6820,10 +6730,10 @@ impl ReadView {
         node_ids: &[u64],
         direction: Direction,
         label_filter_ids: Option<&[u32]>,
-    ) -> PlannerEstimate {
-        self.edge_endpoint_planner_stats(node_ids, direction, label_filter_ids)
+    ) -> Result<PlannerEstimate, EngineError> { Ok({
+        self.edge_endpoint_planner_stats(node_ids, direction, label_filter_ids)?
             .estimate
-    }
+    }) }
 
     fn edge_metadata_sidecar_availability(&self) -> EdgeMetadataSidecarAvailability {
         let mut has_nonempty_segment = false;
@@ -6863,11 +6773,11 @@ impl ReadView {
     }
 
     fn graph_row_has_unrolled_memtable_edges(&self) -> bool {
-        self.memtable.edge_count() > 0
+        self.memtable.retained_edge_slot_count() > 0
             || self
                 .immutable_epochs
                 .iter()
-                .any(|epoch| epoch.memtable.edge_count() > 0)
+                .any(|epoch| epoch.memtable.retained_edge_slot_count() > 0)
     }
 
     fn graph_row_planner_directions(direction: Direction) -> &'static [PlannerStatsDirection] {
@@ -7078,7 +6988,7 @@ impl ReadView {
         edge: &GraphRowRuntimeEdge,
         edge_bound: GraphRowPhysicalEdgeBoundContext,
         memo: &mut GraphRowKnownIdPostingMemo,
-    ) -> GraphRowFanoutEstimate {
+    ) -> Result<GraphRowFanoutEstimate, EngineError> { Ok({
         let mut combined: Option<GraphRowFanoutEstimate> = None;
         for planner_direction in Self::graph_row_planner_directions(direction) {
             let estimate = self.graph_row_single_direction_fanout_estimate(
@@ -7108,7 +7018,7 @@ impl ReadView {
         }
         #[cfg(test)]
         if graph_row_test_legacy_estimator_enabled() {
-            return estimate;
+            return Ok(estimate);
         }
         if !label_filter_ids.is_some_and(|ids| ids.is_empty()) {
             if let Some(ids) = known_source_ids.filter(|ids| !ids.is_empty()) {
@@ -7127,7 +7037,7 @@ impl ReadView {
                             ids,
                             direction,
                             label_filter_ids,
-                        ),
+                        )?,
                     );
                 }
                 estimate.known_id_posting_bound = memo.entries[edge_index][orientation]
@@ -7135,7 +7045,7 @@ impl ReadView {
             }
         }
         estimate
-    }
+    }) }
 
     fn graph_row_node_anchor_plan(
         &self,
@@ -7710,7 +7620,7 @@ impl ReadView {
             .iter()
             .any(|plan| matches!(plan, Some(Ok(plan)) if plan.estimated_candidates.is_some()))
         {
-            self.full_scan_estimate().known_upper_bound()
+            self.full_scan_estimate()?.known_upper_bound()
         } else {
             None
         };
@@ -8312,7 +8222,7 @@ impl ReadView {
                         edge,
                         edge_bound,
                         known_id_posting_memo,
-                    );
+                    )?;
                     let target_selectivity = if bound.contains(target_alias) {
                         None
                     } else {
@@ -8539,8 +8449,8 @@ impl ReadView {
         filter: &NormalizedEdgeFilter,
         label_id: Option<u32>,
         availability: EdgeMetadataSidecarAvailability,
-    ) -> Option<EdgePhysicalPlan> {
-        match filter {
+    ) -> Result<Option<EdgePhysicalPlan>,EngineError> {
+        Ok(match filter {
             NormalizedEdgeFilter::AlwaysTrue => None,
             NormalizedEdgeFilter::AlwaysFalse => Some(EdgePhysicalPlan::Empty),
             NormalizedEdgeFilter::IdRange { .. }
@@ -8551,7 +8461,7 @@ impl ReadView {
                     label_id,
                     bounds,
                     availability.weight,
-                    self.edge_weight_range_estimate(label_id, bounds, availability.weight),
+                    self.edge_weight_range_estimate(label_id, bounds, availability.weight)?,
                 )))
             }
             NormalizedEdgeFilter::UpdatedAtRange { lower_ms, upper_ms } => {
@@ -8568,7 +8478,7 @@ impl ReadView {
                         false,
                         |meta| meta.updated_at,
                         |segment| segment.edge_updated_at_range_count(label_id, bounds),
-                    ),
+                    )?,
                 )))
             }
             NormalizedEdgeFilter::ValidFromRange { lower_ms, upper_ms } => {
@@ -8585,7 +8495,7 @@ impl ReadView {
                         true,
                         |meta| meta.valid_from,
                         |segment| segment.edge_valid_from_range_count(label_id, bounds),
-                    ),
+                    )?,
                 )))
             }
             NormalizedEdgeFilter::ValidToRange { lower_ms, upper_ms } => {
@@ -8602,7 +8512,7 @@ impl ReadView {
                         true,
                         |meta| meta.valid_to,
                         |segment| segment.edge_valid_to_range_count(label_id, bounds),
-                    ),
+                    )?,
                 )))
             }
             NormalizedEdgeFilter::ValidAt { epoch_ms } => {
@@ -8622,7 +8532,7 @@ impl ReadView {
                             |segment| {
                                 segment.edge_valid_from_range_count(label_id, valid_from_bounds)
                             },
-                        ),
+                        )?,
                     ),
                 );
                 let valid_to_bounds = crate::edge_metadata::RangeBoundFlags {
@@ -8643,7 +8553,7 @@ impl ReadView {
                             true,
                             |meta| meta.valid_to,
                             |segment| segment.edge_valid_to_range_count(label_id, valid_to_bounds),
-                        ),
+                        )?,
                     ),
                 );
                 Some(EdgePhysicalPlan::intersect(vec![valid_from, valid_to]))
@@ -8651,17 +8561,16 @@ impl ReadView {
             NormalizedEdgeFilter::And(children) => {
                 let plans = children
                     .iter()
-                    .filter_map(|child| {
+                    .map(|child| {
                         self.edge_metadata_filter_candidate_plan(child, label_id, availability)
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>,_>>()?.into_iter().flatten().collect::<Vec<_>>();
                 (!plans.is_empty()).then(|| EdgePhysicalPlan::intersect(plans))
             }
             NormalizedEdgeFilter::Or(children) => {
                 let mut plans = Vec::with_capacity(children.len());
                 for child in children {
-                    let plan =
-                        self.edge_metadata_filter_candidate_plan(child, label_id, availability)?;
+                    let Some(plan)=self.edge_metadata_filter_candidate_plan(child,label_id,availability)? else{return Ok(None);};
                     plans.push(plan);
                 }
                 Some(EdgePhysicalPlan::union(plans))
@@ -8672,7 +8581,7 @@ impl ReadView {
             | NormalizedEdgeFilter::PropertyRange { .. }
             | NormalizedEdgeFilter::PropertyExists { .. }
             | NormalizedEdgeFilter::PropertyMissing { .. } => None,
-        }
+        })
     }
 
     fn edge_equality_candidate_estimate(
@@ -8688,24 +8597,20 @@ impl ReadView {
                 key,
                 value,
                 self.snapshot_seq,
-            ) as u64;
+            )? as u64;
             return Ok((Some(PlannerEstimate::exact_cheap(count)), None));
         }
         let value_hashes = equality_probe_value_hashes(value);
-        let mut count = value_hashes
-            .iter()
-            .map(|value_hash| {
-                self.memtable
-                    .secondary_eq_edge_hash_count_at(index_id, *value_hash, self.snapshot_seq)
-                    as u64
-            })
-            .sum::<u64>();
+        let mut count=0u64;
+        for value_hash in &value_hashes {count=count.saturating_add(self.memtable
+                    .secondary_eq_edge_hash_count_at(index_id, *value_hash, self.snapshot_seq)?
+                    as u64);}
         for epoch in &self.immutable_epochs {
             for value_hash in &value_hashes {
                 count = count.saturating_add(
                     epoch
                         .memtable
-                        .secondary_eq_edge_hash_count_at(index_id, *value_hash, self.snapshot_seq)
+                        .secondary_eq_edge_hash_count_at(index_id, *value_hash, self.snapshot_seq)?
                         as u64,
                 );
             }
@@ -8729,12 +8634,12 @@ impl ReadView {
             match segment_edge_secondary_eq_posting_count_for_filter(segment, index_id, value) {
                 Ok(Some(posting_count)) => count = count.saturating_add(posting_count as u64),
                 Ok(None) => {
-                    return Ok((None, self.equality_sidecar_failure_followup(index_id, None)));
+                    return Ok((None, self.equality_sidecar_failure_followup(index_id, None)?));
                 }
                 Err(error) => {
                     return Ok((
                         None,
-                        self.equality_sidecar_failure_followup(index_id, Some(error)),
+                        self.equality_sidecar_failure_followup(index_id, Some(error))?,
                     ));
                 }
             }
@@ -8761,18 +8666,18 @@ impl ReadView {
                 key,
                 value,
                 self.snapshot_seq,
-            ) as u64;
+            )? as u64;
             return Ok((Some(PlannerEstimate::exact_cheap(count)), None));
         }
         let mut count = self
             .memtable
-            .secondary_eq_edge_hash_count_at(index_id, value_hash, self.snapshot_seq)
+            .secondary_eq_edge_hash_count_at(index_id, value_hash, self.snapshot_seq)?
             as u64;
         for epoch in &self.immutable_epochs {
             count = count.saturating_add(
                 epoch
                     .memtable
-                    .secondary_eq_edge_hash_count_at(index_id, value_hash, self.snapshot_seq)
+                    .secondary_eq_edge_hash_count_at(index_id, value_hash, self.snapshot_seq)?
                     as u64,
             );
         }
@@ -8796,12 +8701,12 @@ impl ReadView {
             match segment.edge_secondary_eq_posting_count_if_present(index_id, value_hash) {
                 Ok(Some(posting_count)) => count = count.saturating_add(posting_count as u64),
                 Ok(None) => {
-                    return Ok((None, self.equality_sidecar_failure_followup(index_id, None)));
+                    return Ok((None, self.equality_sidecar_failure_followup(index_id, None)?));
                 }
                 Err(error) => {
                     return Ok((
                         None,
-                        self.equality_sidecar_failure_followup(index_id, Some(error)),
+                        self.equality_sidecar_failure_followup(index_id, Some(error))?,
                     ));
                 }
             }
@@ -8880,8 +8785,8 @@ impl ReadView {
             max_ids,
         ) {
             Ok(Some(ids)) => Ok((Some(ids), None)),
-            Ok(None) => Ok((None, self.range_sidecar_failure_followup(index_id, None))),
-            Err(error) => Ok((None, self.range_sidecar_failure_followup(index_id, Some(error)))),
+            Ok(None) => Ok((None, self.range_sidecar_failure_followup(index_id, None)?)),
+            Err(error) => Ok((None, self.range_sidecar_failure_followup(index_id, Some(error))?)),
         }
     }
 
@@ -8901,7 +8806,7 @@ impl ReadView {
                 upper_key,
                 None,
                 self.snapshot_seq,
-            ) as u64;
+            )? as u64;
         if self.active_memtable_only_exact_estimates() {
             return Ok((Some(PlannerEstimate::exact_cheap(count)), None));
         }
@@ -8915,7 +8820,7 @@ impl ReadView {
                         upper_key,
                         None,
                         self.snapshot_seq,
-                    ) as u64,
+                    )? as u64,
             );
         }
 
@@ -8941,11 +8846,11 @@ impl ReadView {
                 upper_key,
             ) {
                 Ok(Some(entries)) => count = count.saturating_add(entries as u64),
-                Ok(None) => return Ok((None, self.range_sidecar_failure_followup(index_id, None))),
+                Ok(None) => return Ok((None, self.range_sidecar_failure_followup(index_id, None)?)),
                 Err(error) => {
                     return Ok((
                         None,
-                        self.range_sidecar_failure_followup(index_id, Some(error)),
+                        self.range_sidecar_failure_followup(index_id, Some(error))?,
                     ));
                 }
             }
@@ -9460,7 +9365,7 @@ impl ReadView {
         {
             return Ok(planned);
         }
-        let Some(compound) = self.best_edge_compound_candidate(query, filter, cap_context, warnings)
+        let Some(compound) = self.best_edge_compound_candidate(query, filter, cap_context, warnings)?
         else {
             return Ok(planned);
         };
@@ -9599,7 +9504,7 @@ impl ReadView {
             | NormalizedEdgeFilter::ValidAt { .. }
             | NormalizedEdgeFilter::ValidFromRange { .. }
             | NormalizedEdgeFilter::ValidToRange { .. } => {
-                match self.edge_metadata_filter_candidate_plan(filter, query.label_id, availability)
+                match self.edge_metadata_filter_candidate_plan(filter, query.label_id, availability)?
                 {
                     Some(EdgePhysicalPlan::Empty) => Ok(EdgeBooleanPlanResult {
                         classification: EdgeBooleanPlanClassification::AlwaysFalse,
@@ -9627,7 +9532,7 @@ impl ReadView {
                 let mut streamable_rejects = Vec::new();
                 if allow_compound {
                     if let Some(compound) =
-                        self.best_edge_compound_candidate(query, filter, cap_context, warnings)
+                        self.best_edge_compound_candidate(query, filter, cap_context, warnings)?
                     {
                         plans.push(EdgePhysicalPlan::source(compound.source));
                     }
@@ -9871,24 +9776,20 @@ impl ReadView {
                 key,
                 value,
                 self.snapshot_seq,
-            ) as u64;
+            )? as u64;
             return Ok((Some(PlannerEstimate::exact_cheap(count)), None));
         }
         let value_hashes = equality_probe_value_hashes(value);
-        let mut count = value_hashes
-            .iter()
-            .map(|value_hash| {
-                self.memtable
-                    .secondary_eq_node_hash_count_at(index_id, *value_hash, self.snapshot_seq)
-                    as u64
-            })
-            .sum::<u64>();
+        let mut count=0u64;
+        for value_hash in &value_hashes {count=count.saturating_add(self.memtable
+                    .secondary_eq_node_hash_count_at(index_id, *value_hash, self.snapshot_seq)?
+                    as u64);}
         for epoch in &self.immutable_epochs {
             for value_hash in &value_hashes {
                 count = count.saturating_add(
                     epoch
                         .memtable
-                        .secondary_eq_node_hash_count_at(index_id, *value_hash, self.snapshot_seq)
+                        .secondary_eq_node_hash_count_at(index_id, *value_hash, self.snapshot_seq)?
                         as u64,
                 );
             }
@@ -9912,12 +9813,12 @@ impl ReadView {
             match segment_secondary_eq_posting_count_for_filter(segment, index_id, value) {
                 Ok(Some(posting_count)) => count = count.saturating_add(posting_count as u64),
                 Ok(None) => {
-                    return Ok((None, self.equality_sidecar_failure_followup(index_id, None)));
+                    return Ok((None, self.equality_sidecar_failure_followup(index_id, None)?));
                 }
                 Err(error) => {
                     return Ok((
                         None,
-                        self.equality_sidecar_failure_followup(index_id, Some(error)),
+                        self.equality_sidecar_failure_followup(index_id, Some(error))?,
                     ));
                 }
             }
@@ -9944,18 +9845,18 @@ impl ReadView {
                 key,
                 value,
                 self.snapshot_seq,
-            ) as u64;
+            )? as u64;
             return Ok((Some(PlannerEstimate::exact_cheap(count)), None));
         }
         let mut count = self
             .memtable
-            .secondary_eq_node_hash_count_at(index_id, value_hash, self.snapshot_seq)
+            .secondary_eq_node_hash_count_at(index_id, value_hash, self.snapshot_seq)?
             as u64;
         for epoch in &self.immutable_epochs {
             count = count.saturating_add(
                 epoch
                     .memtable
-                    .secondary_eq_node_hash_count_at(index_id, value_hash, self.snapshot_seq)
+                    .secondary_eq_node_hash_count_at(index_id, value_hash, self.snapshot_seq)?
                     as u64,
             );
         }
@@ -9979,12 +9880,12 @@ impl ReadView {
             match segment.secondary_eq_posting_count_if_present(index_id, value_hash) {
                 Ok(Some(posting_count)) => count = count.saturating_add(posting_count as u64),
                 Ok(None) => {
-                    return Ok((None, self.equality_sidecar_failure_followup(index_id, None)));
+                    return Ok((None, self.equality_sidecar_failure_followup(index_id, None)?));
                 }
                 Err(error) => {
                     return Ok((
                         None,
-                        self.equality_sidecar_failure_followup(index_id, Some(error)),
+                        self.equality_sidecar_failure_followup(index_id, Some(error))?,
                     ));
                 }
             }
@@ -10053,7 +9954,7 @@ impl ReadView {
         }
         if query.allow_full_scan {
             sources.push(NodeLegalUniverseSource::FullScan {
-                estimate: self.full_scan_estimate(),
+                estimate: self.full_scan_estimate()?,
             });
         }
         Ok(sources)
@@ -11622,7 +11523,7 @@ impl ReadView {
     fn edge_legal_universe_sources(
         &self,
         query: &NormalizedEdgeQuery,
-    ) -> Vec<PlannedEdgeCandidateSource> {
+    ) -> Result<Vec<PlannedEdgeCandidateSource>, EngineError> { Ok({
         let mut sources = Vec::new();
         if !query.ids.is_empty() {
             sources.push(PlannedEdgeCandidateSource::with_normalized_ids(
@@ -11636,7 +11537,7 @@ impl ReadView {
         if let Some(label_id) = query.label_id {
             sources.push(PlannedEdgeCandidateSource::edge_label_index(
                 label_id,
-                self.edge_label_estimate(label_id),
+                self.edge_label_estimate(label_id)?,
             ));
         }
         if !query.from_ids.is_empty() {
@@ -11644,7 +11545,7 @@ impl ReadView {
                 &query.from_ids,
                 Direction::Outgoing,
                 label_filter_ids.as_deref(),
-            );
+            )?;
             sources.push(PlannedEdgeCandidateSource::endpoint_adjacency(
                 EdgeQueryCandidateSourceKind::FromEndpointAdjacency,
                 Arc::new(query.from_ids.clone()),
@@ -11657,7 +11558,7 @@ impl ReadView {
                 &query.to_ids,
                 Direction::Incoming,
                 label_filter_ids.as_deref(),
-            );
+            )?;
             sources.push(PlannedEdgeCandidateSource::endpoint_adjacency(
                 EdgeQueryCandidateSourceKind::ToEndpointAdjacency,
                 Arc::new(query.to_ids.clone()),
@@ -11670,7 +11571,7 @@ impl ReadView {
                 &query.endpoint_ids,
                 Direction::Both,
                 label_filter_ids.as_deref(),
-            );
+            )?;
             sources.push(PlannedEdgeCandidateSource::endpoint_adjacency(
                 EdgeQueryCandidateSourceKind::AnyEndpointAdjacency,
                 Arc::new(query.endpoint_ids.clone()),
@@ -11691,7 +11592,7 @@ impl ReadView {
             ));
         }
         sources
-    }
+    }) }
 
     fn edge_query_cap_context_from_legal_sources(
         sources: &[PlannedEdgeCandidateSource],
@@ -12210,7 +12111,7 @@ impl ReadView {
         allow_compound: bool,
     ) -> Result<PlannedEdgeQuery, EngineError> {
         let mut warnings = query.warnings.clone();
-        let legal_universe_sources = self.edge_legal_universe_sources(query);
+        let legal_universe_sources = self.edge_legal_universe_sources(query)?;
         let cap_context = Self::edge_query_cap_context_from_legal_sources(&legal_universe_sources);
         let legal_universe_fallback =
             Self::cheapest_edge_legal_universe_source(&legal_universe_sources);
@@ -12252,26 +12153,26 @@ impl ReadView {
                 &legal_universe_sources,
                 EdgeQueryCandidateSourceKind::FromEndpointAdjacency,
             )
-            .map(|source| source.estimate)
+            .map(|source| Ok(source.estimate))
             .unwrap_or_else(|| {
                 self.edge_endpoint_estimate(
                     std::slice::from_ref(from),
                     Direction::Outgoing,
                     label_filter_ids.as_deref(),
                 )
-            });
+            })?;
             let to_estimate = Self::edge_legal_source_by_kind(
                 &legal_universe_sources,
                 EdgeQueryCandidateSourceKind::ToEndpointAdjacency,
             )
-            .map(|source| source.estimate)
+            .map(|source| Ok(source.estimate))
             .unwrap_or_else(|| {
                 self.edge_endpoint_estimate(
                     std::slice::from_ref(to),
                     Direction::Incoming,
                     label_filter_ids.as_deref(),
                 )
-            });
+            })?;
             let estimate = min_known_planner_estimate(from_estimate, to_estimate);
             inputs.push(EdgePhysicalPlan::source(
                 PlannedEdgeCandidateSource::edge_triple_index(*from, *to, label_id, estimate),

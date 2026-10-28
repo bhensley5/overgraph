@@ -273,3 +273,30 @@ Licensed under either of
 - [Apache License, Version 2.0](LICENSE-APACHE)
 
 at your option.
+
+### Concurrency diagnostics
+
+Ordinary builds enable `production-concurrency` in the wrapper and Rust core by
+default, including support for explicit `concurrency_options`. The forwarding Cargo
+feature remains available. `maturin build --no-default-features` selects the separate
+legacy route, which rejects `concurrency_options` before filesystem mutation. Retain
+the project's PyO3 extension/ABI3 features when specifying an explicit feature list.
+`binding-test-hooks` remains opt-in.
+
+`OverGraph.open(path, concurrency_options={...})` accepts a Mapping with partial logical
+limits: `max_batch_operations` (65,536), `max_batch_bytes` (16 MiB),
+`generation_operation_limit` (1,048,576), `generation_wal_bytes` (512 MiB), and
+`admission_timeout_ms` (1,000). Values must be nonnegative integers, excluding bool,
+and pass the core validator. They do not bound aggregate memory or RSS.
+
+`db.reclamation_stats()` remains live after close; the async facade exposes
+the same method. Counts are Python ints, close states are `open`/`draining`/`drained`,
+and histograms have 64 microsecond buckets. Unavailable observations remain `None`.
+Retained closed wrappers hold diagnostics/completion metadata only.
+
+New `OverGraphError` outcomes expose `code` (`resource_limit`, `commit_committed`, or
+`commit_indeterminate`); resource errors also expose `resource`, `requested`, `limit`,
+and `retryable`. Accepted commit outcomes must not be blindly retried. Cancelling an
+`AsyncWriteTxn` await after submission waits for its actual worker to settle before
+releasing transaction ordering, including repeated cancellation. Cancellation while
+waiting for that ordering lock still submits no operation.

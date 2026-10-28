@@ -10576,7 +10576,7 @@ fn graph_row_optional_stale_edge_property_index_candidates_are_verified_away() {
     let red_two;
     let blue;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         left_a = insert_graph_row_node(&engine, "Person", "optional-stale-left-a", &[]);
         let left_b = insert_graph_row_node(&engine, "Person", "optional-stale-left-b", &[]);
         insert_graph_row_edge(
@@ -10638,7 +10638,7 @@ fn graph_row_optional_stale_edge_property_index_candidates_are_verified_away() {
         blue,
     );
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let mut optional_edge = match graph_edge_with_label(
         Some("s"),
         "x",
@@ -10907,7 +10907,7 @@ fn graph_row_fixed_queries_respect_flush_reopen_and_source_precedence() {
 
     engine.flush().unwrap();
     drop(engine);
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     let mut reopened_query = graph_query(
         &["a", "b"],
         vec![graph_edge_with_label(Some("r"), "a", "b", "KNOWS")],
@@ -11505,7 +11505,7 @@ fn graph_row_edge_metadata_filter_preserves_order_and_cursor_page_shape() {
 
 #[test]
 fn graph_row_execution_does_not_call_public_node_or_edge_queries() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let source = insert_graph_row_node(&engine, "NodeLabel129", "no-public-source", &[]);
     let target = insert_graph_row_node(&engine, "NodeLabel129", "no-public-target", &[]);
     let edge = insert_graph_row_edge(
@@ -12143,7 +12143,7 @@ fn graph_row_bound_mode_reuses_streamed_endpoint_and_selective_eager_edge_plans(
 
 #[test]
 fn graph_row_unbound_edge_filters_use_planner_before_candidate_cap() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let source = insert_graph_row_node(&engine, "Person", "planner-source", &[]);
     let mut keep = None;
     for index in 0..8 {
@@ -12433,7 +12433,7 @@ fn graph_row_valid_at_split_keeps_legal_metadata_anchor_temporally_correct() {
 
 #[test]
 fn graph_row_delegated_stale_candidates_do_not_consume_frontier_cap() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let source = insert_graph_row_node(&engine, "DelegatedStale", "stale-source", &[]);
     let mut edge_ids = Vec::new();
     for index in 0..8 {
@@ -12696,7 +12696,7 @@ fn graph_row_edge_pull_constrained_node_cache_reuses_positive_and_negative_resul
     assert_cache(&engine);
     engine.flush().unwrap();
     drop(engine);
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     assert_cache(&reopened);
 }
 
@@ -13169,7 +13169,7 @@ fn prepared_edge_metadata_pull_native_label_continues_once_across_flush() {
     drop(prepared);
     drop(view);
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     let reopened_view = reopened.published_state().view.clone();
     let reopened_query = reopened_view.normalize_edge_query(&query).unwrap();
     let (mut reopened_prepared, followups) = reopened_view
@@ -13369,7 +13369,7 @@ fn prepared_edge_metadata_pull_rejects_unreachable_anchored_sources() {
 
 #[test]
 fn prepared_edge_metadata_pull_streamed_union_builds_once_across_many_pulls() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let label = "PREPARED_STREAMED_UNION";
     ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
     ensure_ready_edge_property_index(&engine, label, "region", SecondaryIndexKind::Equality);
@@ -13601,7 +13601,7 @@ fn prepared_edge_metadata_pull_streamed_union_builds_once_across_many_pulls() {
 
 #[test]
 fn prepared_edge_metadata_pull_eager_union_materializes_once() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let label = "PREPARED_EAGER_UNION";
     ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
     ensure_ready_edge_property_index(&engine, label, "region", SecondaryIndexKind::Equality);
@@ -13706,7 +13706,7 @@ fn prepared_edge_metadata_pull_endpoint_cache_is_persistent_and_bounded_for_200k
                     props.insert("needle".to_string(), PropValue::Bool(true));
                 }
                 write_seq += 1;
-                core.active_memtable().apply_op(
+                core.active_memtable().apply_op_for_test(
                     &WalOp::UpsertEdge(EdgeRecord {
                         id: edge_id,
                         from,
@@ -13721,7 +13721,7 @@ fn prepared_edge_metadata_pull_endpoint_cache_is_persistent_and_bounded_for_200k
                         last_write_seq: 0,
                     }),
                     write_seq,
-                );
+                ).unwrap();
             }
             core.engine_seq = write_seq;
             core.next_edge_id = matching_edge_id + 1;
@@ -13874,7 +13874,7 @@ fn graph_row_delegated_rows_explain_and_cursor_are_deterministic_after_reopen() 
 
     engine.flush().unwrap();
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     reopened.reset_query_execution_counters_for_test();
     let reopened_first = reopened.query_graph_rows(&query).unwrap();
     assert_eq!(reopened_first.rows, first.rows);
@@ -14992,7 +14992,9 @@ fn graph_row_fo033_native_residual_succeeds_with_inflight_caps() {
         &[1, 2, 256, usize::MAX],
     );
     engine.flush().unwrap();
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    if engine.runtime.candidate.is_some() { engine.close_fast().unwrap(); }
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     graph_row_chunk_assert_forced_equivalence(
         &reopened,
         &equivalence,
@@ -15802,7 +15804,7 @@ fn graph_row_stale_edge_property_index_candidates_are_verified_away() {
     let red_two;
     let blue;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let nodes = (0..4)
             .map(|idx| {
                 insert_graph_row_node(&engine, "Person", &format!("graph-row-stale-{idx}"), &[])
@@ -15850,7 +15852,7 @@ fn graph_row_stale_edge_property_index_candidates_are_verified_away() {
         blue,
     );
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let mut query = graph_query(
         &["a", "b"],
         vec![GraphPatternPiece::Edge(GraphEdgePattern {
@@ -15888,7 +15890,7 @@ fn graph_row_stale_node_property_index_candidates_are_verified_away() {
     let red_two;
     let blue;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         red_one = insert_graph_row_node(
             &engine,
             "GRAPH_ROW_STALE_NODE",
@@ -15928,7 +15930,7 @@ fn graph_row_stale_node_property_index_candidates_are_verified_away() {
         blue,
     );
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let mut query = graph_query(&["n"], Vec::new());
     query.nodes[0] = graph_node_with_label("n", "GRAPH_ROW_STALE_NODE");
     query.nodes[0].filter = Some(NodeFilterExpr::PropertyEquals {
@@ -16700,7 +16702,7 @@ fn graph_row_explain_reports_remaining_edge_property_projection_after_metadata_s
 
 #[test]
 fn graph_row_explain_reports_exists_missing_boolean_fallback_sources() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let a = insert_graph_row_node(&engine, "ExplainExistsNode", "exists-a", &[]);
     let b = insert_graph_row_node(&engine, "ExplainExistsNode", "exists-b", &[]);
     let c = insert_graph_row_node(&engine, "ExplainExistsNode", "exists-c", &[]);
@@ -16764,7 +16766,7 @@ fn graph_row_explain_reports_exists_missing_boolean_fallback_sources() {
 
 #[test]
 fn graph_row_compound_node_anchor_wins_when_selective() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let target = insert_graph_row_node(&engine, "CompoundGraphTarget", "node-anchor-target", &[]);
     let keep = insert_graph_row_node(
         &engine,
@@ -16860,7 +16862,7 @@ fn graph_row_compound_node_anchor_wins_when_selective() {
 
 #[test]
 fn graph_row_compound_multi_label_any_anchor_unions_per_label() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let target = insert_graph_row_node(&engine, "AnyAnchorTarget", "any-anchor-target", &[]);
     let tuple_props = [
         ("tenant", PropValue::String("acme".to_string())),
@@ -16954,7 +16956,7 @@ fn graph_row_compound_multi_label_any_anchor_unions_per_label() {
 
 #[test]
 fn graph_row_compound_edge_anchor_wins_when_selective() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let mut expected = None;
     for index in 0..80 {
         let from = insert_graph_row_node(
@@ -17034,7 +17036,7 @@ fn graph_row_compound_edge_anchor_wins_when_selective() {
 
 #[test]
 fn graph_row_compound_node_anchor_missing_sidecar_falls_back_to_legal_source() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let target = insert_graph_row_node(&engine, "NodeAnchorMissingTarget", "missing-target", &[]);
     let keep = insert_graph_row_node(
         &engine,
@@ -17062,6 +17064,10 @@ fn graph_row_compound_node_anchor_missing_sidecar_falls_back_to_legal_source() {
         "GRAPH_ROW_COMPOUND_NODE_MISSING",
         &[],
     );
+    for ordinal in 0..32 {
+        let decoy = insert_graph_row_node(&engine, "UnrelatedAnchor", &format!("decoy-{ordinal}"), &[]);
+        insert_graph_row_edge(&engine, decoy, target, "GRAPH_ROW_COMPOUND_NODE_MISSING", &[]);
+    }
     engine.flush().unwrap();
     let index = engine
         .ensure_node_property_index(
@@ -17118,6 +17124,8 @@ fn graph_row_compound_node_anchor_missing_sidecar_falls_back_to_legal_source() {
         index.index_id,
     );
     std::fs::remove_file(&sidecar_path).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    engine.reopen_segment_reader_and_rebuild_sources_for_test(segment_id).unwrap();
 
     assert_eq!(
         graph_row_single_u64_column(engine.query_graph_rows(&query).unwrap()),
@@ -17205,7 +17213,7 @@ fn seed_compound_edge_fallback_graph(
 
 #[test]
 fn graph_row_delegated_compound_missing_sidecar_falls_back_and_preserves_followup() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let (expected, _, info, query) =
         seed_compound_edge_fallback_graph(&engine, "GraphRowCompoundEdgeMissing");
 
@@ -17226,6 +17234,8 @@ fn graph_row_delegated_compound_missing_sidecar_falls_back_and_preserves_followu
         info.index_id,
     );
     std::fs::remove_file(&sidecar_path).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    engine.reopen_segment_reader_and_rebuild_sources_for_test(segment_id).unwrap();
 
     let mut actual = None;
     assert_graph_row_single_read_followup_enqueued(&engine, || {
@@ -17238,7 +17248,7 @@ fn graph_row_delegated_compound_missing_sidecar_falls_back_and_preserves_followu
 
 #[test]
 fn graph_row_vlp_delegated_compound_followups_reach_engine_reconciliation() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let label = "GraphRowVlpCompoundMissing";
     let (_expected, expected_from, info, fixed_query) =
         seed_compound_edge_fallback_graph(&engine, label);
@@ -17268,6 +17278,8 @@ fn graph_row_vlp_delegated_compound_followups_reach_engine_reconciliation() {
         info.index_id,
     );
     std::fs::remove_file(&sidecar_path).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    engine.reopen_segment_reader_and_rebuild_sources_for_test(segment_id).unwrap();
 
     engine.reset_query_execution_counters_for_test();
     let mut actual = None;
@@ -17287,7 +17299,7 @@ fn graph_row_vlp_delegated_compound_followups_reach_engine_reconciliation() {
 fn graph_row_delegated_compound_corrupt_sidecar_falls_back_and_preserves_followup() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let (expected, _, info, query) =
         seed_compound_edge_fallback_graph(&engine, "GraphRowCompoundEdgeCorrupt");
 
@@ -17301,7 +17313,7 @@ fn graph_row_delegated_compound_corrupt_sidecar_falls_back_and_preserves_followu
 
     // Payload-only corruption passes lightweight reopen validation, so the
     // planner still selects the compound source; execution must fall back.
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     wait_for_edge_property_index_state(&reopened, info.index_id, SecondaryIndexState::Ready);
     let explain = reopened.explain_graph_rows(&query).unwrap();
     assert_graph_row_explain_contains(&explain, "CompoundRangeIndex");
@@ -17317,7 +17329,7 @@ fn graph_row_delegated_compound_corrupt_sidecar_falls_back_and_preserves_followu
 
 #[test]
 fn graph_row_delegated_compound_too_broad_streams_verified_fallback_once() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let a = insert_graph_row_node(&engine, "CompoundGraphBroadFrom", "broad-from", &[]);
     let b = insert_graph_row_node(&engine, "CompoundGraphBroadTo", "broad-to", &[]);
 
@@ -17400,7 +17412,7 @@ fn graph_row_delegated_compound_too_broad_streams_verified_fallback_once() {
 
 #[test]
 fn graph_row_endpoint_adjacency_beats_broad_compound_edge_source() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let source = insert_graph_row_node(&engine, "CompoundGraphEndpoint", "endpoint-source", &[]);
     let target = insert_graph_row_node(&engine, "CompoundGraphEndpoint", "endpoint-target", &[]);
     let keep = insert_graph_row_edge(
@@ -17482,7 +17494,7 @@ fn graph_row_endpoint_adjacency_beats_broad_compound_edge_source() {
 
 #[test]
 fn graph_row_optional_compound_miss_preserves_null_row() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let a = insert_graph_row_node(&engine, "CompoundGraphOptional", "optional-a", &[]);
     let b = insert_graph_row_node(&engine, "CompoundGraphOptional", "optional-b", &[]);
     let c = insert_graph_row_node(&engine, "CompoundGraphOptional", "optional-c", &[]);
@@ -17726,7 +17738,7 @@ fn graph_row_edge_bound_rollups_tail_fallback_multilabel_and_both_are_sound() {
     let corrupt_segment_id = engine.segments_for_test()[0].segment_id;
     engine.close().unwrap();
     corrupt_planner_stats_for_segment(&dir.path().join("db"), corrupt_segment_id);
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     let corrupt_view = reopened.published_read_view_for_test();
     let corrupt_bound = corrupt_view.graph_row_physical_edge_bound_context();
     let corrupt_physical = corrupt_bound.physical_edge_bound;
@@ -17833,7 +17845,7 @@ fn graph_row_known_id_posting_cap_memo_proof_and_declines_are_sound() {
         edge,
         edge_bound,
         &mut memo,
-    );
+    ).unwrap();
     assert_eq!(
         estimate.known_id_posting_bound,
         Some(25),
@@ -17858,7 +17870,7 @@ fn graph_row_known_id_posting_cap_memo_proof_and_declines_are_sound() {
             edge,
             edge_bound,
             &mut legacy_memo,
-        )
+        ).unwrap()
     });
     assert_eq!(legacy_estimate.known_id_posting_bound, None);
     let legacy_counters = snapshot_graph_row_planning_probe();
@@ -17878,7 +17890,7 @@ fn graph_row_known_id_posting_cap_memo_proof_and_declines_are_sound() {
         edge,
         edge_bound,
         &mut restored_memo,
-    );
+    ).unwrap();
     assert_eq!(restored.known_id_posting_bound, Some(25));
     assert_eq!(snapshot_graph_row_planning_probe().known_id_posting_consults, 1);
 
@@ -17892,7 +17904,7 @@ fn graph_row_known_id_posting_cap_memo_proof_and_declines_are_sound() {
         edge,
         edge_bound,
         &mut memo,
-    );
+    ).unwrap();
     assert_eq!(repeated.known_id_posting_bound, Some(25));
     let opposite = view.graph_row_edge_fanout_estimate(
         0,
@@ -17904,7 +17916,7 @@ fn graph_row_known_id_posting_cap_memo_proof_and_declines_are_sound() {
         edge,
         edge_bound,
         &mut memo,
-    );
+    ).unwrap();
     assert_eq!(opposite.known_id_posting_bound, Some(1));
     let counters = snapshot_graph_row_planning_probe();
     assert_eq!(counters.known_id_posting_consults, 3);
@@ -17923,7 +17935,7 @@ fn graph_row_known_id_posting_cap_memo_proof_and_declines_are_sound() {
         edge,
         edge_bound,
         &mut at_cap_memo,
-    );
+    ).unwrap();
     assert!(at_cap.known_id_posting_bound.is_some());
     let counters = snapshot_graph_row_planning_probe();
     assert_eq!(counters.known_id_posting_consults, 1);
@@ -17934,7 +17946,7 @@ fn graph_row_known_id_posting_cap_memo_proof_and_declines_are_sound() {
             &source_ids,
             Direction::Both,
             edge.label_filter_ids.as_deref(),
-        ),
+        ).unwrap(),
         Some(26),
         "Direction::Both sums outgoing and incoming physical postings, including a self-loop twice"
     );
@@ -17987,7 +17999,7 @@ fn graph_row_known_id_posting_cap_memo_proof_and_declines_are_sound() {
             edge,
             edge_bound,
             &mut decline_memo,
-        );
+        ).unwrap();
         assert_eq!(declined.known_id_posting_bound, None);
         assert_eq!(declined.avg_upper_fanout, estimate.avg_upper_fanout);
         assert_eq!(declined.p99_fanout, estimate.p99_fanout);
@@ -18014,7 +18026,7 @@ fn graph_row_known_id_posting_cap_memo_proof_and_declines_are_sound() {
         edge,
         edge_bound,
         &mut temporal_memo,
-    );
+    ).unwrap();
     let mut temporal_decline_memo = GraphRowKnownIdPostingMemo::new(runtime.edges.len());
     let temporal_declined = view.graph_row_edge_fanout_estimate(
         0,
@@ -18026,7 +18038,7 @@ fn graph_row_known_id_posting_cap_memo_proof_and_declines_are_sound() {
         edge,
         edge_bound,
         &mut temporal_decline_memo,
-    );
+    ).unwrap();
     assert_eq!(temporal_accepted.confidence, temporal_declined.confidence);
     assert_eq!(temporal_accepted.coverage, temporal_declined.coverage);
     assert_eq!(temporal_accepted.hub_risk, temporal_declined.hub_risk);
@@ -18056,7 +18068,7 @@ fn graph_row_known_id_posting_cap_memo_proof_and_declines_are_sound() {
         edge,
         prune_edge_bound,
         &mut prune_memo,
-    );
+    ).unwrap();
     let mut prune_decline_memo = GraphRowKnownIdPostingMemo::new(runtime.edges.len());
     let prune_declined = prune_view.graph_row_edge_fanout_estimate(
         0,
@@ -18068,7 +18080,7 @@ fn graph_row_known_id_posting_cap_memo_proof_and_declines_are_sound() {
         edge,
         prune_edge_bound,
         &mut prune_decline_memo,
-    );
+    ).unwrap();
     assert_eq!(prune_accepted.confidence, prune_declined.confidence);
     assert_eq!(prune_accepted.coverage, prune_declined.coverage);
     assert_eq!(prune_accepted.hub_risk, prune_declined.hub_risk);
@@ -18091,7 +18103,7 @@ fn graph_row_known_id_posting_cap_memo_proof_and_declines_are_sound() {
         edge,
         edge_bound,
         &mut no_probe_memo,
-    );
+    ).unwrap();
     assert_eq!(id_free.known_id_posting_bound, None);
     let empty_labels = view.graph_row_edge_fanout_estimate(
         0,
@@ -18103,7 +18115,7 @@ fn graph_row_known_id_posting_cap_memo_proof_and_declines_are_sound() {
         edge,
         edge_bound,
         &mut no_probe_memo,
-    );
+    ).unwrap();
     assert_eq!(empty_labels.cost_fanout(), 0);
     assert_eq!(empty_labels.known_id_posting_bound, None);
     let counters = snapshot_graph_row_planning_probe();
@@ -18117,7 +18129,7 @@ fn graph_row_known_id_posting_cap_memo_proof_and_declines_are_sound() {
             &source_ids,
             Direction::Outgoing,
             edge.label_filter_ids.as_deref(),
-        ),
+        ).unwrap(),
         Some(24),
         "the deleted source contributes no active-memtable term while older segment postings remain"
     );
@@ -19054,7 +19066,7 @@ fn graph_row_hub_poisoned_plan_clamps_warm_and_reopened_with_deterministic_caps(
 
     engine.flush().unwrap();
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(
+    let reopened = open_after_native_shutdown(
         &db_path,
         &DbOptions {
             compact_after_n_flushes: 0,
@@ -19120,7 +19132,7 @@ fn graph_row_legacy_estimator_restores_zero_unknown_for_single_and_both_no_rollu
         edge,
         edge_bound,
         &mut current_memo,
-    );
+    ).unwrap();
     assert_eq!(current_both.cost_fanout(), GRAPH_ROW_FANOUT_UNKNOWN_WORK);
     assert_eq!(current_both.visible_total_edges_bound, Some(0));
     let legacy_both = with_graph_row_test_legacy_estimator(|| {
@@ -19135,7 +19147,7 @@ fn graph_row_legacy_estimator_restores_zero_unknown_for_single_and_both_no_rollu
             edge,
             edge_bound,
             &mut legacy_memo,
-        )
+        ).unwrap()
     });
     assert_eq!(legacy_both.cost_fanout(), 0);
     assert_eq!(legacy_both.visible_total_edges_bound, None);
@@ -19395,7 +19407,7 @@ fn graph_row_legacy_estimator_ab_corpus_is_allowlisted_and_behaviorally_sound() 
 
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(
+    let engine = open_index_protocol_fixture(
         &db_path,
         &DbOptions {
             compact_after_n_flushes: 0,
@@ -19985,7 +19997,7 @@ fn graph_row_legacy_estimator_ab_corpus_is_allowlisted_and_behaviorally_sound() 
 
     engine.flush().unwrap();
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(
+    let reopened = open_index_protocol_fixture(
         &db_path,
         &DbOptions {
             compact_after_n_flushes: 0,
@@ -20047,7 +20059,7 @@ fn graph_row_explain_reports_edge_property_sidecar_fallbacks_and_followups() {
     let index_id;
     let segment_id;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let a = insert_graph_row_node(&engine, "ExplainSidecarNode", "sidecar-a", &[]);
         let b = insert_graph_row_node(&engine, "ExplainSidecarNode", "sidecar-b", &[]);
         insert_graph_row_edge(
@@ -20072,7 +20084,7 @@ fn graph_row_explain_reports_edge_property_sidecar_fallbacks_and_followups() {
         index_id,
     );
     corrupt_planner_stats_for_segment(&db_path, segment_id);
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     wait_for_edge_property_index_state(&reopened, index_id, SecondaryIndexState::Ready);
     corrupt_sidecar_header_in_place(&sidecar_path);
 
@@ -20126,7 +20138,7 @@ fn graph_row_explain_reports_node_candidate_sidecar_followup_without_old_edge_an
     let index_id;
     let segment_id;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let source = insert_graph_row_node(
             &engine,
             "ExplainNodeSidecar",
@@ -20156,7 +20168,7 @@ fn graph_row_explain_reports_node_candidate_sidecar_followup_without_old_edge_an
         index_id,
     );
     corrupt_planner_stats_for_segment(&db_path, segment_id);
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     wait_for_property_index_state(&reopened, index_id, SecondaryIndexState::Ready);
     corrupt_sidecar_header_in_place(&sidecar_path);
 
@@ -20520,7 +20532,7 @@ fn graph_row_fanout_delays_high_hub_expansion() {
 
 #[test]
 fn graph_row_planner_target_filter_selectivity_reduces_fanout_cost() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let rare = insert_graph_row_node(
         &engine,
         "GRAPH_ROW_TARGET_SELECTIVE_RARE",
@@ -20674,7 +20686,7 @@ fn graph_row_planner_both_bound_constraint_runs_before_unbound_expansion() {
 
 #[test]
 fn graph_row_planner_edge_property_equality_materializes_edge_source() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let source = insert_graph_row_node(&engine, "GRAPH_ROW_EDGE_EQ", "edge-eq-source", &[]);
     let mut hit = None;
     for index in 0..18 {
@@ -20740,7 +20752,7 @@ fn graph_row_planner_edge_property_equality_materializes_edge_source() {
 
 #[test]
 fn graph_row_explain_standalone_reports_edge_source_choice() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let source = insert_graph_row_node(&engine, "GRAPH_ROW_EXPLAIN_BOUND_EDGE", "bound-source", &[]);
     let hit_target = insert_graph_row_node(
         &engine,
@@ -20800,7 +20812,7 @@ fn graph_row_explain_standalone_reports_edge_source_choice() {
 
 #[test]
 fn graph_row_planner_edge_property_range_materializes_edge_source() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let source = insert_graph_row_node(&engine, "GRAPH_ROW_EDGE_RANGE", "edge-range-source", &[]);
     let mut hit = None;
     for index in 0..18 {
@@ -21246,7 +21258,7 @@ fn graph_row_adjacency_pull_pinned_cursor_walk_crosses_every_physical_state_and_
     query.page.cursor = compacted_edge.next_cursor.clone();
 
     drop(engine);
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     let (_, reopened_adjacency, reopened_edge, _) =
         graph_row_adjacency_forced_differential(&reopened, &query);
     assert_eq!(
@@ -21748,7 +21760,7 @@ fn graph_row_adjacency_pull_forced_sources_prove_same_id_layers_compaction_and_r
     assert_eq!(compacted.next_cursor, final_cursor);
 
     drop(engine);
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     let (_, reopened_adjacency, _, _) =
         graph_row_adjacency_forced_differential(&reopened, &pinned);
     assert_eq!(reopened_adjacency.rows, final_rows);
@@ -22514,7 +22526,7 @@ fn graph_row_adjacency_pull_public_corruption_is_lazy_terminal_and_never_falls_b
 
 #[test]
 fn graph_row_planner_bound_by_prior_edge_explains_selective_edge_source() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let source = insert_graph_row_node(&engine, "GRAPH_ROW_PRIOR_BOUND", "prior-source", &[]);
     let mid = insert_graph_row_node(&engine, "GRAPH_ROW_PRIOR_BOUND_MID", "prior-mid", &[]);
     insert_graph_row_edge(
@@ -22629,7 +22641,7 @@ fn graph_row_planner_bound_by_prior_edge_explains_selective_edge_source() {
 
 #[test]
 fn graph_row_planner_edge_property_in_anchor_preserves_signed_zero() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let source = insert_graph_row_node(&engine, "GRAPH_ROW_EDGE_IN_ZERO", "edge-in-source", &[]);
     let positive_target =
         insert_graph_row_node(&engine, "GRAPH_ROW_EDGE_IN_ZERO", "edge-in-positive", &[]);
@@ -22708,7 +22720,7 @@ fn graph_row_planner_edge_property_in_anchor_preserves_signed_zero() {
 
 #[test]
 fn graph_row_planner_broad_edge_property_source_stays_with_adjacency() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let source = insert_graph_row_node(&engine, "GRAPH_ROW_BROAD_EDGE", "broad-source", &[]);
     let mut expected = Vec::new();
     for index in 0..3 {
@@ -22996,7 +23008,7 @@ fn graph_row_planner_fanout_stats_preserve_results_after_reopen() {
         engine.close().unwrap();
     }
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     let source = reopened
         .query_node_ids(&NodeQuery {
             label_filter: Some(node_label_filter(&["GRAPH_ROW_REOPEN_PLAN"], LabelMatchMode::All)),
@@ -23180,7 +23192,7 @@ fn graph_row_planner_physical_reorder_preserves_explicit_order_by_oracle() {
 
 #[test]
 fn graph_row_explain_reports_mixed_sources_dedupe_newest_props_and_numeric_verification() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let source = insert_graph_row_node(&engine, "ExplainMixedNode", "mixed-source", &[]);
     let target_a = insert_graph_row_node(&engine, "ExplainMixedNode", "mixed-target-a", &[]);
     let target_b = insert_graph_row_node(&engine, "ExplainMixedNode", "mixed-target-b", &[]);
@@ -23245,7 +23257,7 @@ fn graph_row_explain_reports_mixed_sources_dedupe_newest_props_and_numeric_verif
 
 #[test]
 fn graph_row_explain_reports_range_numeric_equivalence_and_order_cursor_row_ops() {
-    let (_dir, engine) = graph_row_test_engine();
+    let (_dir, engine) = graph_row_index_protocol_fixture();
     let a = insert_graph_row_node(&engine, "ExplainRangeNode", "range-a", &[]);
     let b = insert_graph_row_node(&engine, "ExplainRangeNode", "range-b", &[]);
     let c = insert_graph_row_node(&engine, "ExplainRangeNode", "range-c", &[]);
@@ -23454,7 +23466,9 @@ fn graph_row_chunk_eq1_forced_sizes_preserve_rows_cursors_and_pages() {
     );
 
     engine.flush().unwrap();
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    if engine.runtime.candidate.is_some() { engine.close_fast().unwrap(); }
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     graph_row_chunk_assert_forced_equivalence(
         &reopened,
         &query,
@@ -23754,7 +23768,9 @@ fn graph_row_edge_pull_eq44_1_2_3_9_10_12_equivalence_and_reopen() {
     );
 
     engine.flush().unwrap();
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    if engine.runtime.candidate.is_some() { engine.close_fast().unwrap(); }
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     graph_row_chunk_assert_forced_equivalence(
         &reopened,
         &filtered,
@@ -24195,7 +24211,9 @@ fn graph_row_edge_pull_eq44_4_6_7_8_11_suffix_and_branch_equivalence() {
     graph_row_chunk_assert_forced_equivalence(&engine, &vlp_barrier, &[1, 3, 7]);
 
     engine.flush().unwrap();
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    if engine.runtime.candidate.is_some() { engine.close_fast().unwrap(); }
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     for query in [
         &optional,
         &uncorrelated_optional,
@@ -24366,7 +24384,9 @@ fn graph_row_edge_pull_eq44_5_raw_ids_preserve_verification_and_counters() {
     assert_eq!(precedence_counters.graph_row_delegated_edge_queries, 0);
 
     engine.flush().unwrap();
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    if engine.runtime.candidate.is_some() { engine.close_fast().unwrap(); }
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     assert_view(&reopened);
 }
 
@@ -25037,7 +25057,9 @@ fn graph_row_chunk_eq3_eq4_optional_shapes_are_equivalent() {
 
     assert!(!docs.is_empty());
     engine.flush().unwrap();
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    engine.close_fast().unwrap();
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     graph_row_chunk_assert_forced_equivalence(&reopened, &optional_where, &[1, 3, 256]);
     graph_row_chunk_assert_forced_equivalence(&reopened, &nested, &[1, 7, usize::MAX]);
 }
@@ -25159,7 +25181,9 @@ fn graph_row_chunk_eq5_vlp_shapes_are_equivalent() {
     graph_row_chunk_assert_forced_equivalence(&engine, &both, &[1, 2, 7, 256]);
 
     engine.flush().unwrap();
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    engine.close_fast().unwrap();
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     graph_row_chunk_assert_forced_equivalence(&reopened, &query, &[1, 2, 7, 256]);
     graph_row_chunk_assert_forced_equivalence(&reopened, &both, &[1, 2, 7, 256]);
 }
@@ -25203,7 +25227,9 @@ fn graph_row_chunk_eq8_no_step_residual_and_order_are_equivalent() {
     graph_row_chunk_assert_forced_equivalence(&engine, &element, &[1, 7, usize::MAX]);
 
     engine.flush().unwrap();
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    engine.close_fast().unwrap();
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     graph_row_chunk_assert_forced_equivalence(&reopened, &residual, &[1, 7, usize::MAX]);
     graph_row_chunk_assert_forced_equivalence(&reopened, &ordered, &[1, 7, usize::MAX]);
 }
@@ -25816,7 +25842,9 @@ fn graph_row_chunk_early_exit_complete_leaf_natural_exhaustion_and_gates() {
     );
 
     engine.flush().unwrap();
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    engine.close_fast().unwrap();
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     let reopened_exhaustive = with_graph_row_test_early_exit_disabled(|| {
         reopened.query_graph_rows(&query).unwrap()
     });
@@ -26543,7 +26571,9 @@ fn graph_row_chunk_cursor_seek_inclusive_mid_anchor_walks_and_reopen() {
     assert!(actual_plan.contains("early_exit=true; cursor_seek=anchor_ge:"));
 
     engine.flush().unwrap();
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    engine.close_fast().unwrap();
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     graph_row_chunk_cursor_seek_assert_walk_matrix(&reopened, &base, &expected_rows);
 }
 
@@ -26862,4 +26892,12 @@ fn graph_row_chunk_cursor_seek_skips_prefix_error_but_observes_anchor_error_and_
         cap_error.to_string(),
         "invalid operation: graph row max_frontier exceeded configured cap 2"
     );
+}
+
+// Explicit mutable index protocol setup; public candidate setup stays above.
+fn graph_row_index_protocol_fixture() -> (TempDir, DatabaseEngine) {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
+    (dir, engine)
 }

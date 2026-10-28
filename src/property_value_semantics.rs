@@ -516,6 +516,19 @@ fn push_numeric_key_bytes(target: &mut Vec<u8>, key: NumericScalarKey) {
     target.extend_from_slice(&key.significand.to_be_bytes());
 }
 
+pub(crate) fn write_numeric_key_bytes<W: std::io::Write>(
+    target: &mut W,
+    key: NumericScalarKey,
+) -> std::io::Result<()> {
+    target.write_all(&[match key.sign {
+        NumericSign::Negative => 0,
+        NumericSign::Zero => 1,
+        NumericSign::Positive => 2,
+    }])?;
+    target.write_all(&key.exponent.to_be_bytes())?;
+    target.write_all(&key.significand.to_be_bytes())
+}
+
 fn raw_canonical_prop_value_bytes(value: &PropValue) -> Vec<u8> {
     rmp_serde::to_vec(value).expect("PropValue must be serializable")
 }

@@ -1,5 +1,9 @@
+#[path = "support/native_close.rs"]
+mod native_close;
+mod support;
+
 use overgraph::{
-    DatabaseEngine, DbOptions, Direction, NeighborOptions, NodeInput, PropValue, UpsertEdgeOptions,
+    DbOptions, Direction, NeighborOptions, NodeInput, PropValue, UpsertEdgeOptions,
     UpsertNodeOptions, WalSyncMode,
 };
 use std::collections::BTreeMap;
@@ -34,7 +38,7 @@ fn test_crash_recovery_wal_replay() {
 
     // Step 1: write data, flush some to segment, leave some in WAL only
     {
-        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let db = support::open(&db_path, &opts).unwrap();
         node_a = db
             .upsert_node(
                 "Person",
@@ -91,7 +95,7 @@ fn test_crash_recovery_wal_replay() {
 
     // Step 2: reopen and verify everything
     {
-        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let db = support::open(&db_path, &opts).unwrap();
 
         // Segment data
         let alice = db.get_node(node_a).unwrap().unwrap();
@@ -143,7 +147,7 @@ fn test_crash_recovery_with_deletes() {
     let node_b;
 
     {
-        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let db = support::open(&db_path, &opts).unwrap();
         node_a = db
             .upsert_node("Person", "a", UpsertNodeOptions::default())
             .unwrap();
@@ -160,7 +164,7 @@ fn test_crash_recovery_with_deletes() {
     }
 
     {
-        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let db = support::open(&db_path, &opts).unwrap();
         assert!(
             db.get_node(node_a).unwrap().is_none(),
             "deleted node should stay deleted after crash"
@@ -199,7 +203,7 @@ fn test_large_scale_100k_nodes() {
         ..DbOptions::default()
     };
 
-    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = support::open(&db_path, &opts).unwrap();
 
     // Batch insert 100k nodes in chunks
     let chunk_size = 10_000;
@@ -287,7 +291,7 @@ fn test_large_scale_100k_nodes() {
 
     // Close and reopen
     db.close().unwrap();
-    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = support::open(&db_path, &opts).unwrap();
     let node = db.get_node(all_ids[99_999]).unwrap().unwrap();
     assert_eq!(node.key, "node-99999");
     db.close().unwrap();
@@ -309,7 +313,7 @@ fn test_engine_manifest_corruption_recovery() {
 
     // Write data and flush to create a manifest
     {
-        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let db = support::open(&db_path, &opts).unwrap();
         db.upsert_node("Person", "a", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
@@ -317,7 +321,7 @@ fn test_engine_manifest_corruption_recovery() {
         db.upsert_node("Person", "b", UpsertNodeOptions::default())
             .unwrap();
         db.flush().unwrap();
-        db.close().unwrap();
+        native_close::close_and_wait(db);
     }
 
     // Corrupt manifest.current
@@ -327,7 +331,7 @@ fn test_engine_manifest_corruption_recovery() {
 
     // Reopen -- should recover via manifest.prev
     {
-        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let db = support::open(&db_path, &opts).unwrap();
         // The engine should open successfully (recovered from prev)
         // We may lose the second flush's manifest entry, but the WAL
         // should replay and recover the data
@@ -356,7 +360,7 @@ fn test_engine_wal_truncated_record_recovery() {
 
     // Write valid data
     {
-        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let db = support::open(&db_path, &opts).unwrap();
         node_a = db
             .upsert_node(
                 "Person",
@@ -369,6 +373,7 @@ fn test_engine_wal_truncated_record_recovery() {
             .unwrap();
         // Use close_fast() to preserve WAL (close() would flush + retire WAL)
         db.close_fast().unwrap();
+        native_close::wait_for_native_shutdown(&db);
     }
 
     // Append garbage to WAL (simulating crash mid-write of next record)
@@ -387,7 +392,7 @@ fn test_engine_wal_truncated_record_recovery() {
 
     // Reopen -- should recover all valid records, ignoring the truncated tail
     {
-        let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let db = support::open(&db_path, &opts).unwrap();
         let node = db.get_node(node_a).unwrap();
         assert!(
             node.is_some(),
@@ -412,7 +417,7 @@ fn test_temporal_edges_cross_source() {
         ..DbOptions::default()
     };
 
-    let db = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let db = support::open(&db_path, &opts).unwrap();
     let a = db
         .upsert_node("Person", "a", UpsertNodeOptions::default())
         .unwrap();

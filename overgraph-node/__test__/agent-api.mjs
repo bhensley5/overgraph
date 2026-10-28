@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { OverGraph } from '../index.js';
+import { drainAfterClose } from './helpers/native-lifecycle.mjs';
 
 // Phase 10: Agent API tests
 
@@ -415,6 +416,7 @@ describe('graphPatch', () => {
     const nodeId = result.nodeIds[0];
     const edgeId = result.edgeIds[0];
     db2.close();
+    drainAfterClose(db2);
 
     // Reopen with WAL replay
     db2 = OverGraph.open(dbPath, { walSyncMode: 'immediate' });
@@ -427,6 +429,7 @@ describe('graphPatch', () => {
     assert.equal(edge.label, 'DEPENDS_ON');
 
     db2.close();
+    drainAfterClose(db2);
     rmSync(tmpDir2, { recursive: true, force: true });
   });
 });
@@ -541,6 +544,7 @@ describe('prune', () => {
 
     db2.prune({ maxWeight: 0.5 });
     db2.close();
+    drainAfterClose(db2);
 
     // Reopen with WAL replay
     db2 = OverGraph.open(dbPath, { walSyncMode: 'immediate' });
@@ -549,6 +553,7 @@ describe('prune', () => {
     assert.equal(db2.getEdge(e), null);
 
     db2.close();
+    drainAfterClose(db2);
     rmSync(tmpDir2, { recursive: true, force: true });
   });
 });
@@ -623,6 +628,7 @@ describe('prune policy survives close/reopen', () => {
     db.setPrunePolicy('age', { maxAgeMs: 30000 });
     db.setPrunePolicy('weight', { maxWeight: 0.1, label: 'User'});
     db.close();
+    drainAfterClose(db);
 
     db = OverGraph.open(dbPath, { walSyncMode: 'immediate' });
     const list = db.listPrunePolicies();
@@ -634,6 +640,7 @@ describe('prune policy survives close/reopen', () => {
     assert.ok(Math.abs(list[1].policy.maxWeight - 0.1) < 1e-6);
     assert.equal(list[1].policy.label, 'User');
     db.close();
+    drainAfterClose(db);
     rmSync(tmpDir, { recursive: true, force: true });
   });
 });

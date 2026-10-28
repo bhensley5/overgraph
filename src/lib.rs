@@ -56,6 +56,8 @@ pub mod manifest;
 pub(crate) mod memtable;
 #[doc(hidden)]
 pub(crate) mod parallel;
+#[cfg(test)]
+mod persistence_fault;
 #[doc(hidden)]
 pub(crate) mod planner_stats;
 #[doc(hidden)]
@@ -81,6 +83,9 @@ pub(crate) mod wal;
 #[doc(hidden)]
 pub(crate) mod wal_sync;
 
+#[cfg(feature = "production-concurrency")]
+#[doc(hidden)]
+pub use engine::{BindingCloseHandle, BindingStatsHandle};
 pub use engine::{DatabaseEngine, WriteTxn};
 pub use error::EngineError;
 pub use schema::{
@@ -97,42 +102,43 @@ pub use scrub::{scrub_path, scrub_path_with_options};
 pub use types::{
     canonicalize_sparse_vector, canonicalize_sparse_vector_owned, hash_prop_key, hash_prop_value,
     validate_dense_vector, validate_dense_vector_config, AdjacencyExport, AllShortestPathsOptions,
-    CompactionPhase, CompactionProgress, CompactionStats, ComponentOptions, ComponentScrubFinding,
-    DatabaseScrubFinding, DatabaseScrubFindingType, DatabaseScrubReport, DatabaseScrubSeverity,
-    DbOptions, DbStats, DegreeOptions, DenseMetric, DenseVector, DenseVectorConfig, Direction,
-    EdgeFilterExpr, EdgeInput, EdgeLabelInfo, EdgeMetadataIndexField, EdgePropertyIndexInfo,
-    EdgeQuery, EdgeQueryOrder, EdgeView, ExportEdge, ExportOptions, FusionMode, GqlCapSummary,
-    GqlEdge, GqlExecutionCapSummary, GqlExecutionExplain, GqlExecutionMode, GqlExecutionOptions,
-    GqlExecutionResult, GqlExecutionStats, GqlExplain, GqlIndexExplain, GqlIndexExplainField,
-    GqlIndexExplainTarget, GqlIndexStats, GqlLoweringTarget, GqlMutationExplain,
-    GqlMutationOperationExplain, GqlMutationReadPrefixExplain, GqlMutationReturnExplain,
-    GqlMutationStats, GqlNode, GqlParamValue, GqlParams, GqlRow, GqlRowOperation, GqlSchemaExplain,
-    GqlSchemaExplainOptions, GqlSchemaExplainTarget, GqlSchemaStats, GqlSemanticErrorCode,
-    GqlStatementKind, GqlValue, GraphBinaryOp, GraphCapExplain, GraphCaseBranch,
-    GraphCursorExplain, GraphEdgeField, GraphEdgePattern, GraphEdgeValue, GraphElementProjection,
-    GraphExecutionSummaries, GraphExplainNode, GraphExpr, GraphFunction, GraphNodeField,
-    GraphNodePattern, GraphNodeValue, GraphOptionalGroup, GraphOrderDirection, GraphOrderExplain,
-    GraphOrderItem, GraphOutputMode, GraphOutputOptions, GraphPageRequest, GraphParamValue,
-    GraphPatch, GraphPath, GraphPathField, GraphPathValue, GraphPatternPiece,
-    GraphPipelineCapExplain, GraphPipelineExplain, GraphPipelineMatchStage, GraphPipelineOptions,
-    GraphPipelineQuery, GraphPipelineResult, GraphPipelineStage, GraphPipelineStageExplain,
-    GraphPipelineStats, GraphProjectItem, GraphProjectKind, GraphProjectStage,
-    GraphProjectionExplain, GraphProjectionItems, GraphPropertySelection, GraphQueryOptions,
-    GraphReturnItem, GraphReturnProjection, GraphRow, GraphRowExplain, GraphRowOperationExplain,
-    GraphRowQuery, GraphRowResult, GraphRowStats, GraphSelectedEdgeProjection,
-    GraphSelectedNodeProjection, GraphSelectedPathProjection, GraphSelectedProjection,
-    GraphShortestPathEndpoint, GraphShortestPathMode, GraphShortestPathStage, GraphSubqueryStage,
-    GraphUnaryOp, GraphUnionStage, GraphValue, GraphVariableLengthPattern, GraphVectorSelection,
-    HnswConfig, IntoNodeLabels, IsConnectedOptions, LabelMatchMode, ManifestScrubSource,
-    ManifestScrubSummary, ManifestState, NeighborEntry, NeighborOptions, NodeFilterExpr,
-    NodeIdBuildHasher, NodeIdHasher, NodeIdMap, NodeIdSet, NodeInput, NodeKeyQuery,
-    NodeLabelFilter, NodeLabelInfo, NodeMetadataIndexField, NodePropertyIndexInfo, NodeQuery,
-    NodeQueryOrder, NodeView, OrphanSegmentScrubResult, PageRequest, PageResult, PatchResult,
-    PprAlgorithm, PprApproxMeta, PprOptions, PprResult, PropValue, PropertyRangeBound,
-    PropertyRangeCursor, PropertyRangePageRequest, PropertyRangePageResult, PrunePolicy,
-    PrunePolicyInfo, PruneResult, QueryEdgeIdsResult, QueryEdgesResult, QueryNodeIdsResult,
-    QueryNodesResult, QueryPlan, QueryPlanExecutionMode, QueryPlanKind, QueryPlanNode,
-    QueryPlanNote, QueryPlanPublicInputs, QueryPlanPublicName, QueryPlanWarning, ScoringMode,
+    CommitOutcomeState, CompactionPhase, CompactionProgress, CompactionStats, ComponentOptions,
+    ComponentScrubFinding, ConcurrencyOptions, DatabaseScrubFinding, DatabaseScrubFindingType,
+    DatabaseScrubReport, DatabaseScrubSeverity, DbOptions, DbStats, DegreeOptions, DenseMetric,
+    DenseVector, DenseVectorConfig, Direction, EdgeFilterExpr, EdgeInput, EdgeLabelInfo,
+    EdgeMetadataIndexField, EdgePropertyIndexInfo, EdgeQuery, EdgeQueryOrder, EdgeView, ExportEdge,
+    ExportOptions, FusionMode, GqlCapSummary, GqlEdge, GqlExecutionCapSummary, GqlExecutionExplain,
+    GqlExecutionMode, GqlExecutionOptions, GqlExecutionResult, GqlExecutionStats, GqlExplain,
+    GqlIndexExplain, GqlIndexExplainField, GqlIndexExplainTarget, GqlIndexStats, GqlLoweringTarget,
+    GqlMutationExplain, GqlMutationOperationExplain, GqlMutationReadPrefixExplain,
+    GqlMutationReturnExplain, GqlMutationStats, GqlNode, GqlParamValue, GqlParams, GqlRow,
+    GqlRowOperation, GqlSchemaExplain, GqlSchemaExplainOptions, GqlSchemaExplainTarget,
+    GqlSchemaStats, GqlSemanticErrorCode, GqlStatementKind, GqlValue, GraphBinaryOp,
+    GraphCapExplain, GraphCaseBranch, GraphCursorExplain, GraphEdgeField, GraphEdgePattern,
+    GraphEdgeValue, GraphElementProjection, GraphExecutionSummaries, GraphExplainNode, GraphExpr,
+    GraphFunction, GraphNodeField, GraphNodePattern, GraphNodeValue, GraphOptionalGroup,
+    GraphOrderDirection, GraphOrderExplain, GraphOrderItem, GraphOutputMode, GraphOutputOptions,
+    GraphPageRequest, GraphParamValue, GraphPatch, GraphPath, GraphPathField, GraphPathValue,
+    GraphPatternPiece, GraphPipelineCapExplain, GraphPipelineExplain, GraphPipelineMatchStage,
+    GraphPipelineOptions, GraphPipelineQuery, GraphPipelineResult, GraphPipelineStage,
+    GraphPipelineStageExplain, GraphPipelineStats, GraphProjectItem, GraphProjectKind,
+    GraphProjectStage, GraphProjectionExplain, GraphProjectionItems, GraphPropertySelection,
+    GraphQueryOptions, GraphReturnItem, GraphReturnProjection, GraphRow, GraphRowExplain,
+    GraphRowOperationExplain, GraphRowQuery, GraphRowResult, GraphRowStats,
+    GraphSelectedEdgeProjection, GraphSelectedNodeProjection, GraphSelectedPathProjection,
+    GraphSelectedProjection, GraphShortestPathEndpoint, GraphShortestPathMode,
+    GraphShortestPathStage, GraphSubqueryStage, GraphUnaryOp, GraphUnionStage, GraphValue,
+    GraphVariableLengthPattern, GraphVectorSelection, HnswConfig, IntoNodeLabels,
+    IsConnectedOptions, LabelMatchMode, ManifestScrubSource, ManifestScrubSummary, ManifestState,
+    NeighborEntry, NeighborOptions, NodeFilterExpr, NodeIdBuildHasher, NodeIdHasher, NodeIdMap,
+    NodeIdSet, NodeInput, NodeKeyQuery, NodeLabelFilter, NodeLabelInfo, NodeMetadataIndexField,
+    NodePropertyIndexInfo, NodeQuery, NodeQueryOrder, NodeView, OrphanSegmentScrubResult,
+    PageRequest, PageResult, PatchResult, PprAlgorithm, PprApproxMeta, PprOptions, PprResult,
+    PropValue, PropertyRangeBound, PropertyRangeCursor, PropertyRangePageRequest,
+    PropertyRangePageResult, PrunePolicy, PrunePolicyInfo, PruneResult, QueryEdgeIdsResult,
+    QueryEdgesResult, QueryNodeIdsResult, QueryNodesResult, QueryPlan, QueryPlanExecutionMode,
+    QueryPlanKind, QueryPlanNode, QueryPlanNote, QueryPlanPublicInputs, QueryPlanPublicName,
+    QueryPlanWarning, ReclamationCloseState, ReclamationHistogram, ReclamationStats, ScoringMode,
     ScrubFindingType, ScrubPathOptions, ScrubReport, SecondaryIndexField, SecondaryIndexKind,
     SecondaryIndexManifestEntry, SecondaryIndexSpec, SecondaryIndexState, SecondaryIndexTarget,
     SegmentInfo, SegmentScrubResult, ShortestPath, ShortestPathOptions, SourceSpan, SparseVector,
@@ -470,3 +476,7 @@ mod public_api_boundary_tests {
         }
     }
 }
+
+#[cfg(feature = "binding-test-hooks")]
+#[doc(hidden)]
+pub use engine::BindingTestHandle;

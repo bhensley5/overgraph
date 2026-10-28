@@ -6,7 +6,7 @@ fn prepared_edge_metadata_pull_outcome_fixture(
     NormalizedEdgeQuery,
     PlannedEdgeCandidateSource,
 ) {
-    let (dir, engine) = query_test_engine();
+    let (dir, engine) = query_index_protocol_fixture();
     let from = insert_query_node(&engine, "Person", "prepared-outcome-from", &[], 1.0);
     let to = insert_query_node(&engine, "Person", "prepared-outcome-to", &[], 1.0);
     engine
@@ -368,7 +368,7 @@ fn prepared_edge_metadata_pull_real_equality_postings_enforce_global_budget_boun
     const IMMUTABLE_POSTINGS: usize = PREPARED_EDGE_RETAINED_ID_CAP / 2;
     const TOTAL_EDGES: usize = PREPARED_EDGE_RETAINED_ID_CAP + 1;
 
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let label = "PREPARED_BUDGET_BOUNDARY";
     let label_id = engine.ensure_edge_label(label).unwrap();
     let overflow_index = ensure_ready_edge_property_index(
@@ -400,7 +400,7 @@ fn prepared_edge_metadata_pull_real_equality_postings_enforce_global_budget_boun
             props.insert("overflow".to_string(), PropValue::Bool(true));
             props.insert("at_cap".to_string(), PropValue::Bool(true));
             write_seq += 1;
-            core.active_memtable().apply_op(
+            core.active_memtable().apply_op_for_test(
                 &WalOp::UpsertEdge(EdgeRecord {
                     id: first_edge_id + ordinal as u64,
                     from,
@@ -415,7 +415,7 @@ fn prepared_edge_metadata_pull_real_equality_postings_enforce_global_budget_boun
                     last_write_seq: 0,
                 }),
                 write_seq,
-            );
+            ).unwrap();
         }
         core.engine_seq = write_seq;
         core.freeze_memtable().unwrap();
@@ -427,7 +427,7 @@ fn prepared_edge_metadata_pull_real_equality_postings_enforce_global_budget_boun
                 props.insert("at_cap".to_string(), PropValue::Bool(true));
             }
             write_seq += 1;
-            core.active_memtable().apply_op(
+            core.active_memtable().apply_op_for_test(
                 &WalOp::UpsertEdge(EdgeRecord {
                     id: first_edge_id + ordinal as u64,
                     from,
@@ -442,7 +442,7 @@ fn prepared_edge_metadata_pull_real_equality_postings_enforce_global_budget_boun
                     last_write_seq: 0,
                 }),
                 write_seq,
-            );
+            ).unwrap();
         }
         core.engine_seq = write_seq;
         core.next_edge_id = first_edge_id + TOTAL_EDGES as u64;
@@ -462,7 +462,7 @@ fn prepared_edge_metadata_pull_real_equality_postings_enforce_global_budget_boun
             overflow_index,
             true_hash,
             view.snapshot_seq,
-        ),
+        ).unwrap(),
         TOTAL_EDGES - IMMUTABLE_POSTINGS
     );
     assert_eq!(
@@ -472,7 +472,7 @@ fn prepared_edge_metadata_pull_real_equality_postings_enforce_global_budget_boun
                 overflow_index,
                 true_hash,
                 view.snapshot_seq,
-            ),
+            ).unwrap(),
         IMMUTABLE_POSTINGS
     );
     assert_eq!(
@@ -480,13 +480,13 @@ fn prepared_edge_metadata_pull_real_equality_postings_enforce_global_budget_boun
             at_cap_index,
             true_hash,
             view.snapshot_seq,
-        ),
+        ).unwrap(),
         PREPARED_EDGE_RETAINED_ID_CAP - IMMUTABLE_POSTINGS
     );
     assert_eq!(
         view.immutable_epochs[0]
             .memtable
-            .secondary_eq_edge_hash_count_at(at_cap_index, true_hash, view.snapshot_seq),
+            .secondary_eq_edge_hash_count_at(at_cap_index, true_hash, view.snapshot_seq).unwrap(),
         IMMUTABLE_POSTINGS
     );
 
@@ -503,6 +503,27 @@ fn prepared_edge_metadata_pull_real_equality_postings_enforce_global_budget_boun
         TOTAL_EDGES,
     );
 
+    #[cfg(feature = "production-concurrency")]
+    {
+        for (source, key, expected) in [(at_cap_source.clone(), "at_cap", PREPARED_EDGE_RETAINED_ID_CAP), (overflow_source.clone(), "overflow", TOTAL_EDGES)] {
+            let query = prepared_edge_budget_normalized_query(&view, label, EdgeFilterExpr::PropertyEquals { key: key.into(), value: PropValue::Bool(true) });
+            let (mut prepared, followups) = view.prepare_edge_metadata_pull_source(&query, &query, prepared_edge_budget_custom_plan(&view, &query, EdgePhysicalPlan::Source(source)), None).unwrap();
+            assert!(followups.is_empty());
+            assert_eq!(prepared.prepared_mode(), PreparedEdgeSourceMode::StreamedSingle);
+            assert_eq!(prepared.fallback(), PreparedEdgeFallback::None);
+            assert!(prepared.retained_id_units() <= QUERY_VERIFY_CHUNK);
+            let mut count = 0usize;
+            loop {
+                let batch = prepared.pull(8).unwrap();
+                for record in batch.metadata { assert_eq!(record.id, first_edge_id + count as u64); count += 1; }
+                if !batch.has_more { break; }
+            }
+            assert_eq!(count, expected);
+        }
+        engine.close_fast().unwrap();
+    }
+    #[cfg(not(feature = "production-concurrency"))]
+    {
     let at_cap_query = prepared_edge_budget_normalized_query(
         &view,
         label,
@@ -640,4 +661,5 @@ fn prepared_edge_metadata_pull_real_equality_postings_enforce_global_budget_boun
         "one cursor from the demoted branch must be dropped before both exact-cap cursors build"
     );
     drop(sequential_prepared);
+    }
 }

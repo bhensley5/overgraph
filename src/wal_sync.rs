@@ -18,6 +18,35 @@ pub(crate) struct WalSyncState {
     pub(crate) poisoned: Option<String>,
 }
 
+/// One real sync/debt transition shared by the existing timer service and the
+/// candidate coordinator. Failed fsync retains debt; poisoning is irreversible.
+pub(crate) fn sync_pending(state: &mut WalSyncState) -> Result<(), EngineError> {
+    if state.buffered_bytes == 0 {
+        return Ok(());
+    }
+    match state.wal_writer.sync() {
+        Ok(()) => {
+            state.buffered_bytes = 0;
+            state.sync_error_count = 0;
+            Ok(())
+        }
+        Err(error) => {
+            state.sync_error_count += 1;
+            eprintln!(
+                "WAL sync error ({}/{}): {}",
+                state.sync_error_count, MAX_SYNC_FAILURES, error
+            );
+            if state.sync_error_count >= MAX_SYNC_FAILURES {
+                state.poisoned = Some(format!(
+                    "WAL sync failed {} consecutive times, last error: {}",
+                    state.sync_error_count, error
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
 /// Background sync thread loop. Wakes on timer, soft trigger, or shutdown.
 pub(crate) fn sync_thread_loop(wal_state: Arc<(Mutex<WalSyncState>, Condvar)>, interval: Duration) {
     let (lock, cvar) = &*wal_state;
@@ -33,24 +62,12 @@ pub(crate) fn sync_thread_loop(wal_state: Arc<(Mutex<WalSyncState>, Condvar)>, i
         }
 
         if state.buffered_bytes > 0 {
-            match state.wal_writer.sync() {
+            match sync_pending(&mut state) {
                 Ok(()) => {
-                    state.buffered_bytes = 0;
-                    state.sync_error_count = 0;
                     cvar.notify_all();
                 }
-                Err(e) => {
-                    // Do NOT zero buffered_bytes on failure. Retry next tick.
-                    state.sync_error_count += 1;
-                    eprintln!(
-                        "WAL sync error ({}/{}): {}",
-                        state.sync_error_count, MAX_SYNC_FAILURES, e
-                    );
-                    if state.sync_error_count >= MAX_SYNC_FAILURES {
-                        state.poisoned = Some(format!(
-                            "WAL sync failed {} consecutive times, last error: {}",
-                            state.sync_error_count, e
-                        ));
+                Err(_) => {
+                    if state.poisoned.is_some() {
                         cvar.notify_all(); // wake blocked writers so they see the error
                         break; // engine is dead, stop the sync thread
                     }

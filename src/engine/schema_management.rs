@@ -1030,7 +1030,7 @@ impl EngineCore {
         published_entry.updated_at_ms = publish_ms;
 
         let entry_for_write = published_entry.clone();
-        let label_catalog = Arc::clone(&self.label_catalog);
+        let label_catalog = Clone::clone(&self.label_catalog);
         self.with_runtime_manifest_write(|manifest| {
             merge_runtime_label_catalog_into_manifest(manifest, &label_catalog);
             stage_label_tokens_in_manifest(manifest, &node_labels_to_create, &edge_labels_to_create)?;
@@ -1134,7 +1134,7 @@ impl EngineCore {
         published_entry.updated_at_ms = publish_ms;
 
         let entry_for_write = published_entry.clone();
-        let label_catalog = Arc::clone(&self.label_catalog);
+        let label_catalog = Clone::clone(&self.label_catalog);
         self.with_runtime_manifest_write(|manifest| {
             merge_runtime_label_catalog_into_manifest(manifest, &label_catalog);
             stage_label_tokens_in_manifest(manifest, &node_labels_to_create, &edge_labels_to_create)?;
@@ -1266,7 +1266,7 @@ impl EngineCore {
         let published_node_schemas = proposed_manifest.node_schemas.clone();
         let published_edge_schemas = proposed_manifest.edge_schemas.clone();
         let next_schema_id = proposed_manifest.next_schema_id;
-        let label_catalog = Arc::clone(&self.label_catalog);
+        let label_catalog = Clone::clone(&self.label_catalog);
         self.with_runtime_manifest_write(|manifest| {
             merge_runtime_label_catalog_into_manifest(manifest, &label_catalog);
             stage_label_tokens_in_manifest(
@@ -1360,7 +1360,7 @@ impl EngineCore {
         let published_node_schemas = proposed_manifest.node_schemas.clone();
         let published_edge_schemas = proposed_manifest.edge_schemas.clone();
         let next_schema_id = proposed_manifest.next_schema_id;
-        let label_catalog = Arc::clone(&self.label_catalog);
+        let label_catalog = Clone::clone(&self.label_catalog);
         self.with_runtime_manifest_write(|manifest| {
             merge_runtime_label_catalog_into_manifest(manifest, &label_catalog);
             stage_label_tokens_in_manifest(
@@ -1595,7 +1595,7 @@ impl DatabaseEngine {
     ) -> Result<GraphSchemaPublishResult, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::SetGraphSchema { schema, options })?
+            .submit_core_write_with(|| CoreWriteRequest::SetGraphSchema { schema, options })?
         {
             CoreWriteReply::GraphSchemaPublishResult(result) => Ok(result),
             _ => Err(unexpected_bulk_graph_schema_reply("set_graph_schema")),
@@ -1609,7 +1609,7 @@ impl DatabaseEngine {
     ) -> Result<GraphSchemaPublishResult, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::AlterGraphSchema {
+            .submit_core_write_with(|| CoreWriteRequest::AlterGraphSchema {
                 operations,
                 options,
             })?
@@ -1686,7 +1686,7 @@ impl DatabaseEngine {
     pub fn drop_graph_schema(&self) -> Result<GraphSchemaPublishResult, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::DropGraphSchema)?
+            .submit_core_write_with(|| CoreWriteRequest::DropGraphSchema)?
         {
             CoreWriteReply::GraphSchemaPublishResult(result) => Ok(result),
             _ => Err(unexpected_bulk_graph_schema_reply("drop_graph_schema")),
@@ -1709,7 +1709,7 @@ impl DatabaseEngine {
     ) -> Result<NodeSchemaInfo, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::SetNodeSchema {
+            .submit_core_write_with(|| CoreWriteRequest::SetNodeSchema {
                 label: label.to_string(),
                 schema,
                 options,
@@ -1761,7 +1761,7 @@ impl DatabaseEngine {
     pub fn drop_node_schema(&self, label: &str) -> Result<bool, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::DropNodeSchema {
+            .submit_core_write_with(|| CoreWriteRequest::DropNodeSchema {
                 label: label.to_string(),
             })? {
             CoreWriteReply::Bool(removed) => Ok(removed),
@@ -1815,7 +1815,7 @@ impl DatabaseEngine {
     ) -> Result<EdgeSchemaInfo, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::SetEdgeSchema {
+            .submit_core_write_with(|| CoreWriteRequest::SetEdgeSchema {
                 label: label.to_string(),
                 schema,
                 options,
@@ -1863,7 +1863,7 @@ impl DatabaseEngine {
     pub fn drop_edge_schema(&self, label: &str) -> Result<bool, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::DropEdgeSchema {
+            .submit_core_write_with(|| CoreWriteRequest::DropEdgeSchema {
                 label: label.to_string(),
             })? {
             CoreWriteReply::Bool(removed) => Ok(removed),

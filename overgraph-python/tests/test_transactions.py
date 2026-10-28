@@ -1,3 +1,4 @@
+from conftest import drain_after_close
 import os
 
 import pytest
@@ -192,6 +193,7 @@ def test_reopen_and_closed_state_behavior(db_path):
     committed = txn.commit()
     node_id = committed.node_aliases["n"]
     db.close()
+    drain_after_close(db)
 
     reopened = OverGraph.open(db_path)
     assert reopened.get_node(node_id).key == "n"
@@ -207,5 +209,6 @@ def test_reopen_and_closed_state_behavior(db_path):
     with pytest.raises(OverGraphError, match="[Dd]atabase is closed"):
         commit_txn.commit()
     rollback_txn.rollback()
+    drain_after_close(reopened)
 
     assert os.path.exists(db_path)

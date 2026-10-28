@@ -36,11 +36,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build
+      - name: Build default production backend
         run: cargo build --all-targets --features cli
 
-      - name: Run tests
+      - name: Run default production and CLI tests
         run: cargo test --features cli
 
-      - name: Check without default features
+      - name: Check legacy engine without default features
         run: cargo check --all-targets --no-default-features

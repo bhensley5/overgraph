@@ -1,12 +1,22 @@
 use std::sync::OnceLock;
 
+/// Freeze the existing pool's configured width without creating its workers.
+/// Admission and the later pool constructor must use the same choice even if
+/// host affinity/available parallelism changes between preflight and execution.
+pub(crate) fn engine_cpu_threads() -> usize {
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+    })
+}
+
 fn engine_cpu_pool() -> &'static rayon::ThreadPool {
     static ENGINE_CPU_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 
     ENGINE_CPU_POOL.get_or_init(|| {
-        let threads = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1);
+        let threads = engine_cpu_threads();
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .thread_name(|index| format!("overgraph-cpu-{index}"))

@@ -1,6 +1,17 @@
+#[cfg(feature = "production-concurrency")]
+mod graph;
+#[cfg(feature = "production-concurrency")]
+mod id_history;
+#[cfg(feature = "production-concurrency")]
+mod id_radix;
+pub(crate) mod secondary;
+#[cfg(feature = "production-concurrency")]
+use graph::physical_direction;
+pub(crate) mod primary;
 use crate::edge_metadata::EdgeMetadataCandidate;
 #[cfg(test)]
 use crate::edge_metadata::{i64_matches_bounds, weight_matches_bounds, RangeBoundFlags};
+use crate::error::EngineError;
 use crate::property_value_semantics::{
     hash_prop_equality_key, numeric_range_sort_key_for_value, semantic_property_eq,
     NumericRangeSortKey,
@@ -11,16 +22,236 @@ use crate::secondary_index_key::{
     CompoundRangeBounds, CompoundSidecarTargetKind, CompoundTupleContext,
 };
 use crate::types::*;
+use primary::PrimaryRead;
+#[cfg(feature = "production-concurrency")]
+use primary::{PrimaryBinding, PrimaryMaps};
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Bound, ControlFlow};
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 
+// Private vector transport: metadata/presence always survive source shadowing;
+// only explicitly selected vectors are copied. Legacy callbacks keep borrowed data.
+// Flat vector payloads have ordinary stack-safe destruction.
+#[derive(Debug)]
+pub(crate) struct NodeVectorRow<'a> {
+    meta: NodeMetadataForQuery,
+    pub(crate) has_dense: bool,
+    pub(crate) has_sparse: bool,
+    pub(crate) dense_vector: Option<std::borrow::Cow<'a, [f32]>>,
+    pub(crate) sparse_vector: Option<std::borrow::Cow<'a, [(u32, f32)]>>,
+}
+impl std::ops::Deref for NodeVectorRow<'_> {
+    type Target = NodeMetadataForQuery;
+    fn deref(&self) -> &Self::Target {
+        &self.meta
+    }
+}
+impl<'a> NodeVectorRow<'a> {
+    fn borrowed(node: &'a NodeRecord, vectors: crate::row_projection::VectorSelection) -> Self {
+        Self {
+            meta: NodeMetadataForQuery {
+                id: node.id,
+                label_ids: node.label_ids,
+                updated_at: node.updated_at,
+                weight: node.weight,
+            },
+            has_dense: node.dense_vector.is_some(),
+            has_sparse: node.sparse_vector.is_some(),
+            dense_vector: if vectors.needs_dense() {
+                node.dense_vector.as_deref().map(std::borrow::Cow::Borrowed)
+            } else {
+                None
+            },
+            sparse_vector: if vectors.needs_sparse() {
+                node.sparse_vector
+                    .as_deref()
+                    .map(std::borrow::Cow::Borrowed)
+            } else {
+                None
+            },
+        }
+    }
+    #[cfg(feature = "production-concurrency")]
+    fn into_owned(self) -> NodeVectorRow<'static> {
+        NodeVectorRow {
+            meta: self.meta,
+            has_dense: self.has_dense,
+            has_sparse: self.has_sparse,
+            dense_vector: self
+                .dense_vector
+                .map(|v| std::borrow::Cow::Owned(v.into_owned())),
+            sparse_vector: self
+                .sparse_vector
+                .map(|v| std::borrow::Cow::Owned(v.into_owned())),
+        }
+    }
+    #[cfg(feature = "production-concurrency")]
+    fn copied_bytes(node: &NodeRecord, vectors: crate::row_projection::VectorSelection) -> usize {
+        std::mem::size_of::<Self>().saturating_add(Self::vector_bytes(node, vectors))
+    }
+    #[cfg(feature = "production-concurrency")]
+    fn vector_bytes(node: &NodeRecord, vectors: crate::row_projection::VectorSelection) -> usize {
+        let dense = if vectors.needs_dense() {
+            node.dense_vector
+                .as_ref()
+                .map_or(0, |v| v.len().saturating_mul(4))
+        } else {
+            0
+        };
+        let sparse = if vectors.needs_sparse() {
+            node.sparse_vector
+                .as_ref()
+                .map_or(0, |v| v.len().saturating_mul(8))
+        } else {
+            0
+        };
+        dense.saturating_add(sparse)
+    }
+}
+
+#[cfg(feature = "production-concurrency")]
+struct VectorBatchRow {
+    meta: NodeMetadataForQuery,
+    has_dense: bool,
+    has_sparse: bool,
+    dense: Option<std::ops::Range<usize>>,
+    sparse: Option<std::ops::Range<usize>>,
+}
+
+/// Bounded owned transport. Ranges survive backing growth; borrowed slices are
+/// created only after the participant session ends, for one callback at a time.
+#[cfg(feature = "production-concurrency")]
+#[derive(Default)]
+struct VectorBatch {
+    rows: Vec<VectorBatchRow>,
+    dense: DenseVector,
+    sparse: SparseVector,
+}
+#[cfg(feature = "production-concurrency")]
+impl VectorBatch {
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.dense.clear();
+        self.sparse.clear();
+    }
+
+    fn copied_bytes(node: &NodeRecord, vectors: crate::row_projection::VectorSelection) -> usize {
+        std::mem::size_of::<VectorBatchRow>()
+            .saturating_add(NodeVectorRow::vector_bytes(node, vectors))
+    }
+
+    fn push(
+        &mut self,
+        node: &NodeRecord,
+        vectors: crate::row_projection::VectorSelection,
+        remaining: usize,
+    ) {
+        if self.rows.capacity() == 0 {
+            let row_bytes = Self::copied_bytes(node, vectors).max(1);
+            let rows = remaining.min(4096).min((1024 * 1024 / row_bytes).max(1));
+            self.rows.reserve_exact(rows);
+        }
+        fn append<T: Copy>(
+            buffer: &mut Vec<T>,
+            value: Option<&[T]>,
+            rows: usize,
+        ) -> Option<std::ops::Range<usize>> {
+            let value = value?;
+            if buffer.capacity() == 0 && !value.is_empty() {
+                let target = value
+                    .len()
+                    .saturating_mul(rows)
+                    .min(1024 * 1024 / std::mem::size_of::<T>())
+                    .max(value.len());
+                buffer.reserve_exact(target);
+            }
+            let start = buffer.len();
+            buffer.extend_from_slice(value);
+            Some(start..buffer.len())
+        }
+        let dense = append(
+            &mut self.dense,
+            if vectors.needs_dense() {
+                node.dense_vector.as_deref()
+            } else {
+                None
+            },
+            self.rows.capacity(),
+        );
+        let sparse = append(
+            &mut self.sparse,
+            if vectors.needs_sparse() {
+                node.sparse_vector.as_deref()
+            } else {
+                None
+            },
+            self.rows.capacity(),
+        );
+        self.rows.push(VectorBatchRow {
+            meta: NodeMetadataForQuery {
+                id: node.id,
+                label_ids: node.label_ids,
+                updated_at: node.updated_at,
+                weight: node.weight,
+            },
+            has_dense: node.dense_vector.is_some(),
+            has_sparse: node.sparse_vector.is_some(),
+            dense,
+            sparse,
+        });
+    }
+
+    fn row(&self, row: &VectorBatchRow) -> NodeVectorRow<'_> {
+        NodeVectorRow {
+            meta: row.meta,
+            has_dense: row.has_dense,
+            has_sparse: row.has_sparse,
+            dense_vector: row
+                .dense
+                .clone()
+                .map(|r| std::borrow::Cow::Borrowed(&self.dense[r])),
+            sparse_vector: row
+                .sparse
+                .clone()
+                .map(|r| std::borrow::Cow::Borrowed(&self.sparse[r])),
+        }
+    }
+}
+
 #[cfg(test)]
-static ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
+thread_local! {static ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST:Cell<usize>=const {Cell::new(0)};}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct QueryScanWork {
+    pub(crate) edge_count_refills: usize,
+    pub(crate) edge_transport_records: usize,
+    pub(crate) node_id_refills: usize,
+    pub(crate) node_id_copies: usize,
+    pub(crate) full_node_count_calls: usize,
+    pub(crate) full_node_count_opinions: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static QUERY_SCAN_WORK: Cell<QueryScanWork> = Cell::new(QueryScanWork::default());
+}
+
+#[cfg(test)]
+pub(crate) fn take_query_scan_work_for_test() -> QueryScanWork {
+    QUERY_SCAN_WORK.with(|work| work.replace(QueryScanWork::default()))
+}
+
+#[cfg(test)]
+fn note_query_scan_work(update: impl FnOnce(&mut QueryScanWork)) {
+    QUERY_SCAN_WORK.with(|work| {
+        let mut value = work.get();
+        update(&mut value);
+        work.set(value);
+    });
+}
 
 #[cfg(test)]
 thread_local! {
@@ -39,12 +270,12 @@ fn versioned_slot_lookup_comparisons_for_test() -> usize {
 
 #[cfg(test)]
 pub(crate) fn reset_endpoint_cursor_entries_visited_for_test() {
-    ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST.store(0, Ordering::Relaxed);
+    ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST.with(|count| count.set(0));
 }
 
 #[cfg(test)]
 pub(crate) fn endpoint_cursor_entries_visited_for_test() -> usize {
-    ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST.load(Ordering::Relaxed)
+    ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST.with(Cell::get)
 }
 
 fn selected_props_from_map(
@@ -106,10 +337,8 @@ impl<T: Clone> VersionedSlot<T> {
             self.head.value = value;
             return;
         }
-        self.history
-            .get_or_insert_with(Vec::new)
-            .push(self.head.clone());
-        self.head = SlotVersion { write_seq, value };
+        let previous = std::mem::replace(&mut self.head, SlotVersion { write_seq, value });
+        self.history.get_or_insert_with(Vec::new).push(previous);
     }
 
     fn current(&self) -> &T {
@@ -292,9 +521,14 @@ fn estimate_compound_state_entries(
 
 #[derive(Clone, Default)]
 struct MemtableState {
+    #[cfg(feature = "production-concurrency")]
+    sealed_export: Option<crate::segment_writer::SealedExport>,
     estimated_bytes: usize,
     live_node_count: usize,
     live_edge_count: usize,
+    // Candidate-only current diagnostics; never historical read authority.
+    #[cfg(feature = "production-concurrency")]
+    candidate_tombstone_counts: (usize, usize),
     nodes: NodeIdMap<VersionedRecordSlot<NodeRecord>>,
     edges: NodeIdMap<VersionedRecordSlot<EdgeRecord>>,
     node_tombstones: NodeIdMap<MembershipSlot<()>>,
@@ -314,16 +548,27 @@ struct MemtableState {
     retained_adj_in_posting_slots: u64,
     label_edge_index: HashMap<u32, NodeIdMap<MembershipSlot<()>>>,
     time_node_index: BTreeMap<(u32, i64, u64), MembershipSlot<()>>,
-    secondary_index_declarations: HashMap<u64, SecondaryIndexManifestEntry>,
-    secondary_eq_by_prop: HashMap<u32, HashMap<String, Vec<u64>>>,
-    secondary_range_by_prop: HashMap<u32, HashMap<String, Vec<u64>>>,
-    secondary_edge_eq_by_prop: HashMap<u32, HashMap<String, Vec<u64>>>,
-    secondary_edge_range_by_prop: HashMap<u32, HashMap<String, Vec<u64>>>,
-    secondary_node_field_indexes_by_label: HashMap<u32, Vec<u64>>,
-    secondary_edge_field_indexes_by_label: HashMap<u32, Vec<u64>>,
+    catalog: secondary::SecondaryCatalog,
     secondary_eq_state: SecondaryEqState,
     secondary_range_state: SecondaryRangeState,
     secondary_compound_state: CompoundSecondaryIndexState,
+}
+
+// Only candidate facades share diagnostics. Default memtables retain their
+// original direct lock and allocation/indirection behavior.
+#[cfg(feature = "production-concurrency")]
+type MemtableStateOwner = std::sync::Arc<RwLock<MemtableState>>;
+#[cfg(not(feature = "production-concurrency"))]
+type MemtableStateOwner = RwLock<MemtableState>;
+fn new_memtable_state(value: MemtableState) -> MemtableStateOwner {
+    #[cfg(feature = "production-concurrency")]
+    {
+        std::sync::Arc::new(RwLock::new(value))
+    }
+    #[cfg(not(feature = "production-concurrency"))]
+    {
+        RwLock::new(value)
+    }
 }
 
 fn slot_option_current<T: Clone>(slot: &VersionedSlot<Option<T>>) -> Option<&T> {
@@ -481,7 +726,7 @@ fn secondary_range_past_upper(
 }
 
 #[allow(dead_code)]
-fn compound_start_bound(lower: Option<&CompoundLowerBound>) -> Bound<(Vec<u8>, u64)> {
+pub(crate) fn compound_start_bound(lower: Option<&CompoundLowerBound>) -> Bound<(Vec<u8>, u64)> {
     match lower {
         Some(lower) => Bound::Included((lower.key.clone(), 0)),
         None => Bound::Unbounded,
@@ -618,9 +863,12 @@ fn current_secondary_range_state(
 }
 
 #[cfg(test)]
+type CompoundSecondaryTestState = HashMap<u64, BTreeSet<(Vec<u8>, u64)>>;
+
+#[cfg(test)]
 fn current_compound_secondary_state(
     source: &CompoundSecondaryIndexState,
-) -> HashMap<u64, BTreeSet<(Vec<u8>, u64)>> {
+) -> CompoundSecondaryTestState {
     let mut result = HashMap::new();
     for (&index_id, entries) in source {
         let mut visible = BTreeSet::new();
@@ -1361,11 +1609,13 @@ impl MemtableState {
             .map(estimate_membership_slot)
             .sum();
         let secondary_decl_size: usize = self
+            .catalog
             .secondary_index_declarations
             .values()
             .map(estimate_secondary_decl_entry)
             .sum();
         let secondary_eq_lookup_size: usize = self
+            .catalog
             .secondary_eq_by_prop
             .values()
             .map(|by_prop| {
@@ -1378,6 +1628,7 @@ impl MemtableState {
             })
             .sum();
         let secondary_range_lookup_size: usize = self
+            .catalog
             .secondary_range_by_prop
             .values()
             .map(|by_prop| {
@@ -1390,6 +1641,7 @@ impl MemtableState {
             })
             .sum();
         let secondary_edge_eq_lookup_size: usize = self
+            .catalog
             .secondary_edge_eq_by_prop
             .values()
             .map(|by_prop| {
@@ -1402,6 +1654,7 @@ impl MemtableState {
             })
             .sum();
         let secondary_edge_range_lookup_size: usize = self
+            .catalog
             .secondary_edge_range_by_prop
             .values()
             .map(|by_prop| {
@@ -1414,11 +1667,13 @@ impl MemtableState {
             })
             .sum();
         let secondary_node_field_lookup_size: usize = self
+            .catalog
             .secondary_node_field_indexes_by_label
             .values()
             .map(|index_ids| estimate_secondary_field_lookup_entry(index_ids))
             .sum();
         let secondary_edge_field_lookup_size: usize = self
+            .catalog
             .secondary_edge_field_indexes_by_label
             .values()
             .map(|index_ids| estimate_secondary_field_lookup_entry(index_ids))
@@ -1518,182 +1773,13 @@ impl MemtableState {
             .is_some_and(|slot| slot_option_visible(slot, snapshot_seq))
     }
 
-    fn node_tombstone_current(&self, id: u64) -> Option<TombstoneEntry> {
-        self.node_tombstones
-            .get(&id)
-            .and_then(slot_option_current)
-            .and_then(|_| {
-                match self
-                    .nodes
-                    .get(&id)
-                    .and_then(|slot| record_at(slot, u64::MAX))
-                {
-                    Some(RecordState::Tombstone(entry)) => Some(*entry),
-                    _ => None,
-                }
-            })
-    }
-
-    fn edge_tombstone_current(&self, id: u64) -> Option<TombstoneEntry> {
-        self.edge_tombstones
-            .get(&id)
-            .and_then(slot_option_current)
-            .and_then(|_| {
-                match self
-                    .edges
-                    .get(&id)
-                    .and_then(|slot| record_at(slot, u64::MAX))
-                {
-                    Some(RecordState::Tombstone(entry)) => Some(*entry),
-                    _ => None,
-                }
-            })
-    }
-
-    fn collect_secondary_index_entries_for_node_label(
-        &self,
-        label_id: u32,
-        node_id: u64,
-        props: &BTreeMap<String, PropValue>,
-        present: bool,
-        eq_actions: &mut Vec<(u64, u64, u64, bool)>,
-        range_actions: &mut Vec<(u64, NumericRangeSortKey, u64, bool)>,
-    ) {
-        let eq_by_prop = self.secondary_eq_by_prop.get(&label_id);
-        let range_by_prop = self.secondary_range_by_prop.get(&label_id);
-        if eq_by_prop.is_none() && range_by_prop.is_none() {
-            return;
-        }
-
-        for (prop_key, prop_value) in props {
-            if let Some(index_ids) = eq_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str())) {
-                let value_hash = hash_prop_equality_key(prop_value);
-                for &index_id in index_ids {
-                    eq_actions.push((index_id, value_hash, node_id, present));
-                }
-            }
-
-            if let Some(indexes) = range_by_prop.and_then(|by_prop| by_prop.get(prop_key.as_str()))
-            {
-                for &index_id in indexes {
-                    if let Some(encoded) = numeric_range_sort_key_for_value(prop_value) {
-                        range_actions.push((index_id, encoded, node_id, present));
-                    }
-                }
-            }
-        }
-    }
-
-    fn collect_secondary_index_updates_for_node_label(
-        &self,
-        label_id: u32,
-        old_node: &NodeRecord,
-        new_node: &NodeRecord,
-        eq_actions: &mut Vec<(u64, u64, u64, bool)>,
-        range_actions: &mut Vec<(u64, NumericRangeSortKey, u64, bool)>,
-    ) {
-        if let Some(by_prop) = self.secondary_eq_by_prop.get(&label_id) {
-            for (prop_key, index_ids) in by_prop {
-                let old_value = old_node.props.get(prop_key.as_str());
-                let new_value = new_node.props.get(prop_key.as_str());
-                if optional_semantic_property_eq(old_value, new_value) {
-                    continue;
-                }
-                if let Some(old_value) = old_value {
-                    let value_hash = hash_prop_equality_key(old_value);
-                    for &index_id in index_ids {
-                        eq_actions.push((index_id, value_hash, old_node.id, false));
-                    }
-                }
-                if let Some(new_value) = new_value {
-                    let value_hash = hash_prop_equality_key(new_value);
-                    for &index_id in index_ids {
-                        eq_actions.push((index_id, value_hash, new_node.id, true));
-                    }
-                }
-            }
-        }
-
-        if let Some(by_prop) = self.secondary_range_by_prop.get(&label_id) {
-            for (prop_key, indexes) in by_prop {
-                let old_value = old_node.props.get(prop_key.as_str());
-                let new_value = new_node.props.get(prop_key.as_str());
-                let old_encoded = old_value.and_then(numeric_range_sort_key_for_value);
-                let new_encoded = new_value.and_then(numeric_range_sort_key_for_value);
-                if old_encoded == new_encoded {
-                    continue;
-                }
-                for &index_id in indexes {
-                    if let Some(encoded) = old_encoded {
-                        range_actions.push((index_id, encoded, old_node.id, false));
-                    }
-                    if let Some(encoded) = new_encoded {
-                        range_actions.push((index_id, encoded, new_node.id, true));
-                    }
-                }
-            }
-        }
-    }
-
-    fn collect_compound_index_entries_for_node_label(
-        &self,
-        label_id: u32,
-        node: &NodeRecord,
-        present: bool,
-        actions: &mut Vec<CompoundAction>,
-    ) {
-        let Some(index_ids) = self.secondary_node_field_indexes_by_label.get(&label_id) else {
-            return;
-        };
-        for &index_id in index_ids {
-            let entry = self
-                .secondary_index_declarations
-                .get(&index_id)
-                .expect("node field-index lookup points at a declaration");
-            let SecondaryIndexTarget::NodeFieldIndex { fields, .. } = &entry.target else {
-                unreachable!("node field-index lookup points at non-node-field target");
-            };
-            actions.push((
-                index_id,
-                encode_node_compound_tuple_key(label_id, fields, node),
-                node.id,
-                present,
-            ));
-        }
-    }
-
-    fn collect_compound_index_updates_for_node_label(
-        &self,
-        label_id: u32,
-        old_node: &NodeRecord,
-        new_node: &NodeRecord,
-        actions: &mut Vec<CompoundAction>,
-    ) {
-        let Some(index_ids) = self.secondary_node_field_indexes_by_label.get(&label_id) else {
-            return;
-        };
-        for &index_id in index_ids {
-            let entry = self
-                .secondary_index_declarations
-                .get(&index_id)
-                .expect("node field-index lookup points at a declaration");
-            let SecondaryIndexTarget::NodeFieldIndex { fields, .. } = &entry.target else {
-                unreachable!("node field-index lookup points at non-node-field target");
-            };
-            let old_key = encode_node_compound_tuple_key(label_id, fields, old_node);
-            let new_key = encode_node_compound_tuple_key(label_id, fields, new_node);
-            if old_key == new_key {
-                continue;
-            }
-            actions.push((index_id, old_key, old_node.id, false));
-            actions.push((index_id, new_key, new_node.id, true));
-        }
-    }
-
     fn add_secondary_index_entries_for_node(&mut self, node: &NodeRecord, write_seq: u64) {
-        if self.secondary_eq_by_prop.is_empty()
-            && self.secondary_range_by_prop.is_empty()
-            && self.secondary_node_field_indexes_by_label.is_empty()
+        if self.catalog.secondary_eq_by_prop.is_empty()
+            && self.catalog.secondary_range_by_prop.is_empty()
+            && self
+                .catalog
+                .secondary_node_field_indexes_by_label
+                .is_empty()
         {
             return;
         }
@@ -1701,7 +1787,7 @@ impl MemtableState {
         let mut range_actions = Vec::new();
         let mut compound_actions = Vec::new();
         for &label_id in node.label_ids.as_slice() {
-            self.collect_secondary_index_entries_for_node_label(
+            self.catalog.collect_secondary_index_entries_for_node_label(
                 label_id,
                 node.id,
                 &node.props,
@@ -1709,7 +1795,7 @@ impl MemtableState {
                 &mut eq_actions,
                 &mut range_actions,
             );
-            self.collect_compound_index_entries_for_node_label(
+            self.catalog.collect_compound_index_entries_for_node_label(
                 label_id,
                 node,
                 true,
@@ -1728,9 +1814,12 @@ impl MemtableState {
     }
 
     fn remove_secondary_index_entries_for_node(&mut self, node: &NodeRecord, write_seq: u64) {
-        if self.secondary_eq_by_prop.is_empty()
-            && self.secondary_range_by_prop.is_empty()
-            && self.secondary_node_field_indexes_by_label.is_empty()
+        if self.catalog.secondary_eq_by_prop.is_empty()
+            && self.catalog.secondary_range_by_prop.is_empty()
+            && self
+                .catalog
+                .secondary_node_field_indexes_by_label
+                .is_empty()
         {
             return;
         }
@@ -1738,7 +1827,7 @@ impl MemtableState {
         let mut range_actions = Vec::new();
         let mut compound_actions = Vec::new();
         for &label_id in node.label_ids.as_slice() {
-            self.collect_secondary_index_entries_for_node_label(
+            self.catalog.collect_secondary_index_entries_for_node_label(
                 label_id,
                 node.id,
                 &node.props,
@@ -1746,7 +1835,7 @@ impl MemtableState {
                 &mut eq_actions,
                 &mut range_actions,
             );
-            self.collect_compound_index_entries_for_node_label(
+            self.catalog.collect_compound_index_entries_for_node_label(
                 label_id,
                 node,
                 false,
@@ -1770,9 +1859,12 @@ impl MemtableState {
         new_node: &NodeRecord,
         write_seq: u64,
     ) {
-        if self.secondary_eq_by_prop.is_empty()
-            && self.secondary_range_by_prop.is_empty()
-            && self.secondary_node_field_indexes_by_label.is_empty()
+        if self.catalog.secondary_eq_by_prop.is_empty()
+            && self.catalog.secondary_range_by_prop.is_empty()
+            && self
+                .catalog
+                .secondary_node_field_indexes_by_label
+                .is_empty()
         {
             return;
         }
@@ -1788,7 +1880,7 @@ impl MemtableState {
 
         for &old_label_id in old_node.label_ids.as_slice() {
             if !new_node.label_ids.contains(old_label_id) {
-                self.collect_secondary_index_entries_for_node_label(
+                self.catalog.collect_secondary_index_entries_for_node_label(
                     old_label_id,
                     old_node.id,
                     &old_node.props,
@@ -1796,7 +1888,7 @@ impl MemtableState {
                     &mut eq_actions,
                     &mut range_actions,
                 );
-                self.collect_compound_index_entries_for_node_label(
+                self.catalog.collect_compound_index_entries_for_node_label(
                     old_label_id,
                     old_node,
                     false,
@@ -1807,21 +1899,21 @@ impl MemtableState {
 
         for &new_label_id in new_node.label_ids.as_slice() {
             if old_node.label_ids.contains(new_label_id) {
-                self.collect_secondary_index_updates_for_node_label(
+                self.catalog.collect_secondary_index_updates_for_node_label(
                     new_label_id,
                     old_node,
                     new_node,
                     &mut eq_actions,
                     &mut range_actions,
                 );
-                self.collect_compound_index_updates_for_node_label(
+                self.catalog.collect_compound_index_updates_for_node_label(
                     new_label_id,
                     old_node,
                     new_node,
                     &mut compound_actions,
                 );
             } else {
-                self.collect_secondary_index_entries_for_node_label(
+                self.catalog.collect_secondary_index_entries_for_node_label(
                     new_label_id,
                     new_node.id,
                     &new_node.props,
@@ -1829,7 +1921,7 @@ impl MemtableState {
                     &mut eq_actions,
                     &mut range_actions,
                 );
-                self.collect_compound_index_entries_for_node_label(
+                self.catalog.collect_compound_index_entries_for_node_label(
                     new_label_id,
                     new_node,
                     true,
@@ -1848,71 +1940,23 @@ impl MemtableState {
         }
     }
 
-    fn collect_compound_index_entries_for_edge_label(
-        &self,
-        label_id: u32,
-        edge: &EdgeRecord,
-        present: bool,
-        actions: &mut Vec<CompoundAction>,
-    ) {
-        let Some(index_ids) = self.secondary_edge_field_indexes_by_label.get(&label_id) else {
-            return;
-        };
-        for &index_id in index_ids {
-            let entry = self
-                .secondary_index_declarations
-                .get(&index_id)
-                .expect("edge field-index lookup points at a declaration");
-            let SecondaryIndexTarget::EdgeFieldIndex { fields, .. } = &entry.target else {
-                unreachable!("edge field-index lookup points at non-edge-field target");
-            };
-            actions.push((
-                index_id,
-                encode_edge_compound_tuple_key(label_id, fields, edge),
-                edge.id,
-                present,
-            ));
-        }
-    }
-
-    fn collect_compound_index_updates_for_edge_label(
-        &self,
-        label_id: u32,
-        old_edge: &EdgeRecord,
-        new_edge: &EdgeRecord,
-        actions: &mut Vec<CompoundAction>,
-    ) {
-        let Some(index_ids) = self.secondary_edge_field_indexes_by_label.get(&label_id) else {
-            return;
-        };
-        for &index_id in index_ids {
-            let entry = self
-                .secondary_index_declarations
-                .get(&index_id)
-                .expect("edge field-index lookup points at a declaration");
-            let SecondaryIndexTarget::EdgeFieldIndex { fields, .. } = &entry.target else {
-                unreachable!("edge field-index lookup points at non-edge-field target");
-            };
-            let old_key = encode_edge_compound_tuple_key(label_id, fields, old_edge);
-            let new_key = encode_edge_compound_tuple_key(label_id, fields, new_edge);
-            if old_key == new_key {
-                continue;
-            }
-            actions.push((index_id, old_key, old_edge.id, false));
-            actions.push((index_id, new_key, new_edge.id, true));
-        }
-    }
-
     fn add_secondary_index_entries_for_edge(&mut self, edge: &EdgeRecord, write_seq: u64) {
-        if self.secondary_edge_eq_by_prop.is_empty()
-            && self.secondary_edge_range_by_prop.is_empty()
-            && self.secondary_edge_field_indexes_by_label.is_empty()
+        if self.catalog.secondary_edge_eq_by_prop.is_empty()
+            && self.catalog.secondary_edge_range_by_prop.is_empty()
+            && self
+                .catalog
+                .secondary_edge_field_indexes_by_label
+                .is_empty()
         {
             return;
         }
-        let eq_by_prop = self.secondary_edge_eq_by_prop.get(&edge.label_id);
-        let range_by_prop = self.secondary_edge_range_by_prop.get(&edge.label_id);
+        let eq_by_prop = self.catalog.secondary_edge_eq_by_prop.get(&edge.label_id);
+        let range_by_prop = self
+            .catalog
+            .secondary_edge_range_by_prop
+            .get(&edge.label_id);
         let has_compound = self
+            .catalog
             .secondary_edge_field_indexes_by_label
             .contains_key(&edge.label_id);
         if eq_by_prop.is_none() && range_by_prop.is_none() && !has_compound {
@@ -1943,7 +1987,7 @@ impl MemtableState {
                 }
             }
         }
-        self.collect_compound_index_entries_for_edge_label(
+        self.catalog.collect_compound_index_entries_for_edge_label(
             edge.label_id,
             edge,
             true,
@@ -1961,15 +2005,22 @@ impl MemtableState {
     }
 
     fn remove_secondary_index_entries_for_edge(&mut self, edge: &EdgeRecord, write_seq: u64) {
-        if self.secondary_edge_eq_by_prop.is_empty()
-            && self.secondary_edge_range_by_prop.is_empty()
-            && self.secondary_edge_field_indexes_by_label.is_empty()
+        if self.catalog.secondary_edge_eq_by_prop.is_empty()
+            && self.catalog.secondary_edge_range_by_prop.is_empty()
+            && self
+                .catalog
+                .secondary_edge_field_indexes_by_label
+                .is_empty()
         {
             return;
         }
-        let eq_by_prop = self.secondary_edge_eq_by_prop.get(&edge.label_id);
-        let range_by_prop = self.secondary_edge_range_by_prop.get(&edge.label_id);
+        let eq_by_prop = self.catalog.secondary_edge_eq_by_prop.get(&edge.label_id);
+        let range_by_prop = self
+            .catalog
+            .secondary_edge_range_by_prop
+            .get(&edge.label_id);
         let has_compound = self
+            .catalog
             .secondary_edge_field_indexes_by_label
             .contains_key(&edge.label_id);
         if eq_by_prop.is_none() && range_by_prop.is_none() && !has_compound {
@@ -2000,7 +2051,7 @@ impl MemtableState {
                 }
             }
         }
-        self.collect_compound_index_entries_for_edge_label(
+        self.catalog.collect_compound_index_entries_for_edge_label(
             edge.label_id,
             edge,
             false,
@@ -2023,9 +2074,12 @@ impl MemtableState {
         new_edge: &EdgeRecord,
         write_seq: u64,
     ) {
-        if self.secondary_edge_eq_by_prop.is_empty()
-            && self.secondary_edge_range_by_prop.is_empty()
-            && self.secondary_edge_field_indexes_by_label.is_empty()
+        if self.catalog.secondary_edge_eq_by_prop.is_empty()
+            && self.catalog.secondary_edge_range_by_prop.is_empty()
+            && self
+                .catalog
+                .secondary_edge_field_indexes_by_label
+                .is_empty()
         {
             return;
         }
@@ -2041,9 +2095,16 @@ impl MemtableState {
             return;
         }
 
-        let eq_by_prop = self.secondary_edge_eq_by_prop.get(&new_edge.label_id);
-        let range_by_prop = self.secondary_edge_range_by_prop.get(&new_edge.label_id);
+        let eq_by_prop = self
+            .catalog
+            .secondary_edge_eq_by_prop
+            .get(&new_edge.label_id);
+        let range_by_prop = self
+            .catalog
+            .secondary_edge_range_by_prop
+            .get(&new_edge.label_id);
         let has_compound = self
+            .catalog
             .secondary_edge_field_indexes_by_label
             .contains_key(&new_edge.label_id);
         if eq_by_prop.is_none() && range_by_prop.is_none() && !has_compound {
@@ -2094,7 +2155,7 @@ impl MemtableState {
                 }
             }
         }
-        self.collect_compound_index_updates_for_edge_label(
+        self.catalog.collect_compound_index_updates_for_edge_label(
             new_edge.label_id,
             old_edge,
             new_edge,
@@ -2112,17 +2173,53 @@ impl MemtableState {
     }
 }
 
-/// In-memory graph state. The current head and optional per-entry history live
-/// under one memtable-wide `RwLock`, so active and frozen epochs share the same
-/// authoritative MVCC substrate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdentityOpinion<T = u64> {
+    Missing,
+    Removed,
+    Live(T),
+}
+impl<T> From<Option<Option<T>>> for IdentityOpinion<T> {
+    fn from(value: Option<Option<T>>) -> Self {
+        match value {
+            None => Self::Missing,
+            Some(None) => Self::Removed,
+            Some(Some(value)) => Self::Live(value),
+        }
+    }
+}
+
+pub(crate) type EdgeCoreFields = (u64, u64, i64, i64, f32, i64, i64);
+
+pub(crate) enum PrimaryOpinion<T> {
+    Missing,
+    Removed(TombstoneEntry),
+    Live(T),
+}
+
+/// Generation-owned MVCC state. Legacy histories use `state`; candidate primary,
+/// graph and secondary append maps are authoritative and read without that lock.
 pub struct Memtable {
-    state: RwLock<MemtableState>,
+    state: MemtableStateOwner,
+    #[cfg(feature = "production-concurrency")]
+    primary: Option<PrimaryBinding>,
+    #[cfg(test)]
+    tombstone_scan_work: std::sync::atomic::AtomicUsize,
 }
 
 impl Clone for Memtable {
     fn clone(&self) -> Self {
+        #[cfg(feature = "production-concurrency")]
+        assert!(
+            self.primary.is_none(),
+            "candidate generations clone their guarded owner"
+        );
         Self {
-            state: RwLock::new(self.state.read().unwrap().clone()),
+            state: new_memtable_state(self.state.read().unwrap().clone()),
+            #[cfg(feature = "production-concurrency")]
+            primary: None,
+            #[cfg(test)]
+            tombstone_scan_work: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -2134,29 +2231,179 @@ impl Default for Memtable {
 }
 
 impl Memtable {
-    pub fn new() -> Self {
-        Self {
-            state: RwLock::new(MemtableState::default()),
+    pub(crate) fn key_opinions_at(
+        &self,
+        keys: &[(u32, &str)],
+        seq: u64,
+    ) -> Result<Vec<IdentityOpinion>, EngineError> {
+        let state = self.primary_read()?;
+        Ok(state.keys(keys, seq))
+    }
+    pub(crate) fn triple_opinions_at(
+        &self,
+        triples: &[(u64, u64, u32)],
+        seq: u64,
+    ) -> Result<Vec<IdentityOpinion>, EngineError> {
+        let state = self.primary_read()?;
+        Ok(triples
+            .iter()
+            .map(|&triple| IdentityOpinion::from(state.triple(triple, seq)))
+            .collect())
+    }
+
+    #[cfg(feature = "production-concurrency")]
+    pub(crate) fn seal_export(&self, seq: u64) {
+        let facts = crate::segment_writer::SealedExport::capture(self, seq);
+        self.state.write().unwrap().sealed_export = Some(facts);
+    }
+    #[cfg(feature = "production-concurrency")]
+    pub(crate) fn sealed_export(&self) -> Result<crate::segment_writer::SealedExport, EngineError> {
+        self.state.read().unwrap().sealed_export.ok_or_else(|| {
+            EngineError::InvalidOperation(
+                "candidate storage export requires a sealed generation".into(),
+            )
+        })
+    }
+    pub(crate) fn is_candidate(&self) -> bool {
+        #[cfg(feature = "production-concurrency")]
+        {
+            self.primary.is_some()
+        }
+        #[cfg(not(feature = "production-concurrency"))]
+        {
+            false
         }
     }
 
+    pub fn new() -> Self {
+        Self {
+            state: new_memtable_state(MemtableState::default()),
+            #[cfg(feature = "production-concurrency")]
+            primary: None,
+            #[cfg(test)]
+            tombstone_scan_work: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn node_sequence_opinion_at(
+        &self,
+        id: u64,
+        seq: u64,
+    ) -> Result<PrimaryOpinion<u64>, EngineError> {
+        let p = self.primary_read()?;
+        Ok(match p.node_state(id, seq) {
+            None => PrimaryOpinion::Missing,
+            Some(RecordState::Tombstone(t)) => PrimaryOpinion::Removed(*t),
+            Some(RecordState::Live(n)) => PrimaryOpinion::Live(n.last_write_seq),
+        })
+    }
+    pub(crate) fn edge_sequence_opinion_at(
+        &self,
+        id: u64,
+        seq: u64,
+    ) -> Result<PrimaryOpinion<u64>, EngineError> {
+        let p = self.primary_read()?;
+        Ok(match p.edge_state(id, seq) {
+            None => PrimaryOpinion::Missing,
+            Some(RecordState::Tombstone(t)) => PrimaryOpinion::Removed(*t),
+            Some(RecordState::Live(n)) => PrimaryOpinion::Live(n.last_write_seq),
+        })
+    }
+    pub(crate) fn node_opinion_at(
+        &self,
+        id: u64,
+        seq: u64,
+    ) -> Result<PrimaryOpinion<NodeRecord>, EngineError> {
+        let p = self.primary_read()?;
+        Ok(match p.node_state(id, seq) {
+            None => PrimaryOpinion::Missing,
+            Some(RecordState::Tombstone(t)) => PrimaryOpinion::Removed(*t),
+            Some(RecordState::Live(v)) => PrimaryOpinion::Live(v.clone()),
+        })
+    }
+    pub(crate) fn edge_opinion_at(
+        &self,
+        id: u64,
+        seq: u64,
+    ) -> Result<PrimaryOpinion<EdgeRecord>, EngineError> {
+        let p = self.primary_read()?;
+        Ok(match p.edge_state(id, seq) {
+            None => PrimaryOpinion::Missing,
+            Some(RecordState::Tombstone(t)) => PrimaryOpinion::Removed(*t),
+            Some(RecordState::Live(v)) => PrimaryOpinion::Live(v.clone()),
+        })
+    }
+    pub(crate) fn node_key_record_opinion_at(
+        &self,
+        label: u32,
+        key: &str,
+        seq: u64,
+    ) -> Result<IdentityOpinion<NodeRecord>, EngineError> {
+        let p = self.primary_read()?;
+        Ok(match p.key(label, key, seq) {
+            None => IdentityOpinion::Missing,
+            Some(None) => IdentityOpinion::Removed,
+            Some(Some(id)) => p
+                .node_at(id, seq)
+                .filter(|n| n.label_ids.contains(label) && n.key == key)
+                .map_or(IdentityOpinion::Removed, |n| {
+                    IdentityOpinion::Live(n.clone())
+                }),
+        })
+    }
+
+    fn primary_read(&self) -> Result<PrimaryRead<'_>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(maps) = &self.primary {
+            let session = maps
+                .admission
+                .try_acquire()
+                .map_err(primary::participant_error)?;
+            #[cfg(test)]
+            maps.pause_for_test(3)?;
+            return Ok(PrimaryRead::Candidate(maps, session));
+        }
+        Ok(PrimaryRead::Legacy(self.state.read().unwrap()))
+    }
+
     pub(crate) fn apply_op(&self, op: &WalOp, last_write_seq: u64) {
+        #[cfg(feature = "production-concurrency")]
+        assert!(
+            self.primary.is_none(),
+            "candidate install requires pre-WAL preparation/session"
+        );
+        self.apply_transition(op, last_write_seq, None, None, true);
+    }
+
+    // Legacy installation only. Candidate installation updates small diagnostics
+    // directly after its append-only families, without maintaining these histories.
+    fn apply_transition(
+        &self,
+        op: &WalOp,
+        last_write_seq: u64,
+        old_node: Option<&NodeRecord>,
+        old_edge: Option<&EdgeRecord>,
+        legacy: bool,
+    ) {
         let mut state = self.state.write().unwrap();
         match op {
             WalOp::UpsertNode(node) => {
-                let old_node = state.current_node(node.id).cloned();
+                let legacy_old = legacy.then(|| {
+                    crate::engine::payload::Owned::new(state.current_node(node.id).cloned())
+                });
+                let old_node = legacy_old.as_ref().map_or(old_node, |owned| owned.as_ref());
                 let was_live = old_node.is_some();
                 let was_deleted = state.node_deleted_at(node.id, u64::MAX);
-                if let Some(old) = old_node.as_ref() {
+                if let Some(old) = old_node {
                     for &old_label_id in old.label_ids.as_slice() {
                         let label_removed = !node.label_ids.contains(old_label_id);
-                        if label_removed || old.key != node.key {
+                        if legacy && (label_removed || old.key != node.key) {
                             state.set_node_key(old_label_id, &old.key, None, last_write_seq);
                         }
-                        if label_removed {
+                        if label_removed && legacy {
                             state.set_node_label_slot(old_label_id, old.id, false, last_write_seq);
                         }
-                        if label_removed || old.updated_at != node.updated_at {
+                        if (label_removed || old.updated_at != node.updated_at) && legacy {
                             state.set_time_slot(
                                 (old_label_id, old.updated_at, old.id),
                                 false,
@@ -2166,58 +2413,90 @@ impl Memtable {
                     }
                 }
 
-                let mut stored = node.clone();
-                stored.last_write_seq = last_write_seq;
+                let mut stored = legacy.then(|| crate::engine::payload::Owned::new(node.clone()));
+                if let Some(stored) = &mut stored {
+                    stored.last_write_seq = last_write_seq;
+                }
                 for &new_label_id in node.label_ids.as_slice() {
-                    state.set_node_key(new_label_id, &node.key, Some(node.id), last_write_seq);
-                    state.set_node_label_slot(new_label_id, node.id, true, last_write_seq);
-                    state.set_time_slot(
-                        (new_label_id, node.updated_at, node.id),
-                        true,
+                    if legacy {
+                        state.set_node_key(new_label_id, &node.key, Some(node.id), last_write_seq);
+                    }
+                    if legacy {
+                        state.set_node_label_slot(new_label_id, node.id, true, last_write_seq);
+                    }
+                    if legacy {
+                        state.set_time_slot(
+                            (new_label_id, node.updated_at, node.id),
+                            true,
+                            last_write_seq,
+                        );
+                    }
+                }
+                if legacy {
+                    state.sync_secondary_index_entries_for_node_upsert(
+                        old_node,
+                        stored.as_deref().unwrap_or(node),
                         last_write_seq,
                     );
                 }
-                state.sync_secondary_index_entries_for_node_upsert(
-                    old_node.as_ref(),
-                    &stored,
-                    last_write_seq,
-                );
                 if was_deleted {
                     state.set_node_tombstone_slot(node.id, false, last_write_seq);
                 }
-                state.set_node_state(node.id, RecordState::Live(stored), last_write_seq);
+                if legacy {
+                    state.set_node_state(
+                        node.id,
+                        RecordState::Live(stored.take().expect("legacy primary").into_inner()),
+                        last_write_seq,
+                    );
+                }
                 if !was_live {
                     state.live_node_count = state.live_node_count.saturating_add(1);
                 }
             }
             WalOp::UpsertEdge(edge) => {
-                let old_edge = state.current_edge(edge.id).cloned();
+                let legacy_old = legacy.then(|| {
+                    crate::engine::payload::Owned::new(state.current_edge(edge.id).cloned())
+                });
+                let old_edge = legacy_old.as_ref().map_or(old_edge, |owned| owned.as_ref());
                 let was_live = old_edge.is_some();
                 let was_deleted = state.edge_deleted_at(edge.id, u64::MAX);
-                state.sync_ordered_adj_groups_for_edge_transition(
-                    old_edge.as_ref(),
-                    Some(edge),
-                    last_write_seq,
-                );
-                if let Some(old) = old_edge.as_ref() {
-                    if (old.from != edge.from || old.to != edge.to || old.label_id != edge.label_id)
+                if legacy {
+                    state.sync_ordered_adj_groups_for_edge_transition(
+                        old_edge,
+                        Some(edge),
+                        last_write_seq,
+                    );
+                }
+                if let Some(old) = old_edge {
+                    if legacy
+                        && (old.from != edge.from
+                            || old.to != edge.to
+                            || old.label_id != edge.label_id)
                         && state.current_edge_triple_id(old.from, old.to, old.label_id)
                             == Some(old.id)
                     {
                         state.set_edge_triple(old.from, old.to, old.label_id, None, last_write_seq);
                     }
                     if old.label_id != edge.label_id {
-                        state.set_edge_label_slot(old.label_id, old.id, false, last_write_seq);
-                        state.set_ordered_edge_label_slot(
-                            old.label_id,
-                            old.id,
-                            false,
-                            last_write_seq,
-                        );
+                        if legacy {
+                            state.set_edge_label_slot(old.label_id, old.id, false, last_write_seq);
+                        }
+                        if legacy {
+                            state.set_ordered_edge_label_slot(
+                                old.label_id,
+                                old.id,
+                                false,
+                                last_write_seq,
+                            );
+                        }
                     }
                     if old.from != edge.from || old.to != edge.to {
-                        state.set_adj_out_slot(old.from, old.id, None, last_write_seq);
-                        state.set_adj_in_slot(old.to, old.id, None, last_write_seq);
+                        if legacy {
+                            state.set_adj_out_slot(old.from, old.id, None, last_write_seq);
+                        }
+                        if legacy {
+                            state.set_adj_in_slot(old.to, old.id, None, last_write_seq);
+                        }
                     }
                 }
 
@@ -2238,80 +2517,120 @@ impl Memtable {
                     valid_to: edge.valid_to,
                 };
 
-                let current_triple_id =
-                    state.current_edge_triple_id(edge.from, edge.to, edge.label_id);
-                let should_update_triple = match old_edge.as_ref() {
-                    Some(old)
-                        if old.from == edge.from
-                            && old.to == edge.to
-                            && old.label_id == edge.label_id =>
-                    {
-                        current_triple_id.is_none_or(|current_id| current_id == edge.id)
+                if legacy {
+                    let current_triple_id =
+                        state.current_edge_triple_id(edge.from, edge.to, edge.label_id);
+                    let should_update_triple = match old_edge {
+                        Some(old)
+                            if old.from == edge.from
+                                && old.to == edge.to
+                                && old.label_id == edge.label_id =>
+                        {
+                            current_triple_id.is_none_or(|current_id| current_id == edge.id)
+                        }
+                        _ => true,
+                    };
+                    if should_update_triple {
+                        state.set_edge_triple(
+                            edge.from,
+                            edge.to,
+                            edge.label_id,
+                            Some(edge.id),
+                            last_write_seq,
+                        );
                     }
-                    _ => true,
-                };
-                if should_update_triple {
-                    state.set_edge_triple(
-                        edge.from,
-                        edge.to,
-                        edge.label_id,
-                        Some(edge.id),
+                }
+                if legacy {
+                    state.set_adj_out_slot(edge.from, edge.id, Some(adj_out_entry), last_write_seq);
+                }
+                if legacy {
+                    state.set_adj_in_slot(edge.to, edge.id, Some(adj_in_entry), last_write_seq);
+                }
+                if legacy {
+                    state.set_edge_label_slot(edge.label_id, edge.id, true, last_write_seq);
+                }
+                if legacy {
+                    state.set_ordered_edge_label_slot(edge.label_id, edge.id, true, last_write_seq);
+                }
+                if legacy {
+                    state.set_ordered_edge_slot(edge.id, true, last_write_seq);
+                }
+
+                let mut stored = legacy.then(|| crate::engine::payload::Owned::new(edge.clone()));
+                if let Some(stored) = &mut stored {
+                    stored.last_write_seq = last_write_seq;
+                }
+                if legacy {
+                    state.sync_secondary_index_entries_for_edge_upsert(
+                        old_edge,
+                        stored.as_deref().unwrap_or(edge),
                         last_write_seq,
                     );
                 }
-                state.set_adj_out_slot(edge.from, edge.id, Some(adj_out_entry), last_write_seq);
-                state.set_adj_in_slot(edge.to, edge.id, Some(adj_in_entry), last_write_seq);
-                state.set_edge_label_slot(edge.label_id, edge.id, true, last_write_seq);
-                state.set_ordered_edge_label_slot(edge.label_id, edge.id, true, last_write_seq);
-                state.set_ordered_edge_slot(edge.id, true, last_write_seq);
-
-                let mut stored = edge.clone();
-                stored.last_write_seq = last_write_seq;
-                state.sync_secondary_index_entries_for_edge_upsert(
-                    old_edge.as_ref(),
-                    &stored,
-                    last_write_seq,
-                );
                 if was_deleted {
                     state.set_edge_tombstone_slot(edge.id, false, last_write_seq);
                 }
-                state.set_edge_state(edge.id, RecordState::Live(stored), last_write_seq);
+                if legacy {
+                    state.set_edge_state(
+                        edge.id,
+                        RecordState::Live(stored.take().expect("legacy primary").into_inner()),
+                        last_write_seq,
+                    );
+                }
                 if !was_live {
                     state.live_edge_count = state.live_edge_count.saturating_add(1);
                 }
             }
             WalOp::DeleteNode { id, deleted_at } => {
-                if let Some(node) = state.current_node(*id).cloned() {
+                let legacy_old = legacy
+                    .then(|| crate::engine::payload::Owned::new(state.current_node(*id).cloned()));
+                if let Some(node) = legacy_old.as_ref().map_or(old_node, |owned| owned.as_ref()) {
                     for &label_id in node.label_ids.as_slice() {
-                        state.set_node_key(label_id, &node.key, None, last_write_seq);
-                        state.set_node_label_slot(label_id, node.id, false, last_write_seq);
-                        state.set_time_slot(
-                            (label_id, node.updated_at, node.id),
-                            false,
-                            last_write_seq,
-                        );
+                        if legacy {
+                            state.set_node_key(label_id, &node.key, None, last_write_seq);
+                        }
+                        if legacy {
+                            state.set_node_label_slot(label_id, node.id, false, last_write_seq);
+                        }
+                        if legacy {
+                            state.set_time_slot(
+                                (label_id, node.updated_at, node.id),
+                                false,
+                                last_write_seq,
+                            );
+                        }
                     }
-                    state.remove_secondary_index_entries_for_node(&node, last_write_seq);
+                    if legacy {
+                        state.remove_secondary_index_entries_for_node(node, last_write_seq);
+                    }
                     state.live_node_count = state.live_node_count.saturating_sub(1);
                 }
-                state.set_node_state(
-                    *id,
-                    RecordState::Tombstone(TombstoneEntry {
-                        deleted_at: *deleted_at,
+                if legacy {
+                    state.set_node_state(
+                        *id,
+                        RecordState::Tombstone(TombstoneEntry {
+                            deleted_at: *deleted_at,
+                            last_write_seq,
+                        }),
                         last_write_seq,
-                    }),
-                    last_write_seq,
-                );
+                    );
+                }
                 state.set_node_tombstone_slot(*id, true, last_write_seq);
             }
             WalOp::DeleteEdge { id, deleted_at } => {
-                if let Some(edge) = state.current_edge(*id).cloned() {
-                    state.sync_ordered_adj_groups_for_edge_transition(
-                        Some(&edge),
-                        None,
-                        last_write_seq,
-                    );
-                    if state.current_edge_triple_id(edge.from, edge.to, edge.label_id) == Some(*id)
+                let legacy_old = legacy
+                    .then(|| crate::engine::payload::Owned::new(state.current_edge(*id).cloned()));
+                if let Some(edge) = legacy_old.as_ref().map_or(old_edge, |owned| owned.as_ref()) {
+                    if legacy {
+                        state.sync_ordered_adj_groups_for_edge_transition(
+                            Some(edge),
+                            None,
+                            last_write_seq,
+                        );
+                    }
+                    if legacy
+                        && state.current_edge_triple_id(edge.from, edge.to, edge.label_id)
+                            == Some(*id)
                     {
                         state.set_edge_triple(
                             edge.from,
@@ -2321,27 +2640,41 @@ impl Memtable {
                             last_write_seq,
                         );
                     }
-                    state.set_edge_label_slot(edge.label_id, edge.id, false, last_write_seq);
-                    state.set_ordered_edge_label_slot(
-                        edge.label_id,
-                        edge.id,
-                        false,
-                        last_write_seq,
-                    );
-                    state.set_adj_out_slot(edge.from, edge.id, None, last_write_seq);
-                    state.set_adj_in_slot(edge.to, edge.id, None, last_write_seq);
-                    state.set_ordered_edge_slot(edge.id, false, last_write_seq);
-                    state.remove_secondary_index_entries_for_edge(&edge, last_write_seq);
+                    if legacy {
+                        state.set_edge_label_slot(edge.label_id, edge.id, false, last_write_seq);
+                    }
+                    if legacy {
+                        state.set_ordered_edge_label_slot(
+                            edge.label_id,
+                            edge.id,
+                            false,
+                            last_write_seq,
+                        );
+                    }
+                    if legacy {
+                        state.set_adj_out_slot(edge.from, edge.id, None, last_write_seq);
+                    }
+                    if legacy {
+                        state.set_adj_in_slot(edge.to, edge.id, None, last_write_seq);
+                    }
+                    if legacy {
+                        state.set_ordered_edge_slot(edge.id, false, last_write_seq);
+                    }
+                    if legacy {
+                        state.remove_secondary_index_entries_for_edge(edge, last_write_seq);
+                    }
                     state.live_edge_count = state.live_edge_count.saturating_sub(1);
                 }
-                state.set_edge_state(
-                    *id,
-                    RecordState::Tombstone(TombstoneEntry {
-                        deleted_at: *deleted_at,
+                if legacy {
+                    state.set_edge_state(
+                        *id,
+                        RecordState::Tombstone(TombstoneEntry {
+                            deleted_at: *deleted_at,
+                            last_write_seq,
+                        }),
                         last_write_seq,
-                    }),
-                    last_write_seq,
-                );
+                    );
+                }
                 state.set_edge_tombstone_slot(*id, true, last_write_seq);
             }
             WalOp::EnsureNodeLabel { .. }
@@ -2351,15 +2684,25 @@ impl Memtable {
         }
     }
 
-    pub fn register_secondary_index(&self, entry: &SecondaryIndexManifestEntry) {
+    pub fn register_secondary_index(
+        &self,
+        entry: &SecondaryIndexManifestEntry,
+    ) -> Result<(), EngineError> {
+        if self.is_candidate() {
+            return Err(EngineError::InvalidOperation(
+                "candidate indexes require an immutable replacement binding".into(),
+            ));
+        }
         let mut state = self.state.write().unwrap();
         if state
+            .catalog
             .secondary_index_declarations
             .contains_key(&entry.index_id)
         {
-            return;
+            return Ok(());
         }
         state
+            .catalog
             .secondary_index_declarations
             .insert(entry.index_id, entry.clone());
         state.estimated_bytes += estimate_secondary_decl_entry(entry);
@@ -2367,7 +2710,11 @@ impl Memtable {
             SecondaryIndexTarget::NodeProperty { label_id, prop_key } => match &entry.kind {
                 SecondaryIndexKind::Equality => {
                     let (lookup_before, lookup_after) = {
-                        let by_prop = state.secondary_eq_by_prop.entry(*label_id).or_default();
+                        let by_prop = state
+                            .catalog
+                            .secondary_eq_by_prop
+                            .entry(*label_id)
+                            .or_default();
                         match by_prop.get_mut(prop_key) {
                             Some(index_ids) => {
                                 let before =
@@ -2388,10 +2735,7 @@ impl Memtable {
                     apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
                     state.secondary_eq_state.entry(entry.index_id).or_default();
                     let mut seeded = Vec::new();
-                    for slot in state.nodes.values() {
-                        let Some(node) = record_current(slot) else {
-                            continue;
-                        };
+                    for node in state.nodes.values().filter_map(record_current) {
                         if !node.label_ids.contains(*label_id) {
                             continue;
                         }
@@ -2416,7 +2760,11 @@ impl Memtable {
                 }
                 SecondaryIndexKind::Range => {
                     let (lookup_before, lookup_after) = {
-                        let by_prop = state.secondary_range_by_prop.entry(*label_id).or_default();
+                        let by_prop = state
+                            .catalog
+                            .secondary_range_by_prop
+                            .entry(*label_id)
+                            .or_default();
                         match by_prop.get_mut(prop_key) {
                             Some(indexes) => {
                                 let before =
@@ -2441,10 +2789,7 @@ impl Memtable {
                         .entry(entry.index_id)
                         .or_default();
                     let mut seeded = Vec::new();
-                    for slot in state.nodes.values() {
-                        let Some(node) = record_current(slot) else {
-                            continue;
-                        };
+                    for node in state.nodes.values().filter_map(record_current) {
                         if !node.label_ids.contains(*label_id) {
                             continue;
                         }
@@ -2471,6 +2816,7 @@ impl Memtable {
                 SecondaryIndexKind::Equality => {
                     let (lookup_before, lookup_after) = {
                         let by_prop = state
+                            .catalog
                             .secondary_edge_eq_by_prop
                             .entry(*label_id)
                             .or_default();
@@ -2494,10 +2840,7 @@ impl Memtable {
                     apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
                     state.secondary_eq_state.entry(entry.index_id).or_default();
                     let mut seeded = Vec::new();
-                    for slot in state.edges.values() {
-                        let Some(edge) = record_current(slot) else {
-                            continue;
-                        };
+                    for edge in state.edges.values().filter_map(record_current) {
                         if edge.label_id != *label_id {
                             continue;
                         }
@@ -2523,6 +2866,7 @@ impl Memtable {
                 SecondaryIndexKind::Range => {
                     let (lookup_before, lookup_after) = {
                         let by_prop = state
+                            .catalog
                             .secondary_edge_range_by_prop
                             .entry(*label_id)
                             .or_default();
@@ -2550,10 +2894,7 @@ impl Memtable {
                         .entry(entry.index_id)
                         .or_default();
                     let mut seeded = Vec::new();
-                    for slot in state.edges.values() {
-                        let Some(edge) = record_current(slot) else {
-                            continue;
-                        };
+                    for edge in state.edges.values().filter_map(record_current) {
                         if edge.label_id != *label_id {
                             continue;
                         }
@@ -2578,7 +2919,7 @@ impl Memtable {
             },
             SecondaryIndexTarget::NodeFieldIndex { label_id, fields } => {
                 let (lookup_before, lookup_after) = MemtableState::add_field_index_lookup(
-                    &mut state.secondary_node_field_indexes_by_label,
+                    &mut state.catalog.secondary_node_field_indexes_by_label,
                     *label_id,
                     entry.index_id,
                 );
@@ -2588,10 +2929,7 @@ impl Memtable {
                     .entry(entry.index_id)
                     .or_default();
                 let mut seeded = Vec::new();
-                for slot in state.nodes.values() {
-                    let Some(node) = record_current(slot) else {
-                        continue;
-                    };
+                for node in state.nodes.values().filter_map(record_current) {
                     if !node.label_ids.contains(*label_id) {
                         continue;
                     }
@@ -2607,7 +2945,7 @@ impl Memtable {
             }
             SecondaryIndexTarget::EdgeFieldIndex { label_id, fields } => {
                 let (lookup_before, lookup_after) = MemtableState::add_field_index_lookup(
-                    &mut state.secondary_edge_field_indexes_by_label,
+                    &mut state.catalog.secondary_edge_field_indexes_by_label,
                     *label_id,
                     entry.index_id,
                 );
@@ -2617,10 +2955,7 @@ impl Memtable {
                     .entry(entry.index_id)
                     .or_default();
                 let mut seeded = Vec::new();
-                for slot in state.edges.values() {
-                    let Some(edge) = record_current(slot) else {
-                        continue;
-                    };
+                for edge in state.edges.values().filter_map(record_current) {
                     if edge.label_id != *label_id {
                         continue;
                     }
@@ -2635,11 +2970,12 @@ impl Memtable {
                 }
             }
         }
+        Ok(())
     }
 
     pub fn unregister_secondary_index(&self, index_id: u64) -> bool {
         let mut state = self.state.write().unwrap();
-        let Some(entry) = state.secondary_index_declarations.remove(&index_id) else {
+        let Some(entry) = state.catalog.secondary_index_declarations.remove(&index_id) else {
             return false;
         };
         state.estimated_bytes = state
@@ -2651,7 +2987,8 @@ impl Memtable {
                     let (lookup_before, lookup_after, remove_label_entry) = {
                         let mut delta = (0, 0);
                         let mut remove_label_entry = false;
-                        if let Some(by_prop) = state.secondary_eq_by_prop.get_mut(&label_id) {
+                        if let Some(by_prop) = state.catalog.secondary_eq_by_prop.get_mut(&label_id)
+                        {
                             let mut remove_prop_entry = false;
                             if let Some(index_ids) = by_prop.get_mut(&prop_key) {
                                 delta.0 = estimate_secondary_eq_lookup_entry(&prop_key, index_ids);
@@ -2672,7 +3009,7 @@ impl Memtable {
                     };
                     apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
                     if remove_label_entry {
-                        state.secondary_eq_by_prop.remove(&label_id);
+                        state.catalog.secondary_eq_by_prop.remove(&label_id);
                     }
                     if let Some(groups) = state.secondary_eq_state.remove(&index_id) {
                         state.estimated_bytes = state
@@ -2684,75 +3021,8 @@ impl Memtable {
                     let (lookup_before, lookup_after, remove_label_entry) = {
                         let mut delta = (0, 0);
                         let mut remove_label_entry = false;
-                        if let Some(by_prop) = state.secondary_range_by_prop.get_mut(&label_id) {
-                            let mut remove_prop_entry = false;
-                            if let Some(indexes) = by_prop.get_mut(&prop_key) {
-                                delta.0 = estimate_secondary_range_lookup_entry(&prop_key, indexes);
-                                indexes.retain(|&id| id != index_id);
-                                if indexes.is_empty() {
-                                    remove_prop_entry = true;
-                                } else {
-                                    delta.1 =
-                                        estimate_secondary_range_lookup_entry(&prop_key, indexes);
-                                }
-                            }
-                            if remove_prop_entry {
-                                by_prop.remove(&prop_key);
-                            }
-                            remove_label_entry = by_prop.is_empty();
-                        }
-                        (delta.0, delta.1, remove_label_entry)
-                    };
-                    apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
-                    if remove_label_entry {
-                        state.secondary_range_by_prop.remove(&label_id);
-                    }
-                    if let Some(entries) = state.secondary_range_state.remove(&index_id) {
-                        state.estimated_bytes = state
-                            .estimated_bytes
-                            .saturating_sub(estimate_secondary_range_state_entries(&entries));
-                    }
-                }
-            },
-            SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => match entry.kind {
-                SecondaryIndexKind::Equality => {
-                    let (lookup_before, lookup_after, remove_label_entry) = {
-                        let mut delta = (0, 0);
-                        let mut remove_label_entry = false;
-                        if let Some(by_prop) = state.secondary_edge_eq_by_prop.get_mut(&label_id) {
-                            let mut remove_prop_entry = false;
-                            if let Some(index_ids) = by_prop.get_mut(&prop_key) {
-                                delta.0 = estimate_secondary_eq_lookup_entry(&prop_key, index_ids);
-                                index_ids.retain(|&id| id != index_id);
-                                if index_ids.is_empty() {
-                                    remove_prop_entry = true;
-                                } else {
-                                    delta.1 =
-                                        estimate_secondary_eq_lookup_entry(&prop_key, index_ids);
-                                }
-                            }
-                            if remove_prop_entry {
-                                by_prop.remove(&prop_key);
-                            }
-                            remove_label_entry = by_prop.is_empty();
-                        }
-                        (delta.0, delta.1, remove_label_entry)
-                    };
-                    apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
-                    if remove_label_entry {
-                        state.secondary_edge_eq_by_prop.remove(&label_id);
-                    }
-                    if let Some(groups) = state.secondary_eq_state.remove(&index_id) {
-                        state.estimated_bytes = state
-                            .estimated_bytes
-                            .saturating_sub(estimate_secondary_eq_state_groups(&groups));
-                    }
-                }
-                SecondaryIndexKind::Range => {
-                    let (lookup_before, lookup_after, remove_label_entry) = {
-                        let mut delta = (0, 0);
-                        let mut remove_label_entry = false;
-                        if let Some(by_prop) = state.secondary_edge_range_by_prop.get_mut(&label_id)
+                        if let Some(by_prop) =
+                            state.catalog.secondary_range_by_prop.get_mut(&label_id)
                         {
                             let mut remove_prop_entry = false;
                             if let Some(indexes) = by_prop.get_mut(&prop_key) {
@@ -2774,7 +3044,81 @@ impl Memtable {
                     };
                     apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
                     if remove_label_entry {
-                        state.secondary_edge_range_by_prop.remove(&label_id);
+                        state.catalog.secondary_range_by_prop.remove(&label_id);
+                    }
+                    if let Some(entries) = state.secondary_range_state.remove(&index_id) {
+                        state.estimated_bytes = state
+                            .estimated_bytes
+                            .saturating_sub(estimate_secondary_range_state_entries(&entries));
+                    }
+                }
+            },
+            SecondaryIndexTarget::EdgeProperty { label_id, prop_key } => match entry.kind {
+                SecondaryIndexKind::Equality => {
+                    let (lookup_before, lookup_after, remove_label_entry) = {
+                        let mut delta = (0, 0);
+                        let mut remove_label_entry = false;
+                        if let Some(by_prop) =
+                            state.catalog.secondary_edge_eq_by_prop.get_mut(&label_id)
+                        {
+                            let mut remove_prop_entry = false;
+                            if let Some(index_ids) = by_prop.get_mut(&prop_key) {
+                                delta.0 = estimate_secondary_eq_lookup_entry(&prop_key, index_ids);
+                                index_ids.retain(|&id| id != index_id);
+                                if index_ids.is_empty() {
+                                    remove_prop_entry = true;
+                                } else {
+                                    delta.1 =
+                                        estimate_secondary_eq_lookup_entry(&prop_key, index_ids);
+                                }
+                            }
+                            if remove_prop_entry {
+                                by_prop.remove(&prop_key);
+                            }
+                            remove_label_entry = by_prop.is_empty();
+                        }
+                        (delta.0, delta.1, remove_label_entry)
+                    };
+                    apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
+                    if remove_label_entry {
+                        state.catalog.secondary_edge_eq_by_prop.remove(&label_id);
+                    }
+                    if let Some(groups) = state.secondary_eq_state.remove(&index_id) {
+                        state.estimated_bytes = state
+                            .estimated_bytes
+                            .saturating_sub(estimate_secondary_eq_state_groups(&groups));
+                    }
+                }
+                SecondaryIndexKind::Range => {
+                    let (lookup_before, lookup_after, remove_label_entry) = {
+                        let mut delta = (0, 0);
+                        let mut remove_label_entry = false;
+                        if let Some(by_prop) = state
+                            .catalog
+                            .secondary_edge_range_by_prop
+                            .get_mut(&label_id)
+                        {
+                            let mut remove_prop_entry = false;
+                            if let Some(indexes) = by_prop.get_mut(&prop_key) {
+                                delta.0 = estimate_secondary_range_lookup_entry(&prop_key, indexes);
+                                indexes.retain(|&id| id != index_id);
+                                if indexes.is_empty() {
+                                    remove_prop_entry = true;
+                                } else {
+                                    delta.1 =
+                                        estimate_secondary_range_lookup_entry(&prop_key, indexes);
+                                }
+                            }
+                            if remove_prop_entry {
+                                by_prop.remove(&prop_key);
+                            }
+                            remove_label_entry = by_prop.is_empty();
+                        }
+                        (delta.0, delta.1, remove_label_entry)
+                    };
+                    apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
+                    if remove_label_entry {
+                        state.catalog.secondary_edge_range_by_prop.remove(&label_id);
                     }
                     if let Some(entries) = state.secondary_range_state.remove(&index_id) {
                         state.estimated_bytes = state
@@ -2786,13 +3130,14 @@ impl Memtable {
             SecondaryIndexTarget::NodeFieldIndex { label_id, .. } => {
                 let (lookup_before, lookup_after, remove_label_entry) =
                     MemtableState::remove_field_index_lookup(
-                        &mut state.secondary_node_field_indexes_by_label,
+                        &mut state.catalog.secondary_node_field_indexes_by_label,
                         label_id,
                         index_id,
                     );
                 apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
                 if remove_label_entry {
                     state
+                        .catalog
                         .secondary_node_field_indexes_by_label
                         .remove(&label_id);
                 }
@@ -2805,13 +3150,14 @@ impl Memtable {
             SecondaryIndexTarget::EdgeFieldIndex { label_id, .. } => {
                 let (lookup_before, lookup_after, remove_label_entry) =
                     MemtableState::remove_field_index_lookup(
-                        &mut state.secondary_edge_field_indexes_by_label,
+                        &mut state.catalog.secondary_edge_field_indexes_by_label,
                         label_id,
                         index_id,
                     );
                 apply_size_delta(&mut state.estimated_bytes, lookup_before, lookup_after);
                 if remove_label_entry {
                     state
+                        .catalog
                         .secondary_edge_field_indexes_by_label
                         .remove(&label_id);
                 }
@@ -2825,36 +3171,101 @@ impl Memtable {
         true
     }
 
-    pub(crate) fn get_node_at(&self, id: u64, snapshot_seq: u64) -> Option<NodeRecord> {
-        let state = self.state.read().unwrap();
-        state.node_at(id, snapshot_seq).cloned()
+    #[cfg(test)]
+    pub(crate) fn get_node_at(
+        &self,
+        id: u64,
+        snapshot_seq: u64,
+    ) -> Result<Option<NodeRecord>, EngineError> {
+        let state = self.primary_read()?;
+        Ok(state.node_at(id, snapshot_seq).cloned())
     }
 
     pub(crate) fn visit_nodes_sorted_at<F>(
         &self,
         sorted_ids: &[u64],
         snapshot_seq: u64,
+        vectors: crate::row_projection::VectorSelection,
         remaining: &mut Vec<u64>,
         callback: &mut F,
-    ) where
-        F: FnMut(u64, &NodeRecord),
+    ) -> Result<(), EngineError>
+    where
+        F: FnMut(u64, &NodeVectorRow<'_>),
     {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            let mut position = 0;
+            let mut batch = VectorBatch::default();
+            while position < sorted_ids.len() {
+                batch.clear();
+                let state = self.primary_read()?;
+                let PrimaryRead::Candidate(maps, session) = &state else {
+                    unreachable!("candidate vector source");
+                };
+                let mut copied = 0usize;
+                let mut remaining_requests = sorted_ids.len() - position;
+                let consumed = maps.copy_nodes_sorted_at(
+                    session,
+                    &sorted_ids[position..],
+                    snapshot_seq,
+                    |id, value| {
+                        match value {
+                            Some(RecordState::Live(node)) => {
+                                let bytes = VectorBatch::copied_bytes(node, vectors);
+                                if !batch.rows.is_empty()
+                                    && copied.saturating_add(bytes) > 1024 * 1024
+                                {
+                                    return ControlFlow::Break(false);
+                                }
+                                batch.push(node, vectors, remaining_requests);
+                                #[cfg(test)]
+                                self.primary.as_ref().unwrap().note_vector_copy_for_test(
+                                    &NodeVectorRow::borrowed(node, vectors),
+                                );
+                                copied = copied.saturating_add(bytes);
+                            }
+                            Some(RecordState::Tombstone(_)) => {}
+                            None => remaining.push(id),
+                        }
+                        remaining_requests -= 1;
+                        if copied >= 1024 * 1024 {
+                            ControlFlow::Break(true)
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    },
+                );
+                debug_assert!(consumed > 0, "empty vector refill must advance");
+                position += consumed;
+                drop(state);
+                for row in &batch.rows {
+                    callback(row.meta.id, &batch.row(row));
+                }
+            }
+            return Ok(());
+        }
         let state = self.state.read().unwrap();
         for &id in sorted_ids {
             if state.node_deleted_at(id, snapshot_seq) {
                 continue;
             }
             if let Some(node) = state.node_at(id, snapshot_seq) {
-                callback(id, node);
+                callback(id, &NodeVectorRow::borrowed(node, vectors));
             } else {
                 remaining.push(id);
             }
         }
+        Ok(())
     }
 
-    pub(crate) fn get_edge_at(&self, id: u64, snapshot_seq: u64) -> Option<EdgeRecord> {
-        let state = self.state.read().unwrap();
-        state.edge_at(id, snapshot_seq).cloned()
+    #[cfg(test)]
+    pub(crate) fn get_edge_at(
+        &self,
+        id: u64,
+        snapshot_seq: u64,
+    ) -> Result<Option<EdgeRecord>, EngineError> {
+        let state = self.primary_read()?;
+        Ok(state.edge_at(id, snapshot_seq).cloned())
     }
 
     pub(crate) fn batch_get_node_selected_fields_at(
@@ -2864,7 +3275,8 @@ impl Memtable {
         snapshot_seq: u64,
         results: &mut [Option<SelectedNodeFields>],
         #[cfg(test)] selected_field_read_counters: Option<&SelectedFieldReadCounters>,
-    ) -> Vec<(usize, u64)> {
+    ) -> Result<Vec<(usize, u64)>, EngineError> {
+        let state = self.primary_read()?;
         #[derive(Clone, Copy)]
         enum CachedLookup {
             Live(usize),
@@ -2873,10 +3285,9 @@ impl Memtable {
         }
 
         if lookups.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        let state = self.state.read().unwrap();
         let mut cache =
             NodeIdMap::with_capacity_and_hasher(lookups.len(), NodeIdBuildHasher::default());
         let mut remaining = Vec::with_capacity(lookups.len());
@@ -2889,63 +3300,60 @@ impl Memtable {
                 Some(CachedLookup::Tombstone) => {}
                 Some(CachedLookup::Miss) => remaining.push((orig_idx, id)),
                 None => {
-                    let outcome = match state.nodes.get(&id) {
-                        Some(slot) => match record_at(slot, snapshot_seq) {
-                            Some(RecordState::Live(node)) => {
-                                #[cfg(test)]
-                                let dense_vector = if needs.vectors.needs_dense() {
-                                    let vector = node.dense_vector.clone();
-                                    if vector.is_some() {
-                                        if let Some(counters) = selected_field_read_counters {
-                                            counters.note_node_dense_vector_projection_read();
-                                        }
+                    let outcome = match state.node_state(id, snapshot_seq) {
+                        Some(RecordState::Live(node)) => {
+                            #[cfg(test)]
+                            let dense_vector = if needs.vectors.needs_dense() {
+                                let vector = node.dense_vector.clone();
+                                if vector.is_some() {
+                                    if let Some(counters) = selected_field_read_counters {
+                                        counters.note_node_dense_vector_projection_read();
                                     }
-                                    vector
-                                } else {
-                                    None
-                                };
-                                #[cfg(not(test))]
-                                let dense_vector = needs
-                                    .vectors
-                                    .needs_dense()
-                                    .then(|| node.dense_vector.clone())
-                                    .flatten();
-                                #[cfg(test)]
-                                let sparse_vector = if needs.vectors.needs_sparse() {
-                                    let vector = node.sparse_vector.clone();
-                                    if vector.is_some() {
-                                        if let Some(counters) = selected_field_read_counters {
-                                            counters.note_node_sparse_vector_projection_read();
-                                        }
+                                }
+                                vector
+                            } else {
+                                None
+                            };
+                            #[cfg(not(test))]
+                            let dense_vector = needs
+                                .vectors
+                                .needs_dense()
+                                .then(|| node.dense_vector.clone())
+                                .flatten();
+                            #[cfg(test)]
+                            let sparse_vector = if needs.vectors.needs_sparse() {
+                                let vector = node.sparse_vector.clone();
+                                if vector.is_some() {
+                                    if let Some(counters) = selected_field_read_counters {
+                                        counters.note_node_sparse_vector_projection_read();
                                     }
-                                    vector
-                                } else {
-                                    None
-                                };
-                                #[cfg(not(test))]
-                                let sparse_vector = needs
-                                    .vectors
-                                    .needs_sparse()
-                                    .then(|| node.sparse_vector.clone())
-                                    .flatten();
-                                results[orig_idx] = Some(SelectedNodeFields {
-                                    meta: NodeMetadataForQuery {
-                                        id: node.id,
-                                        label_ids: node.label_ids,
-                                        updated_at: node.updated_at,
-                                        weight: node.weight,
-                                    },
-                                    key: needs.key.then(|| node.key.clone()),
-                                    props: selected_props_from_map(&node.props, &needs.props),
-                                    created_at: needs.created_at.then_some(node.created_at),
-                                    dense_vector,
-                                    sparse_vector,
-                                });
-                                CachedLookup::Live(orig_idx)
-                            }
-                            Some(RecordState::Tombstone(_)) => CachedLookup::Tombstone,
-                            None => CachedLookup::Miss,
-                        },
+                                }
+                                vector
+                            } else {
+                                None
+                            };
+                            #[cfg(not(test))]
+                            let sparse_vector = needs
+                                .vectors
+                                .needs_sparse()
+                                .then(|| node.sparse_vector.clone())
+                                .flatten();
+                            results[orig_idx] = Some(SelectedNodeFields {
+                                meta: NodeMetadataForQuery {
+                                    id: node.id,
+                                    label_ids: node.label_ids,
+                                    updated_at: node.updated_at,
+                                    weight: node.weight,
+                                },
+                                key: needs.key.then(|| node.key.clone()),
+                                props: selected_props_from_map(&node.props, &needs.props),
+                                created_at: needs.created_at.then_some(node.created_at),
+                                dense_vector,
+                                sparse_vector,
+                            });
+                            CachedLookup::Live(orig_idx)
+                        }
+                        Some(RecordState::Tombstone(_)) => CachedLookup::Tombstone,
                         None => CachedLookup::Miss,
                     };
                     cache.insert(id, outcome);
@@ -2955,8 +3363,7 @@ impl Memtable {
                 }
             }
         }
-
-        remaining
+        Ok(remaining)
     }
 
     pub(crate) fn batch_get_edge_selected_fields_at(
@@ -2966,7 +3373,8 @@ impl Memtable {
         snapshot_seq: u64,
         results: &mut [Option<SelectedEdgeFields>],
         #[cfg(test)] _selected_field_read_counters: Option<&SelectedFieldReadCounters>,
-    ) -> Vec<(usize, u64)> {
+    ) -> Result<Vec<(usize, u64)>, EngineError> {
+        let state = self.primary_read()?;
         #[derive(Clone, Copy)]
         enum CachedLookup {
             Live(usize),
@@ -2975,10 +3383,9 @@ impl Memtable {
         }
 
         if lookups.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        let state = self.state.read().unwrap();
         let mut cache =
             NodeIdMap::with_capacity_and_hasher(lookups.len(), NodeIdBuildHasher::default());
         let mut remaining = Vec::with_capacity(lookups.len());
@@ -2991,19 +3398,16 @@ impl Memtable {
                 Some(CachedLookup::Tombstone) => {}
                 Some(CachedLookup::Miss) => remaining.push((orig_idx, id)),
                 None => {
-                    let outcome = match state.edges.get(&id) {
-                        Some(slot) => match record_at(slot, snapshot_seq) {
-                            Some(RecordState::Live(edge)) => {
-                                results[orig_idx] = Some(SelectedEdgeFields {
-                                    meta: EdgeMetadataForQuery::from(edge),
-                                    props: selected_props_from_map(&edge.props, &needs.props),
-                                    created_at: needs.created_at.then_some(edge.created_at),
-                                });
-                                CachedLookup::Live(orig_idx)
-                            }
-                            Some(RecordState::Tombstone(_)) => CachedLookup::Tombstone,
-                            None => CachedLookup::Miss,
-                        },
+                    let outcome = match state.edge_state(id, snapshot_seq) {
+                        Some(RecordState::Live(edge)) => {
+                            results[orig_idx] = Some(SelectedEdgeFields {
+                                meta: EdgeMetadataForQuery::from(edge),
+                                props: selected_props_from_map(&edge.props, &needs.props),
+                                created_at: needs.created_at.then_some(edge.created_at),
+                            });
+                            CachedLookup::Live(orig_idx)
+                        }
+                        Some(RecordState::Tombstone(_)) => CachedLookup::Tombstone,
                         None => CachedLookup::Miss,
                     };
                     cache.insert(id, outcome);
@@ -3013,26 +3417,28 @@ impl Memtable {
                 }
             }
         }
-
-        remaining
+        Ok(remaining)
     }
 
-    pub(crate) fn get_edge_core_at(
+    pub(crate) fn edge_core_opinion_at(
         &self,
         id: u64,
         snapshot_seq: u64,
-    ) -> Option<(u64, u64, i64, i64, f32, i64, i64)> {
-        let state = self.state.read().unwrap();
-        let edge = state.edge_at(id, snapshot_seq)?;
-        Some((
-            edge.from,
-            edge.to,
-            edge.created_at,
-            edge.updated_at,
-            edge.weight,
-            edge.valid_from,
-            edge.valid_to,
-        ))
+    ) -> Result<PrimaryOpinion<EdgeCoreFields>, EngineError> {
+        let state = self.primary_read()?;
+        Ok(match state.edge_state(id, snapshot_seq) {
+            None => PrimaryOpinion::Missing,
+            Some(RecordState::Tombstone(t)) => PrimaryOpinion::Removed(*t),
+            Some(RecordState::Live(edge)) => PrimaryOpinion::Live((
+                edge.from,
+                edge.to,
+                edge.created_at,
+                edge.updated_at,
+                edge.weight,
+                edge.valid_from,
+                edge.valid_to,
+            )),
+        })
     }
 
     pub(crate) fn batch_get_edge_metadata_at(
@@ -3040,14 +3446,14 @@ impl Memtable {
         lookups: &[(usize, u64)],
         snapshot_seq: u64,
         results: &mut [crate::edge_metadata::EdgeMetadataVisibilityState],
-    ) -> Vec<(usize, u64)> {
+    ) -> Result<Vec<(usize, u64)>, EngineError> {
+        let state = self.primary_read()?;
         use crate::edge_metadata::EdgeMetadataVisibilityState;
 
         if lookups.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        let state = self.state.read().unwrap();
         let mut cache =
             NodeIdMap::with_capacity_and_hasher(lookups.len(), NodeIdBuildHasher::default());
         let mut remaining = Vec::with_capacity(lookups.len());
@@ -3056,16 +3462,12 @@ impl Memtable {
             let visibility = match cache.get(&id).copied() {
                 Some(visibility) => visibility,
                 None => {
-                    let visibility = match state
-                        .edges
-                        .get(&id)
-                        .and_then(|slot| record_at(slot, snapshot_seq))
-                    {
+                    let visibility = match state.edge_state(id, snapshot_seq) {
                         Some(RecordState::Live(edge)) => EdgeMetadataVisibilityState::Live(
                             EdgeMetadataCandidate::from_edge(edge),
                         ),
                         Some(RecordState::Tombstone(_)) => EdgeMetadataVisibilityState::Deleted,
-                        None if state.edge_deleted_at(id, snapshot_seq) => {
+                        None if state.missing_edge_deleted_at(id, snapshot_seq) => {
                             EdgeMetadataVisibilityState::Deleted
                         }
                         None => EdgeMetadataVisibilityState::Missing,
@@ -3079,8 +3481,7 @@ impl Memtable {
                 remaining.push((orig_idx, id));
             }
         }
-
-        remaining
+        Ok(remaining)
     }
 
     pub(crate) fn batch_get_node_visibility_meta_at(
@@ -3088,12 +3489,12 @@ impl Memtable {
         lookups: &[(usize, u64)],
         snapshot_seq: u64,
         results: &mut [NodeVisibilityState],
-    ) -> Vec<(usize, u64)> {
+    ) -> Result<Vec<(usize, u64)>, EngineError> {
+        let state = self.primary_read()?;
         if lookups.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        let state = self.state.read().unwrap();
         let mut cache =
             NodeIdMap::with_capacity_and_hasher(lookups.len(), NodeIdBuildHasher::default());
         let mut remaining = Vec::with_capacity(lookups.len());
@@ -3102,11 +3503,7 @@ impl Memtable {
             let visibility = match cache.get(&id).copied() {
                 Some(state) => state,
                 None => {
-                    let state = match state
-                        .nodes
-                        .get(&id)
-                        .and_then(|slot| record_at(slot, snapshot_seq))
-                    {
+                    let state = match state.node_state(id, snapshot_seq) {
                         Some(RecordState::Live(node)) => {
                             NodeVisibilityState::Live(NodeVisibilityMeta {
                                 label_ids: node.label_ids,
@@ -3115,7 +3512,7 @@ impl Memtable {
                             })
                         }
                         Some(RecordState::Tombstone(_)) => NodeVisibilityState::Deleted,
-                        None if state.node_deleted_at(id, snapshot_seq) => {
+                        None if state.missing_node_deleted_at(id, snapshot_seq) => {
                             NodeVisibilityState::Deleted
                         }
                         None => NodeVisibilityState::Missing,
@@ -3132,26 +3529,21 @@ impl Memtable {
                 NodeVisibilityState::Missing => remaining.push((orig_idx, id)),
             }
         }
-
-        remaining
+        Ok(remaining)
     }
 
     pub(crate) fn edge_visibility_state_at(
         &self,
         id: u64,
         snapshot_seq: u64,
-    ) -> EdgeVisibilityState {
-        let state = self.state.read().unwrap();
-        match state
-            .edges
-            .get(&id)
-            .and_then(|slot| record_at(slot, snapshot_seq))
-        {
+    ) -> Result<EdgeVisibilityState, EngineError> {
+        let state = self.primary_read()?;
+        Ok(match state.edge_state(id, snapshot_seq) {
             Some(RecordState::Live(_)) => EdgeVisibilityState::Live,
             Some(RecordState::Tombstone(_)) => EdgeVisibilityState::Deleted,
-            None if state.edge_deleted_at(id, snapshot_seq) => EdgeVisibilityState::Deleted,
+            None if state.missing_edge_deleted_at(id, snapshot_seq) => EdgeVisibilityState::Deleted,
             None => EdgeVisibilityState::Missing,
-        }
+        })
     }
 
     pub(crate) fn batch_get_nodes_at(
@@ -3159,7 +3551,8 @@ impl Memtable {
         lookups: &[(usize, u64)],
         snapshot_seq: u64,
         results: &mut [Option<NodeRecord>],
-    ) -> Vec<(usize, u64)> {
+    ) -> Result<Vec<(usize, u64)>, EngineError> {
+        let state = self.primary_read()?;
         #[derive(Clone, Copy)]
         enum CachedLookup {
             Live(usize),
@@ -3168,10 +3561,9 @@ impl Memtable {
         }
 
         if lookups.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        let state = self.state.read().unwrap();
         let mut cache =
             NodeIdMap::with_capacity_and_hasher(lookups.len(), NodeIdBuildHasher::default());
         let mut remaining = Vec::with_capacity(lookups.len());
@@ -3184,15 +3576,12 @@ impl Memtable {
                 Some(CachedLookup::Tombstone) => {}
                 Some(CachedLookup::Miss) => remaining.push((orig_idx, id)),
                 None => {
-                    let outcome = match state.nodes.get(&id) {
-                        Some(slot) => match record_at(slot, snapshot_seq) {
-                            Some(RecordState::Live(node)) => {
-                                results[orig_idx] = Some(node.clone());
-                                CachedLookup::Live(orig_idx)
-                            }
-                            Some(RecordState::Tombstone(_)) => CachedLookup::Tombstone,
-                            None => CachedLookup::Miss,
-                        },
+                    let outcome = match state.node_state(id, snapshot_seq) {
+                        Some(RecordState::Live(node)) => {
+                            results[orig_idx] = Some(node.clone());
+                            CachedLookup::Live(orig_idx)
+                        }
+                        Some(RecordState::Tombstone(_)) => CachedLookup::Tombstone,
                         None => CachedLookup::Miss,
                     };
                     cache.insert(id, outcome);
@@ -3202,8 +3591,7 @@ impl Memtable {
                 }
             }
         }
-
-        remaining
+        Ok(remaining)
     }
 
     pub(crate) fn batch_get_edges_at(
@@ -3211,7 +3599,8 @@ impl Memtable {
         lookups: &[(usize, u64)],
         snapshot_seq: u64,
         results: &mut [Option<EdgeRecord>],
-    ) -> Vec<(usize, u64)> {
+    ) -> Result<Vec<(usize, u64)>, EngineError> {
+        let state = self.primary_read()?;
         #[derive(Clone, Copy)]
         enum CachedLookup {
             Live(usize),
@@ -3220,10 +3609,9 @@ impl Memtable {
         }
 
         if lookups.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        let state = self.state.read().unwrap();
         let mut cache =
             NodeIdMap::with_capacity_and_hasher(lookups.len(), NodeIdBuildHasher::default());
         let mut remaining = Vec::with_capacity(lookups.len());
@@ -3236,15 +3624,12 @@ impl Memtable {
                 Some(CachedLookup::Tombstone) => {}
                 Some(CachedLookup::Miss) => remaining.push((orig_idx, id)),
                 None => {
-                    let outcome = match state.edges.get(&id) {
-                        Some(slot) => match record_at(slot, snapshot_seq) {
-                            Some(RecordState::Live(edge)) => {
-                                results[orig_idx] = Some(edge.clone());
-                                CachedLookup::Live(orig_idx)
-                            }
-                            Some(RecordState::Tombstone(_)) => CachedLookup::Tombstone,
-                            None => CachedLookup::Miss,
-                        },
+                    let outcome = match state.edge_state(id, snapshot_seq) {
+                        Some(RecordState::Live(edge)) => {
+                            results[orig_idx] = Some(edge.clone());
+                            CachedLookup::Live(orig_idx)
+                        }
+                        Some(RecordState::Tombstone(_)) => CachedLookup::Tombstone,
                         None => CachedLookup::Miss,
                     };
                     cache.insert(id, outcome);
@@ -3254,325 +3639,546 @@ impl Memtable {
                 }
             }
         }
-
-        remaining
+        Ok(remaining)
     }
 
-    pub(crate) fn is_node_deleted_at(&self, id: u64, snapshot_seq: u64) -> bool {
-        let state = self.state.read().unwrap();
-        state.node_deleted_at(id, snapshot_seq)
+    pub(crate) fn is_node_deleted_at(
+        &self,
+        id: u64,
+        snapshot_seq: u64,
+    ) -> Result<bool, EngineError> {
+        let state = self.primary_read()?;
+        Ok(state.node_deleted_at(id, snapshot_seq))
     }
 
-    pub(crate) fn is_edge_deleted_at(&self, id: u64, snapshot_seq: u64) -> bool {
-        let state = self.state.read().unwrap();
-        state.edge_deleted_at(id, snapshot_seq)
+    pub(crate) fn is_edge_deleted_at(
+        &self,
+        id: u64,
+        snapshot_seq: u64,
+    ) -> Result<bool, EngineError> {
+        let state = self.primary_read()?;
+        Ok(state.edge_deleted_at(id, snapshot_seq))
     }
 
-    pub(crate) fn node_tombstone_at(&self, id: u64, snapshot_seq: u64) -> Option<TombstoneEntry> {
-        let state = self.state.read().unwrap();
-        state
-            .nodes
-            .get(&id)
-            .and_then(|slot| match record_at(slot, snapshot_seq) {
-                Some(RecordState::Tombstone(entry)) => Some(*entry),
-                _ => None,
-            })
+    #[cfg(test)]
+    pub(crate) fn node_tombstone_at(
+        &self,
+        id: u64,
+        snapshot_seq: u64,
+    ) -> Result<Option<TombstoneEntry>, EngineError> {
+        let state = self.primary_read()?;
+        Ok(match state.node_state(id, snapshot_seq) {
+            Some(RecordState::Tombstone(entry)) => Some(*entry),
+            _ => None,
+        })
     }
 
-    pub(crate) fn edge_tombstone_at(&self, id: u64, snapshot_seq: u64) -> Option<TombstoneEntry> {
-        let state = self.state.read().unwrap();
-        state
-            .edges
-            .get(&id)
-            .and_then(|slot| match record_at(slot, snapshot_seq) {
-                Some(RecordState::Tombstone(entry)) => Some(*entry),
-                _ => None,
-            })
+    #[cfg(all(test, feature = "production-concurrency"))]
+    pub(crate) fn edge_tombstone_at(
+        &self,
+        id: u64,
+        snapshot_seq: u64,
+    ) -> Result<Option<TombstoneEntry>, EngineError> {
+        let state = self.primary_read()?;
+        Ok(match state.edge_state(id, snapshot_seq) {
+            Some(RecordState::Tombstone(entry)) => Some(*entry),
+            _ => None,
+        })
     }
 
+    #[cfg(test)]
     pub(crate) fn node_by_key_at(
         &self,
         label_id: u32,
         key: &str,
         snapshot_seq: u64,
-    ) -> Option<NodeRecord> {
-        let state = self.state.read().unwrap();
-        let node_id =
-            *slot_option_at(state.node_key_index.get(&label_id)?.get(key)?, snapshot_seq)?;
-        state.node_at(node_id, snapshot_seq).cloned()
+    ) -> Result<Option<NodeRecord>, EngineError> {
+        let state = self.primary_read()?;
+        Ok(state
+            .key(label_id, key, snapshot_seq)
+            .flatten()
+            .and_then(|id| state.node_at(id, snapshot_seq))
+            .cloned())
     }
 
-    pub(crate) fn node_id_by_key_at(
-        &self,
-        label_id: u32,
-        key: &str,
-        snapshot_seq: u64,
-    ) -> Option<u64> {
-        let state = self.state.read().unwrap();
-        let node_id =
-            *slot_option_at(state.node_key_index.get(&label_id)?.get(key)?, snapshot_seq)?;
-        let node = state.node_at(node_id, snapshot_seq)?;
-        (node.label_ids.contains(label_id) && node.key == key).then_some(node_id)
-    }
-
+    #[cfg(test)]
     pub(crate) fn edge_by_triple_at(
         &self,
         from: u64,
         to: u64,
         label_id: u32,
         snapshot_seq: u64,
-    ) -> Option<EdgeRecord> {
-        let state = self.state.read().unwrap();
-        let edge_id = *slot_option_at(
-            state.edge_triple_index.get(&(from, to, label_id))?,
-            snapshot_seq,
-        )?;
-        state.edge_at(edge_id, snapshot_seq).cloned()
-    }
-
-    pub(crate) fn batch_edges_by_triples_at(
-        &self,
-        lookups: &[(usize, u64, u64, u32)],
-        snapshot_seq: u64,
-        results: &mut [Option<EdgeRecord>],
-    ) -> Vec<(usize, u64, u64, u32)> {
-        #[derive(Clone, Copy)]
-        enum CachedLookup {
-            Live(usize),
-            Miss,
-        }
-
-        if lookups.is_empty() {
-            return Vec::new();
-        }
-
-        let state = self.state.read().unwrap();
-        let mut cache = HashMap::with_capacity(lookups.len());
-        let mut remaining = Vec::with_capacity(lookups.len());
-
-        for &(orig_idx, from, to, label_id) in lookups {
-            let triple = (from, to, label_id);
-            match cache.get(&triple).copied() {
-                Some(CachedLookup::Live(cached_idx)) => {
-                    results[orig_idx] = results[cached_idx].clone();
-                }
-                Some(CachedLookup::Miss) => remaining.push((orig_idx, from, to, label_id)),
-                None => {
-                    let outcome = match state
-                        .edge_triple_index
-                        .get(&triple)
-                        .and_then(|slot| slot_option_at(slot, snapshot_seq))
-                        .and_then(|edge_id| state.edge_at(*edge_id, snapshot_seq))
-                    {
-                        Some(edge) => {
-                            results[orig_idx] = Some(edge.clone());
-                            CachedLookup::Live(orig_idx)
-                        }
-                        None => {
-                            remaining.push((orig_idx, from, to, label_id));
-                            CachedLookup::Miss
-                        }
-                    };
-                    cache.insert(triple, outcome);
-                }
-            }
-        }
-
-        remaining
+    ) -> Result<Option<EdgeRecord>, EngineError> {
+        let state = self.primary_read()?;
+        Ok(state
+            .triple((from, to, label_id), snapshot_seq)
+            .flatten()
+            .and_then(|id| state.edge_at(id, snapshot_seq))
+            .cloned())
     }
 
     pub(crate) fn for_each_visible_node_at<F>(
         &self,
         snapshot_seq: u64,
+        vectors: crate::row_projection::VectorSelection,
         callback: &mut F,
-    ) -> ControlFlow<()>
+    ) -> Result<ControlFlow<()>, EngineError>
     where
-        F: FnMut(&NodeRecord) -> ControlFlow<()>,
+        F: FnMut(&NodeVectorRow<'_>) -> ControlFlow<()>,
     {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(maps) = &self.primary {
+            let upper = self.max_node_id();
+            let mut after = None;
+            loop {
+                let (records, last, exhausted) =
+                    maps.node_refill(snapshot_seq, (after, upper), vectors)?;
+                for node in records.iter() {
+                    if callback(node).is_break() {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+                if exhausted {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                debug_assert!(last > after);
+                after = last;
+            }
+        }
         let state = self.state.read().unwrap();
         for slot in state.nodes.values() {
-            let Some(RecordState::Live(node)) = record_at(slot, snapshot_seq) else {
-                continue;
+            if let Some(RecordState::Live(node)) = record_at(slot, snapshot_seq) {
+                if callback(&NodeVectorRow::borrowed(node, vectors)).is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    pub(crate) fn refill_endpoint_ids_at(
+        &self,
+        owner: u64,
+        outgoing: bool,
+        labels: Option<&[u32]>,
+        seq: u64,
+        bound: Bound<u64>,
+    ) -> Result<(Vec<u64>, Option<u64>, bool), EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_session(|m, s| {
+                let r = m.graph.adj_refill(
+                    s,
+                    usize::from(!outgoing),
+                    owner,
+                    seq,
+                    bound,
+                    labels,
+                    128,
+                    Vec::new(),
+                );
+                #[cfg(test)]
+                ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST
+                    .with(|count| count.set(count.get() + r.examined));
+                let ids = if m.graph_node_deleted(s, owner, seq) {
+                    Vec::new()
+                } else {
+                    r.entries
+                        .into_iter()
+                        .filter(|e| !m.graph_node_deleted(s, e.neighbor_id, seq))
+                        .map(|e| e.edge_id)
+                        .collect()
+                };
+                (ids, r.last_edge_id_examined, r.exhausted)
+            });
+        }
+        let r = self.refill_ordered_adj_postings_at(
+            if outgoing {
+                Direction::Outgoing
+            } else {
+                Direction::Incoming
+            },
+            owner,
+            labels,
+            seq,
+            bound,
+            128,
+            Vec::new(),
+        )?;
+        #[cfg(test)]
+        ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST.with(|count| count.set(count.get() + r.examined));
+        let state = self.state.read().unwrap();
+        let ids = if state.node_deleted_at(owner, seq) {
+            Vec::new()
+        } else {
+            r.entries
+                .into_iter()
+                .filter(|e| !state.node_deleted_at(e.neighbor_id, seq))
+                .map(|e| e.edge_id)
+                .collect()
+        };
+        Ok((ids, r.last_edge_id_examined, r.exhausted))
+    }
+    pub(crate) fn refill_label_ids_at(
+        &self,
+        edge: bool,
+        label: u32,
+        seq: u64,
+        bound: Bound<u64>,
+    ) -> Result<(Vec<u64>, Option<u64>, bool), EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_session(|m, s| {
+                let (rows, w) = m.graph.label_refill(
+                    s,
+                    usize::from(edge),
+                    Some(label),
+                    seq,
+                    bound.map(|id| (label, id)),
+                    128,
+                );
+                (
+                    rows.into_iter().map(|(_, id)| id).collect(),
+                    w.last.map(|(_, id)| id),
+                    w.exhausted,
+                )
+            });
+        }
+        let state = self.state.read().unwrap();
+        let index = if edge {
+            &state.ordered_label_edge_index
+        } else {
+            &state.label_node_index
+        };
+        let start = bound.map(|id| (label, id));
+        let start = if matches!(start, Bound::Unbounded) {
+            Bound::Included((label, 0))
+        } else {
+            start
+        };
+        let mut iter = index.range((start, Bound::Included((label, u64::MAX))));
+        let mut rows = Vec::new();
+        let mut last = None;
+        for _ in 0..128 {
+            let Some((&(_, id), slot)) = iter.next() else {
+                return Ok((rows, last, true));
             };
-            if callback(node).is_break() {
-                return ControlFlow::Break(());
+            last = Some(id);
+            if slot_option_visible(slot, seq) {
+                rows.push(id);
             }
         }
-        ControlFlow::Continue(())
+        Ok((rows, last, false))
+    }
+    #[cfg(feature = "production-concurrency")]
+    pub(crate) fn node_id_scan_upper_bound(&self) -> Option<u64> {
+        self.primary
+            .as_ref()
+            .map(|maps| maps.max_node.load(std::sync::atomic::Ordering::Relaxed))
     }
 
-    pub(crate) fn visible_nodes_by_label_id(&self, label_id: u32, snapshot_seq: u64) -> Vec<u64> {
-        let state = self.state.read().unwrap();
-        let mut ids = Vec::new();
-        for (&(_, node_id), slot) in state
-            .label_node_index
-            .range((label_id, 0)..=(label_id, u64::MAX))
-        {
-            if slot_option_visible(slot, snapshot_seq) {
-                ids.push(node_id);
-            }
-        }
-        ids
+    #[cfg(feature = "production-concurrency")]
+    pub(crate) fn refill_node_ids_at(
+        &self,
+        seq: u64,
+        bound: Bound<u64>,
+        upper: u64,
+    ) -> Result<(Vec<u64>, Option<u64>, bool), EngineError> {
+        let after = match bound {
+            Bound::Included(id) => id.checked_sub(1),
+            Bound::Excluded(id) => Some(id),
+            Bound::Unbounded => None,
+        };
+        self.primary
+            .as_ref()
+            .expect("candidate node ID scan")
+            .node_ids_refill(seq, (after, upper))
     }
 
-    pub(crate) fn visible_node_ids_at(&self, snapshot_seq: u64) -> Vec<u64> {
+    pub(crate) fn refill_edge_ids_at(
+        &self,
+        seq: u64,
+        bound: Bound<u64>,
+    ) -> Result<(Vec<u64>, Option<u64>, bool), EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_session(|m, s| {
+                let mut ids = Vec::new();
+                let after = match bound {
+                    Bound::Included(id) => id.checked_sub(1),
+                    Bound::Excluded(id) => Some(id),
+                    Bound::Unbounded => None,
+                };
+                let (last, done) =
+                    m.edges
+                        .walk_versions_at(s, seq, (after, u64::MAX), 128, |id, value| {
+                            if matches!(&**value, RecordState::Live(_)) {
+                                ids.push(id);
+                            }
+                            true
+                        });
+                (ids, last, done)
+            });
+        }
         let state = self.state.read().unwrap();
+        let mut iter = state.ordered_edge_ids.range((bound, Bound::Unbounded));
         let mut ids = Vec::new();
-        for (&node_id, slot) in &state.nodes {
-            if matches!(record_at(slot, snapshot_seq), Some(RecordState::Live(_))) {
-                ids.push(node_id);
+        let mut last = None;
+        for _ in 0..128 {
+            let Some((&id, slot)) = iter.next() else {
+                return Ok((ids, last, true));
+            };
+            last = Some(id);
+            if slot_option_visible(slot, seq) {
+                ids.push(id);
             }
         }
+        Ok((ids, last, false))
+    }
+    pub(crate) fn visible_nodes_by_label_id(
+        &self,
+        label_id: u32,
+        snapshot_seq: u64,
+    ) -> Result<Vec<u64>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return Ok(self
+                .graph_labels(0, Some(label_id), snapshot_seq)?
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect());
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            let mut ids = Vec::new();
+            for (&(_, node_id), slot) in state
+                .label_node_index
+                .range((label_id, 0)..=(label_id, u64::MAX))
+            {
+                if slot_option_visible(slot, snapshot_seq) {
+                    ids.push(node_id);
+                }
+            }
+            ids
+        })
+    }
+
+    pub(crate) fn visible_node_ids_at(&self, snapshot_seq: u64) -> Result<Vec<u64>, EngineError> {
+        let state = self.primary_read()?;
+        let mut ids = Vec::new();
+        state.nodes_at(snapshot_seq, |id, value| {
+            if matches!(value, RecordState::Live(_)) {
+                ids.push(id);
+            }
+        });
         ids.sort_unstable();
-        ids
+        Ok(ids)
     }
 
-    pub(crate) fn visible_node_count_at(&self, snapshot_seq: u64) -> usize {
-        let state = self.state.read().unwrap();
-        state
-            .nodes
-            .values()
-            .filter(|slot| matches!(record_at(slot, snapshot_seq), Some(RecordState::Live(_))))
-            .count()
+    pub(crate) fn visible_node_count_at(&self, snapshot_seq: u64) -> Result<usize, EngineError> {
+        let state = self.primary_read()?;
+        let mut count = 0;
+        #[cfg(test)]
+        note_query_scan_work(|work| work.full_node_count_calls += 1);
+        state.nodes_at(snapshot_seq, |_, value| {
+            #[cfg(test)]
+            note_query_scan_work(|work| work.full_node_count_opinions += 1);
+            if matches!(value, RecordState::Live(_)) {
+                count += 1;
+            }
+        });
+        Ok(count)
     }
 
     pub(crate) fn visible_nodes_by_label_id_count(
         &self,
         label_id: u32,
         snapshot_seq: u64,
-    ) -> usize {
-        let state = self.state.read().unwrap();
-        state
-            .label_node_index
-            .range((label_id, 0)..=(label_id, u64::MAX))
-            .filter(|(_, slot)| slot_option_visible(slot, snapshot_seq))
-            .count()
+    ) -> Result<usize, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_label_count(label_id, snapshot_seq);
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            state
+                .label_node_index
+                .range((label_id, 0)..=(label_id, u64::MAX))
+                .filter(|(_, slot)| slot_option_visible(slot, snapshot_seq))
+                .count()
+        })
     }
 
-    pub(crate) fn visible_edges_by_label_id(&self, label_id: u32, snapshot_seq: u64) -> Vec<u64> {
-        let state = self.state.read().unwrap();
-        let mut ids = Vec::new();
-        if let Some(members) = state.label_edge_index.get(&label_id) {
-            for (&edge_id, slot) in members {
-                if slot_option_visible(slot, snapshot_seq) {
-                    ids.push(edge_id);
+    pub(crate) fn visible_edges_by_label_id(
+        &self,
+        label_id: u32,
+        snapshot_seq: u64,
+    ) -> Result<Vec<u64>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return Ok(self
+                .graph_labels(1, Some(label_id), snapshot_seq)?
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect());
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            let mut ids = Vec::new();
+            if let Some(members) = state.label_edge_index.get(&label_id) {
+                for (&edge_id, slot) in members {
+                    if slot_option_visible(slot, snapshot_seq) {
+                        ids.push(edge_id);
+                    }
                 }
             }
-        }
-        ids.sort_unstable();
-        ids
+            ids.sort_unstable();
+            ids
+        })
     }
 
-    pub(crate) fn edge_label_posting_count_upper_bound(&self, label_id: u32) -> usize {
-        let state = self.state.read().unwrap();
-        state
-            .label_edge_index
-            .get(&label_id)
-            .map_or(0, NodeIdMap::len)
+    pub(crate) fn edge_label_posting_count_upper_bound(
+        &self,
+        label_id: u32,
+    ) -> Result<usize, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_session(|m, s| m.graph.label_bound(s, 1, label_id));
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            state
+                .label_edge_index
+                .get(&label_id)
+                .map_or(0, NodeIdMap::len)
+        })
     }
 
     #[cfg(test)]
-    pub(crate) fn visible_edge_ids_at(&self, snapshot_seq: u64) -> Vec<u64> {
-        let state = self.state.read().unwrap();
+    pub(crate) fn visible_edge_ids_at(&self, snapshot_seq: u64) -> Result<Vec<u64>, EngineError> {
+        let state = self.primary_read()?;
         let mut ids = Vec::new();
-        for (&edge_id, slot) in &state.edges {
-            if matches!(record_at(slot, snapshot_seq), Some(RecordState::Live(_))) {
-                ids.push(edge_id);
+        state.edges_at(snapshot_seq, |id, value| {
+            if matches!(value, RecordState::Live(_)) {
+                ids.push(id);
             }
-        }
+        });
         ids.sort_unstable();
-        ids
+        Ok(ids)
     }
 
-    pub(crate) fn next_visible_edge_id_after(
-        &self,
-        snapshot_seq: u64,
-        after: Option<u64>,
-    ) -> Option<u64> {
-        let state = self.state.read().unwrap();
-        let start = after.map_or(Bound::Unbounded, Bound::Excluded);
-        for (&edge_id, slot) in state.ordered_edge_ids.range((start, Bound::Unbounded)) {
-            if slot_option_visible(slot, snapshot_seq) {
-                return Some(edge_id);
-            }
-        }
-        None
-    }
-
+    #[allow(dead_code)] // Scalar compatibility helpers; production scans retain ID chunks.
     pub(crate) fn next_visible_node_by_label_id_after(
         &self,
         label_id: u32,
         snapshot_seq: u64,
         after: Option<u64>,
-    ) -> Option<u64> {
-        let state = self.state.read().unwrap();
-        let start_key = (label_id, after.unwrap_or(0));
-        let start = match after {
-            Some(_) => Bound::Excluded(start_key),
-            None => Bound::Included(start_key),
-        };
-        let end = Bound::Included((label_id, u64::MAX));
-        for (&(_, node_id), slot) in state.label_node_index.range((start, end)) {
-            if slot_option_visible(slot, snapshot_seq) {
-                return Some(node_id);
-            }
+    ) -> Result<Option<u64>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_label_next(
+                0,
+                label_id,
+                snapshot_seq,
+                after.map_or(Bound::Unbounded, Bound::Excluded),
+            );
         }
-        None
+        Ok((|| {
+            let state = self.state.read().unwrap();
+            let start_key = (label_id, after.unwrap_or(0));
+            let start = match after {
+                Some(_) => Bound::Excluded(start_key),
+                None => Bound::Included(start_key),
+            };
+            let end = Bound::Included((label_id, u64::MAX));
+            for (&(_, node_id), slot) in state.label_node_index.range((start, end)) {
+                if slot_option_visible(slot, snapshot_seq) {
+                    return Some(node_id);
+                }
+            }
+            None
+        })())
     }
 
+    #[allow(dead_code)] // Scalar compatibility helpers; production scans retain ID chunks.
     pub(crate) fn next_visible_node_by_label_id_ge(
         &self,
         label_id: u32,
         snapshot_seq: u64,
         bound: u64,
-    ) -> Option<u64> {
-        let state = self.state.read().unwrap();
-        let start = Bound::Included((label_id, bound));
-        let end = Bound::Included((label_id, u64::MAX));
-        for (&(_, node_id), slot) in state.label_node_index.range((start, end)) {
-            if slot_option_visible(slot, snapshot_seq) {
-                return Some(node_id);
-            }
+    ) -> Result<Option<u64>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_label_next(0, label_id, snapshot_seq, Bound::Included(bound));
         }
-        None
+        Ok((|| {
+            let state = self.state.read().unwrap();
+            let start = Bound::Included((label_id, bound));
+            let end = Bound::Included((label_id, u64::MAX));
+            for (&(_, node_id), slot) in state.label_node_index.range((start, end)) {
+                if slot_option_visible(slot, snapshot_seq) {
+                    return Some(node_id);
+                }
+            }
+            None
+        })())
     }
 
+    #[allow(dead_code)] // Scalar compatibility helpers; production scans retain ID chunks.
     pub(crate) fn next_visible_edge_by_label_id_after(
         &self,
         label_id: u32,
         snapshot_seq: u64,
         after: Option<u64>,
-    ) -> Option<u64> {
-        let state = self.state.read().unwrap();
-        let start_key = (label_id, after.unwrap_or(0));
-        let start = match after {
-            Some(_) => Bound::Excluded(start_key),
-            None => Bound::Included(start_key),
-        };
-        let end = Bound::Included((label_id, u64::MAX));
-        for (&(_, edge_id), slot) in state.ordered_label_edge_index.range((start, end)) {
-            if slot_option_visible(slot, snapshot_seq) {
-                return Some(edge_id);
-            }
+    ) -> Result<Option<u64>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_label_next(
+                1,
+                label_id,
+                snapshot_seq,
+                after.map_or(Bound::Unbounded, Bound::Excluded),
+            );
         }
-        None
+        Ok((|| {
+            let state = self.state.read().unwrap();
+            let start_key = (label_id, after.unwrap_or(0));
+            let start = match after {
+                Some(_) => Bound::Excluded(start_key),
+                None => Bound::Included(start_key),
+            };
+            let end = Bound::Included((label_id, u64::MAX));
+            for (&(_, edge_id), slot) in state.ordered_label_edge_index.range((start, end)) {
+                if slot_option_visible(slot, snapshot_seq) {
+                    return Some(edge_id);
+                }
+            }
+            None
+        })())
     }
 
+    #[allow(dead_code)] // Scalar compatibility helpers; production scans retain ID chunks.
     pub(crate) fn next_visible_edge_by_label_id_ge(
         &self,
         label_id: u32,
         snapshot_seq: u64,
         bound: u64,
-    ) -> Option<u64> {
-        let state = self.state.read().unwrap();
-        let start = Bound::Included((label_id, bound));
-        let end = Bound::Included((label_id, u64::MAX));
-        for (&(_, edge_id), slot) in state.ordered_label_edge_index.range((start, end)) {
-            if slot_option_visible(slot, snapshot_seq) {
-                return Some(edge_id);
-            }
+    ) -> Result<Option<u64>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_label_next(1, label_id, snapshot_seq, Bound::Included(bound));
         }
-        None
+        Ok((|| {
+            let state = self.state.read().unwrap();
+            let start = Bound::Included((label_id, bound));
+            let end = Bound::Included((label_id, u64::MAX));
+            for (&(_, edge_id), slot) in state.ordered_label_edge_index.range((start, end)) {
+                if slot_option_visible(slot, snapshot_seq) {
+                    return Some(edge_id);
+                }
+            }
+            None
+        })())
     }
 
     pub(crate) fn edge_ids_by_triple_at(
@@ -3581,21 +4187,33 @@ impl Memtable {
         to: u64,
         label_id: u32,
         snapshot_seq: u64,
-    ) -> Vec<u64> {
-        let state = self.state.read().unwrap();
+    ) -> Result<Vec<u64>, EngineError> {
         let mut ids = Vec::new();
-        if let Some(entries) = state.adj_out.get(&from) {
-            for (&edge_id, slot) in entries {
-                let Some(entry) = slot_option_at(slot, snapshot_seq) else {
-                    continue;
-                };
-                if entry.neighbor_id == to && entry.label_id == label_id {
-                    ids.push(edge_id);
-                }
+        let mut bound = Bound::Unbounded;
+        loop {
+            let r = self.refill_ordered_adj_postings_at(
+                Direction::Outgoing,
+                from,
+                Some(&[label_id]),
+                snapshot_seq,
+                bound,
+                4096,
+                Vec::new(),
+            )?;
+            ids.extend(
+                r.entries
+                    .into_iter()
+                    .filter(|e| e.neighbor_id == to)
+                    .map(|e| e.edge_id),
+            );
+            if r.exhausted {
+                return Ok(ids);
             }
+            bound = Bound::Excluded(
+                r.last_edge_id_examined
+                    .expect("nonterminal triple refill progresses"),
+            );
         }
-        ids.sort_unstable();
-        ids
     }
 
     #[cfg(test)]
@@ -3603,43 +4221,110 @@ impl Memtable {
         &self,
         snapshot_seq: u64,
         mut predicate: F,
-    ) -> Vec<u64>
+    ) -> Result<Vec<u64>, EngineError>
     where
         F: FnMut(EdgeMetadataCandidate) -> bool,
     {
-        let state = self.state.read().unwrap();
-        let mut ids = Vec::new();
-        for (&edge_id, slot) in &state.edges {
-            let Some(RecordState::Live(edge)) = record_at(slot, snapshot_seq) else {
-                continue;
-            };
-            let meta = EdgeMetadataCandidate::from_edge(edge);
-            if predicate(meta) {
-                ids.push(edge_id);
+        let state = self.primary_read()?;
+        let mut copies = Vec::new();
+        state.edges_at(snapshot_seq, |id, value| {
+            if let RecordState::Live(e) = value {
+                copies.push((id, EdgeMetadataCandidate::from_edge(e)));
             }
-        }
+        });
+        drop(state);
+        let mut ids = copies
+            .into_iter()
+            .filter_map(|(id, m)| predicate(m).then_some(id))
+            .collect::<Vec<_>>();
         ids.sort_unstable();
-        ids
+        Ok(ids)
     }
 
     pub(crate) fn for_each_edge_metadata_at<F>(
         &self,
         snapshot_seq: u64,
         mut callback: F,
-    ) -> ControlFlow<()>
+    ) -> Result<ControlFlow<()>, EngineError>
     where
         F: FnMut(EdgeMetadataCandidate) -> ControlFlow<()>,
     {
-        let state = self.state.read().unwrap();
-        for slot in state.edges.values() {
-            let Some(RecordState::Live(edge)) = record_at(slot, snapshot_seq) else {
-                continue;
-            };
-            if callback(EdgeMetadataCandidate::from_edge(edge)).is_break() {
-                return ControlFlow::Break(());
+        #[cfg(feature = "production-concurrency")]
+        if let Some(maps) = &self.primary {
+            let upper = self.max_edge_id();
+            let mut after = None;
+            loop {
+                let (records, last, exhausted) =
+                    maps.edge_metadata_refill(snapshot_seq, (after, upper))?;
+                for meta in records {
+                    if callback(meta).is_break() {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+                if exhausted {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                debug_assert!(last > after);
+                after = last;
             }
         }
-        ControlFlow::Continue(())
+        let state = self.state.read().unwrap();
+        for slot in state.edges.values() {
+            if let Some(RecordState::Live(edge)) = record_at(slot, snapshot_seq) {
+                if callback(EdgeMetadataCandidate::from_edge(edge)).is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// Trusted planner predicate only: count borrowed metadata without result transport.
+    pub(crate) fn count_edge_metadata_at(
+        &self,
+        snapshot_seq: u64,
+        matches: impl Fn(EdgeMetadataCandidate) -> bool,
+    ) -> Result<u64, EngineError> {
+        let mut count = 0u64;
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            let upper = self.max_edge_id();
+            let mut after = None;
+            loop {
+                let (last, exhausted) = self.graph_session(|maps, session| {
+                    maps.edges.walk_versions_at(
+                        session,
+                        snapshot_seq,
+                        (after, upper),
+                        4096,
+                        |_, value| {
+                            if let RecordState::Live(edge) = &**value {
+                                if matches(EdgeMetadataCandidate::from_edge(edge)) {
+                                    count = count.saturating_add(1);
+                                }
+                            }
+                            true
+                        },
+                    )
+                })?;
+                #[cfg(test)]
+                note_query_scan_work(|work| work.edge_count_refills += 1);
+                if exhausted {
+                    return Ok(count);
+                }
+                debug_assert!(last > after);
+                after = last;
+            }
+        }
+        let state = self.state.read().unwrap();
+        for slot in state.edges.values() {
+            if let Some(RecordState::Live(edge)) = record_at(slot, snapshot_seq) {
+                if matches(EdgeMetadataCandidate::from_edge(edge)) {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+        Ok(count)
     }
 
     #[cfg(test)]
@@ -3653,6 +4338,7 @@ impl Memtable {
             label_id.is_none_or(|target| meta.label_id == target)
                 && weight_matches_bounds(meta.weight, bounds)
         })
+        .unwrap()
     }
 
     #[cfg(test)]
@@ -3666,6 +4352,7 @@ impl Memtable {
             label_id.is_none_or(|target| meta.label_id == target)
                 && i64_matches_bounds(meta.updated_at, bounds)
         })
+        .unwrap()
     }
 
     #[cfg(test)]
@@ -3679,6 +4366,7 @@ impl Memtable {
             label_id.is_none_or(|target| meta.label_id == target)
                 && i64_matches_bounds(meta.valid_from, bounds)
         })
+        .unwrap()
     }
 
     #[cfg(test)]
@@ -3692,6 +4380,7 @@ impl Memtable {
             label_id.is_none_or(|target| meta.label_id == target)
                 && i64_matches_bounds(meta.valid_to, bounds)
         })
+        .unwrap()
     }
 
     pub(crate) fn visible_nodes_by_time_range(
@@ -3700,24 +4389,39 @@ impl Memtable {
         from_ms: i64,
         to_ms: i64,
         snapshot_seq: u64,
-    ) -> Vec<u64> {
-        if from_ms > to_ms {
-            return Vec::new();
+    ) -> Result<Vec<u64>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return {
+                let mut ids = Vec::new();
+                let _ =
+                    self.graph_time_each(label_id, from_ms, to_ms, snapshot_seq, &mut |id| {
+                        ids.push(id);
+                        ControlFlow::Continue(())
+                    })?;
+                ids.sort_unstable();
+                Ok(ids)
+            };
         }
-        let state = self.state.read().unwrap();
-        use std::ops::Bound;
-        let start = (label_id, from_ms, 0u64);
-        let end = (label_id, to_ms, u64::MAX);
-        let mut ids = state
-            .time_node_index
-            .range((Bound::Included(start), Bound::Included(end)))
-            .filter_map(|(&(entry_label_id, _, node_id), slot)| {
-                (entry_label_id == label_id && slot_option_visible(slot, snapshot_seq))
-                    .then_some(node_id)
-            })
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        ids
+        Ok((|| {
+            if from_ms > to_ms {
+                return Vec::new();
+            }
+            let state = self.state.read().unwrap();
+            use std::ops::Bound;
+            let start = (label_id, from_ms, 0u64);
+            let end = (label_id, to_ms, u64::MAX);
+            let mut ids = state
+                .time_node_index
+                .range((Bound::Included(start), Bound::Included(end)))
+                .filter_map(|(&(entry_label_id, _, node_id), slot)| {
+                    (entry_label_id == label_id && slot_option_visible(slot, snapshot_seq))
+                        .then_some(node_id)
+                })
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids
+        })())
     }
 
     pub(crate) fn visible_node_time_range_count_at(
@@ -3726,7 +4430,7 @@ impl Memtable {
         from_ms: i64,
         to_ms: i64,
         snapshot_seq: u64,
-    ) -> usize {
+    ) -> Result<usize, EngineError> {
         let mut count = 0usize;
         let _ = self.for_each_visible_node_by_time_range_at(
             label_id,
@@ -3737,8 +4441,8 @@ impl Memtable {
                 count = count.saturating_add(1);
                 ControlFlow::Continue(())
             },
-        );
-        count
+        )?;
+        Ok(count)
     }
 
     pub(crate) fn for_each_visible_node_by_time_range_at<F>(
@@ -3748,29 +4452,35 @@ impl Memtable {
         to_ms: i64,
         snapshot_seq: u64,
         callback: &mut F,
-    ) -> ControlFlow<()>
+    ) -> Result<ControlFlow<()>, EngineError>
     where
         F: FnMut(u64) -> ControlFlow<()>,
     {
-        if from_ms > to_ms {
-            return ControlFlow::Continue(());
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_time_each(label_id, from_ms, to_ms, snapshot_seq, callback);
         }
-        let state = self.state.read().unwrap();
-        use std::ops::Bound;
-        let start = (label_id, from_ms, 0u64);
-        let end = (label_id, to_ms, u64::MAX);
-        for (&(entry_label_id, _, node_id), slot) in state
-            .time_node_index
-            .range((Bound::Included(start), Bound::Included(end)))
-        {
-            if entry_label_id != label_id || !slot_option_visible(slot, snapshot_seq) {
-                continue;
+        Ok((|| {
+            if from_ms > to_ms {
+                return ControlFlow::Continue(());
             }
-            if callback(node_id).is_break() {
-                return ControlFlow::Break(());
+            let state = self.state.read().unwrap();
+            use std::ops::Bound;
+            let start = (label_id, from_ms, 0u64);
+            let end = (label_id, to_ms, u64::MAX);
+            for (&(entry_label_id, _, node_id), slot) in state
+                .time_node_index
+                .range((Bound::Included(start), Bound::Included(end)))
+            {
+                if entry_label_id != label_id || !slot_option_visible(slot, snapshot_seq) {
+                    continue;
+                }
+                if callback(node_id).is_break() {
+                    return ControlFlow::Break(());
+                }
             }
-        }
-        ControlFlow::Continue(())
+            ControlFlow::Continue(())
+        })())
     }
 
     pub(crate) fn neighbors_at(
@@ -3780,65 +4490,80 @@ impl Memtable {
         label_filter_ids: Option<&[u32]>,
         limit: usize,
         snapshot_seq: u64,
-    ) -> Vec<NeighborRecord> {
-        let state = self.state.read().unwrap();
-        if state.node_deleted_at(node_id, snapshot_seq) {
-            return Vec::new();
+    ) -> Result<Vec<NeighborRecord>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_neighbors_one(
+                node_id,
+                direction,
+                label_filter_ids,
+                limit,
+                snapshot_seq,
+                true,
+            );
         }
+        Ok((|| {
+            let state = self.state.read().unwrap();
+            if state.node_deleted_at(node_id, snapshot_seq) {
+                return Vec::new();
+            }
 
-        let mut results = Vec::new();
-        let mut self_loop_edge_ids = NodeIdSet::default();
-        let mut collect = |map: Option<&NodeIdMap<MembershipSlot<AdjEntry>>>,
-                           dedupe_self_loops: bool,
-                           results: &mut Vec<NeighborRecord>| {
-            let Some(map) = map else {
-                return;
-            };
-            for slot in map.values() {
-                if limit > 0 && results.len() >= limit {
-                    break;
-                }
-                let Some(entry) = slot_option_at(slot, snapshot_seq) else {
-                    continue;
+            let mut results = Vec::new();
+            let mut self_loop_edge_ids = NodeIdSet::default();
+            let mut collect = |map: Option<&NodeIdMap<MembershipSlot<AdjEntry>>>,
+                               dedupe_self_loops: bool,
+                               results: &mut Vec<NeighborRecord>| {
+                let Some(map) = map else {
+                    return;
                 };
-                if label_filter_ids.is_some_and(|label_ids| !label_ids.contains(&entry.label_id)) {
-                    continue;
-                }
-                if state.node_deleted_at(entry.neighbor_id, snapshot_seq) {
-                    continue;
-                }
-                if dedupe_self_loops && entry.neighbor_id == node_id {
-                    if !self_loop_edge_ids.insert(entry.edge_id) {
+                for slot in map.values() {
+                    if limit > 0 && results.len() >= limit {
+                        break;
+                    }
+                    let Some(entry) = slot_option_at(slot, snapshot_seq) else {
+                        continue;
+                    };
+                    if label_filter_ids
+                        .is_some_and(|label_ids| !label_ids.contains(&entry.label_id))
+                    {
                         continue;
                     }
-                } else if entry.neighbor_id == node_id {
-                    self_loop_edge_ids.insert(entry.edge_id);
+                    if state.node_deleted_at(entry.neighbor_id, snapshot_seq) {
+                        continue;
+                    }
+                    if dedupe_self_loops && entry.neighbor_id == node_id {
+                        if !self_loop_edge_ids.insert(entry.edge_id) {
+                            continue;
+                        }
+                    } else if entry.neighbor_id == node_id {
+                        self_loop_edge_ids.insert(entry.edge_id);
+                    }
+                    results.push(NeighborRecord {
+                        node_id: entry.neighbor_id,
+                        edge_id: entry.edge_id,
+                        edge_label_id: entry.label_id,
+                        weight: entry.weight,
+                        valid_from: entry.valid_from,
+                        valid_to: entry.valid_to,
+                    });
                 }
-                results.push(NeighborRecord {
-                    node_id: entry.neighbor_id,
-                    edge_id: entry.edge_id,
-                    edge_label_id: entry.label_id,
-                    weight: entry.weight,
-                    valid_from: entry.valid_from,
-                    valid_to: entry.valid_to,
-                });
-            }
-        };
+            };
 
-        match direction {
-            Direction::Outgoing => {
-                collect(state.adj_out.get(&node_id), false, &mut results);
+            match direction {
+                Direction::Outgoing => {
+                    collect(state.adj_out.get(&node_id), false, &mut results);
+                }
+                Direction::Incoming => {
+                    collect(state.adj_in.get(&node_id), false, &mut results);
+                }
+                Direction::Both => {
+                    collect(state.adj_out.get(&node_id), false, &mut results);
+                    collect(state.adj_in.get(&node_id), true, &mut results);
+                }
             }
-            Direction::Incoming => {
-                collect(state.adj_in.get(&node_id), false, &mut results);
-            }
-            Direction::Both => {
-                collect(state.adj_out.get(&node_id), false, &mut results);
-                collect(state.adj_in.get(&node_id), true, &mut results);
-            }
-        }
 
-        results
+            results
+        })())
     }
 
     #[cfg(debug_assertions)]
@@ -3848,61 +4573,105 @@ impl Memtable {
         direction: Direction,
         label_filter_ids: Option<&[u32]>,
         snapshot_seq: u64,
-    ) -> Vec<NeighborRecord> {
-        let state = self.state.read().unwrap();
-        if state.node_deleted_at(node_id, snapshot_seq) {
-            return Vec::new();
+    ) -> Result<Vec<NeighborRecord>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_neighbors_one(
+                node_id,
+                direction,
+                label_filter_ids,
+                0,
+                snapshot_seq,
+                false,
+            );
         }
+        Ok((|| {
+            let state = self.state.read().unwrap();
+            if state.node_deleted_at(node_id, snapshot_seq) {
+                return Vec::new();
+            }
 
-        let mut results = Vec::new();
-        let mut self_loop_edge_ids = NodeIdSet::default();
-        let mut collect = |map: Option<&NodeIdMap<MembershipSlot<AdjEntry>>>,
-                           dedupe_self_loops: bool,
-                           results: &mut Vec<NeighborRecord>| {
-            let Some(map) = map else {
-                return;
-            };
-            for slot in map.values() {
-                let Some(entry) = slot_option_at(slot, snapshot_seq) else {
-                    continue;
+            let mut results = Vec::new();
+            let mut self_loop_edge_ids = NodeIdSet::default();
+            let mut collect = |map: Option<&NodeIdMap<MembershipSlot<AdjEntry>>>,
+                               dedupe_self_loops: bool,
+                               results: &mut Vec<NeighborRecord>| {
+                let Some(map) = map else {
+                    return;
                 };
-                if label_filter_ids.is_some_and(|label_ids| !label_ids.contains(&entry.label_id)) {
-                    continue;
-                }
-                if dedupe_self_loops && entry.neighbor_id == node_id {
-                    if !self_loop_edge_ids.insert(entry.edge_id) {
+                for slot in map.values() {
+                    let Some(entry) = slot_option_at(slot, snapshot_seq) else {
+                        continue;
+                    };
+                    if label_filter_ids
+                        .is_some_and(|label_ids| !label_ids.contains(&entry.label_id))
+                    {
                         continue;
                     }
-                } else if entry.neighbor_id == node_id {
-                    self_loop_edge_ids.insert(entry.edge_id);
+                    if dedupe_self_loops && entry.neighbor_id == node_id {
+                        if !self_loop_edge_ids.insert(entry.edge_id) {
+                            continue;
+                        }
+                    } else if entry.neighbor_id == node_id {
+                        self_loop_edge_ids.insert(entry.edge_id);
+                    }
+                    results.push(NeighborRecord {
+                        node_id: entry.neighbor_id,
+                        edge_id: entry.edge_id,
+                        edge_label_id: entry.label_id,
+                        weight: entry.weight,
+                        valid_from: entry.valid_from,
+                        valid_to: entry.valid_to,
+                    });
                 }
-                results.push(NeighborRecord {
-                    node_id: entry.neighbor_id,
-                    edge_id: entry.edge_id,
-                    edge_label_id: entry.label_id,
-                    weight: entry.weight,
-                    valid_from: entry.valid_from,
-                    valid_to: entry.valid_to,
-                });
-            }
-        };
+            };
 
-        match direction {
-            Direction::Outgoing => {
-                collect(state.adj_out.get(&node_id), false, &mut results);
+            match direction {
+                Direction::Outgoing => {
+                    collect(state.adj_out.get(&node_id), false, &mut results);
+                }
+                Direction::Incoming => {
+                    collect(state.adj_in.get(&node_id), false, &mut results);
+                }
+                Direction::Both => {
+                    collect(state.adj_out.get(&node_id), false, &mut results);
+                    collect(state.adj_in.get(&node_id), true, &mut results);
+                }
             }
-            Direction::Incoming => {
-                collect(state.adj_in.get(&node_id), false, &mut results);
-            }
-            Direction::Both => {
-                collect(state.adj_out.get(&node_id), false, &mut results);
-                collect(state.adj_in.get(&node_id), true, &mut results);
-            }
-        }
 
-        results
+            results
+        })())
     }
 
+    pub(crate) fn adj_stats_at(
+        &self,
+        node_id: u64,
+        direction: Direction,
+        labels: Option<&[u32]>,
+        seq: u64,
+        reference_time: i64,
+    ) -> Result<(u64, f64), EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_adj_stats(node_id, direction, labels, seq, reference_time);
+        }
+        let mut count = 0;
+        let mut weight = 0.0;
+        let _ = self.for_each_adj_entry_at(
+            node_id,
+            direction,
+            labels,
+            seq,
+            &mut |_, _, w, from, to| {
+                if from <= reference_time && reference_time < to {
+                    count += 1;
+                    weight += w as f64;
+                }
+                ControlFlow::Continue(())
+            },
+        )?;
+        Ok((count, weight))
+    }
     pub(crate) fn for_each_adj_entry_at<F>(
         &self,
         node_id: u64,
@@ -3910,63 +4679,78 @@ impl Memtable {
         label_filter_ids: Option<&[u32]>,
         snapshot_seq: u64,
         callback: &mut F,
-    ) -> ControlFlow<()>
+    ) -> Result<ControlFlow<()>, EngineError>
     where
         F: FnMut(u64, u64, f32, i64, i64) -> ControlFlow<()>,
     {
-        let state = self.state.read().unwrap();
-        if state.node_deleted_at(node_id, snapshot_seq) {
-            return ControlFlow::Continue(());
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_adj_each(
+                node_id,
+                direction,
+                label_filter_ids,
+                snapshot_seq,
+                callback,
+            );
         }
-
-        let mut self_loop_edge_ids = NodeIdSet::default();
-        let mut visit = |map: Option<&NodeIdMap<MembershipSlot<AdjEntry>>>,
-                         dedupe_self_loops: bool| {
-            let Some(map) = map else {
+        Ok((|| {
+            let state = self.state.read().unwrap();
+            if state.node_deleted_at(node_id, snapshot_seq) {
                 return ControlFlow::Continue(());
-            };
-            for slot in map.values() {
-                let Some(entry) = slot_option_at(slot, snapshot_seq) else {
-                    continue;
+            }
+
+            let mut self_loop_edge_ids = NodeIdSet::default();
+            let mut visit = |map: Option<&NodeIdMap<MembershipSlot<AdjEntry>>>,
+                             dedupe_self_loops: bool| {
+                let Some(map) = map else {
+                    return ControlFlow::Continue(());
                 };
-                if label_filter_ids.is_some_and(|label_ids| !label_ids.contains(&entry.label_id)) {
-                    continue;
-                }
-                if state.node_deleted_at(entry.neighbor_id, snapshot_seq) {
-                    continue;
-                }
-                if dedupe_self_loops && entry.neighbor_id == node_id {
-                    if !self_loop_edge_ids.insert(entry.edge_id) {
+                for slot in map.values() {
+                    let Some(entry) = slot_option_at(slot, snapshot_seq) else {
+                        continue;
+                    };
+                    if label_filter_ids
+                        .is_some_and(|label_ids| !label_ids.contains(&entry.label_id))
+                    {
                         continue;
                     }
-                } else if entry.neighbor_id == node_id {
-                    self_loop_edge_ids.insert(entry.edge_id);
+                    if state.node_deleted_at(entry.neighbor_id, snapshot_seq) {
+                        continue;
+                    }
+                    if dedupe_self_loops && entry.neighbor_id == node_id {
+                        if !self_loop_edge_ids.insert(entry.edge_id) {
+                            continue;
+                        }
+                    } else if entry.neighbor_id == node_id {
+                        self_loop_edge_ids.insert(entry.edge_id);
+                    }
+                    if callback(
+                        entry.edge_id,
+                        entry.neighbor_id,
+                        entry.weight,
+                        entry.valid_from,
+                        entry.valid_to,
+                    )
+                    .is_break()
+                    {
+                        return ControlFlow::Break(());
+                    }
                 }
-                if callback(
-                    entry.edge_id,
-                    entry.neighbor_id,
-                    entry.weight,
-                    entry.valid_from,
-                    entry.valid_to,
-                )
-                .is_break()
-                {
-                    return ControlFlow::Break(());
-                }
-            }
-            ControlFlow::Continue(())
-        };
+                ControlFlow::Continue(())
+            };
 
-        match direction {
-            Direction::Outgoing => visit(state.adj_out.get(&node_id), false),
-            Direction::Incoming => visit(state.adj_in.get(&node_id), false),
-            Direction::Both => {
-                visit(state.adj_out.get(&node_id), false)?;
-                visit(state.adj_in.get(&node_id), true)
+            match direction {
+                Direction::Outgoing => visit(state.adj_out.get(&node_id), false),
+                Direction::Incoming => visit(state.adj_in.get(&node_id), false),
+                Direction::Both => {
+                    visit(state.adj_out.get(&node_id), false)?;
+                    visit(state.adj_in.get(&node_id), true)
+                }
             }
-        }
+        })())
     }
 
+    #[allow(dead_code)] // Scalar compatibility helpers; production scans retain ID chunks.
     fn next_visible_adj_edge_after(
         state: &MemtableState,
         node_id: u64,
@@ -3987,7 +4771,7 @@ impl Memtable {
         let start = after.map_or(Bound::Unbounded, Bound::Excluded);
         for (&edge_id, slot) in entries.range((start, Bound::Unbounded)) {
             #[cfg(test)]
-            ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST.fetch_add(1, Ordering::Relaxed);
+            ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST.with(|count| count.set(count.get() + 1));
             let Some(entry) = slot_option_at(slot, snapshot_seq) else {
                 continue;
             };
@@ -4002,6 +4786,7 @@ impl Memtable {
         None
     }
 
+    #[allow(dead_code)] // Scalar compatibility helpers; production scans retain ID chunks.
     fn next_visible_adj_edge_ge_in_state(
         state: &MemtableState,
         node_id: u64,
@@ -4021,7 +4806,7 @@ impl Memtable {
         let entries = source.get(&node_id)?;
         for (&edge_id, slot) in entries.range((Bound::Included(bound), Bound::Unbounded)) {
             #[cfg(test)]
-            ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST.fetch_add(1, Ordering::Relaxed);
+            ENDPOINT_CURSOR_ENTRIES_VISITED_FOR_TEST.with(|count| count.set(count.get() + 1));
             let Some(entry) = slot_option_at(slot, snapshot_seq) else {
                 continue;
             };
@@ -4036,6 +4821,7 @@ impl Memtable {
         None
     }
 
+    #[allow(dead_code)] // Scalar compatibility helpers; production scans retain ID chunks.
     pub(crate) fn next_visible_adj_edge_ge(
         &self,
         node_id: u64,
@@ -4043,16 +4829,28 @@ impl Memtable {
         label_filter_id: Option<u32>,
         snapshot_seq: u64,
         bound: u64,
-    ) -> Option<u64> {
-        let state = self.state.read().unwrap();
-        Self::next_visible_adj_edge_ge_in_state(
-            &state,
-            node_id,
-            outgoing,
-            label_filter_id,
-            snapshot_seq,
-            bound,
-        )
+    ) -> Result<Option<u64>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_endpoint_next(
+                node_id,
+                usize::from(!outgoing),
+                label_filter_id.as_ref().map(std::slice::from_ref),
+                snapshot_seq,
+                Bound::Included(bound),
+            );
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            Self::next_visible_adj_edge_ge_in_state(
+                &state,
+                node_id,
+                outgoing,
+                label_filter_id,
+                snapshot_seq,
+                bound,
+            )
+        })
     }
 
     fn visible_adj_edge_count_estimate(
@@ -4152,40 +4950,66 @@ impl Memtable {
         }
     }
 
+    #[allow(dead_code)] // Scalar compatibility helpers; production scans retain ID chunks.
     pub(crate) fn next_visible_edge_from_endpoint_after(
         &self,
         node_id: u64,
         label_filter_ids: Option<&[u32]>,
         snapshot_seq: u64,
         after: Option<u64>,
-    ) -> Option<u64> {
-        let state = self.state.read().unwrap();
-        Self::next_visible_adj_edge_after(
-            &state,
-            node_id,
-            true,
-            label_filter_ids,
-            snapshot_seq,
-            after,
-        )
+    ) -> Result<Option<u64>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_endpoint_next(
+                node_id,
+                0,
+                label_filter_ids,
+                snapshot_seq,
+                after.map_or(Bound::Unbounded, Bound::Excluded),
+            );
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            Self::next_visible_adj_edge_after(
+                &state,
+                node_id,
+                true,
+                label_filter_ids,
+                snapshot_seq,
+                after,
+            )
+        })
     }
 
+    #[allow(dead_code)] // Scalar compatibility helpers; production scans retain ID chunks.
     pub(crate) fn next_visible_edge_to_endpoint_after(
         &self,
         node_id: u64,
         label_filter_ids: Option<&[u32]>,
         snapshot_seq: u64,
         after: Option<u64>,
-    ) -> Option<u64> {
-        let state = self.state.read().unwrap();
-        Self::next_visible_adj_edge_after(
-            &state,
-            node_id,
-            false,
-            label_filter_ids,
-            snapshot_seq,
-            after,
-        )
+    ) -> Result<Option<u64>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_endpoint_next(
+                node_id,
+                1,
+                label_filter_ids,
+                snapshot_seq,
+                after.map_or(Bound::Unbounded, Bound::Excluded),
+            );
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            Self::next_visible_adj_edge_after(
+                &state,
+                node_id,
+                false,
+                label_filter_ids,
+                snapshot_seq,
+                after,
+            )
+        })
     }
 
     #[cfg(test)]
@@ -4194,9 +5018,26 @@ impl Memtable {
         node_id: u64,
         label_filter_ids: Option<&[u32]>,
         snapshot_seq: u64,
-    ) -> MemtableEndpointCountEstimate {
-        let state = self.state.read().unwrap();
-        Self::visible_adj_edge_count_estimate(&state, node_id, true, label_filter_ids, snapshot_seq)
+    ) -> Result<MemtableEndpointCountEstimate, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_endpoint_estimate(
+                &[node_id],
+                Direction::Outgoing,
+                label_filter_ids,
+                snapshot_seq,
+            );
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            Self::visible_adj_edge_count_estimate(
+                &state,
+                node_id,
+                true,
+                label_filter_ids,
+                snapshot_seq,
+            )
+        })
     }
 
     #[cfg(test)]
@@ -4205,15 +5046,26 @@ impl Memtable {
         node_id: u64,
         label_filter_ids: Option<&[u32]>,
         snapshot_seq: u64,
-    ) -> MemtableEndpointCountEstimate {
-        let state = self.state.read().unwrap();
-        Self::visible_adj_edge_count_estimate(
-            &state,
-            node_id,
-            false,
-            label_filter_ids,
-            snapshot_seq,
-        )
+    ) -> Result<MemtableEndpointCountEstimate, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_endpoint_estimate(
+                &[node_id],
+                Direction::Incoming,
+                label_filter_ids,
+                snapshot_seq,
+            );
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            Self::visible_adj_edge_count_estimate(
+                &state,
+                node_id,
+                false,
+                label_filter_ids,
+                snapshot_seq,
+            )
+        })
     }
 
     pub(crate) fn visible_endpoint_edges_count_estimate_at(
@@ -4222,36 +5074,64 @@ impl Memtable {
         direction: Direction,
         label_filter_ids: Option<&[u32]>,
         snapshot_seq: u64,
-    ) -> MemtableEndpointCountEstimate {
-        let state = self.state.read().unwrap();
-        Self::visible_endpoint_edges_count_estimate(
-            &state,
-            node_ids,
-            direction,
-            label_filter_ids,
-            snapshot_seq,
-        )
+    ) -> Result<MemtableEndpointCountEstimate, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_endpoint_estimate(
+                node_ids,
+                direction,
+                label_filter_ids,
+                snapshot_seq,
+            );
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            Self::visible_endpoint_edges_count_estimate(
+                &state,
+                node_ids,
+                direction,
+                label_filter_ids,
+                snapshot_seq,
+            )
+        })
     }
 
-    pub(crate) fn visible_node_label_ids(&self, snapshot_seq: u64) -> Vec<u32> {
-        let state = self.state.read().unwrap();
-        let mut label_ids = Vec::new();
-        let mut current_label_id = None;
-        let mut current_label_visible = false;
-        for (&(label_id, _), slot) in &state.label_node_index {
-            if current_label_id != Some(label_id) {
-                if current_label_visible {
-                    label_ids.push(current_label_id.expect("label group is present"));
+    pub(crate) fn visible_node_label_ids(
+        &self,
+        snapshot_seq: u64,
+    ) -> Result<Vec<u32>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return {
+                let mut ids = self
+                    .graph_labels(0, None, snapshot_seq)?
+                    .into_iter()
+                    .map(|(label, _)| label)
+                    .collect::<Vec<_>>();
+                ids.dedup();
+                Ok(ids)
+            };
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            let mut label_ids = Vec::new();
+            let mut current_label_id = None;
+            let mut current_label_visible = false;
+            for (&(label_id, _), slot) in &state.label_node_index {
+                if current_label_id != Some(label_id) {
+                    if current_label_visible {
+                        label_ids.push(current_label_id.expect("label group is present"));
+                    }
+                    current_label_id = Some(label_id);
+                    current_label_visible = false;
                 }
-                current_label_id = Some(label_id);
-                current_label_visible = false;
+                current_label_visible |= slot_option_visible(slot, snapshot_seq);
             }
-            current_label_visible |= slot_option_visible(slot, snapshot_seq);
-        }
-        if current_label_visible {
-            label_ids.push(current_label_id.expect("label group is present"));
-        }
-        label_ids
+            if current_label_visible {
+                label_ids.push(current_label_id.expect("label group is present"));
+            }
+            label_ids
+        })
     }
 
     pub(crate) fn find_secondary_eq_nodes_at(
@@ -4260,7 +5140,7 @@ impl Memtable {
         prop_key: &str,
         prop_value: &PropValue,
         snapshot_seq: u64,
-    ) -> Vec<u64> {
+    ) -> Result<Vec<u64>, EngineError> {
         self.find_secondary_eq_nodes_at_limited(index_id, prop_key, prop_value, snapshot_seq, None)
     }
 
@@ -4271,7 +5151,18 @@ impl Memtable {
         prop_value: &PropValue,
         snapshot_seq: u64,
         max_ids: Option<usize>,
-    ) -> Vec<u64> {
+    ) -> Result<Vec<u64>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.candidate_eq_collect(
+                index_id,
+                hash_prop_equality_key(prop_value),
+                snapshot_seq,
+                max_ids,
+                Some((false, prop_key, prop_value)),
+            );
+        }
+
         let state = self.state.read().unwrap();
         let value_hash = hash_prop_equality_key(prop_value);
         let mut ids = Vec::new();
@@ -4298,22 +5189,26 @@ impl Memtable {
             }
         }
         ids.sort_unstable();
-        ids
+        Ok(ids)
     }
-
     pub(crate) fn find_secondary_eq_nodes_by_hash_at_limited(
         &self,
         index_id: u64,
         value_hash: u64,
         snapshot_seq: u64,
         max_ids: Option<usize>,
-    ) -> Vec<u64> {
+    ) -> Result<Vec<u64>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.candidate_eq_collect(index_id, value_hash, snapshot_seq, max_ids, None);
+        }
+
         let state = self.state.read().unwrap();
         let Some(groups) = state.secondary_eq_state.get(&index_id) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Some(group) = groups.get(&value_hash) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
 
         let mut ids = Vec::new();
@@ -4327,7 +5222,7 @@ impl Memtable {
             }
         }
         ids.sort_unstable();
-        ids
+        Ok(ids)
     }
 
     // CP40.1 stream construction helper; CP40.2 wires it into query execution.
@@ -4337,16 +5232,8 @@ impl Memtable {
         index_id: u64,
         value_hash: u64,
         snapshot_seq: u64,
-    ) -> Vec<u64> {
-        let mut ids = self.find_secondary_eq_nodes_by_hash_at_limited(
-            index_id,
-            value_hash,
-            snapshot_seq,
-            None,
-        );
-        ids.sort_unstable();
-        ids.dedup();
-        ids
+    ) -> Result<Vec<u64>, EngineError> {
+        self.find_secondary_eq_nodes_by_hash_at_limited(index_id, value_hash, snapshot_seq, None)
     }
 
     pub(crate) fn secondary_eq_node_count_at(
@@ -4355,14 +5242,24 @@ impl Memtable {
         prop_key: &str,
         prop_value: &PropValue,
         snapshot_seq: u64,
-    ) -> usize {
+    ) -> Result<usize, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.candidate_eq_count(
+                index_id,
+                hash_prop_equality_key(prop_value),
+                snapshot_seq,
+                Some((false, prop_key, prop_value)),
+            );
+        }
+
         let state = self.state.read().unwrap();
         let value_hash = hash_prop_equality_key(prop_value);
         let Some(groups) = state.secondary_eq_state.get(&index_id) else {
-            return 0;
+            return Ok(0);
         };
         let Some(group) = groups.get(&value_hash) else {
-            return 0;
+            return Ok(0);
         };
 
         let mut count = 0;
@@ -4381,26 +5278,31 @@ impl Memtable {
                 count += 1;
             }
         }
-        count
+        Ok(count)
     }
-
     pub(crate) fn secondary_eq_node_hash_count_at(
         &self,
         index_id: u64,
         value_hash: u64,
         snapshot_seq: u64,
-    ) -> usize {
-        let state = self.state.read().unwrap();
-        let Some(groups) = state.secondary_eq_state.get(&index_id) else {
-            return 0;
-        };
-        let Some(group) = groups.get(&value_hash) else {
-            return 0;
-        };
-        group
-            .values()
-            .filter(|slot| slot_option_visible(slot, snapshot_seq))
-            .count()
+    ) -> Result<usize, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.candidate_eq_count(index_id, value_hash, snapshot_seq, None);
+        }
+        Ok((|| {
+            let state = self.state.read().unwrap();
+            let Some(groups) = state.secondary_eq_state.get(&index_id) else {
+                return 0;
+            };
+            let Some(group) = groups.get(&value_hash) else {
+                return 0;
+            };
+            group
+                .values()
+                .filter(|slot| slot_option_visible(slot, snapshot_seq))
+                .count()
+        })())
     }
 
     pub(crate) fn find_secondary_eq_edges_by_hash_at_limited(
@@ -4409,13 +5311,18 @@ impl Memtable {
         value_hash: u64,
         snapshot_seq: u64,
         max_ids: Option<usize>,
-    ) -> Vec<u64> {
+    ) -> Result<Vec<u64>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.candidate_eq_collect(index_id, value_hash, snapshot_seq, max_ids, None);
+        }
+
         let state = self.state.read().unwrap();
         let Some(groups) = state.secondary_eq_state.get(&index_id) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Some(group) = groups.get(&value_hash) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
 
         let mut ids = Vec::new();
@@ -4429,7 +5336,7 @@ impl Memtable {
             }
         }
         ids.sort_unstable();
-        ids
+        Ok(ids)
     }
 
     pub(crate) fn visible_secondary_eq_edge_ids_sorted(
@@ -4437,16 +5344,8 @@ impl Memtable {
         index_id: u64,
         value_hash: u64,
         snapshot_seq: u64,
-    ) -> Vec<u64> {
-        let mut ids = self.find_secondary_eq_edges_by_hash_at_limited(
-            index_id,
-            value_hash,
-            snapshot_seq,
-            None,
-        );
-        ids.sort_unstable();
-        ids.dedup();
-        ids
+    ) -> Result<Vec<u64>, EngineError> {
+        self.find_secondary_eq_edges_by_hash_at_limited(index_id, value_hash, snapshot_seq, None)
     }
 
     pub(crate) fn secondary_eq_edge_count_at(
@@ -4455,14 +5354,24 @@ impl Memtable {
         prop_key: &str,
         prop_value: &PropValue,
         snapshot_seq: u64,
-    ) -> usize {
+    ) -> Result<usize, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.candidate_eq_count(
+                index_id,
+                hash_prop_equality_key(prop_value),
+                snapshot_seq,
+                Some((true, prop_key, prop_value)),
+            );
+        }
+
         let state = self.state.read().unwrap();
         let value_hash = hash_prop_equality_key(prop_value);
         let Some(groups) = state.secondary_eq_state.get(&index_id) else {
-            return 0;
+            return Ok(0);
         };
         let Some(group) = groups.get(&value_hash) else {
-            return 0;
+            return Ok(0);
         };
 
         let mut count = 0;
@@ -4481,26 +5390,31 @@ impl Memtable {
                 count += 1;
             }
         }
-        count
+        Ok(count)
     }
-
     pub(crate) fn secondary_eq_edge_hash_count_at(
         &self,
         index_id: u64,
         value_hash: u64,
         snapshot_seq: u64,
-    ) -> usize {
-        let state = self.state.read().unwrap();
-        let Some(groups) = state.secondary_eq_state.get(&index_id) else {
-            return 0;
-        };
-        let Some(group) = groups.get(&value_hash) else {
-            return 0;
-        };
-        group
-            .values()
-            .filter(|slot| slot_option_visible(slot, snapshot_seq))
-            .count()
+    ) -> Result<usize, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.candidate_eq_count(index_id, value_hash, snapshot_seq, None);
+        }
+        Ok((|| {
+            let state = self.state.read().unwrap();
+            let Some(groups) = state.secondary_eq_state.get(&index_id) else {
+                return 0;
+            };
+            let Some(group) = groups.get(&value_hash) else {
+                return 0;
+            };
+            group
+                .values()
+                .filter(|slot| slot_option_visible(slot, snapshot_seq))
+                .count()
+        })())
     }
 
     #[cfg(test)]
@@ -4511,7 +5425,7 @@ impl Memtable {
         upper: Option<(NumericRangeSortKey, bool)>,
         after: Option<(NumericRangeSortKey, u64)>,
         snapshot_seq: u64,
-    ) -> Vec<(NumericRangeSortKey, u64)> {
+    ) -> Result<Vec<(NumericRangeSortKey, u64)>, EngineError> {
         self.visible_secondary_range_entries_limited(
             index_id,
             lower,
@@ -4530,30 +5444,27 @@ impl Memtable {
         after: Option<(NumericRangeSortKey, u64)>,
         snapshot_seq: u64,
         limit: Option<usize>,
-    ) -> Vec<(NumericRangeSortKey, u64)> {
+    ) -> Result<Vec<(NumericRangeSortKey, u64)>, EngineError> {
+        let mut rows = Vec::new();
+        let mut after = after;
         if limit == Some(0) {
-            return Vec::new();
+            return Ok(rows);
         }
-        let state = self.state.read().unwrap();
-        let Some(entries) = state.secondary_range_state.get(&index_id) else {
-            return Vec::new();
-        };
-
-        let start = secondary_range_start_bound(lower, after);
-        let mut result = Vec::new();
-        for (&(encoded, node_id), slot) in entries.range((start, std::ops::Bound::Unbounded)) {
-            if secondary_range_past_upper(encoded, upper) {
-                break;
+        loop {
+            let (chunk, last, done) = self.refill_secondary_range_at(
+                index_id,
+                lower,
+                upper,
+                after,
+                snapshot_seq,
+                limit.unwrap_or(usize::MAX).saturating_sub(rows.len()),
+            )?;
+            rows.extend(chunk);
+            if done || limit.is_some_and(|max| rows.len() >= max) {
+                return Ok(rows);
             }
-            if !slot_option_visible(slot, snapshot_seq) {
-                continue;
-            }
-            result.push((encoded, node_id));
-            if limit.is_some_and(|limit| result.len() >= limit) {
-                break;
-            }
+            after = last.or(after);
         }
-        result
     }
 
     pub(crate) fn visible_secondary_range_entry_count(
@@ -4563,18 +5474,24 @@ impl Memtable {
         upper: Option<(NumericRangeSortKey, bool)>,
         after: Option<(NumericRangeSortKey, u64)>,
         snapshot_seq: u64,
-    ) -> usize {
-        let state = self.state.read().unwrap();
-        let Some(entries) = state.secondary_range_state.get(&index_id) else {
-            return 0;
-        };
+    ) -> Result<usize, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.candidate_range_count(index_id, lower, upper, after, snapshot_seq);
+        }
+        Ok((|| {
+            let state = self.state.read().unwrap();
+            let Some(entries) = state.secondary_range_state.get(&index_id) else {
+                return 0;
+            };
 
-        let start = secondary_range_start_bound(lower, after);
-        entries
-            .range((start, std::ops::Bound::Unbounded))
-            .take_while(|&(&(encoded, _), _)| !secondary_range_past_upper(encoded, upper))
-            .filter(|&(_, slot)| slot_option_visible(slot, snapshot_seq))
-            .count()
+            let start = secondary_range_start_bound(lower, after);
+            entries
+                .range((start, std::ops::Bound::Unbounded))
+                .take_while(|&(&(encoded, _), _)| !secondary_range_past_upper(encoded, upper))
+                .filter(|&(_, slot)| slot_option_visible(slot, snapshot_seq))
+                .count()
+        })())
     }
 
     pub(crate) fn for_each_visible_secondary_range_entry_at<F>(
@@ -4585,29 +5502,24 @@ impl Memtable {
         after: Option<(NumericRangeSortKey, u64)>,
         snapshot_seq: u64,
         callback: &mut F,
-    ) -> ControlFlow<()>
+    ) -> Result<ControlFlow<()>, EngineError>
     where
         F: FnMut((NumericRangeSortKey, u64)) -> ControlFlow<()>,
     {
-        let state = self.state.read().unwrap();
-        let Some(entries) = state.secondary_range_state.get(&index_id) else {
-            return ControlFlow::Continue(());
-        };
-
-        let start = secondary_range_start_bound(lower, after);
-        for (&(encoded, node_id), slot) in entries.range((start, std::ops::Bound::Unbounded)) {
-            if secondary_range_past_upper(encoded, upper) {
-                break;
+        let mut after = after;
+        loop {
+            let (chunk, last, done) =
+                self.refill_secondary_range_at(index_id, lower, upper, after, snapshot_seq, 4096)?;
+            for row in chunk {
+                if callback(row).is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
             }
-            if !slot_option_visible(slot, snapshot_seq) {
-                continue;
+            if done {
+                return Ok(ControlFlow::Continue(()));
             }
-            if callback((encoded, node_id)).is_break() {
-                return ControlFlow::Break(());
-            }
+            after = last.or(after);
         }
-
-        ControlFlow::Continue(())
     }
 
     #[allow(dead_code)]
@@ -4616,7 +5528,7 @@ impl Memtable {
         index_id: u64,
         bounds: &CompoundPrefixBounds,
         snapshot_seq: u64,
-    ) -> Vec<u64> {
+    ) -> Result<Vec<u64>, EngineError> {
         self.find_compound_prefix_at(index_id, bounds, snapshot_seq)
     }
 
@@ -4626,7 +5538,7 @@ impl Memtable {
         index_id: u64,
         bounds: &CompoundPrefixBounds,
         snapshot_seq: u64,
-    ) -> Vec<u64> {
+    ) -> Result<Vec<u64>, EngineError> {
         self.find_compound_prefix_at(index_id, bounds, snapshot_seq)
     }
 
@@ -4636,7 +5548,7 @@ impl Memtable {
         index_id: u64,
         bounds: &CompoundPrefixBounds,
         snapshot_seq: u64,
-    ) -> usize {
+    ) -> Result<usize, EngineError> {
         self.count_compound_prefix_at(index_id, bounds, snapshot_seq)
     }
 
@@ -4646,7 +5558,7 @@ impl Memtable {
         index_id: u64,
         bounds: &CompoundPrefixBounds,
         snapshot_seq: u64,
-    ) -> usize {
+    ) -> Result<usize, EngineError> {
         self.count_compound_prefix_at(index_id, bounds, snapshot_seq)
     }
 
@@ -4656,7 +5568,7 @@ impl Memtable {
         index_id: u64,
         bounds: &CompoundRangeBounds,
         snapshot_seq: u64,
-    ) -> Vec<u64> {
+    ) -> Result<Vec<u64>, EngineError> {
         self.find_compound_range_at(index_id, bounds, snapshot_seq)
     }
 
@@ -4666,7 +5578,7 @@ impl Memtable {
         index_id: u64,
         bounds: &CompoundRangeBounds,
         snapshot_seq: u64,
-    ) -> Vec<u64> {
+    ) -> Result<Vec<u64>, EngineError> {
         self.find_compound_range_at(index_id, bounds, snapshot_seq)
     }
 
@@ -4676,7 +5588,7 @@ impl Memtable {
         index_id: u64,
         bounds: &CompoundRangeBounds,
         snapshot_seq: u64,
-    ) -> usize {
+    ) -> Result<usize, EngineError> {
         self.count_compound_range_at(index_id, bounds, snapshot_seq)
     }
 
@@ -4686,7 +5598,7 @@ impl Memtable {
         index_id: u64,
         bounds: &CompoundRangeBounds,
         snapshot_seq: u64,
-    ) -> usize {
+    ) -> Result<usize, EngineError> {
         self.count_compound_range_at(index_id, bounds, snapshot_seq)
     }
 
@@ -4696,18 +5608,24 @@ impl Memtable {
         index_id: u64,
         bounds: &CompoundPrefixBounds,
         snapshot_seq: u64,
-    ) -> Vec<u64> {
-        let state = self.state.read().unwrap();
-        let Some(entries) = state.secondary_compound_state.get(&index_id) else {
-            return Vec::new();
-        };
-        collect_visible_compound_ids(
-            entries,
-            Bound::Included((bounds.lower.clone(), 0)),
-            &bounds.upper_exclusive,
-            None,
-            snapshot_seq,
-        )
+    ) -> Result<Vec<u64>, EngineError> {
+        let mut start = Bound::Included((bounds.lower.clone(), 0));
+        let mut ids = Vec::new();
+        loop {
+            let (rows, last, done) = self.refill_compound_at(
+                index_id,
+                start,
+                &bounds.upper_exclusive,
+                None,
+                snapshot_seq,
+                4096,
+            )?;
+            ids.extend(rows.into_iter().map(|(_, id)| id));
+            if done {
+                return Ok(ids);
+            }
+            start = Bound::Excluded(last.expect("compound progress"));
+        }
     }
 
     #[allow(dead_code)]
@@ -4716,18 +5634,30 @@ impl Memtable {
         index_id: u64,
         bounds: &CompoundPrefixBounds,
         snapshot_seq: u64,
-    ) -> usize {
-        let state = self.state.read().unwrap();
-        let Some(entries) = state.secondary_compound_state.get(&index_id) else {
-            return 0;
-        };
-        count_visible_compound_ids(
-            entries,
-            Bound::Included((bounds.lower.clone(), 0)),
-            &bounds.upper_exclusive,
-            None,
-            snapshot_seq,
-        )
+    ) -> Result<usize, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.candidate_compound_count(
+                index_id,
+                Bound::Included((bounds.lower.clone(), 0)),
+                &bounds.upper_exclusive,
+                None,
+                snapshot_seq,
+            );
+        }
+        Ok((|| {
+            let state = self.state.read().unwrap();
+            let Some(entries) = state.secondary_compound_state.get(&index_id) else {
+                return 0;
+            };
+            count_visible_compound_ids(
+                entries,
+                Bound::Included((bounds.lower.clone(), 0)),
+                &bounds.upper_exclusive,
+                None,
+                snapshot_seq,
+            )
+        })())
     }
 
     #[allow(dead_code)]
@@ -4736,23 +5666,28 @@ impl Memtable {
         index_id: u64,
         bounds: &CompoundRangeBounds,
         snapshot_seq: u64,
-    ) -> Vec<u64> {
-        let state = self.state.read().unwrap();
-        let Some(entries) = state.secondary_compound_state.get(&index_id) else {
-            return Vec::new();
-        };
-        let skip_prefix = bounds
-            .lower
-            .as_ref()
-            .filter(|lower| lower.exclusive_component_prefix)
-            .map(|lower| lower.key.as_slice());
-        collect_visible_compound_ids(
-            entries,
-            compound_start_bound(bounds.lower.as_ref()),
-            &bounds.upper_exclusive,
-            skip_prefix,
-            snapshot_seq,
-        )
+    ) -> Result<Vec<u64>, EngineError> {
+        let mut start = compound_start_bound(bounds.lower.as_ref());
+        let mut ids = Vec::new();
+        loop {
+            let (rows, last, done) = self.refill_compound_at(
+                index_id,
+                start,
+                &bounds.upper_exclusive,
+                bounds
+                    .lower
+                    .as_ref()
+                    .filter(|lower| lower.exclusive_component_prefix)
+                    .map(|lower| lower.key.as_slice()),
+                snapshot_seq,
+                4096,
+            )?;
+            ids.extend(rows.into_iter().map(|(_, id)| id));
+            if done {
+                return Ok(ids);
+            }
+            start = Bound::Excluded(last.expect("compound progress"));
+        }
     }
 
     #[allow(dead_code)]
@@ -4761,45 +5696,69 @@ impl Memtable {
         index_id: u64,
         bounds: &CompoundRangeBounds,
         snapshot_seq: u64,
-    ) -> usize {
-        let state = self.state.read().unwrap();
-        let Some(entries) = state.secondary_compound_state.get(&index_id) else {
-            return 0;
-        };
-        let skip_prefix = bounds
-            .lower
-            .as_ref()
-            .filter(|lower| lower.exclusive_component_prefix)
-            .map(|lower| lower.key.as_slice());
-        count_visible_compound_ids(
-            entries,
-            compound_start_bound(bounds.lower.as_ref()),
-            &bounds.upper_exclusive,
-            skip_prefix,
-            snapshot_seq,
-        )
+    ) -> Result<usize, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.candidate_compound_count(
+                index_id,
+                compound_start_bound(bounds.lower.as_ref()),
+                &bounds.upper_exclusive,
+                bounds
+                    .lower
+                    .as_ref()
+                    .filter(|b| b.exclusive_component_prefix)
+                    .map(|b| b.key.as_slice()),
+                snapshot_seq,
+            );
+        }
+        Ok((|| {
+            let state = self.state.read().unwrap();
+            let Some(entries) = state.secondary_compound_state.get(&index_id) else {
+                return 0;
+            };
+            let skip_prefix = bounds
+                .lower
+                .as_ref()
+                .filter(|lower| lower.exclusive_component_prefix)
+                .map(|lower| lower.key.as_slice());
+            count_visible_compound_ids(
+                entries,
+                compound_start_bound(bounds.lower.as_ref()),
+                &bounds.upper_exclusive,
+                skip_prefix,
+                snapshot_seq,
+            )
+        })())
     }
 
-    pub(crate) fn collect_deleted_nodes_at(&self, snapshot_seq: u64) -> NodeIdSet {
-        let state = self.state.read().unwrap();
-        let mut deleted = NodeIdSet::default();
-        for (&node_id, slot) in &state.node_tombstones {
-            if slot_option_visible(slot, snapshot_seq) {
-                deleted.insert(node_id);
-            }
-        }
-        deleted
+    pub(crate) fn collect_deleted_nodes_at(
+        &self,
+        snapshot_seq: u64,
+    ) -> Result<NodeIdSet, EngineError> {
+        let state = self.primary_read()?;
+        Ok(state.deleted_node_ids_at(snapshot_seq, || {
+            #[cfg(test)]
+            self.tombstone_scan_work
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }))
     }
 
-    pub(crate) fn collect_deleted_edges_at(&self, snapshot_seq: u64) -> NodeIdSet {
-        let state = self.state.read().unwrap();
-        let mut deleted = NodeIdSet::default();
-        for (&edge_id, slot) in &state.edge_tombstones {
-            if slot_option_visible(slot, snapshot_seq) {
-                deleted.insert(edge_id);
-            }
-        }
-        deleted
+    #[cfg(test)]
+    pub(crate) fn take_tombstone_scan_work_for_test(&self) -> usize {
+        self.tombstone_scan_work
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn collect_deleted_edges_at(
+        &self,
+        snapshot_seq: u64,
+    ) -> Result<NodeIdSet, EngineError> {
+        let state = self.primary_read()?;
+        Ok(state.deleted_edge_ids_at(snapshot_seq, || {
+            #[cfg(test)]
+            self.tombstone_scan_work
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }))
     }
 
     #[allow(dead_code)]
@@ -4809,7 +5768,7 @@ impl Memtable {
         direction: Direction,
         label_filter_ids: Option<&[u32]>,
         limit: usize,
-    ) -> Vec<NeighborRecord> {
+    ) -> Result<Vec<NeighborRecord>, EngineError> {
         self.neighbors_at(node_id, direction, label_filter_ids, limit, u64::MAX)
     }
 
@@ -4819,15 +5778,8 @@ impl Memtable {
         node_ids: &[u64],
         direction: Direction,
         label_filter_ids: Option<&[u32]>,
-    ) -> NodeIdMap<Vec<NeighborRecord>> {
-        let mut results = NodeIdMap::default();
-        for &nid in node_ids {
-            let entries = self.neighbors(nid, direction, label_filter_ids, 0);
-            if !entries.is_empty() {
-                results.insert(nid, entries);
-            }
-        }
-        results
+    ) -> Result<NodeIdMap<Vec<NeighborRecord>>, EngineError> {
+        self.neighbors_batch_at(node_ids, direction, label_filter_ids, u64::MAX)
     }
 
     pub(crate) fn neighbors_batch_at(
@@ -4836,15 +5788,65 @@ impl Memtable {
         direction: Direction,
         label_filter_ids: Option<&[u32]>,
         snapshot_seq: u64,
-    ) -> NodeIdMap<Vec<NeighborRecord>> {
-        let mut results = NodeIdMap::default();
-        for &nid in node_ids {
-            let entries = self.neighbors_at(nid, direction, label_filter_ids, 0, snapshot_seq);
-            if !entries.is_empty() {
-                results.insert(nid, entries);
-            }
+    ) -> Result<NodeIdMap<Vec<NeighborRecord>>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_neighbors_batch(
+                node_ids,
+                direction,
+                label_filter_ids,
+                snapshot_seq,
+                true,
+            );
         }
-        results
+        (|| -> Result<_, EngineError> {
+            let mut results = NodeIdMap::default();
+            for &nid in node_ids {
+                let entries =
+                    self.neighbors_at(nid, direction, label_filter_ids, 0, snapshot_seq)?;
+                if !entries.is_empty() {
+                    results.insert(nid, entries);
+                }
+            }
+            Ok(results)
+        })()
+    }
+
+    #[cfg(all(test, feature = "production-concurrency"))]
+    pub(crate) fn locked_primary_slots_for_test(&self) -> [usize; 4] {
+        let s = self.state.read().unwrap();
+        [
+            s.nodes.len(),
+            s.edges.len(),
+            s.node_key_index.len(),
+            s.edge_triple_index.len(),
+        ]
+    }
+
+    #[cfg(all(test, feature = "production-concurrency"))]
+    pub(crate) fn locked_tombstone_slots_for_test(&self) -> [usize; 2] {
+        let s = self.state.read().unwrap();
+        [s.node_tombstones.len(), s.edge_tombstones.len()]
+    }
+
+    pub(crate) fn current_tombstone_counts(&self) -> (usize, usize) {
+        let state = self.state.read().unwrap();
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return state.candidate_tombstone_counts;
+        }
+        (
+            state
+                .node_tombstones
+                .values()
+                .filter(|slot| slot.current().is_some())
+                .count(),
+            state
+                .edge_tombstones
+                .values()
+                .filter(|slot| slot.current().is_some())
+                .count(),
+        )
     }
 
     pub fn node_count(&self) -> usize {
@@ -4858,16 +5860,31 @@ impl Memtable {
     }
 
     pub fn retained_edge_slot_count(&self) -> usize {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(m) = &self.primary {
+            return m.edge_ids.load(std::sync::atomic::Ordering::Relaxed);
+        }
+
         let state = self.state.read().unwrap();
         state.edges.len()
     }
 
     pub(crate) fn retained_edge_record_keys_is_empty(&self) -> bool {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(m) = &self.primary {
+            return m.edge_ids.load(std::sync::atomic::Ordering::Relaxed) == 0;
+        }
+
         let state = self.state.read().unwrap();
         state.edges.is_empty()
     }
 
     pub(crate) fn retained_ordered_adj_outer_group_count(&self, direction: Direction) -> usize {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(m) = &self.primary {
+            return m.graph.retained_groups(physical_direction(direction));
+        }
+
         let state = self.state.read().unwrap();
         match direction {
             Direction::Outgoing => state.ordered_adj_out_groups.len(),
@@ -4880,6 +5897,11 @@ impl Memtable {
 
     #[allow(dead_code)]
     pub(crate) fn retained_ordered_adj_posting_slot_count(&self, direction: Direction) -> u64 {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(m) = &self.primary {
+            return m.graph.retained_postings(physical_direction(direction));
+        }
+
         let state = self.state.read().unwrap();
         match direction {
             Direction::Outgoing => state.retained_adj_out_posting_slots,
@@ -4897,60 +5919,81 @@ impl Memtable {
         snapshot_seq: u64,
         group_bound: Bound<(u64, u32)>,
         max_group_entries_examined: usize,
-    ) -> MemtableAdjacencyOwnerRefill {
-        assert!(
-            max_group_entries_examined > 0,
-            "ordered adjacency owner refill maximum must be positive"
-        );
-        if normalized_labels.is_some_and(<[u32]>::is_empty) {
-            return MemtableAdjacencyOwnerRefill {
-                owner_head: None,
-                last_group_key_examined: None,
-                examined: 0,
-                exhausted: true,
+    ) -> Result<MemtableAdjacencyOwnerRefill, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return {
+                assert!(
+                    max_group_entries_examined > 0,
+                    "ordered adjacency owner refill maximum must be positive"
+                );
+                self.graph_session(|m, s| {
+                    m.graph.owner_refill(
+                        s,
+                        physical_direction(direction),
+                        snapshot_seq,
+                        group_bound,
+                        normalized_labels,
+                        max_group_entries_examined,
+                    )
+                })
             };
         }
-
-        let state = self.state.read().unwrap();
-        let groups = match direction {
-            Direction::Outgoing => &state.ordered_adj_out_groups,
-            Direction::Incoming => &state.ordered_adj_in_groups,
-            Direction::Both => {
-                panic!("ordered adjacency owner refill requires a physical direction")
-            }
-        };
-        let mut range = groups.range((group_bound, Bound::Unbounded));
-        let mut last_group_key_examined = None;
-        let mut examined = 0usize;
-        while examined < max_group_entries_examined {
-            let Some((&key, group)) = range.next() else {
+        Ok((|| {
+            assert!(
+                max_group_entries_examined > 0,
+                "ordered adjacency owner refill maximum must be positive"
+            );
+            if normalized_labels.is_some_and(<[u32]>::is_empty) {
                 return MemtableAdjacencyOwnerRefill {
                     owner_head: None,
-                    last_group_key_examined,
-                    examined,
+                    last_group_key_examined: None,
+                    examined: 0,
                     exhausted: true,
                 };
-            };
-            examined += 1;
-            last_group_key_examined = Some(key);
-            let label_matches =
-                normalized_labels.is_none_or(|labels| labels.binary_search(&key.1).is_ok());
-            if label_matches && slot_option_visible(&group.membership, snapshot_seq) {
-                return MemtableAdjacencyOwnerRefill {
-                    owner_head: Some(key.0),
-                    last_group_key_examined,
-                    examined,
-                    exhausted: false,
-                };
             }
-        }
 
-        MemtableAdjacencyOwnerRefill {
-            owner_head: None,
-            last_group_key_examined,
-            examined,
-            exhausted: false,
-        }
+            let state = self.state.read().unwrap();
+            let groups = match direction {
+                Direction::Outgoing => &state.ordered_adj_out_groups,
+                Direction::Incoming => &state.ordered_adj_in_groups,
+                Direction::Both => {
+                    panic!("ordered adjacency owner refill requires a physical direction")
+                }
+            };
+            let mut range = groups.range((group_bound, Bound::Unbounded));
+            let mut last_group_key_examined = None;
+            let mut examined = 0usize;
+            while examined < max_group_entries_examined {
+                let Some((&key, group)) = range.next() else {
+                    return MemtableAdjacencyOwnerRefill {
+                        owner_head: None,
+                        last_group_key_examined,
+                        examined,
+                        exhausted: true,
+                    };
+                };
+                examined += 1;
+                last_group_key_examined = Some(key);
+                let label_matches =
+                    normalized_labels.is_none_or(|labels| labels.binary_search(&key.1).is_ok());
+                if label_matches && slot_option_visible(&group.membership, snapshot_seq) {
+                    return MemtableAdjacencyOwnerRefill {
+                        owner_head: Some(key.0),
+                        last_group_key_examined,
+                        examined,
+                        exhausted: false,
+                    };
+                }
+            }
+
+            MemtableAdjacencyOwnerRefill {
+                owner_head: None,
+                last_group_key_examined,
+                examined,
+                exhausted: false,
+            }
+        })())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4963,182 +6006,303 @@ impl Memtable {
         edge_bound: Bound<u64>,
         max_posting_slots_examined: usize,
         mut scratch: Vec<AdjEntry>,
-    ) -> MemtableAdjacencyPostingRefill {
-        assert!(
-            max_posting_slots_examined > 0,
-            "ordered adjacency posting refill maximum must be positive"
-        );
-        scratch.clear();
-        if normalized_labels.is_some_and(<[u32]>::is_empty) {
-            return MemtableAdjacencyPostingRefill {
-                entries: scratch,
-                last_edge_id_examined: None,
-                examined: 0,
-                exhausted: true,
+    ) -> Result<MemtableAdjacencyPostingRefill, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return {
+                assert!(
+                    max_posting_slots_examined > 0,
+                    "ordered adjacency posting refill maximum must be positive"
+                );
+                self.graph_session(|m, s| {
+                    m.graph.adj_refill(
+                        s,
+                        physical_direction(direction),
+                        owner_id,
+                        snapshot_seq,
+                        edge_bound,
+                        normalized_labels,
+                        max_posting_slots_examined,
+                        scratch,
+                    )
+                })
             };
         }
-        let state = self.state.read().unwrap();
-        let source = match direction {
-            Direction::Outgoing => &state.ordered_adj_out,
-            Direction::Incoming => &state.ordered_adj_in,
-            Direction::Both => {
-                panic!("ordered adjacency posting refill requires a physical direction")
-            }
-        };
-        let Some(entries) = source.get(&owner_id) else {
-            return MemtableAdjacencyPostingRefill {
-                entries: scratch,
-                last_edge_id_examined: None,
-                examined: 0,
-                exhausted: true,
-            };
-        };
-        let mut range = entries.range((edge_bound, Bound::Unbounded));
-        let mut last_edge_id_examined = None;
-        let mut examined = 0usize;
-        while examined < max_posting_slots_examined {
-            let Some((&edge_id, slot)) = range.next() else {
+        Ok((|| {
+            assert!(
+                max_posting_slots_examined > 0,
+                "ordered adjacency posting refill maximum must be positive"
+            );
+            scratch.clear();
+            if normalized_labels.is_some_and(<[u32]>::is_empty) {
                 return MemtableAdjacencyPostingRefill {
                     entries: scratch,
-                    last_edge_id_examined,
-                    examined,
+                    last_edge_id_examined: None,
+                    examined: 0,
+                    exhausted: true,
+                };
+            }
+            let state = self.state.read().unwrap();
+            let source = match direction {
+                Direction::Outgoing => &state.ordered_adj_out,
+                Direction::Incoming => &state.ordered_adj_in,
+                Direction::Both => {
+                    panic!("ordered adjacency posting refill requires a physical direction")
+                }
+            };
+            let Some(entries) = source.get(&owner_id) else {
+                return MemtableAdjacencyPostingRefill {
+                    entries: scratch,
+                    last_edge_id_examined: None,
+                    examined: 0,
                     exhausted: true,
                 };
             };
-            examined += 1;
-            last_edge_id_examined = Some(edge_id);
-            let Some(entry) = slot_option_at(slot, snapshot_seq) else {
-                continue;
-            };
-            if normalized_labels
-                .is_some_and(|labels| labels.binary_search(&entry.label_id).is_err())
-            {
-                continue;
-            }
-            scratch.push(entry.clone());
-        }
-
-        MemtableAdjacencyPostingRefill {
-            entries: scratch,
-            last_edge_id_examined,
-            examined,
-            exhausted: false,
-        }
-    }
-
-    pub fn nodes(&self) -> NodeIdMap<NodeRecord> {
-        let state = self.state.read().unwrap();
-        state
-            .nodes
-            .iter()
-            .filter_map(|(&id, slot)| record_current(slot).map(|node| (id, node.clone())))
-            .collect()
-    }
-
-    pub fn edges(&self) -> NodeIdMap<EdgeRecord> {
-        let state = self.state.read().unwrap();
-        state
-            .edges
-            .iter()
-            .filter_map(|(&id, slot)| record_current(slot).map(|edge| (id, edge.clone())))
-            .collect()
-    }
-
-    pub fn deleted_nodes(&self) -> NodeIdMap<TombstoneEntry> {
-        let state = self.state.read().unwrap();
-        state
-            .node_tombstones
-            .iter()
-            .filter_map(|(&id, _)| state.node_tombstone_current(id).map(|entry| (id, entry)))
-            .collect()
-    }
-
-    pub fn deleted_edges(&self) -> NodeIdMap<TombstoneEntry> {
-        let state = self.state.read().unwrap();
-        state
-            .edge_tombstones
-            .iter()
-            .filter_map(|(&id, _)| state.edge_tombstone_current(id).map(|entry| (id, entry)))
-            .collect()
-    }
-
-    pub fn adj_out(&self) -> NodeIdMap<NodeIdMap<AdjEntry>> {
-        let state = self.state.read().unwrap();
-        current_adj_map(&state.adj_out)
-    }
-
-    pub fn adj_in(&self) -> NodeIdMap<NodeIdMap<AdjEntry>> {
-        let state = self.state.read().unwrap();
-        current_adj_map(&state.adj_in)
-    }
-
-    pub(crate) fn node_label_posting_groups_current(&self) -> Vec<(u32, Vec<u64>)> {
-        let state = self.state.read().unwrap();
-        let mut groups = Vec::new();
-        let mut current_label_id = None;
-        let mut current_ids = Vec::new();
-
-        for (&(label_id, node_id), slot) in &state.label_node_index {
-            if current_label_id != Some(label_id) {
-                if !current_ids.is_empty() {
-                    groups.push((
-                        current_label_id.expect("label group is present"),
-                        std::mem::take(&mut current_ids),
-                    ));
+            let mut range = entries.range((edge_bound, Bound::Unbounded));
+            let mut last_edge_id_examined = None;
+            let mut examined = 0usize;
+            while examined < max_posting_slots_examined {
+                let Some((&edge_id, slot)) = range.next() else {
+                    return MemtableAdjacencyPostingRefill {
+                        entries: scratch,
+                        last_edge_id_examined,
+                        examined,
+                        exhausted: true,
+                    };
+                };
+                examined += 1;
+                last_edge_id_examined = Some(edge_id);
+                let Some(entry) = slot_option_at(slot, snapshot_seq) else {
+                    continue;
+                };
+                if normalized_labels
+                    .is_some_and(|labels| labels.binary_search(&entry.label_id).is_err())
+                {
+                    continue;
                 }
-                current_label_id = Some(label_id);
+                scratch.push(entry.clone());
             }
-            if slot_option_current(slot).is_some() {
-                current_ids.push(node_id);
-            }
-        }
 
-        if !current_ids.is_empty() {
-            groups.push((
-                current_label_id.expect("label group is present"),
-                current_ids,
-            ));
-        }
-        groups
+            MemtableAdjacencyPostingRefill {
+                entries: scratch,
+                last_edge_id_examined,
+                examined,
+                exhausted: false,
+            }
+        })())
     }
 
-    pub fn label_edge_index(&self) -> HashMap<u32, NodeIdSet> {
-        let state = self.state.read().unwrap();
-        current_label_membership_index(&state.label_edge_index)
+    pub fn nodes(&self) -> Result<NodeIdMap<NodeRecord>, EngineError> {
+        let state = self.primary_read()?;
+        let mut rows = NodeIdMap::default();
+        state.nodes_at(u64::MAX, |id, value| {
+            if let RecordState::Live(value) = value {
+                rows.insert(id, value.clone());
+            }
+        });
+        Ok(rows)
+    }
+
+    pub fn edges(&self) -> Result<NodeIdMap<EdgeRecord>, EngineError> {
+        let state = self.primary_read()?;
+        let mut rows = NodeIdMap::default();
+        state.edges_at(u64::MAX, |id, value| {
+            if let RecordState::Live(value) = value {
+                rows.insert(id, value.clone());
+            }
+        });
+        Ok(rows)
+    }
+
+    pub fn deleted_nodes(&self) -> Result<NodeIdMap<TombstoneEntry>, EngineError> {
+        let state = self.primary_read()?;
+        let mut rows = NodeIdMap::default();
+        state.nodes_at(u64::MAX, |id, value| {
+            if let RecordState::Tombstone(value) = value {
+                rows.insert(id, *value);
+            }
+        });
+        Ok(rows)
+    }
+
+    pub fn deleted_edges(&self) -> Result<NodeIdMap<TombstoneEntry>, EngineError> {
+        let state = self.primary_read()?;
+        let mut rows = NodeIdMap::default();
+        state.edges_at(u64::MAX, |id, value| {
+            if let RecordState::Tombstone(value) = value {
+                rows.insert(id, *value);
+            }
+        });
+        Ok(rows)
+    }
+
+    pub fn adj_out(&self) -> Result<NodeIdMap<NodeIdMap<AdjEntry>>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_export_adj(0);
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            current_adj_map(&state.adj_out)
+        })
+    }
+
+    pub fn adj_in(&self) -> Result<NodeIdMap<NodeIdMap<AdjEntry>>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_export_adj(1);
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            current_adj_map(&state.adj_in)
+        })
+    }
+
+    pub(crate) fn node_label_posting_groups_current(
+        &self,
+    ) -> Result<Vec<(u32, Vec<u64>)>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return {
+                let mut groups: Vec<(u32, Vec<u64>)> = Vec::new();
+                for (label, id) in self.graph_labels(0, None, u64::MAX)? {
+                    if groups.last().is_none_or(|g| g.0 != label) {
+                        groups.push((label, Vec::new()));
+                    }
+                    groups.last_mut().unwrap().1.push(id);
+                }
+                Ok(groups)
+            };
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            let mut groups = Vec::new();
+            let mut current_label_id = None;
+            let mut current_ids = Vec::new();
+
+            for (&(label_id, node_id), slot) in &state.label_node_index {
+                if current_label_id != Some(label_id) {
+                    if !current_ids.is_empty() {
+                        groups.push((
+                            current_label_id.expect("label group is present"),
+                            std::mem::take(&mut current_ids),
+                        ));
+                    }
+                    current_label_id = Some(label_id);
+                }
+                if slot_option_current(slot).is_some() {
+                    current_ids.push(node_id);
+                }
+            }
+
+            if !current_ids.is_empty() {
+                groups.push((
+                    current_label_id.expect("label group is present"),
+                    current_ids,
+                ));
+            }
+            groups
+        })
+    }
+
+    pub fn label_edge_index(&self) -> Result<HashMap<u32, NodeIdSet>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return {
+                let mut groups = HashMap::new();
+                for (label, id) in self.graph_labels(1, None, u64::MAX)? {
+                    groups
+                        .entry(label)
+                        .or_insert_with(NodeIdSet::default)
+                        .insert(id);
+                }
+                Ok(groups)
+            };
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            current_label_membership_index(&state.label_edge_index)
+        })
     }
 
     pub fn secondary_index_declarations(&self) -> HashMap<u64, SecondaryIndexManifestEntry> {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(m) = &self.primary {
+            return m
+                .secondary
+                .catalog
+                .dispatch
+                .secondary_index_declarations
+                .clone();
+        }
+
         let state = self.state.read().unwrap();
-        state.secondary_index_declarations.clone()
+        state.catalog.secondary_index_declarations.clone()
     }
 
-    pub fn secondary_eq_state(&self) -> HashMap<u64, HashMap<u64, NodeIdSet>> {
-        let state = self.state.read().unwrap();
-        current_secondary_eq_state(&state.secondary_eq_state)
+    pub fn secondary_eq_state(&self) -> Result<HashMap<u64, HashMap<u64, NodeIdSet>>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.candidate_export_eq();
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            current_secondary_eq_state(&state.secondary_eq_state)
+        })
     }
 
-    pub fn secondary_range_state(&self) -> HashMap<u64, BTreeSet<(NumericRangeSortKey, u64)>> {
-        let state = self.state.read().unwrap();
-        current_secondary_range_state(&state.secondary_range_state)
+    pub fn secondary_range_state(
+        &self,
+    ) -> Result<HashMap<u64, BTreeSet<(NumericRangeSortKey, u64)>>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.candidate_export_range();
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            current_secondary_range_state(&state.secondary_range_state)
+        })
     }
 
     #[cfg(test)]
-    pub(crate) fn compound_secondary_state(&self) -> HashMap<u64, BTreeSet<(Vec<u8>, u64)>> {
-        let state = self.state.read().unwrap();
-        current_compound_secondary_state(&state.secondary_compound_state)
+    pub(crate) fn compound_secondary_state(
+        &self,
+    ) -> Result<CompoundSecondaryTestState, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.candidate_export_compound(None).map(|m| {
+                m.into_iter()
+                    .map(|(i, rows)| (i, rows.into_iter().collect()))
+                    .collect()
+            });
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            current_compound_secondary_state(&state.secondary_compound_state)
+        })
     }
 
     pub(crate) fn compound_secondary_state_for_indexes(
         &self,
         index_ids: &[u64],
-    ) -> HashMap<u64, Vec<(Vec<u8>, u64)>> {
-        let state = self.state.read().unwrap();
-        current_compound_secondary_state_for_indexes(&state.secondary_compound_state, index_ids)
+    ) -> Result<secondary::CompoundSecondaryExport, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.candidate_export_compound(Some(index_ids));
+        }
+        Ok({
+            let state = self.state.read().unwrap();
+            current_compound_secondary_state_for_indexes(&state.secondary_compound_state, index_ids)
+        })
     }
 
-    pub fn time_node_index(&self) -> BTreeSet<(u32, i64, u64)> {
+    pub fn time_node_index(&self) -> Result<BTreeSet<(u32, i64, u64)>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.primary.is_some() {
+            return self.graph_export_time();
+        }
         let state = self.state.read().unwrap();
-        current_time_index(&state.time_node_index)
+        Ok(current_time_index(&state.time_node_index))
     }
 
     fn estimate_node_record(node: &NodeRecord) -> usize {
@@ -5175,26 +6339,63 @@ impl Memtable {
 
     pub fn estimated_size(&self) -> usize {
         let state = self.state.read().unwrap();
-        state.estimated_bytes
+        state.estimated_bytes + {
+            #[cfg(feature = "production-concurrency")]
+            {
+                self.primary.as_ref().map_or(0, |m| {
+                    m.estimated.load(std::sync::atomic::Ordering::Relaxed)
+                        + m.graph.estimated()
+                        + m.secondary.estimated()
+                })
+            }
+            #[cfg(not(feature = "production-concurrency"))]
+            {
+                0
+            }
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn estimated_size_full_for_test(&self) -> usize {
         let state = self.state.read().unwrap();
-        state.recompute_estimated_size()
+        let derived = state.recompute_estimated_size();
+        #[cfg(feature = "production-concurrency")]
+        if let Some(primary) = &self.primary {
+            let session = primary.admission.try_acquire().unwrap();
+            return derived
+                + primary.estimated_size_full_for_test()
+                + primary.secondary.estimated_full(&session);
+        }
+        derived
     }
 
     pub fn is_empty(&self) -> bool {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(m) = &self.primary {
+            return m.node_ids.load(std::sync::atomic::Ordering::Relaxed) == 0
+                && m.edge_ids.load(std::sync::atomic::Ordering::Relaxed) == 0;
+        }
+
         let state = self.state.read().unwrap();
         state.nodes.is_empty() && state.edges.is_empty()
     }
 
     pub fn max_node_id(&self) -> u64 {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(m) = &self.primary {
+            return m.max_node.load(std::sync::atomic::Ordering::Relaxed);
+        }
+
         let state = self.state.read().unwrap();
         state.nodes.keys().max().copied().unwrap_or(0)
     }
 
     pub fn max_edge_id(&self) -> u64 {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(m) = &self.primary {
+            return m.max_edge.load(std::sync::atomic::Ordering::Relaxed);
+        }
+
         let state = self.state.read().unwrap();
         state.edges.keys().max().copied().unwrap_or(0)
     }
@@ -5203,7 +6404,7 @@ impl Memtable {
 #[cfg(test)]
 impl Memtable {
     fn label_node_index_key_count(&self) -> usize {
-        self.node_label_posting_groups_current().len()
+        self.node_label_posting_groups_current().unwrap().len()
     }
 
     fn node_key_index_key_count(&self) -> usize {
@@ -5220,7 +6421,7 @@ impl Memtable {
     }
 
     fn time_node_index_len(&self) -> usize {
-        self.time_node_index().len()
+        self.time_node_index().unwrap().len()
     }
 }
 
@@ -5383,10 +6584,19 @@ mod tests {
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 1);
         mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 10)), 2);
 
-        assert_eq!(mt.get_node_at(1, u64::MAX).unwrap().key, "alice");
-        assert_eq!(mt.get_edge_at(1, u64::MAX).unwrap().from, 1);
-        assert_eq!(mt.node_by_key_at(1, "alice", u64::MAX).unwrap().id, 1);
-        assert_eq!(mt.edge_by_triple_at(1, 2, 10, u64::MAX).unwrap().id, 1);
+        assert_eq!(mt.get_node_at(1, u64::MAX).unwrap().unwrap().key, "alice");
+        assert_eq!(mt.get_edge_at(1, u64::MAX).unwrap().unwrap().from, 1);
+        assert_eq!(
+            mt.node_by_key_at(1, "alice", u64::MAX).unwrap().unwrap().id,
+            1
+        );
+        assert_eq!(
+            mt.edge_by_triple_at(1, 2, 10, u64::MAX)
+                .unwrap()
+                .unwrap()
+                .id,
+            1
+        );
     }
 
     #[test]
@@ -5401,7 +6611,7 @@ mod tests {
         mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)), 3);
         assert_eq!(mt.node_count(), 2);
         assert_eq!(mt.edge_count(), 1);
-        assert_eq!(mt.visible_node_count_at(2), 2);
+        assert_eq!(mt.visible_node_count_at(2).unwrap(), 2);
 
         mt.apply_op(
             &WalOp::DeleteNode {
@@ -5419,15 +6629,15 @@ mod tests {
         );
         assert_eq!(mt.node_count(), 1);
         assert_eq!(mt.edge_count(), 0);
-        assert_eq!(mt.visible_node_count_at(2), 2);
-        assert_eq!(mt.visible_node_count_at(4), 1);
+        assert_eq!(mt.visible_node_count_at(2).unwrap(), 2);
+        assert_eq!(mt.visible_node_count_at(4).unwrap(), 1);
 
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a2")), 6);
         mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)), 7);
         assert_eq!(mt.node_count(), 2);
         assert_eq!(mt.edge_count(), 1);
-        assert_eq!(mt.visible_node_count_at(4), 1);
-        assert_eq!(mt.visible_node_count_at(6), 2);
+        assert_eq!(mt.visible_node_count_at(4).unwrap(), 1);
+        assert_eq!(mt.visible_node_count_at(6).unwrap(), 2);
 
         mt.apply_op(
             &WalOp::DeleteNode {
@@ -5490,18 +6700,21 @@ mod tests {
     #[test]
     fn edge_label_posting_upper_bound_is_snapshot_safe_and_slot_stable() {
         let mt = Memtable::new();
-        let visible_count =
-            |label_id, snapshot_seq| mt.visible_edges_by_label_id(label_id, snapshot_seq).len();
+        let visible_count = |label_id, snapshot_seq| {
+            mt.visible_edges_by_label_id(label_id, snapshot_seq)
+                .unwrap()
+                .len()
+        };
 
-        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 0);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5).unwrap(), 0);
         mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)), 1);
-        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 1);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5).unwrap(), 1);
         assert_eq!(visible_count(5, 1), 1);
 
         let mut same_label = make_edge(10, 1, 2, 5);
         same_label.weight = 2.0;
         mt.apply_op(&WalOp::UpsertEdge(same_label), 2);
-        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 1);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5).unwrap(), 1);
         assert_eq!(visible_count(5, 1), 1);
         assert_eq!(visible_count(5, 2), 1);
 
@@ -5512,37 +6725,39 @@ mod tests {
             },
             3,
         );
-        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 1);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5).unwrap(), 1);
         assert_eq!(visible_count(5, 1), 1);
         assert_eq!(visible_count(5, 3), 0);
 
         mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)), 4);
-        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 1);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5).unwrap(), 1);
         assert_eq!(visible_count(5, 3), 0);
         assert_eq!(visible_count(5, 4), 1);
 
         mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 6)), 5);
-        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 1);
-        assert_eq!(mt.edge_label_posting_count_upper_bound(6), 1);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5).unwrap(), 1);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(6).unwrap(), 1);
         assert_eq!(visible_count(5, 4), 1);
         assert_eq!(visible_count(5, 5), 0);
         assert_eq!(visible_count(6, 5), 1);
 
         mt.apply_op(&WalOp::UpsertEdge(make_edge(10, 1, 2, 5)), 6);
-        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 1);
-        assert_eq!(mt.edge_label_posting_count_upper_bound(6), 1);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5).unwrap(), 1);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(6).unwrap(), 1);
         assert_eq!(visible_count(5, 6), 1);
         assert_eq!(visible_count(6, 6), 0);
 
         mt.apply_op(&WalOp::UpsertEdge(make_edge(11, 1, 3, 5)), 7);
-        assert_eq!(mt.edge_label_posting_count_upper_bound(5), 2);
+        assert_eq!(mt.edge_label_posting_count_upper_bound(5).unwrap(), 2);
         for snapshot_seq in 0..=7 {
             assert!(
-                mt.edge_label_posting_count_upper_bound(5) >= visible_count(5, snapshot_seq),
+                mt.edge_label_posting_count_upper_bound(5).unwrap()
+                    >= visible_count(5, snapshot_seq),
                 "posting count must bound label 5 at snapshot {snapshot_seq}"
             );
             assert!(
-                mt.edge_label_posting_count_upper_bound(6) >= visible_count(6, snapshot_seq),
+                mt.edge_label_posting_count_upper_bound(6).unwrap()
+                    >= visible_count(6, snapshot_seq),
                 "posting count must bound label 6 at snapshot {snapshot_seq}"
             );
         }
@@ -5576,11 +6791,12 @@ mod tests {
             4,
         );
 
-        assert_eq!(mt.visible_edge_ids_at(3), vec![10, 11, 12]);
-        assert_eq!(mt.visible_edge_ids_at(4), vec![10, 11]);
-        assert_eq!(mt.visible_edges_by_label_id(5, 4), vec![10, 11]);
+        assert_eq!(mt.visible_edge_ids_at(3).unwrap(), vec![10, 11, 12]);
+        assert_eq!(mt.visible_edge_ids_at(4).unwrap(), vec![10, 11]);
+        assert_eq!(mt.visible_edges_by_label_id(5, 4).unwrap(), vec![10, 11]);
         let mut outgoing_ids = mt
             .neighbors_batch_at(&[1], Direction::Outgoing, Some(&[5]), 4)
+            .unwrap()
             .into_values()
             .flatten()
             .map(|entry| entry.edge_id)
@@ -5589,6 +6805,7 @@ mod tests {
         assert_eq!(outgoing_ids, vec![10, 11]);
         let mut both_ids = mt
             .neighbors_batch_at(&[1], Direction::Both, None, 4)
+            .unwrap()
             .into_values()
             .flatten()
             .map(|entry| entry.edge_id)
@@ -5596,7 +6813,7 @@ mod tests {
         both_ids.sort_unstable();
         both_ids.dedup();
         assert_eq!(both_ids, vec![10, 11]);
-        assert_eq!(mt.edge_ids_by_triple_at(1, 2, 5, 4), vec![10]);
+        assert_eq!(mt.edge_ids_by_triple_at(1, 2, 5, 4).unwrap(), vec![10]);
         assert_eq!(
             mt.edge_ids_by_weight_range_at(
                 Some(5),
@@ -5642,10 +6859,13 @@ mod tests {
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice")), 10);
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice_v2")), 20);
 
-        assert_eq!(mt.get_node_at(1, 10).unwrap().key, "alice");
-        assert_eq!(mt.get_node_at(1, 19).unwrap().key, "alice");
-        assert_eq!(mt.get_node_at(1, 20).unwrap().key, "alice_v2");
-        assert_eq!(mt.get_node_at(1, u64::MAX).unwrap().key, "alice_v2");
+        assert_eq!(mt.get_node_at(1, 10).unwrap().unwrap().key, "alice");
+        assert_eq!(mt.get_node_at(1, 19).unwrap().unwrap().key, "alice");
+        assert_eq!(mt.get_node_at(1, 20).unwrap().unwrap().key, "alice_v2");
+        assert_eq!(
+            mt.get_node_at(1, u64::MAX).unwrap().unwrap().key,
+            "alice_v2"
+        );
     }
 
     #[test]
@@ -5660,12 +6880,15 @@ mod tests {
             6,
         );
 
-        assert!(mt.get_node_at(1, u64::MAX).is_none());
-        assert_eq!(mt.get_node_at(1, 5).unwrap().key, "alice");
-        assert!(mt.get_node_at(1, 6).is_none());
-        assert!(mt.is_node_deleted_at(1, 6));
-        assert!(!mt.is_node_deleted_at(1, 5));
-        assert_eq!(mt.deleted_nodes().get(&1).unwrap().last_write_seq, 6);
+        assert!(mt.get_node_at(1, u64::MAX).unwrap().is_none());
+        assert_eq!(mt.get_node_at(1, 5).unwrap().unwrap().key, "alice");
+        assert!(mt.get_node_at(1, 6).unwrap().is_none());
+        assert!(mt.is_node_deleted_at(1, 6).unwrap());
+        assert!(!mt.is_node_deleted_at(1, 5).unwrap());
+        assert_eq!(
+            mt.deleted_nodes().unwrap().get(&1).unwrap().last_write_seq,
+            6
+        );
     }
 
     #[test]
@@ -5681,13 +6904,16 @@ mod tests {
         );
         mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "alice_v2")), 3);
 
-        assert!(mt.collect_deleted_nodes_at(1).is_empty());
-        assert_eq!(mt.collect_deleted_nodes_at(2), NodeIdSet::from_iter([1]));
-        assert!(mt.collect_deleted_nodes_at(3).is_empty());
-        assert!(mt.deleted_nodes().is_empty());
-        assert!(!mt.is_node_deleted_at(3, 3));
-        assert_eq!(mt.get_node_at(1, 1).unwrap().key, "alice");
-        assert_eq!(mt.get_node_at(1, 3).unwrap().key, "alice_v2");
+        assert!(mt.collect_deleted_nodes_at(1).unwrap().is_empty());
+        assert_eq!(
+            mt.collect_deleted_nodes_at(2).unwrap(),
+            NodeIdSet::from_iter([1])
+        );
+        assert!(mt.collect_deleted_nodes_at(3).unwrap().is_empty());
+        assert!(mt.deleted_nodes().unwrap().is_empty());
+        assert!(!mt.is_node_deleted_at(3, 3).unwrap());
+        assert_eq!(mt.get_node_at(1, 1).unwrap().unwrap().key, "alice");
+        assert_eq!(mt.get_node_at(1, 3).unwrap().unwrap().key, "alice_v2");
     }
 
     #[test]
@@ -5703,12 +6929,15 @@ mod tests {
         );
         mt.apply_op(&WalOp::UpsertEdge(make_edge(9, 1, 3, 7)), 3);
 
-        assert!(mt.collect_deleted_edges_at(1).is_empty());
-        assert_eq!(mt.collect_deleted_edges_at(2), NodeIdSet::from_iter([9]));
-        assert!(mt.collect_deleted_edges_at(3).is_empty());
-        assert!(mt.deleted_edges().is_empty());
-        assert!(!mt.is_edge_deleted_at(9, 3));
-        assert_eq!(mt.get_edge_at(9, 3).unwrap().to, 3);
+        assert!(mt.collect_deleted_edges_at(1).unwrap().is_empty());
+        assert_eq!(
+            mt.collect_deleted_edges_at(2).unwrap(),
+            NodeIdSet::from_iter([9])
+        );
+        assert!(mt.collect_deleted_edges_at(3).unwrap().is_empty());
+        assert!(mt.deleted_edges().unwrap().is_empty());
+        assert!(!mt.is_edge_deleted_at(9, 3).unwrap());
+        assert_eq!(mt.get_edge_at(9, 3).unwrap().unwrap().to, 3);
     }
 
     #[test]
@@ -5724,10 +6953,13 @@ mod tests {
         );
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 1, "alice")), 3);
 
-        assert_eq!(mt.node_by_key_at(1, "alice", 1).unwrap().id, 1);
-        assert!(mt.node_by_key_at(1, "alice", 2).is_none());
-        assert_eq!(mt.node_by_key_at(1, "alice", 3).unwrap().id, 2);
-        assert_eq!(mt.node_by_key_at(1, "alice", u64::MAX).unwrap().id, 2);
+        assert_eq!(mt.node_by_key_at(1, "alice", 1).unwrap().unwrap().id, 1);
+        assert!(mt.node_by_key_at(1, "alice", 2).unwrap().is_none());
+        assert_eq!(mt.node_by_key_at(1, "alice", 3).unwrap().unwrap().id, 2);
+        assert_eq!(
+            mt.node_by_key_at(1, "alice", u64::MAX).unwrap().unwrap().id,
+            2
+        );
     }
 
     #[test]
@@ -5744,13 +6976,14 @@ mod tests {
             4,
         );
 
-        assert_eq!(mt.visible_edges_by_label_id(10, 3), vec![1]);
-        assert!(mt.visible_edges_by_label_id(10, 4).is_empty());
-        let before_delete = mt.neighbors_at(1, Direction::Outgoing, None, 0, 3);
+        assert_eq!(mt.visible_edges_by_label_id(10, 3).unwrap(), vec![1]);
+        assert!(mt.visible_edges_by_label_id(10, 4).unwrap().is_empty());
+        let before_delete = mt.neighbors_at(1, Direction::Outgoing, None, 0, 3).unwrap();
         assert_eq!(before_delete.len(), 1);
         assert_eq!(before_delete[0].node_id, 2);
         assert!(mt
             .neighbors_at(1, Direction::Outgoing, None, 0, 4)
+            .unwrap()
             .is_empty());
     }
 
@@ -5767,30 +7000,42 @@ mod tests {
             for &node_id in node_ids {
                 match direction {
                     Direction::Outgoing => {
-                        estimate.add_assign(mt.visible_edges_from_endpoint_count_estimate(
-                            node_id,
-                            label_filter_ids,
-                            snapshot_seq,
-                        ));
+                        estimate.add_assign(
+                            mt.visible_edges_from_endpoint_count_estimate(
+                                node_id,
+                                label_filter_ids,
+                                snapshot_seq,
+                            )
+                            .unwrap(),
+                        );
                     }
                     Direction::Incoming => {
-                        estimate.add_assign(mt.visible_edges_to_endpoint_count_estimate(
-                            node_id,
-                            label_filter_ids,
-                            snapshot_seq,
-                        ));
+                        estimate.add_assign(
+                            mt.visible_edges_to_endpoint_count_estimate(
+                                node_id,
+                                label_filter_ids,
+                                snapshot_seq,
+                            )
+                            .unwrap(),
+                        );
                     }
                     Direction::Both => {
-                        estimate.add_assign(mt.visible_edges_from_endpoint_count_estimate(
-                            node_id,
-                            label_filter_ids,
-                            snapshot_seq,
-                        ));
-                        estimate.add_assign(mt.visible_edges_to_endpoint_count_estimate(
-                            node_id,
-                            label_filter_ids,
-                            snapshot_seq,
-                        ));
+                        estimate.add_assign(
+                            mt.visible_edges_from_endpoint_count_estimate(
+                                node_id,
+                                label_filter_ids,
+                                snapshot_seq,
+                            )
+                            .unwrap(),
+                        );
+                        estimate.add_assign(
+                            mt.visible_edges_to_endpoint_count_estimate(
+                                node_id,
+                                label_filter_ids,
+                                snapshot_seq,
+                            )
+                            .unwrap(),
+                        );
                     }
                 }
             }
@@ -5833,12 +7078,14 @@ mod tests {
         for snapshot_seq in 0..=10 {
             for direction in [Direction::Outgoing, Direction::Incoming, Direction::Both] {
                 for label_filter_ids in label_filters {
-                    let batch = mt.visible_endpoint_edges_count_estimate_at(
-                        &node_ids,
-                        direction,
-                        label_filter_ids,
-                        snapshot_seq,
-                    );
+                    let batch = mt
+                        .visible_endpoint_edges_count_estimate_at(
+                            &node_ids,
+                            direction,
+                            label_filter_ids,
+                            snapshot_seq,
+                        )
+                        .unwrap();
                     let scalar = scalar_endpoint_estimate(
                         &mt,
                         &node_ids,
@@ -5879,28 +7126,43 @@ mod tests {
             8,
         );
 
-        assert_eq!(mt.next_visible_adj_edge_ge(1, true, None, 6, 10), Some(10));
         assert_eq!(
-            mt.next_visible_adj_edge_ge(1, true, Some(7), 6, 10),
+            mt.next_visible_adj_edge_ge(1, true, None, 6, 10).unwrap(),
             Some(10)
         );
         assert_eq!(
-            mt.next_visible_adj_edge_ge(1, true, Some(8), 6, 10),
+            mt.next_visible_adj_edge_ge(1, true, Some(7), 6, 10)
+                .unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            mt.next_visible_adj_edge_ge(1, true, Some(8), 6, 10)
+                .unwrap(),
             Some(12)
         );
         assert_eq!(
-            mt.next_visible_adj_edge_ge(1, true, Some(7), 6, 11),
+            mt.next_visible_adj_edge_ge(1, true, Some(7), 6, 11)
+                .unwrap(),
             Some(14)
         );
 
-        assert_eq!(mt.next_visible_adj_edge_ge(1, true, None, 8, 10), Some(14));
-        assert_eq!(mt.next_visible_adj_edge_ge(1, true, Some(8), 8, 10), None);
         assert_eq!(
-            mt.next_visible_adj_edge_ge(2, false, Some(7), 8, 0),
+            mt.next_visible_adj_edge_ge(1, true, None, 8, 10).unwrap(),
             Some(14)
         );
         assert_eq!(
-            mt.next_visible_adj_edge_ge(1, true, None, 8, u64::MAX),
+            mt.next_visible_adj_edge_ge(1, true, Some(8), 8, 10)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            mt.next_visible_adj_edge_ge(2, false, Some(7), 8, 0)
+                .unwrap(),
+            Some(14)
+        );
+        assert_eq!(
+            mt.next_visible_adj_edge_ge(1, true, None, 8, u64::MAX)
+                .unwrap(),
             None
         );
     }
@@ -5911,9 +7173,18 @@ mod tests {
         mt.apply_op(&WalOp::UpsertNode(make_node_at(1, 1, "a", 100)), 1);
         mt.apply_op(&WalOp::UpsertNode(make_node_at(1, 1, "a", 200)), 2);
 
-        assert_eq!(mt.visible_nodes_by_time_range(1, 50, 150, 1), vec![1]);
-        assert!(mt.visible_nodes_by_time_range(1, 50, 150, 2).is_empty());
-        assert_eq!(mt.visible_nodes_by_time_range(1, 150, 250, 2), vec![1]);
+        assert_eq!(
+            mt.visible_nodes_by_time_range(1, 50, 150, 1).unwrap(),
+            vec![1]
+        );
+        assert!(mt
+            .visible_nodes_by_time_range(1, 50, 150, 2)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            mt.visible_nodes_by_time_range(1, 150, 250, 2).unwrap(),
+            vec![1]
+        );
     }
 
     #[test]
@@ -5933,8 +7204,10 @@ mod tests {
         for snapshot_seq in 1..=4 {
             for (from_ms, to_ms) in [(0, 500), (50, 175), (250, 350), (500, 0)] {
                 assert_eq!(
-                    mt.visible_node_time_range_count_at(1, from_ms, to_ms, snapshot_seq),
+                    mt.visible_node_time_range_count_at(1, from_ms, to_ms, snapshot_seq)
+                        .unwrap(),
                     mt.visible_nodes_by_time_range(1, from_ms, to_ms, snapshot_seq)
+                        .unwrap()
                         .len(),
                     "snapshot={snapshot_seq}, range={from_ms}..={to_ms}"
                 );
@@ -5952,17 +7225,20 @@ mod tests {
 
         for label_id in [1, 2, 5] {
             assert_eq!(
-                mt.node_by_key_at(label_id, "alice", 1).map(|node| node.id),
+                mt.node_by_key_at(label_id, "alice", 1)
+                    .unwrap()
+                    .map(|node| node.id),
                 Some(1)
             );
-            assert_eq!(mt.visible_nodes_by_label_id(label_id, 1), vec![1]);
+            assert_eq!(mt.visible_nodes_by_label_id(label_id, 1).unwrap(), vec![1]);
             assert_eq!(
-                mt.visible_nodes_by_time_range(label_id, 100, 100, 1),
+                mt.visible_nodes_by_time_range(label_id, 100, 100, 1)
+                    .unwrap(),
                 vec![1]
             );
         }
-        assert!(mt.node_by_key_at(9, "alice", 1).is_none());
-        assert!(mt.visible_nodes_by_label_id(9, 1).is_empty());
+        assert!(mt.node_by_key_at(9, "alice", 1).unwrap().is_none());
+        assert!(mt.visible_nodes_by_label_id(9, 1).unwrap().is_empty());
 
         mt.apply_op(
             &WalOp::UpsertNode(make_node_with_labels(1, &[2, 5, 9], "alice", 200)),
@@ -5970,24 +7246,33 @@ mod tests {
         );
 
         assert_eq!(
-            mt.node_by_key_at(1, "alice", 1).map(|node| node.id),
+            mt.node_by_key_at(1, "alice", 1)
+                .unwrap()
+                .map(|node| node.id),
             Some(1)
         );
-        assert!(mt.node_by_key_at(1, "alice", 2).is_none());
-        assert!(mt.visible_nodes_by_label_id(1, 2).is_empty());
-        assert!(mt.visible_nodes_by_time_range(1, 100, 100, 2).is_empty());
+        assert!(mt.node_by_key_at(1, "alice", 2).unwrap().is_none());
+        assert!(mt.visible_nodes_by_label_id(1, 2).unwrap().is_empty());
+        assert!(mt
+            .visible_nodes_by_time_range(1, 100, 100, 2)
+            .unwrap()
+            .is_empty());
 
         for label_id in [2, 5, 9] {
             assert_eq!(
-                mt.node_by_key_at(label_id, "alice", 2).map(|node| node.id),
+                mt.node_by_key_at(label_id, "alice", 2)
+                    .unwrap()
+                    .map(|node| node.id),
                 Some(1)
             );
-            assert_eq!(mt.visible_nodes_by_label_id(label_id, 2), vec![1]);
+            assert_eq!(mt.visible_nodes_by_label_id(label_id, 2).unwrap(), vec![1]);
             assert!(mt
                 .visible_nodes_by_time_range(label_id, 100, 100, 2)
+                .unwrap()
                 .is_empty());
             assert_eq!(
-                mt.visible_nodes_by_time_range(label_id, 200, 200, 2),
+                mt.visible_nodes_by_time_range(label_id, 200, 200, 2)
+                    .unwrap(),
                 vec![1]
             );
         }
@@ -6000,10 +7285,14 @@ mod tests {
             3,
         );
         for label_id in [2, 5, 9] {
-            assert!(mt.node_by_key_at(label_id, "alice", 3).is_none());
-            assert!(mt.visible_nodes_by_label_id(label_id, 3).is_empty());
+            assert!(mt.node_by_key_at(label_id, "alice", 3).unwrap().is_none());
+            assert!(mt
+                .visible_nodes_by_label_id(label_id, 3)
+                .unwrap()
+                .is_empty());
             assert!(mt
                 .visible_nodes_by_time_range(label_id, 200, 200, 3)
+                .unwrap()
                 .is_empty());
         }
     }
@@ -6022,17 +7311,21 @@ mod tests {
             4,
         );
 
-        assert_eq!(mt.visible_nodes_by_label_id(1, 2), vec![1, 3]);
-        assert_eq!(mt.next_visible_node_by_label_id_after(1, 2, None), Some(1));
+        assert_eq!(mt.visible_nodes_by_label_id(1, 2).unwrap(), vec![1, 3]);
         assert_eq!(
-            mt.next_visible_node_by_label_id_after(1, 2, Some(1)),
+            mt.next_visible_node_by_label_id_after(1, 2, None).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            mt.next_visible_node_by_label_id_after(1, 2, Some(1))
+                .unwrap(),
             Some(3)
         );
-        assert_eq!(mt.visible_nodes_by_label_id(1, 4), vec![3]);
-        assert_eq!(mt.visible_nodes_by_label_id(2, 4), vec![1, 2]);
-        assert_eq!(mt.visible_node_label_ids(4), vec![1, 2, 3]);
+        assert_eq!(mt.visible_nodes_by_label_id(1, 4).unwrap(), vec![3]);
+        assert_eq!(mt.visible_nodes_by_label_id(2, 4).unwrap(), vec![1, 2]);
+        assert_eq!(mt.visible_node_label_ids(4).unwrap(), vec![1, 2, 3]);
         assert_eq!(
-            mt.node_label_posting_groups_current(),
+            mt.node_label_posting_groups_current().unwrap(),
             vec![(1, vec![3]), (2, vec![1, 2]), (3, vec![1])]
         );
 
@@ -6044,18 +7337,26 @@ mod tests {
             5,
         );
 
-        assert!(mt.visible_nodes_by_label_id(1, 5).is_empty());
-        assert_eq!(mt.visible_node_label_ids(5), vec![2, 3]);
+        assert!(mt.visible_nodes_by_label_id(1, 5).unwrap().is_empty());
+        assert_eq!(mt.visible_node_label_ids(5).unwrap(), vec![2, 3]);
         assert_eq!(
-            mt.node_label_posting_groups_current(),
+            mt.node_label_posting_groups_current().unwrap(),
             vec![(2, vec![1, 2]), (3, vec![1])]
         );
-        assert_eq!(mt.next_visible_node_by_label_id_after(2, 5, None), Some(1));
         assert_eq!(
-            mt.next_visible_node_by_label_id_after(2, 5, Some(1)),
+            mt.next_visible_node_by_label_id_after(2, 5, None).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            mt.next_visible_node_by_label_id_after(2, 5, Some(1))
+                .unwrap(),
             Some(2)
         );
-        assert_eq!(mt.next_visible_node_by_label_id_after(2, 5, Some(2)), None);
+        assert_eq!(
+            mt.next_visible_node_by_label_id_after(2, 5, Some(2))
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -6074,17 +7375,41 @@ mod tests {
         );
         mt.apply_op(&WalOp::UpsertNode(make_node(2, 7, "d")), 6);
 
-        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 3, 0), Some(1));
-        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 3, 1), Some(1));
-        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 3, 2), Some(3));
-        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 3, 3), Some(3));
-        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 3, 4), Some(5));
-        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 3, 5), Some(5));
-        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 3, 6), None);
+        assert_eq!(
+            mt.next_visible_node_by_label_id_ge(7, 3, 0).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            mt.next_visible_node_by_label_id_ge(7, 3, 1).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            mt.next_visible_node_by_label_id_ge(7, 3, 2).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            mt.next_visible_node_by_label_id_ge(7, 3, 3).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            mt.next_visible_node_by_label_id_ge(7, 3, 4).unwrap(),
+            Some(5)
+        );
+        assert_eq!(
+            mt.next_visible_node_by_label_id_ge(7, 3, 5).unwrap(),
+            Some(5)
+        );
+        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 3, 6).unwrap(), None);
 
-        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 4, 2), Some(5));
-        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 5, 2), None);
-        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 6, 2), Some(2));
+        assert_eq!(
+            mt.next_visible_node_by_label_id_ge(7, 4, 2).unwrap(),
+            Some(5)
+        );
+        assert_eq!(mt.next_visible_node_by_label_id_ge(7, 5, 2).unwrap(), None);
+        assert_eq!(
+            mt.next_visible_node_by_label_id_ge(7, 6, 2).unwrap(),
+            Some(2)
+        );
     }
 
     #[test]
@@ -6103,17 +7428,41 @@ mod tests {
         );
         mt.apply_op(&WalOp::UpsertEdge(make_edge(2, 1, 2, 7)), 6);
 
-        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 3, 0), Some(1));
-        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 3, 1), Some(1));
-        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 3, 2), Some(3));
-        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 3, 3), Some(3));
-        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 3, 4), Some(5));
-        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 3, 5), Some(5));
-        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 3, 6), None);
+        assert_eq!(
+            mt.next_visible_edge_by_label_id_ge(7, 3, 0).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            mt.next_visible_edge_by_label_id_ge(7, 3, 1).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            mt.next_visible_edge_by_label_id_ge(7, 3, 2).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            mt.next_visible_edge_by_label_id_ge(7, 3, 3).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            mt.next_visible_edge_by_label_id_ge(7, 3, 4).unwrap(),
+            Some(5)
+        );
+        assert_eq!(
+            mt.next_visible_edge_by_label_id_ge(7, 3, 5).unwrap(),
+            Some(5)
+        );
+        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 3, 6).unwrap(), None);
 
-        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 4, 2), Some(5));
-        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 5, 2), None);
-        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 6, 2), Some(2));
+        assert_eq!(
+            mt.next_visible_edge_by_label_id_ge(7, 4, 2).unwrap(),
+            Some(5)
+        );
+        assert_eq!(mt.next_visible_edge_by_label_id_ge(7, 5, 2).unwrap(), None);
+        assert_eq!(
+            mt.next_visible_edge_by_label_id_ge(7, 6, 2).unwrap(),
+            Some(2)
+        );
     }
 
     #[test]
@@ -6126,7 +7475,9 @@ mod tests {
 
         for label_id in [1, 2] {
             assert_eq!(
-                mt.node_by_key_at(label_id, "alice", 1).map(|node| node.id),
+                mt.node_by_key_at(label_id, "alice", 1)
+                    .unwrap()
+                    .map(|node| node.id),
                 Some(1)
             );
         }
@@ -6138,17 +7489,19 @@ mod tests {
 
         for label_id in [1, 2] {
             assert!(
-                mt.node_by_key_at(label_id, "alice", 2).is_none(),
+                mt.node_by_key_at(label_id, "alice", 2).unwrap().is_none(),
                 "old key remained visible for label {label_id}"
             );
         }
         assert!(
-            mt.node_by_key_at(1, "alice2", 2).is_none(),
+            mt.node_by_key_at(1, "alice2", 2).unwrap().is_none(),
             "new key became visible for removed label"
         );
         for label_id in [2, 3] {
             assert_eq!(
-                mt.node_by_key_at(label_id, "alice2", 2).map(|node| node.id),
+                mt.node_by_key_at(label_id, "alice2", 2)
+                    .unwrap()
+                    .map(|node| node.id),
                 Some(1),
                 "new key missing for label {label_id}"
             );
@@ -6170,7 +7523,7 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&entry);
+        mt.register_secondary_index(&entry).unwrap();
         mt.apply_op(
             &WalOp::UpsertNode(make_node_with_props(1, 1, "a", props)),
             1,
@@ -6184,14 +7537,17 @@ mod tests {
         );
 
         assert_eq!(
-            mt.find_secondary_eq_nodes_at(10, "name", &PropValue::String("alice".into()), 1),
+            mt.find_secondary_eq_nodes_at(10, "name", &PropValue::String("alice".into()), 1)
+                .unwrap(),
             vec![1]
         );
         assert!(mt
             .find_secondary_eq_nodes_at(10, "name", &PropValue::String("alice".into()), 2)
+            .unwrap()
             .is_empty());
         assert_eq!(
-            mt.find_secondary_eq_nodes_at(10, "name", &PropValue::String("bob".into()), 2),
+            mt.find_secondary_eq_nodes_at(10, "name", &PropValue::String("bob".into()), 2)
+                .unwrap(),
             vec![1]
         );
     }
@@ -6209,7 +7565,7 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&entry);
+        mt.register_secondary_index(&entry).unwrap();
 
         let hot = PropValue::String("hot".into());
         let cold = PropValue::String("cold".into());
@@ -6250,27 +7606,33 @@ mod tests {
         );
 
         assert_eq!(
-            mt.visible_secondary_eq_node_ids_sorted(12, hot_hash, 2),
+            mt.visible_secondary_eq_node_ids_sorted(12, hot_hash, 2)
+                .unwrap(),
             vec![1, 3]
         );
         assert_eq!(
-            mt.visible_secondary_eq_node_ids_sorted(12, hot_hash, 3),
+            mt.visible_secondary_eq_node_ids_sorted(12, hot_hash, 3)
+                .unwrap(),
             vec![1]
         );
         assert_eq!(
-            mt.visible_secondary_eq_node_ids_sorted(12, cold_hash, 3),
+            mt.visible_secondary_eq_node_ids_sorted(12, cold_hash, 3)
+                .unwrap(),
             vec![3]
         );
         assert_eq!(
-            mt.visible_secondary_eq_node_ids_sorted(12, hot_hash, 4),
+            mt.visible_secondary_eq_node_ids_sorted(12, hot_hash, 4)
+                .unwrap(),
             vec![1, 2]
         );
         assert_eq!(
-            mt.visible_secondary_eq_node_ids_sorted(12, hot_hash, 5),
+            mt.visible_secondary_eq_node_ids_sorted(12, hot_hash, 5)
+                .unwrap(),
             vec![1]
         );
         assert_eq!(
-            mt.visible_secondary_eq_node_ids_sorted(12, hot_hash, 6),
+            mt.visible_secondary_eq_node_ids_sorted(12, hot_hash, 6)
+                .unwrap(),
             vec![1]
         );
     }
@@ -6288,7 +7650,7 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&entry);
+        mt.register_secondary_index(&entry).unwrap();
 
         let hot = PropValue::String("hot".into());
         let cold = PropValue::String("cold".into());
@@ -6329,27 +7691,33 @@ mod tests {
         );
 
         assert_eq!(
-            mt.visible_secondary_eq_edge_ids_sorted(13, hot_hash, 2),
+            mt.visible_secondary_eq_edge_ids_sorted(13, hot_hash, 2)
+                .unwrap(),
             vec![1, 3]
         );
         assert_eq!(
-            mt.visible_secondary_eq_edge_ids_sorted(13, hot_hash, 3),
+            mt.visible_secondary_eq_edge_ids_sorted(13, hot_hash, 3)
+                .unwrap(),
             vec![1]
         );
         assert_eq!(
-            mt.visible_secondary_eq_edge_ids_sorted(13, cold_hash, 3),
+            mt.visible_secondary_eq_edge_ids_sorted(13, cold_hash, 3)
+                .unwrap(),
             vec![3]
         );
         assert_eq!(
-            mt.visible_secondary_eq_edge_ids_sorted(13, hot_hash, 4),
+            mt.visible_secondary_eq_edge_ids_sorted(13, hot_hash, 4)
+                .unwrap(),
             vec![1, 2]
         );
         assert_eq!(
-            mt.visible_secondary_eq_edge_ids_sorted(13, hot_hash, 5),
+            mt.visible_secondary_eq_edge_ids_sorted(13, hot_hash, 5)
+                .unwrap(),
             vec![1]
         );
         assert_eq!(
-            mt.visible_secondary_eq_edge_ids_sorted(13, hot_hash, 6),
+            mt.visible_secondary_eq_edge_ids_sorted(13, hot_hash, 6)
+                .unwrap(),
             vec![1]
         );
     }
@@ -6377,8 +7745,8 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&node_entry);
-        mt.register_secondary_index(&edge_entry);
+        mt.register_secondary_index(&node_entry).unwrap();
+        mt.register_secondary_index(&edge_entry).unwrap();
 
         let hot = PropValue::String("hot".into());
         let cold = PropValue::String("cold".into());
@@ -6421,14 +7789,42 @@ mod tests {
             6,
         );
 
-        assert_eq!(mt.secondary_eq_node_hash_count_at(18, hot_hash, 1), 1);
-        assert_eq!(mt.secondary_eq_node_hash_count_at(18, hot_hash, 3), 0);
-        assert_eq!(mt.secondary_eq_node_hash_count_at(18, cold_hash, 3), 1);
-        assert_eq!(mt.secondary_eq_node_hash_count_at(18, cold_hash, 5), 0);
-        assert_eq!(mt.secondary_eq_edge_hash_count_at(19, hot_hash, 2), 1);
-        assert_eq!(mt.secondary_eq_edge_hash_count_at(19, hot_hash, 4), 0);
-        assert_eq!(mt.secondary_eq_edge_hash_count_at(19, cold_hash, 4), 1);
-        assert_eq!(mt.secondary_eq_edge_hash_count_at(19, cold_hash, 6), 0);
+        assert_eq!(
+            mt.secondary_eq_node_hash_count_at(18, hot_hash, 1).unwrap(),
+            1
+        );
+        assert_eq!(
+            mt.secondary_eq_node_hash_count_at(18, hot_hash, 3).unwrap(),
+            0
+        );
+        assert_eq!(
+            mt.secondary_eq_node_hash_count_at(18, cold_hash, 3)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            mt.secondary_eq_node_hash_count_at(18, cold_hash, 5)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            mt.secondary_eq_edge_hash_count_at(19, hot_hash, 2).unwrap(),
+            1
+        );
+        assert_eq!(
+            mt.secondary_eq_edge_hash_count_at(19, hot_hash, 4).unwrap(),
+            0
+        );
+        assert_eq!(
+            mt.secondary_eq_edge_hash_count_at(19, cold_hash, 4)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            mt.secondary_eq_edge_hash_count_at(19, cold_hash, 6)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -6454,8 +7850,8 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&node_entry);
-        mt.register_secondary_index(&edge_entry);
+        mt.register_secondary_index(&node_entry).unwrap();
+        mt.register_secondary_index(&edge_entry).unwrap();
 
         let pos_array = PropValue::Array(vec![PropValue::Float(0.0)]);
         let neg_array = PropValue::Array(vec![PropValue::Float(-0.0)]);
@@ -6473,11 +7869,13 @@ mod tests {
         );
 
         assert_eq!(
-            mt.find_secondary_eq_nodes_at(20, "p", &neg_array, 2),
+            mt.find_secondary_eq_nodes_at(20, "p", &neg_array, 2)
+                .unwrap(),
             vec![1]
         );
         assert!(mt
             .find_secondary_eq_nodes_at(20, "p", &pos_array, 2)
+            .unwrap()
             .is_empty());
 
         let mut pos_map = BTreeMap::new();
@@ -6499,8 +7897,14 @@ mod tests {
             4,
         );
 
-        assert_eq!(mt.secondary_eq_edge_count_at(21, "p", &neg_map, 4), 1);
-        assert_eq!(mt.secondary_eq_edge_count_at(21, "p", &pos_map, 4), 0);
+        assert_eq!(
+            mt.secondary_eq_edge_count_at(21, "p", &neg_map, 4).unwrap(),
+            1
+        );
+        assert_eq!(
+            mt.secondary_eq_edge_count_at(21, "p", &pos_map, 4).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -6526,8 +7930,8 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&eq_entry);
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&eq_entry).unwrap();
+        mt.register_secondary_index(&range_entry).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("score".into(), PropValue::Int(42));
@@ -6578,7 +7982,7 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&range_entry).unwrap();
 
         for id in 1..=5 {
             let mut props = BTreeMap::new();
@@ -6595,24 +7999,28 @@ mod tests {
         let encoded_40 = numeric_range_sort_key_for_value(&PropValue::Int(40)).unwrap();
         let encoded_50 = numeric_range_sort_key_for_value(&PropValue::Int(50)).unwrap();
 
-        let first = mt.visible_secondary_range_entries_limited(
-            40,
-            Some((encoded_10, true)),
-            Some((encoded_50, true)),
-            None,
-            5,
-            Some(2),
-        );
+        let first = mt
+            .visible_secondary_range_entries_limited(
+                40,
+                Some((encoded_10, true)),
+                Some((encoded_50, true)),
+                None,
+                5,
+                Some(2),
+            )
+            .unwrap();
         assert_eq!(first, vec![(encoded_10, 1), (encoded_20, 2)]);
 
-        let second = mt.visible_secondary_range_entries_limited(
-            40,
-            Some((encoded_10, true)),
-            Some((encoded_50, true)),
-            first.last().copied(),
-            5,
-            Some(2),
-        );
+        let second = mt
+            .visible_secondary_range_entries_limited(
+                40,
+                Some((encoded_10, true)),
+                Some((encoded_50, true)),
+                first.last().copied(),
+                5,
+                Some(2),
+            )
+            .unwrap();
         assert_eq!(second, vec![(encoded_30, 3), (encoded_40, 4)]);
 
         assert_eq!(
@@ -6623,7 +8031,8 @@ mod tests {
                 None,
                 5,
                 Some(10),
-            ),
+            )
+            .unwrap(),
             vec![(encoded_20, 2)]
         );
         assert!(mt
@@ -6635,6 +8044,7 @@ mod tests {
                 5,
                 Some(0),
             )
+            .unwrap()
             .is_empty());
     }
 
@@ -6682,7 +8092,7 @@ mod tests {
             last_error: None,
         };
         for entry in [&eq_label_1, &eq_label_2, &range_label_2, &range_label_3] {
-            mt.register_secondary_index(entry);
+            mt.register_secondary_index(entry).unwrap();
         }
 
         let mut props = BTreeMap::new();
@@ -6700,11 +8110,13 @@ mod tests {
         );
 
         assert_eq!(
-            mt.find_secondary_eq_nodes_at(10, "color", &PropValue::String("red".into()), 1),
+            mt.find_secondary_eq_nodes_at(10, "color", &PropValue::String("red".into()), 1)
+                .unwrap(),
             vec![1]
         );
         assert_eq!(
-            mt.find_secondary_eq_nodes_at(11, "color", &PropValue::String("red".into()), 1),
+            mt.find_secondary_eq_nodes_at(11, "color", &PropValue::String("red".into()), 1)
+                .unwrap(),
             vec![1]
         );
         let encoded_42 = numeric_range_sort_key_for_value(&PropValue::Int(42)).unwrap();
@@ -6715,7 +8127,8 @@ mod tests {
                 Some((encoded_42, true)),
                 None,
                 1
-            ),
+            )
+            .unwrap(),
             vec![(encoded_42, 1)]
         );
         assert_eq!(
@@ -6725,7 +8138,8 @@ mod tests {
                 Some((encoded_42, true)),
                 None,
                 1
-            ),
+            )
+            .unwrap(),
             vec![(encoded_42, 1)]
         );
 
@@ -6745,12 +8159,15 @@ mod tests {
 
         assert!(mt
             .find_secondary_eq_nodes_at(10, "color", &PropValue::String("red".into()), 2)
+            .unwrap()
             .is_empty());
         assert!(mt
             .find_secondary_eq_nodes_at(11, "color", &PropValue::String("red".into()), 2)
+            .unwrap()
             .is_empty());
         assert_eq!(
-            mt.find_secondary_eq_nodes_at(11, "color", &PropValue::String("blue".into()), 2),
+            mt.find_secondary_eq_nodes_at(11, "color", &PropValue::String("blue".into()), 2)
+                .unwrap(),
             vec![1]
         );
         let encoded_50 = numeric_range_sort_key_for_value(&PropValue::Int(50)).unwrap();
@@ -6762,6 +8179,7 @@ mod tests {
                 None,
                 2
             )
+            .unwrap()
             .is_empty());
         assert_eq!(
             mt.visible_secondary_range_entries(
@@ -6770,7 +8188,8 @@ mod tests {
                 Some((encoded_50, true)),
                 None,
                 2
-            ),
+            )
+            .unwrap(),
             vec![(encoded_50, 1)]
         );
     }
@@ -6788,7 +8207,7 @@ mod tests {
             ],
             SecondaryIndexKind::Equality,
         );
-        mt.register_secondary_index(&entry);
+        mt.register_secondary_index(&entry).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("tenant".into(), PropValue::String("acme".into()));
@@ -6803,8 +8222,11 @@ mod tests {
 
         let tenant = PropValue::String("acme".into());
         let prefix = prefix_bounds_for(&entry, &[CompoundFieldValue::Property(Some(&tenant))]);
-        assert_eq!(mt.find_node_compound_prefix_at(70, &prefix, 1), vec![1]);
-        assert_eq!(mt.count_node_compound_prefix_at(70, &prefix, 1), 1);
+        assert_eq!(
+            mt.find_node_compound_prefix_at(70, &prefix, 1).unwrap(),
+            vec![1]
+        );
+        assert_eq!(mt.count_node_compound_prefix_at(70, &prefix, 1).unwrap(), 1);
 
         let complex = props.get("profile").unwrap().clone();
         let complex_prefix = prefix_bounds_for(
@@ -6815,7 +8237,8 @@ mod tests {
             ],
         );
         assert_eq!(
-            mt.find_node_compound_prefix_at(70, &complex_prefix, 1),
+            mt.find_node_compound_prefix_at(70, &complex_prefix, 1)
+                .unwrap(),
             vec![1]
         );
 
@@ -6843,9 +8266,12 @@ mod tests {
             &WalOp::UpsertNode(make_node_with_props(1, 1, "alice", changed_props)),
             3,
         );
-        assert!(mt.find_node_compound_prefix_at(70, &prefix, 3).is_empty());
+        assert!(mt
+            .find_node_compound_prefix_at(70, &prefix, 3)
+            .unwrap()
+            .is_empty());
         assert_eq!(
-            mt.find_node_compound_prefix_at(70, &prefix, 1),
+            mt.find_node_compound_prefix_at(70, &prefix, 1).unwrap(),
             vec![1],
             "old snapshot keeps the old tuple visible"
         );
@@ -6853,7 +8279,8 @@ mod tests {
         let globex_prefix =
             prefix_bounds_for(&entry, &[CompoundFieldValue::Property(Some(&globex))]);
         assert_eq!(
-            mt.find_node_compound_prefix_at(70, &globex_prefix, 3),
+            mt.find_node_compound_prefix_at(70, &globex_prefix, 3)
+                .unwrap(),
             vec![1]
         );
 
@@ -6863,13 +8290,14 @@ mod tests {
             vec![property_field("tenant"), property_field("missing_suffix")],
             SecondaryIndexKind::Equality,
         );
-        mt.register_secondary_index(&missing_entry);
+        mt.register_secondary_index(&missing_entry).unwrap();
         let missing_prefix = prefix_bounds_for(
             &missing_entry,
             &[CompoundFieldValue::Property(Some(&globex))],
         );
         assert_eq!(
-            mt.find_node_compound_prefix_at(71, &missing_prefix, 3),
+            mt.find_node_compound_prefix_at(71, &missing_prefix, 3)
+                .unwrap(),
             vec![1],
             "missing suffix still emits a tuple for prefix completeness"
         );
@@ -6883,9 +8311,11 @@ mod tests {
         );
         assert!(mt
             .find_node_compound_prefix_at(70, &globex_prefix, 4)
+            .unwrap()
             .is_empty());
         assert!(mt
             .find_node_compound_prefix_at(71, &missing_prefix, 4)
+            .unwrap()
             .is_empty());
     }
 
@@ -6901,7 +8331,7 @@ mod tests {
             ],
             SecondaryIndexKind::Range,
         );
-        mt.register_secondary_index(&entry);
+        mt.register_secondary_index(&entry).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("tenant".into(), PropValue::String("acme".into()));
@@ -6917,7 +8347,10 @@ mod tests {
         );
         let tenant = PropValue::String("acme".into());
         let prefix = prefix_bounds_for(&entry, &[CompoundFieldValue::Property(Some(&tenant))]);
-        assert!(mt.find_node_compound_prefix_at(72, &prefix, 1).is_empty());
+        assert!(mt
+            .find_node_compound_prefix_at(72, &prefix, 1)
+            .unwrap()
+            .is_empty());
 
         mt.apply_op(
             &WalOp::UpsertNode(make_node_with_labels_and_props(
@@ -6929,7 +8362,10 @@ mod tests {
             )),
             2,
         );
-        assert_eq!(mt.find_node_compound_prefix_at(72, &prefix, 2), vec![1]);
+        assert_eq!(
+            mt.find_node_compound_prefix_at(72, &prefix, 2).unwrap(),
+            vec![1]
+        );
 
         mt.apply_op(
             &WalOp::UpsertNode(make_node_with_labels_and_props(
@@ -6954,8 +8390,11 @@ mod tests {
         let range =
             compound_range_bounds(&equality_prefix, Some((&lower, true)), Some((&upper, true)))
                 .unwrap();
-        assert_eq!(mt.find_node_compound_range_at(72, &range, 3), vec![1]);
-        assert_eq!(mt.count_node_compound_range_at(72, &range, 3), 1);
+        assert_eq!(
+            mt.find_node_compound_range_at(72, &range, 3).unwrap(),
+            vec![1]
+        );
+        assert_eq!(mt.count_node_compound_range_at(72, &range, 3).unwrap(), 1);
 
         mt.apply_op(
             &WalOp::UpsertNode(make_node_with_labels_and_props(
@@ -6967,7 +8406,10 @@ mod tests {
             )),
             4,
         );
-        assert!(mt.find_node_compound_prefix_at(72, &prefix, 4).is_empty());
+        assert!(mt
+            .find_node_compound_prefix_at(72, &prefix, 4)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -6982,10 +8424,10 @@ mod tests {
             ],
             SecondaryIndexKind::Equality,
         );
-        mt.register_secondary_index(&entry);
+        mt.register_secondary_index(&entry).unwrap();
         assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
 
-        let before_state = mt.compound_secondary_state();
+        let before_state = mt.compound_secondary_state().unwrap();
         let mut props = BTreeMap::new();
         props.insert("tenant".into(), PropValue::String("acme".into()));
         mt.apply_op(
@@ -6993,7 +8435,7 @@ mod tests {
             1,
         );
 
-        assert_eq!(mt.compound_secondary_state(), before_state);
+        assert_eq!(mt.compound_secondary_state().unwrap(), before_state);
         assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
     }
 
@@ -7012,7 +8454,7 @@ mod tests {
             ],
             SecondaryIndexKind::Equality,
         );
-        mt.register_secondary_index(&entry);
+        mt.register_secondary_index(&entry).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("status".into(), PropValue::String("open".into()));
@@ -7030,7 +8472,7 @@ mod tests {
             ],
             SecondaryIndexKind::Range,
         );
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&range_entry).unwrap();
         let status = PropValue::String("open".into());
         let range_context = CompoundTupleContext::from_manifest_entry(&range_entry).unwrap();
         let equality_prefix = encode_compound_tuple_prefix(
@@ -7050,8 +8492,14 @@ mod tests {
         let edge_range =
             compound_range_bounds(&equality_prefix, Some((&lower, true)), Some((&upper, true)))
                 .unwrap();
-        assert_eq!(mt.find_edge_compound_range_at(81, &edge_range, 1), vec![10]);
-        assert_eq!(mt.count_edge_compound_range_at(81, &edge_range, 1), 1);
+        assert_eq!(
+            mt.find_edge_compound_range_at(81, &edge_range, 1).unwrap(),
+            vec![10]
+        );
+        assert_eq!(
+            mt.count_edge_compound_range_at(81, &edge_range, 1).unwrap(),
+            1
+        );
 
         let prefix = prefix_bounds_for(
             &entry,
@@ -7062,13 +8510,22 @@ mod tests {
                 CompoundFieldValue::MetadataI64(100),
             ],
         );
-        assert_eq!(mt.find_edge_compound_prefix_at(80, &prefix, 1), vec![10]);
-        assert_eq!(mt.count_edge_compound_prefix_at(80, &prefix, 1), 1);
+        assert_eq!(
+            mt.find_edge_compound_prefix_at(80, &prefix, 1).unwrap(),
+            vec![10]
+        );
+        assert_eq!(mt.count_edge_compound_prefix_at(80, &prefix, 1).unwrap(), 1);
 
         edge.valid_to = 200;
         mt.apply_op(&WalOp::UpsertEdge(edge.clone()), 2);
-        assert!(mt.find_edge_compound_prefix_at(80, &prefix, 2).is_empty());
-        assert_eq!(mt.find_edge_compound_prefix_at(80, &prefix, 1), vec![10]);
+        assert!(mt
+            .find_edge_compound_prefix_at(80, &prefix, 2)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            mt.find_edge_compound_prefix_at(80, &prefix, 1).unwrap(),
+            vec![10]
+        );
 
         let moved_prefix = prefix_bounds_for(
             &entry,
@@ -7080,7 +8537,8 @@ mod tests {
             ],
         );
         assert_eq!(
-            mt.find_edge_compound_prefix_at(80, &moved_prefix, 2),
+            mt.find_edge_compound_prefix_at(80, &moved_prefix, 2)
+                .unwrap(),
             vec![10]
         );
 
@@ -7089,11 +8547,13 @@ mod tests {
         mt.apply_op(&WalOp::UpsertEdge(other_label), 3);
         assert!(mt
             .find_edge_compound_prefix_at(80, &moved_prefix, 3)
+            .unwrap()
             .is_empty());
 
         mt.apply_op(&WalOp::UpsertEdge(edge), 4);
         assert_eq!(
-            mt.find_edge_compound_prefix_at(80, &moved_prefix, 4),
+            mt.find_edge_compound_prefix_at(80, &moved_prefix, 4)
+                .unwrap(),
             vec![10]
         );
         mt.apply_op(
@@ -7105,6 +8565,7 @@ mod tests {
         );
         assert!(mt
             .find_edge_compound_prefix_at(80, &moved_prefix, 5)
+            .unwrap()
             .is_empty());
     }
 
@@ -7120,10 +8581,10 @@ mod tests {
             ],
             SecondaryIndexKind::Equality,
         );
-        mt.register_secondary_index(&entry);
+        mt.register_secondary_index(&entry).unwrap();
         assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
 
-        let before_state = mt.compound_secondary_state();
+        let before_state = mt.compound_secondary_state().unwrap();
         let mut props = BTreeMap::new();
         props.insert("status".into(), PropValue::String("open".into()));
         mt.apply_op(
@@ -7131,7 +8592,7 @@ mod tests {
             1,
         );
 
-        assert_eq!(mt.compound_secondary_state(), before_state);
+        assert_eq!(mt.compound_secondary_state().unwrap(), before_state);
         assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
     }
 
@@ -7147,7 +8608,7 @@ mod tests {
             ],
             SecondaryIndexKind::Equality,
         );
-        mt.register_secondary_index(&entry);
+        mt.register_secondary_index(&entry).unwrap();
         let mut props = BTreeMap::new();
         props.insert("tenant".into(), PropValue::String("acme".into()));
         mt.apply_op(
@@ -7157,13 +8618,19 @@ mod tests {
 
         let tenant = PropValue::String("acme".into());
         let prefix = prefix_bounds_for(&entry, &[CompoundFieldValue::Property(Some(&tenant))]);
-        assert_eq!(mt.find_node_compound_prefix_at(90, &prefix, 1), vec![1]);
-        assert!(mt.compound_secondary_state().contains_key(&90));
+        assert_eq!(
+            mt.find_node_compound_prefix_at(90, &prefix, 1).unwrap(),
+            vec![1]
+        );
+        assert!(mt.compound_secondary_state().unwrap().contains_key(&90));
         assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
 
         assert!(mt.unregister_secondary_index(90));
-        assert!(mt.find_node_compound_prefix_at(90, &prefix, 1).is_empty());
-        assert!(!mt.compound_secondary_state().contains_key(&90));
+        assert!(mt
+            .find_node_compound_prefix_at(90, &prefix, 1)
+            .unwrap()
+            .is_empty());
+        assert!(!mt.compound_secondary_state().unwrap().contains_key(&90));
         assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
     }
 
@@ -7446,15 +8913,17 @@ mod tests {
         }
         let group = ordered_group_snapshot(&mt, Direction::Outgoing, (50_000, 9), u64::MAX);
         assert_eq!(group, (1, true, 0, 10_000));
-        let refill = mt.refill_ordered_adj_postings_at(
-            Direction::Outgoing,
-            50_000,
-            Some(&[9]),
-            u64::MAX,
-            Bound::Unbounded,
-            4096,
-            Vec::new(),
-        );
+        let refill = mt
+            .refill_ordered_adj_postings_at(
+                Direction::Outgoing,
+                50_000,
+                Some(&[9]),
+                u64::MAX,
+                Bound::Unbounded,
+                4096,
+                Vec::new(),
+            )
+            .unwrap();
         assert_eq!(refill.examined, 513);
         assert_eq!(refill.entries.len(), 1);
         assert!(refill.exhausted);
@@ -7534,47 +9003,55 @@ mod tests {
             5,
         );
 
-        let empty =
-            mt.refill_ordered_adj_owner_at(Direction::Outgoing, Some(&[]), 5, Bound::Unbounded, 1);
+        let empty = mt
+            .refill_ordered_adj_owner_at(Direction::Outgoing, Some(&[]), 5, Bound::Unbounded, 1)
+            .unwrap();
         assert_eq!(
             (empty.owner_head, empty.examined, empty.exhausted),
             (None, 0, true)
         );
 
-        let first =
-            mt.refill_ordered_adj_owner_at(Direction::Outgoing, Some(&[7]), 5, Bound::Unbounded, 1);
+        let first = mt
+            .refill_ordered_adj_owner_at(Direction::Outgoing, Some(&[7]), 5, Bound::Unbounded, 1)
+            .unwrap();
         assert_eq!(first.owner_head, None);
         assert_eq!(first.last_group_key_examined, Some((0, 0)));
         assert_eq!(first.examined, 1);
         assert!(!first.exhausted);
-        let second = mt.refill_ordered_adj_owner_at(
-            Direction::Outgoing,
-            Some(&[7]),
-            5,
-            Bound::Excluded(first.last_group_key_examined.unwrap()),
-            4096,
-        );
+        let second = mt
+            .refill_ordered_adj_owner_at(
+                Direction::Outgoing,
+                Some(&[7]),
+                5,
+                Bound::Excluded(first.last_group_key_examined.unwrap()),
+                4096,
+            )
+            .unwrap();
         assert_eq!(second.owner_head, Some(4));
         assert_eq!(second.examined, 2);
-        let after_owner_zero = mt.refill_ordered_adj_owner_at(
-            Direction::Outgoing,
-            Some(&[0, 7, u32::MAX]),
-            5,
-            Bound::Excluded((0, u32::MAX)),
-            4096,
-        );
+        let after_owner_zero = mt
+            .refill_ordered_adj_owner_at(
+                Direction::Outgoing,
+                Some(&[0, 7, u32::MAX]),
+                5,
+                Bound::Excluded((0, u32::MAX)),
+                4096,
+            )
+            .unwrap();
         assert_eq!(after_owner_zero.owner_head, Some(4));
 
         let scratch = Vec::with_capacity(8);
-        let postings = mt.refill_ordered_adj_postings_at(
-            Direction::Outgoing,
-            0,
-            None,
-            5,
-            Bound::Unbounded,
-            1,
-            scratch,
-        );
+        let postings = mt
+            .refill_ordered_adj_postings_at(
+                Direction::Outgoing,
+                0,
+                None,
+                5,
+                Bound::Unbounded,
+                1,
+                scratch,
+            )
+            .unwrap();
         assert_eq!(postings.examined, 1);
         assert_eq!(postings.last_edge_id_examined, Some(0));
         assert_eq!(
@@ -7587,50 +9064,58 @@ mod tests {
         );
         assert!(postings.entries.capacity() >= 8);
         assert!(!postings.exhausted);
-        let postings = mt.refill_ordered_adj_postings_at(
-            Direction::Outgoing,
-            0,
-            None,
-            5,
-            Bound::Excluded(postings.last_edge_id_examined.unwrap()),
-            4096,
-            postings.entries,
-        );
+        let postings = mt
+            .refill_ordered_adj_postings_at(
+                Direction::Outgoing,
+                0,
+                None,
+                5,
+                Bound::Excluded(postings.last_edge_id_examined.unwrap()),
+                4096,
+                postings.entries,
+            )
+            .unwrap();
         assert_eq!(postings.examined, 1, "deleted physical slot still counts");
         assert!(postings.entries.is_empty());
         assert!(postings.exhausted);
 
-        let nonmatching = mt.refill_ordered_adj_postings_at(
-            Direction::Outgoing,
-            0,
-            Some(&[7]),
-            4,
-            Bound::Unbounded,
-            4096,
-            Vec::new(),
-        );
+        let nonmatching = mt
+            .refill_ordered_adj_postings_at(
+                Direction::Outgoing,
+                0,
+                Some(&[7]),
+                4,
+                Bound::Unbounded,
+                4096,
+                Vec::new(),
+            )
+            .unwrap();
         assert_eq!(nonmatching.examined, 2);
         assert!(nonmatching.entries.is_empty());
-        let version_invisible = mt.refill_ordered_adj_postings_at(
-            Direction::Outgoing,
-            0,
-            None,
-            0,
-            Bound::Unbounded,
-            4096,
-            Vec::new(),
-        );
+        let version_invisible = mt
+            .refill_ordered_adj_postings_at(
+                Direction::Outgoing,
+                0,
+                None,
+                0,
+                Bound::Unbounded,
+                4096,
+                Vec::new(),
+            )
+            .unwrap();
         assert_eq!(version_invisible.examined, 2);
         assert!(version_invisible.entries.is_empty());
-        let known_empty_postings = mt.refill_ordered_adj_postings_at(
-            Direction::Outgoing,
-            0,
-            Some(&[]),
-            5,
-            Bound::Unbounded,
-            4096,
-            Vec::with_capacity(4),
-        );
+        let known_empty_postings = mt
+            .refill_ordered_adj_postings_at(
+                Direction::Outgoing,
+                0,
+                Some(&[]),
+                5,
+                Bound::Unbounded,
+                4096,
+                Vec::with_capacity(4),
+            )
+            .unwrap();
         assert_eq!(
             (
                 known_empty_postings.examined,
@@ -7640,31 +9125,37 @@ mod tests {
             (0, true, 4)
         );
 
-        let max_owner = mt.refill_ordered_adj_owner_at(
-            Direction::Outgoing,
-            Some(&[u32::MAX]),
-            5,
-            Bound::Included((u64::MAX, u32::MIN)),
-            4096,
-        );
+        let max_owner = mt
+            .refill_ordered_adj_owner_at(
+                Direction::Outgoing,
+                Some(&[u32::MAX]),
+                5,
+                Bound::Included((u64::MAX, u32::MIN)),
+                4096,
+            )
+            .unwrap();
         assert_eq!(max_owner.owner_head, Some(u64::MAX));
-        let owned = mt.refill_ordered_adj_postings_at(
-            Direction::Outgoing,
-            u64::MAX,
-            Some(&[u32::MAX]),
-            5,
-            Bound::Unbounded,
-            4096,
-            Vec::new(),
-        );
+        let owned = mt
+            .refill_ordered_adj_postings_at(
+                Direction::Outgoing,
+                u64::MAX,
+                Some(&[u32::MAX]),
+                5,
+                Bound::Unbounded,
+                4096,
+                Vec::new(),
+            )
+            .unwrap();
         assert_eq!(owned.entries[0].edge_id, u64::MAX);
-        let incoming = mt.refill_ordered_adj_owner_at(
-            Direction::Incoming,
-            Some(&[u32::MAX]),
-            5,
-            Bound::Included((6, u32::MIN)),
-            4096,
-        );
+        let incoming = mt
+            .refill_ordered_adj_owner_at(
+                Direction::Incoming,
+                Some(&[u32::MAX]),
+                5,
+                Bound::Included((6, u32::MIN)),
+                4096,
+            )
+            .unwrap();
         assert_eq!(incoming.owner_head, Some(6));
         mt.apply_op(&WalOp::UpsertEdge(make_edge(99, 100, 101, 9)), 6);
         assert_eq!(
@@ -7677,27 +9168,25 @@ mod tests {
     #[test]
     #[should_panic(expected = "ordered adjacency owner refill maximum must be positive")]
     fn ordered_adjacency_owner_refill_rejects_zero_maximum() {
-        Memtable::new().refill_ordered_adj_owner_at(
-            Direction::Outgoing,
-            None,
-            0,
-            Bound::Unbounded,
-            0,
-        );
+        Memtable::new()
+            .refill_ordered_adj_owner_at(Direction::Outgoing, None, 0, Bound::Unbounded, 0)
+            .unwrap();
     }
 
     #[test]
     #[should_panic(expected = "ordered adjacency posting refill maximum must be positive")]
     fn ordered_adjacency_posting_refill_rejects_zero_maximum() {
-        Memtable::new().refill_ordered_adj_postings_at(
-            Direction::Outgoing,
-            0,
-            None,
-            0,
-            Bound::Unbounded,
-            0,
-            Vec::new(),
-        );
+        Memtable::new()
+            .refill_ordered_adj_postings_at(
+                Direction::Outgoing,
+                0,
+                None,
+                0,
+                Bound::Unbounded,
+                0,
+                Vec::new(),
+            )
+            .unwrap();
     }
 
     #[test]
@@ -7723,8 +9212,8 @@ mod tests {
             state: SecondaryIndexState::Ready,
             last_error: None,
         };
-        mt.register_secondary_index(&eq_entry);
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&eq_entry).unwrap();
+        mt.register_secondary_index(&range_entry).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("name".into(), PropValue::String("alice".into()));
@@ -7845,9 +9334,9 @@ mod tests {
             last_error: None,
         };
 
-        mt.register_secondary_index(&eq_entry);
+        mt.register_secondary_index(&eq_entry).unwrap();
         assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
-        mt.register_secondary_index(&range_entry);
+        mt.register_secondary_index(&range_entry).unwrap();
         assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
         mt.unregister_secondary_index(10);
         assert_eq!(mt.estimated_size(), mt.estimated_size_full_for_test());
@@ -7870,7 +9359,150 @@ mod tests {
         assert_eq!(mt.node_key_index_key_count(), 0);
         assert_eq!(mt.label_node_index_key_count(), 0);
         assert_eq!(mt.time_node_index_len(), 0);
-        assert!(mt.get_node_at(1, u64::MAX).is_none());
+        assert!(mt.get_node_at(1, u64::MAX).unwrap().is_none());
         assert_eq!(mt.max_node_id(), 1);
+    }
+    #[test]
+    fn p45b1_legacy_tombstone_scan_ignores_unrelated_live_records() {
+        let mt = Memtable::new();
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "one")), 1);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 1)), 2);
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 1,
+                deleted_at: 3,
+            },
+            3,
+        );
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 1,
+                deleted_at: 4,
+            },
+            4,
+        );
+        mt.apply_op(&WalOp::UpsertNode(make_node(1, 1, "resurrected")), 5);
+        mt.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 1)), 6);
+        let check = || {
+            mt.take_tombstone_scan_work_for_test();
+            assert_eq!(
+                mt.collect_deleted_nodes_at(4).unwrap(),
+                NodeIdSet::from_iter([1])
+            );
+            assert_eq!(
+                mt.collect_deleted_edges_at(4).unwrap(),
+                NodeIdSet::from_iter([1])
+            );
+            assert_eq!(mt.take_tombstone_scan_work_for_test(), 2);
+            assert!(mt.collect_deleted_nodes_at(u64::MAX).unwrap().is_empty());
+            assert!(mt.collect_deleted_edges_at(u64::MAX).unwrap().is_empty());
+            assert_eq!(mt.take_tombstone_scan_work_for_test(), 2);
+        };
+        check();
+        for id in 2..1002 {
+            mt.apply_op(
+                &WalOp::UpsertNode(make_node(id, 1, &format!("live{id}"))),
+                id * 2 + 10,
+            );
+            mt.apply_op(&WalOp::UpsertEdge(make_edge(id, 1, id + 1, 1)), id * 2 + 11);
+        }
+        check(); // Exactly two candidate IDs, despite 2,000 unrelated live rows.
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 2,
+                deleted_at: 9000,
+            },
+            9000,
+        );
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 2,
+                deleted_at: 9001,
+            },
+            9001,
+        );
+        assert_eq!(
+            mt.collect_deleted_nodes_at(4).unwrap(),
+            NodeIdSet::from_iter([1])
+        );
+        assert_eq!(
+            mt.collect_deleted_edges_at(4).unwrap(),
+            NodeIdSet::from_iter([1])
+        );
+        assert_eq!(mt.take_tombstone_scan_work_for_test(), 4);
+        assert_eq!(
+            mt.collect_deleted_nodes_at(u64::MAX).unwrap(),
+            NodeIdSet::from_iter([2])
+        );
+        assert_eq!(
+            mt.collect_deleted_edges_at(u64::MAX).unwrap(),
+            NodeIdSet::from_iter([2])
+        );
+    }
+}
+
+#[cfg(test)]
+mod post45_read_legacy_tests {
+    use super::*;
+    #[test]
+    fn post45_read_legacy_separate_tombstones_survive_missing_records() {
+        let mt = Memtable::new();
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 7,
+                deleted_at: 10,
+            },
+            1,
+        );
+        mt.apply_op(
+            &WalOp::DeleteEdge {
+                id: 7,
+                deleted_at: 10,
+            },
+            1,
+        );
+        // Exercise the independent legacy tombstone representation explicitly.
+        {
+            let mut state = mt.state.write().unwrap();
+            state.nodes.remove(&7);
+            state.edges.remove(&7);
+        }
+        for (seq, deleted) in [(0, false), (1, true)] {
+            let mut nodes = vec![NodeVisibilityState::Missing; 2];
+            let remaining = mt
+                .batch_get_node_visibility_meta_at(&[(0, 7), (1, 7)], seq, &mut nodes)
+                .unwrap();
+            assert_eq!(
+                nodes[0],
+                if deleted {
+                    NodeVisibilityState::Deleted
+                } else {
+                    NodeVisibilityState::Missing
+                }
+            );
+            assert_eq!(remaining.is_empty(), deleted);
+            use crate::edge_metadata::EdgeMetadataVisibilityState;
+            let mut edges = vec![EdgeMetadataVisibilityState::Missing; 2];
+            let remaining = mt
+                .batch_get_edge_metadata_at(&[(0, 7), (1, 7)], seq, &mut edges)
+                .unwrap();
+            assert_eq!(
+                edges[0],
+                if deleted {
+                    EdgeMetadataVisibilityState::Deleted
+                } else {
+                    EdgeMetadataVisibilityState::Missing
+                }
+            );
+            assert_eq!(remaining.is_empty(), deleted);
+            assert_eq!(
+                mt.edge_visibility_state_at(7, seq).unwrap(),
+                if deleted {
+                    EdgeVisibilityState::Deleted
+                } else {
+                    EdgeVisibilityState::Missing
+                }
+            );
+        }
     }
 }

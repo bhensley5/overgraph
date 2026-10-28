@@ -60,6 +60,7 @@ enum NodeLabelScanSource<'a> {
         memtable: &'a Memtable,
         label_id: u32,
         snapshot_seq: u64,
+        chunk: MemtableIdChunk,
     },
     Segment {
         segment: &'a SegmentReader,
@@ -68,17 +69,23 @@ enum NodeLabelScanSource<'a> {
 }
 
 impl NodeLabelScanSource<'_> {
-    fn next_after(&self, after: Option<u64>) -> Result<Option<u64>, EngineError> {
+    fn next_after(&mut self, after: Option<u64>) -> Result<Option<u64>, EngineError> {
         match self {
             NodeLabelScanSource::Memtable {
                 memtable,
                 label_id,
                 snapshot_seq,
-            } => Ok(memtable.next_visible_node_by_label_id_after(
-                *label_id,
-                *snapshot_seq,
-                after,
-            )),
+                chunk,
+            } => {
+                let bound = match after {
+                    Some(u64::MAX) => return Ok(None),
+                    Some(id) => id + 1,
+                    None => 0,
+                };
+                chunk.next_ge(bound, |start| {
+                    memtable.refill_label_ids_at(false, *label_id, *snapshot_seq, start)
+                })
+            }
             NodeLabelScanSource::Segment { segment, posting } => {
                 let index = match after {
                     Some(after) => segment.node_label_posting_lower_bound(*posting, after)?,
@@ -95,6 +102,7 @@ enum EdgeLabelScanSource<'a> {
         memtable: &'a Memtable,
         label_id: u32,
         snapshot_seq: u64,
+        chunk: MemtableIdChunk,
     },
     Segment {
         segment: &'a SegmentReader,
@@ -103,17 +111,23 @@ enum EdgeLabelScanSource<'a> {
 }
 
 impl EdgeLabelScanSource<'_> {
-    fn next_after(&self, after: Option<u64>) -> Result<Option<u64>, EngineError> {
+    fn next_after(&mut self, after: Option<u64>) -> Result<Option<u64>, EngineError> {
         match self {
             EdgeLabelScanSource::Memtable {
                 memtable,
                 label_id,
                 snapshot_seq,
-            } => Ok(memtable.next_visible_edge_by_label_id_after(
-                *label_id,
-                *snapshot_seq,
-                after,
-            )),
+                chunk,
+            } => {
+                let bound = match after {
+                    Some(u64::MAX) => return Ok(None),
+                    Some(id) => id + 1,
+                    None => 0,
+                };
+                chunk.next_ge(bound, |start| {
+                    memtable.refill_label_ids_at(true, *label_id, *snapshot_seq, start)
+                })
+            }
             EdgeLabelScanSource::Segment { segment, posting } => {
                 let index = match after {
                     Some(after) => segment.edge_label_id_lower_bound_posting(*posting, after)?,
@@ -196,7 +210,7 @@ fn memtable_secondary_eq_nodes_for_filter(
     prop_key: &str,
     prop_value: &PropValue,
     snapshot_seq: u64,
-) -> Vec<u64> {
+)->Result<Vec<u64>,EngineError>{
     memtable.find_secondary_eq_nodes_at(index_id, prop_key, prop_value, snapshot_seq)
 }
 
@@ -210,7 +224,7 @@ fn memtable_secondary_eq_raw_nodes_for_filter(
     prop_value: &PropValue,
     snapshot_seq: u64,
     max_ids: Option<usize>,
-) -> (Vec<u64>, bool) {
+) -> Result<(Vec<u64>, bool),EngineError> {
     let mut ids = Vec::new();
     let mut possibly_truncated = false;
     for value_hash in equality_probe_value_hashes(prop_value) {
@@ -224,7 +238,7 @@ fn memtable_secondary_eq_raw_nodes_for_filter(
             value_hash,
             snapshot_seq,
             remaining,
-        );
+        )?;
         if remaining.is_some_and(|remaining| group_ids.len() >= remaining) {
             possibly_truncated = true;
         }
@@ -232,7 +246,7 @@ fn memtable_secondary_eq_raw_nodes_for_filter(
     }
     ids.sort_unstable();
     ids.dedup();
-    (ids, possibly_truncated)
+    Ok((ids, possibly_truncated))
 }
 
 fn memtable_secondary_eq_count_for_filter(
@@ -241,7 +255,7 @@ fn memtable_secondary_eq_count_for_filter(
     prop_key: &str,
     prop_value: &PropValue,
     snapshot_seq: u64,
-) -> usize {
+)->Result<usize,EngineError>{
     memtable.secondary_eq_node_count_at(index_id, prop_key, prop_value, snapshot_seq)
 }
 
@@ -389,21 +403,10 @@ impl ReadyRangeSource<'_> {
                     return Ok(ReadyRangeSourceStep::Exhausted);
                 }
 
-                let entries = memtable.visible_secondary_range_entries_limited(
-                    *index_id,
-                    *lower,
-                    *upper,
-                    *after,
-                    *snapshot_seq,
-                    Some(*chunk_size),
-                );
-                if entries.is_empty() {
-                    *exhausted = true;
-                    return Ok(ReadyRangeSourceStep::Exhausted);
-                }
-
-                *after = entries.last().copied();
-                *buffer = entries;
+                let (entries,last,done) = memtable.refill_secondary_range_at(*index_id,*lower,*upper,*after,*snapshot_seq,*chunk_size)?;
+                *after=last.or(*after);
+                *exhausted=done;
+                *buffer=entries;
                 *offset = 0;
             },
             ReadyRangeSourceKind::Segment {
@@ -561,7 +564,7 @@ impl ReadView {
         }
         let now = now_millis();
         let cutoffs = PrecomputedPruneCutoffs::from_policies(&self.manifest.prune_policies, now);
-        cutoffs.excludes(node)
+        cutoffs.excludes_fields(&node.label_ids, node.updated_at, node.weight)
     }
 
     /// Batch-compute the set of node IDs that should be excluded by prune policies.
@@ -659,7 +662,7 @@ impl ReadView {
         &self,
         index_id: u64,
         error: Option<EngineError>,
-    ) -> Option<SecondaryIndexReadFollowup> {
+    ) -> Result<Option<SecondaryIndexReadFollowup>, EngineError> {
         let next_state = if error
             .as_ref()
             .is_some_and(|error| !is_not_found_io_error(error))
@@ -668,12 +671,15 @@ impl ReadView {
         } else {
             SecondaryIndexState::Building
         };
-        let current_entry = self
+        let Some(current_entry) = self
             .secondary_index_entries
             .iter()
-            .find(|entry| entry.index_id == index_id)?;
+            .find(|entry| entry.index_id == index_id)
+        else {
+            return Ok(None);
+        };
         if !matches!(current_entry.kind, SecondaryIndexKind::Equality) {
-            return None;
+            return Ok(None);
         }
         let next_last_error = if next_state == SecondaryIndexState::Failed {
             error.as_ref().map(|error| {
@@ -683,21 +689,20 @@ impl ReadView {
             None
         };
         if current_entry.state == next_state && current_entry.last_error == next_last_error {
-            return None;
+            return Ok(None);
         }
 
-        if matches!(
-            current_entry.target,
-            SecondaryIndexTarget::NodeFieldIndex { .. }
-                | SecondaryIndexTarget::EdgeFieldIndex { .. }
-        ) {
-            Some(SecondaryIndexReadFollowup::CompoundEqualitySidecarFailure {
-                index_id,
-                error,
-            })
-        } else {
-            Some(SecondaryIndexReadFollowup::EqualitySidecarFailure { index_id, error })
-        }
+        Ok(
+            if matches!(
+                current_entry.target,
+                SecondaryIndexTarget::NodeFieldIndex { .. }
+                    | SecondaryIndexTarget::EdgeFieldIndex { .. }
+            ) {
+                Some(SecondaryIndexReadFollowup::CompoundEqualitySidecarFailure { index_id, error })
+            } else {
+                Some(SecondaryIndexReadFollowup::EqualitySidecarFailure { index_id, error })
+            },
+        )
     }
 
     /// Compound materializations select declarations of either kind for
@@ -708,14 +713,12 @@ impl ReadView {
         &self,
         entry: &SecondaryIndexManifestEntry,
         error: Option<EngineError>,
-    ) -> Option<SecondaryIndexReadFollowup> {
+    ) -> Result<Option<SecondaryIndexReadFollowup>, EngineError> {
         match entry.kind {
             SecondaryIndexKind::Equality => {
                 self.equality_sidecar_failure_followup(entry.index_id, error)
             }
-            SecondaryIndexKind::Range => {
-                self.range_sidecar_failure_followup(entry.index_id, error)
-            }
+            SecondaryIndexKind::Range => self.range_sidecar_failure_followup(entry.index_id, error),
         }
     }
 
@@ -772,9 +775,9 @@ impl ReadView {
             prop_key,
             prop_value,
             self.snapshot_seq,
-        );
+        )?;
         let memtable_verified: NodeIdSet = memtable_ids.iter().copied().collect();
-        let mut deleted_above = self.memtable.collect_deleted_nodes_at(self.snapshot_seq);
+        let mut deleted_above = self.memtable.collect_deleted_nodes_at(self.snapshot_seq)?;
         let mut segment_ids: Vec<Vec<u64>> =
             Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
 
@@ -785,24 +788,24 @@ impl ReadView {
                 prop_key,
                 prop_value,
                 self.snapshot_seq,
-            )
+            )?
                 .into_iter()
                 .filter(|id| !deleted_above.contains(id))
                 .collect();
             segment_ids.push(ids);
-            deleted_above.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq));
+            deleted_above.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq)?);
         }
 
         for seg in &self.segments {
             let ids = match segment_secondary_eq_ids_for_filter(seg, index_id, prop_value) {
                 Ok(Some(ids)) => ids,
                 Ok(None) => {
-                    return Ok((None, self.equality_sidecar_failure_followup(index_id, None)));
+                    return Ok((None, self.equality_sidecar_failure_followup(index_id, None)?));
                 }
                 Err(error) => {
                     return Ok((
                         None,
-                        self.equality_sidecar_failure_followup(index_id, Some(error)),
+                        self.equality_sidecar_failure_followup(index_id, Some(error))?,
                     ));
                 }
             };
@@ -949,13 +952,13 @@ impl ReadView {
             prop_value,
             self.snapshot_seq,
             Some(raw_limit),
-        );
+        )?;
         if raw_posting_budget.consume(ids.len()) || truncated {
             return Ok((None, None));
         }
         accepted.extend(ids);
 
-        let mut deleted_above = self.memtable.collect_deleted_nodes_at(self.snapshot_seq);
+        let mut deleted_above = self.memtable.collect_deleted_nodes_at(self.snapshot_seq)?;
         for epoch in &self.immutable_epochs {
             let raw_limit = match raw_posting_budget.remaining_source_limit() {
                 Some(limit) if limit > 0 => limit,
@@ -967,12 +970,12 @@ impl ReadView {
                 prop_value,
                 self.snapshot_seq,
                 Some(raw_limit),
-            );
+            )?;
             if raw_posting_budget.consume(ids.len()) || truncated {
                 return Ok((None, None));
             }
             accepted.extend(ids.into_iter().filter(|id| !deleted_above.contains(id)));
-            deleted_above.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq));
+            deleted_above.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq)?);
         }
 
         for segment in &self.segments {
@@ -994,13 +997,13 @@ impl ReadView {
                     Ok(None) => {
                         return Ok((
                             None,
-                            self.equality_sidecar_failure_followup(index_id, None),
+                            self.equality_sidecar_failure_followup(index_id, None)?,
                         ));
                     }
                     Err(error) => {
                         return Ok((
                             None,
-                            self.equality_sidecar_failure_followup(index_id, Some(error)),
+                            self.equality_sidecar_failure_followup(index_id, Some(error))?,
                         ));
                     }
                 }
@@ -1043,7 +1046,7 @@ impl ReadView {
             prop_key,
             prop_value,
             self.snapshot_seq,
-        ) {
+        )? {
             accepted.insert(node_id);
             if accepted.len() >= max_ids {
                 break;
@@ -1062,7 +1065,7 @@ impl ReadView {
                 prop_key,
                 prop_value,
                 self.snapshot_seq,
-            );
+            )?;
             if self.extend_verified_equality_candidates(
                 ids,
                 prop_key,
@@ -1098,12 +1101,12 @@ impl ReadView {
                     }
                     Ok(Some(EqualitySegmentPostingScan::Exhausted)) => {}
                     Ok(None) => {
-                        return Ok((None, self.equality_sidecar_failure_followup(index_id, None)));
+                        return Ok((None, self.equality_sidecar_failure_followup(index_id, None)?));
                     }
                     Err(error) => {
                         return Ok((
                             None,
-                            self.equality_sidecar_failure_followup(index_id, Some(error)),
+                            self.equality_sidecar_failure_followup(index_id, Some(error))?,
                         ));
                     }
                 }
@@ -1186,7 +1189,7 @@ impl ReadView {
         &self,
         index_id: u64,
         error: Option<EngineError>,
-    ) -> Option<SecondaryIndexReadFollowup> {
+    ) -> Result<Option<SecondaryIndexReadFollowup>, EngineError> {
         let next_state = if error
             .as_ref()
             .is_some_and(|error| !is_not_found_io_error(error))
@@ -1195,12 +1198,15 @@ impl ReadView {
         } else {
             SecondaryIndexState::Building
         };
-        let current_entry = self
+        let Some(current_entry) = self
             .secondary_index_entries
             .iter()
-            .find(|entry| entry.index_id == index_id)?;
+            .find(|entry| entry.index_id == index_id)
+        else {
+            return Ok(None);
+        };
         if !matches!(current_entry.kind, SecondaryIndexKind::Range) {
-            return None;
+            return Ok(None);
         }
         let next_last_error = if next_state == SecondaryIndexState::Failed {
             error.as_ref().map(|error| {
@@ -1210,18 +1216,20 @@ impl ReadView {
             None
         };
         if current_entry.state == next_state && current_entry.last_error == next_last_error {
-            return None;
+            return Ok(None);
         }
 
-        if matches!(
-            current_entry.target,
-            SecondaryIndexTarget::NodeFieldIndex { .. }
-                | SecondaryIndexTarget::EdgeFieldIndex { .. }
-        ) {
-            Some(SecondaryIndexReadFollowup::CompoundRangeSidecarFailure { index_id, error })
-        } else {
-            Some(SecondaryIndexReadFollowup::RangeSidecarFailure { index_id, error })
-        }
+        Ok(
+            if matches!(
+                current_entry.target,
+                SecondaryIndexTarget::NodeFieldIndex { .. }
+                    | SecondaryIndexTarget::EdgeFieldIndex { .. }
+            ) {
+                Some(SecondaryIndexReadFollowup::CompoundRangeSidecarFailure { index_id, error })
+            } else {
+                Some(SecondaryIndexReadFollowup::RangeSidecarFailure { index_id, error })
+            },
+        )
     }
 
     fn nodes_by_single_label_id_paged_unfiltered(
@@ -1276,12 +1284,14 @@ impl ReadView {
             memtable: self.memtable.as_ref(),
             label_id: single_label_id,
             snapshot_seq: self.snapshot_seq,
+            chunk: MemtableIdChunk::default(),
         });
         for epoch in &self.immutable_epochs {
             sources.push(NodeLabelScanSource::Memtable {
                 memtable: epoch.memtable.as_ref(),
                 label_id: single_label_id,
                 snapshot_seq: self.snapshot_seq,
+                chunk: MemtableIdChunk::default(),
             });
         }
         for segment in &self.segments {
@@ -1312,7 +1322,7 @@ impl ReadView {
         }
 
         let mut heap = BinaryHeap::new();
-        for (source_index, source) in sources.iter().enumerate() {
+        for (source_index, source) in sources.iter_mut().enumerate() {
             if let Some(node_id) = source.next_after(start_after)? {
                 heap.push(Reverse((node_id, source_index)));
             }
@@ -1353,12 +1363,14 @@ impl ReadView {
             memtable: self.memtable.as_ref(),
             label_id,
             snapshot_seq: self.snapshot_seq,
+            chunk: MemtableIdChunk::default(),
         });
         for epoch in &self.immutable_epochs {
             sources.push(EdgeLabelScanSource::Memtable {
                 memtable: epoch.memtable.as_ref(),
                 label_id,
                 snapshot_seq: self.snapshot_seq,
+                chunk: MemtableIdChunk::default(),
             });
         }
         for segment in &self.segments {
@@ -1383,10 +1395,10 @@ impl ReadView {
         F: FnMut(&[u64]) -> Result<ControlFlow<()>, EngineError>,
     {
         let chunk_limit = chunk_limit.max(1);
-        let sources = self.single_label_edge_sources(label_id)?;
+        let mut sources = self.single_label_edge_sources(label_id)?;
 
         let mut heap = BinaryHeap::new();
-        for (source_index, source) in sources.iter().enumerate() {
+        for (source_index, source) in sources.iter_mut().enumerate() {
             if let Some(edge_id) = source.next_after(start_after)? {
                 heap.push(Reverse((edge_id, source_index)));
             }
@@ -1430,9 +1442,9 @@ impl ReadView {
         F: FnMut(u64, &NodeRecord) -> Result<ControlFlow<()>, EngineError>,
     {
         let chunk_limit = chunk_limit.max(1);
-        let sources = self.single_label_node_sources(single_label_id)?;
+        let mut sources = self.single_label_node_sources(single_label_id)?;
         let mut heap = BinaryHeap::new();
-        for (source_index, source) in sources.iter().enumerate() {
+        for (source_index, source) in sources.iter_mut().enumerate() {
             if let Some(node_id) = source.next_after(start_after)? {
                 heap.push(Reverse((node_id, source_index)));
             }
@@ -1495,7 +1507,7 @@ impl ReadView {
             if !node.label_ids.contains(single_label_id) {
                 continue;
             }
-            if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
+            if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes_fields(&node.label_ids, node.updated_at, node.weight)) {
                 continue;
             }
             if visitor(node_id, node)?.is_break() {
@@ -1742,7 +1754,7 @@ impl ReadView {
     ) -> Option<PropValue> {
         let node = node?;
         if !node.label_ids.contains(label_id)
-            || policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node))
+            || policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes_fields(&node.label_ids, node.updated_at, node.weight))
         {
             return None;
         }
@@ -1859,12 +1871,12 @@ impl ReadView {
             ) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
-                    return Ok((None, self.range_sidecar_failure_followup(index_id, None)));
+                    return Ok((None, self.range_sidecar_failure_followup(index_id, None)?));
                 }
                 Err(error) => {
                     return Ok((
                         None,
-                        self.range_sidecar_failure_followup(index_id, Some(error)),
+                        self.range_sidecar_failure_followup(index_id, Some(error))?,
                     ));
                 }
             }
@@ -1879,7 +1891,7 @@ impl ReadView {
             &mut |(_, node_id)| {
                 push_unique_candidate_id_limited(&mut ids, &mut seen, node_id, max_ids)
             },
-        );
+        )?;
         if flow.is_break() {
             ids.sort_unstable();
             return Ok((Some(ids), None));
@@ -1895,7 +1907,7 @@ impl ReadView {
                 &mut |(_, node_id)| {
                     push_unique_candidate_id_limited(&mut ids, &mut seen, node_id, max_ids)
                 },
-            );
+            )?;
             if flow.is_break() {
                 ids.sort_unstable();
                 return Ok((Some(ids), None));
@@ -1929,12 +1941,12 @@ impl ReadView {
                     }
                     Ok(ReadyRangeSourceStep::Exhausted) => break,
                     Ok(ReadyRangeSourceStep::MissingSidecar) => {
-                        return Ok((None, self.range_sidecar_failure_followup(index_id, None)));
+                        return Ok((None, self.range_sidecar_failure_followup(index_id, None)?));
                     }
                     Err(error) => {
                         return Ok((
                             None,
-                            self.range_sidecar_failure_followup(index_id, Some(error)),
+                            self.range_sidecar_failure_followup(index_id, Some(error))?,
                         ));
                     }
                 }
@@ -2014,12 +2026,12 @@ impl ReadView {
                 }
                 Ok(ReadyRangeSourceStep::Exhausted) => {}
                 Ok(ReadyRangeSourceStep::MissingSidecar) => {
-                    return Ok((None, self.range_sidecar_failure_followup(index_id, None)));
+                    return Ok((None, self.range_sidecar_failure_followup(index_id, None)?));
                 }
                 Err(error) => {
                     return Ok((
                         None,
-                        self.range_sidecar_failure_followup(index_id, Some(error)),
+                        self.range_sidecar_failure_followup(index_id, Some(error))?,
                     ));
                 }
             }
@@ -2079,12 +2091,12 @@ impl ReadView {
                 }
                 Ok(ReadyRangeSourceStep::Exhausted) => {}
                 Ok(ReadyRangeSourceStep::MissingSidecar) => {
-                    return Ok((None, self.range_sidecar_failure_followup(index_id, None)));
+                    return Ok((None, self.range_sidecar_failure_followup(index_id, None)?));
                 }
                 Err(error) => {
                     return Ok((
                         None,
-                        self.range_sidecar_failure_followup(index_id, Some(error)),
+                        self.range_sidecar_failure_followup(index_id, Some(error))?,
                     ));
                 }
             }
@@ -2205,12 +2217,13 @@ impl ReadView {
         self.memtable.visit_nodes_sorted_at(
             &ids,
             self.snapshot_seq,
+            crate::row_projection::VectorSelection::Dense,
             &mut remaining,
             &mut |node_id, node| {
                 if !node_label_filter_matches(label_filter, &node.label_ids) {
                     return;
                 }
-                if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
+                if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes_fields(&node.label_ids, node.updated_at, node.weight)) {
                     return;
                 }
                 let Some(dense_vector) = node.dense_vector.as_ref() else {
@@ -2226,7 +2239,7 @@ impl ReadView {
                     ),
                 });
             },
-        );
+        )?;
 
         // Check immutable memtables (newest-first), reusing a single buffer.
         let mut next_remaining_imm = Vec::with_capacity(remaining.len());
@@ -2238,12 +2251,13 @@ impl ReadView {
             epoch.memtable.visit_nodes_sorted_at(
                 &remaining,
                 self.snapshot_seq,
+                crate::row_projection::VectorSelection::Dense,
                 &mut next_remaining_imm,
                 &mut |node_id, node| {
                     if !node_label_filter_matches(label_filter, &node.label_ids) {
                         return;
                     }
-                    if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
+                    if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes_fields(&node.label_ids, node.updated_at, node.weight)) {
                         return;
                     }
                     if let Some(dense_vector) = node.dense_vector.as_ref() {
@@ -2258,7 +2272,7 @@ impl ReadView {
                         });
                     }
                 },
-            );
+            )?;
             std::mem::swap(&mut remaining, &mut next_remaining_imm);
         }
 
@@ -2708,34 +2722,49 @@ impl ReadView {
 
         // --- Small-scope fast path: skip HNSW, exact-score scope IDs only ---
         if let Some(scope) = scope_ids {
-            let mut active_dense_points = 0usize;
-            let _ = self
-                .memtable
-                .for_each_visible_node_at(self.snapshot_seq, &mut |node| {
-                    if node.dense_vector.is_some() {
-                        active_dense_points += 1;
-                    }
-                    ControlFlow::Continue(())
-                });
-            let mut immutable_dense_points = 0usize;
-            for epoch in &self.immutable_epochs {
-                let _ = epoch
-                    .memtable
-                    .for_each_visible_node_at(self.snapshot_seq, &mut |node| {
-                        if node.dense_vector.is_some() {
-                            immutable_dense_points += 1;
+            let exact_scope = scope.len() <= 2048 || {
+                #[cfg(test)]
+                self.query_execution_counters
+                    .dense_scope_count_passes
+                    .fetch_add(1, Ordering::Relaxed);
+                let mut active_dense_points = 0usize;
+                let _ = self.memtable.for_each_visible_node_at(
+                    self.snapshot_seq,
+                    crate::row_projection::VectorSelection::None,
+                    &mut |node| {
+                        if node.has_dense {
+                            active_dense_points += 1;
                         }
                         ControlFlow::Continue(())
-                    });
-            }
-            let total_dense_points: usize = self
-                .segments
-                .iter()
-                .map(|segment| segment.dense_vector_count())
-                .sum::<usize>()
-                + active_dense_points
-                + immutable_dense_points;
-            if scope.len() <= total_dense_points / 20 || scope.len() <= 2048 {
+                    },
+                )?;
+                let mut immutable_dense_points = 0usize;
+                for epoch in &self.immutable_epochs {
+                    let _ = epoch.memtable.for_each_visible_node_at(
+                        self.snapshot_seq,
+                        crate::row_projection::VectorSelection::None,
+                        &mut |node| {
+                            if node.has_dense {
+                                immutable_dense_points += 1;
+                            }
+                            ControlFlow::Continue(())
+                        },
+                    )?;
+                }
+                let total_dense_points: usize = self
+                    .segments
+                    .iter()
+                    .map(|segment| segment.dense_vector_count())
+                    .sum::<usize>()
+                    + active_dense_points
+                    + immutable_dense_points;
+                scope.len() <= total_dense_points / 20
+            };
+            if exact_scope {
+                #[cfg(test)]
+                self.query_execution_counters
+                    .dense_scope_exact_routes
+                    .fetch_add(1, Ordering::Relaxed);
                 let mut hits = self.score_dense_candidate_ids(
                     scope,
                     query,
@@ -2749,7 +2778,7 @@ impl ReadView {
         }
 
         // --- Standard path (no scope) or large-scope path (HNSW + ACORN) ---
-        let active_deleted = self.memtable.collect_deleted_nodes_at(self.snapshot_seq);
+        let active_deleted = self.memtable.collect_deleted_nodes_at(self.snapshot_seq)?;
         let mut active_node_ids =
             NodeIdSet::with_capacity_and_hasher(0, NodeIdBuildHasher::default());
         let mut candidate_ids = NodeIdSet::with_capacity_and_hasher(0, NodeIdBuildHasher::default());
@@ -2758,27 +2787,27 @@ impl ReadView {
         initial_hidden_ids.extend(active_deleted.iter().copied());
         let _ = self
             .memtable
-            .for_each_visible_node_at(self.snapshot_seq, &mut |node| {
+            .for_each_visible_node_at(self.snapshot_seq, crate::row_projection::VectorSelection::None, &mut |node| {
                 active_node_ids.insert(node.id);
                 initial_hidden_ids.insert(node.id);
-                if node.dense_vector.is_some()
+                if node.has_dense
                     && node_label_filter_matches(label_filter, &node.label_ids)
                     && scope_ids.is_none_or(|scope| scope.contains(&node.id))
                 {
                     candidate_ids.insert(node.id);
                 }
                 ControlFlow::Continue(())
-            });
+            })?;
         // Also collect dense vector candidates from immutable memtables.
         // Note: candidate_ids is a NodeIdSet, so duplicates across immutable memtables
         // are harmless; score_dense_candidate_ids does a proper newest-first lookup.
         for epoch in &self.immutable_epochs {
-            initial_hidden_ids.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq));
+            initial_hidden_ids.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq)?);
             let _ = epoch
                 .memtable
-                .for_each_visible_node_at(self.snapshot_seq, &mut |node| {
+                .for_each_visible_node_at(self.snapshot_seq, crate::row_projection::VectorSelection::None, &mut |node| {
                     initial_hidden_ids.insert(node.id);
-                    if node.dense_vector.is_some()
+                    if node.has_dense
                         && !active_deleted.contains(&node.id)
                         && !active_node_ids.contains(&node.id)
                         && node_label_filter_matches(label_filter, &node.label_ids)
@@ -2787,7 +2816,7 @@ impl ReadView {
                         candidate_ids.insert(node.id);
                     }
                     ControlFlow::Continue(())
-                });
+                })?;
         }
 
         let mut hits = self.score_dense_candidate_ids(
@@ -3057,13 +3086,10 @@ impl ReadView {
         let mut top_hits = BinaryHeap::with_capacity(k);
         let mut hidden_ids: NodeIdSet =
             NodeIdSet::with_capacity_and_hasher(0, NodeIdBuildHasher::default());
-        hidden_ids.extend(self.memtable.collect_deleted_nodes_at(self.snapshot_seq));
-        for epoch in &self.immutable_epochs {
-            hidden_ids.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq));
-        }
+        hidden_ids.extend(self.memtable.collect_deleted_nodes_at(self.snapshot_seq)?);
         let _ = self
             .memtable
-            .for_each_visible_node_at(self.snapshot_seq, &mut |node| {
+            .for_each_visible_node_at(self.snapshot_seq, crate::row_projection::VectorSelection::Sparse, &mut |node| {
                 hidden_ids.insert(node.id);
                 if scope_ids.is_some_and(|scope| !scope.contains(&node.id)) {
                     return ControlFlow::Continue(());
@@ -3073,7 +3099,7 @@ impl ReadView {
                 }
                 if policy_cutoffs
                     .as_ref()
-                    .is_some_and(|cutoffs| cutoffs.excludes(node))
+                    .is_some_and(|cutoffs| cutoffs.excludes_fields(&node.label_ids, node.updated_at, node.weight))
                 {
                     return ControlFlow::Continue(());
                 }
@@ -3085,14 +3111,15 @@ impl ReadView {
                     Self::push_sparse_top_k(&mut top_hits, k, node.id, score);
                 }
                 ControlFlow::Continue(())
-            });
+            })?;
 
         // Score nodes in immutable memtables (newest-first)
         for epoch in &self.immutable_epochs {
+            hidden_ids.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq)?);
             let _ = epoch
                 .memtable
-                .for_each_visible_node_at(self.snapshot_seq, &mut |node| {
-                    hidden_ids.insert(node.id);
+                .for_each_visible_node_at(self.snapshot_seq, crate::row_projection::VectorSelection::Sparse, &mut |node| {
+                    if !hidden_ids.insert(node.id) {return ControlFlow::Continue(());}
                     if scope_ids.is_some_and(|scope| !scope.contains(&node.id)) {
                         return ControlFlow::Continue(());
                     }
@@ -3101,7 +3128,7 @@ impl ReadView {
                     }
                     if policy_cutoffs
                         .as_ref()
-                        .is_some_and(|cutoffs| cutoffs.excludes(node))
+                        .is_some_and(|cutoffs| cutoffs.excludes_fields(&node.label_ids, node.updated_at, node.weight))
                     {
                         return ControlFlow::Continue(());
                     }
@@ -3113,7 +3140,7 @@ impl ReadView {
                         Self::push_sparse_top_k(&mut top_hits, k, node.id, score);
                     }
                     ControlFlow::Continue(())
-                });
+                })?;
         }
 
         // Count segments with sparse posting data to decide parallel vs serial.
@@ -3265,12 +3292,13 @@ impl ReadView {
         self.memtable.visit_nodes_sorted_at(
             &sorted_ids,
             self.snapshot_seq,
+            crate::row_projection::VectorSelection::Sparse,
             &mut remaining,
             &mut |node_id, node| {
                 if !node_label_filter_matches(label_filter, &node.label_ids) {
                     return;
                 }
-                if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
+                if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes_fields(&node.label_ids, node.updated_at, node.weight)) {
                     return;
                 }
                 if let Some(sparse_vector) = node.sparse_vector.as_ref() {
@@ -3280,7 +3308,7 @@ impl ReadView {
                     }
                 }
             },
-        );
+        )?;
 
         // Check immutable memtables (newest-first)
         for epoch in &self.immutable_epochs {
@@ -3291,12 +3319,13 @@ impl ReadView {
             epoch.memtable.visit_nodes_sorted_at(
                 &remaining,
                 self.snapshot_seq,
+                crate::row_projection::VectorSelection::Sparse,
                 &mut next,
                 &mut |node_id, node| {
                     if !node_label_filter_matches(label_filter, &node.label_ids) {
                         return;
                     }
-                    if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes(node)) {
+                    if policy_cutoffs.is_some_and(|cutoffs| cutoffs.excludes_fields(&node.label_ids, node.updated_at, node.weight)) {
                         return;
                     }
                     if let Some(sparse_vector) = node.sparse_vector.as_ref() {
@@ -3306,7 +3335,7 @@ impl ReadView {
                         }
                     }
                 },
-            );
+            )?;
             remaining = next;
         }
 
@@ -3643,12 +3672,12 @@ impl ReadView {
     fn nodes_by_label_id_raw(&self, label_id: u32) -> Result<Vec<u64>, EngineError> {
         let mut candidates = Vec::new();
 
-        for id in self.memtable.visible_nodes_by_label_id(label_id, self.snapshot_seq) {
+        for id in self.memtable.visible_nodes_by_label_id(label_id, self.snapshot_seq)? {
             candidates.push(id);
         }
 
         for epoch in &self.immutable_epochs {
-            for id in epoch.memtable.visible_nodes_by_label_id(label_id, self.snapshot_seq) {
+            for id in epoch.memtable.visible_nodes_by_label_id(label_id, self.snapshot_seq)? {
                 candidates.push(id);
             }
         }
@@ -3679,34 +3708,7 @@ impl ReadView {
     /// Return all live edge IDs with the given label_id, merged across
     /// memtable and all segments. Excludes tombstoned edges.
     pub fn edges_by_label_id(&self, label_id: u32) -> Result<Vec<u64>, EngineError> {
-        let deleted = self.sources().collect_deleted_edges();
-
-        let mut seen = NodeIdSet::default();
-        let mut results = Vec::new();
-
-        for id in self.memtable.visible_edges_by_label_id(label_id, self.snapshot_seq) {
-            if !deleted.contains(&id) && seen.insert(id) {
-                results.push(id);
-            }
-        }
-
-        for epoch in &self.immutable_epochs {
-            for id in epoch.memtable.visible_edges_by_label_id(label_id, self.snapshot_seq) {
-                if !deleted.contains(&id) && seen.insert(id) {
-                    results.push(id);
-                }
-            }
-        }
-
-        for seg in &self.segments {
-            for id in seg.edges_by_label_id(label_id)? {
-                if !deleted.contains(&id) && seen.insert(id) {
-                    results.push(id);
-                }
-            }
-        }
-
-        Ok(results)
+        self.sources().edge_ids_by_label_id(label_id)
     }
 
     /// Return all live node records with the given label_id, hydrated from
@@ -3884,25 +3886,7 @@ impl ReadView {
         label_id: u32,
         page: &PageRequest,
     ) -> Result<PageResult<u64>, EngineError> {
-        let deleted = self.sources().collect_deleted_edges();
-
-        // Collect sources
-        let memtable_ids = self.memtable.visible_edges_by_label_id(label_id, self.snapshot_seq);
-        let mut segment_ids: Vec<Vec<u64>> =
-            Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
-        for epoch in &self.immutable_epochs {
-            segment_ids.push(epoch.memtable.visible_edges_by_label_id(label_id, self.snapshot_seq));
-        }
-        for seg in &self.segments {
-            segment_ids.push(seg.edges_by_label_id(label_id)?);
-        }
-
-        Ok(merge_record_ids_paged(
-            memtable_ids,
-            segment_ids,
-            &deleted,
-            page,
-        ))
+        Ok(merge_record_ids_paged(self.sources().edge_ids_by_label_id(label_id)?,Vec::new(),&NodeIdSet::default(),page))
     }
 
     /// Paginated version of `get_nodes_by_label_id`. Returns a page of hydrated node
@@ -3962,7 +3946,7 @@ impl ReadView {
             &mut |node_id| {
                 push_unique_candidate_id_limited(&mut ids, &mut seen, node_id, max_ids)
             },
-        );
+        )?;
         if flow.is_break() {
             ids.sort_unstable();
             return Ok(ids);
@@ -3977,7 +3961,7 @@ impl ReadView {
                 &mut |node_id| {
                     push_unique_candidate_id_limited(&mut ids, &mut seen, node_id, max_ids)
                 },
-            );
+            )?;
             if flow.is_break() {
                 ids.sort_unstable();
                 return Ok(ids);
@@ -4219,10 +4203,10 @@ impl ReadView {
         to_ms: i64,
         page: &PageRequest,
     ) -> Result<PageResult<u64>, EngineError> {
-        let deleted = self.sources().collect_deleted_nodes();
+        let deleted = self.sources().collect_deleted_nodes()?;
         let memtable_ids =
             self.memtable
-                .visible_nodes_by_time_range(label_id, from_ms, to_ms, self.snapshot_seq);
+                .visible_nodes_by_time_range(label_id, from_ms, to_ms, self.snapshot_seq)?;
         let mut segment_ids: Vec<Vec<u64>> =
             Vec::with_capacity(self.immutable_epochs.len() + self.segments.len());
         for epoch in &self.immutable_epochs {
@@ -4231,7 +4215,7 @@ impl ReadView {
                 from_ms,
                 to_ms,
                 self.snapshot_seq,
-            ));
+            )?);
         }
         for seg in &self.segments {
             segment_ids.push(seg.nodes_by_time_range(label_id, from_ms, to_ms)?);

@@ -17,7 +17,7 @@ OverGraph is a log-structured merge tree (LSM) graph database with built-in vect
                     │                     │
                     │  ┌───────────────┐  │
                     │  │   Memtable    │  │  ← in-memory, mutable
-                    │  │  (HashMap)    │  │    (exact brute-force for vectors)
+                    │  │ (ID histories)│  │    (exact brute-force for vectors)
                     │  └───────┬───────┘  │
                     │          │ flush    │
                     │  ┌───────▼───────┐  │
@@ -37,9 +37,9 @@ OverGraph is a log-structured merge tree (LSM) graph database with built-in vect
 
 Every mutation follows the same path:
 
-1. **WAL append.** The operation is serialized and appended to the active write-ahead log generation (`wal_<generation>.wal`, starting with `wal_0.wal`). This is the durability guarantee: if we crash after this point, we can replay retained WAL generations on restart.
+1. **WAL append.** The coordinator serializes the mutation and appends it to the active write-ahead log generation (`wal_<generation>.wal`, starting with `wal_0.wal`). Recovery replays complete retained WAL records. Crash durability depends on the configured sync mode and the completed fsync frontier.
 
-2. **Memtable apply.** The operation is applied to the in-memory memtable. The memtable uses HashMaps for nodes, edges, adjacency lists, key lookups, and internal label-token indexes. Reads served from the memtable are always the freshest.
+2. **Memtable apply and publication.** The default primary directory maps node and edge IDs to append-only version histories. Secondary and graph indexes retain their ordered maps. A complete committed read view is published after application; readers resolve versions visible to the sequence captured by that view.
 
 3. **Ack.** The caller gets back the node or edge ID. The write is durable (depending on sync mode) and immediately visible to subsequent reads.
 
@@ -54,20 +54,21 @@ WAL records use a simple `[length: u32][crc32: u32][payload: bytes]` format. The
 
 Reads check multiple sources and merge them:
 
-1. **Memtable** (freshest data, always checked first)
-2. **Immutable segments** (scanned newest to oldest)
+1. **Active memtable** at the captured snapshot sequence
+2. **Frozen memtables** retained by that read view
+3. **Immutable segments** in the read view, scanned newest to oldest
 
-For point lookups (`get_node`, `get_edge`, `get_node_by_key`), we stop at the first source that has the record. For collection queries (`neighbors`, `find_nodes`, `nodes_by_labels`), we merge results from all sources using a K-way merge with a min-heap. Multi-label convenience scans use `All` semantics over label memberships; `Any` semantics are expressed through explicit node label filters. Planner-backed queries can also use optional per-segment `planner_stats.dat` sidecars for private cost estimates, adaptive candidate caps, and graph-row fanout planning; the stats are advisory only, and final visible-record verification still decides results. For eligible aggregation queries (`degree`, `degrees`, `sum_edge_weights`, `avg_edge_weight` with no edge-label filter, no explicit epoch, no active prune policy, and valid degree sidecars on all visible segments), reads sum published degree overlays plus per-segment `degree_delta.dat` sidecars without walking adjacency. Filtered, temporal, prune-policy, temporal-edge, or sidecar-unavailable cases fall back to the adjacency walk path.
+For point lookups (`get_node`, `get_edge`, `get_node_by_key`), we resolve the first visible record or tombstone in source-precedence order. For collection queries (`neighbors`, `find_nodes`, `nodes_by_labels`), we merge results from all sources using a K-way merge with a min-heap. Multi-label convenience scans use `All` semantics over label memberships; `Any` semantics are expressed through explicit node label filters. Planner-backed queries can also use optional per-segment `planner_stats.dat` sidecars for private cost estimates, adaptive candidate caps, and graph-row fanout planning; the stats are advisory only, and final visible-record verification still decides results. For eligible aggregation queries (`degree`, `degrees`, `sum_edge_weights`, `avg_edge_weight` with no edge-label filter, no explicit epoch, no active prune policy, and valid degree sidecars on all visible segments), reads sum published degree overlays plus per-segment `degree_delta.dat` sidecars without walking adjacency. Filtered, temporal, prune-policy, temporal-edge, or sidecar-unavailable cases fall back to the adjacency walk path.
 
 Tombstones (from `delete_node` / `delete_edge`) are applied during the merge. Prune policies are also evaluated at read time, so a registered policy takes effect immediately without waiting for compaction.
 
 ### Pagination
 
-All collection queries support keyset pagination via `limit` + `after`. The `after` cursor is the last ID seen. When a cursor is provided, each source binary-searches to skip past it in O(log N), so page 1000 is just as fast as page 1.
+ID-keyed collection APIs use keyset pagination via `limit` + `after`; planner-backed queries and traversal APIs use their own opaque cursors. Eligible ordered sources seek to the continuation boundary and continue from there. Work still depends on source count, filtering and the records examined.
 
 ## Segments
 
-When the memtable exceeds a size threshold (default 128MB), it gets frozen and flushed to disk as a new segment. A fresh memtable is allocated for incoming writes, so the flush never blocks the write path.
+When the memtable exceeds a size threshold (default 128MB), it gets frozen and flushed to disk as a new segment. Incoming writes use a fresh generation. Writers can still wait for configured memory, pending-flush or admission limits while maintenance catches up.
 
 Each segment is a directory containing a small manifest plus a packed immutable core:
 
@@ -93,7 +94,7 @@ degree deltas, dense HNSW, and sparse postings can be missing, rebuilt, or refre
 rewriting `segment.core`; query correctness falls back to scans or exact vector search when an
 optional accelerator is unavailable.
 
-The packed core is immutable after creation. Reads use memory-mapped I/O (`mmap`), so the OS page cache handles caching without any application-level buffer management. This means reads never block writes and there's no cache invalidation to worry about.
+The packed core is immutable after creation. Reads use memory-mapped I/O (`mmap`), so the OS page cache handles caching without any application-level buffer management. Captured read views keep their immutable segment readers valid while newer views adopt maintenance outputs.
 
 ### Adjacency index
 
@@ -170,7 +171,7 @@ OverGraph's compaction is designed to be fast:
 
 5. **Atomic swap.** The manifest is updated atomically (write to temp file, fsync, rename). Old segments are deleted only after the manifest update succeeds.
 
-Compaction runs on a background thread and is fully cancellable (for fast shutdown). It never blocks reads or writes. If you need compaction to happen right now, call `compact()` or `compact_with_progress(callback)`.
+Compaction runs on a background thread and is cancellable for fast shutdown. Readers retain their captured views while completed outputs are adopted; writers can still encounter admission or maintenance backpressure. If you need compaction to happen right now, call `compact()` or `compact_with_progress(callback)`.
 
 ### Prune policies and compaction
 
@@ -197,9 +198,17 @@ Updates to the manifest are atomic: write to `manifest.tmp`, fsync, rename to `m
 
 ## Concurrency model
 
+The concurrent engine is the default in Rust, Node.js and Python. Rust and wrapper
+source builds can explicitly select the separate legacy engine with
+`--no-default-features`. The concurrent primary index uses an ordered compressed
+radix directory and per-ID version histories, so captured views can resolve the
+version visible to their snapshot while newer writes commit. The on-disk WAL and
+segment formats are unchanged.
+
 - **Cloneable shared handles.** `DatabaseEngine` is a lightweight handle over shared process-local runtime state. Clones share the same coordinator, WAL, published read state, lifecycle workers, and close barrier.
 - **Serialized commits.** Public write APIs and explicit transaction commits enter an internal commit/lifecycle coordinator. The coordinator orders WAL append, memtable apply, snapshot publication, flush adoption, compaction adoption, and close barriers so there is one authoritative mutation path.
 - **Published read views.** Public reads capture the current `ReadView` snapshot at call start and run without holding the coordinator. A read view contains the active memtable snapshot, frozen memtables, visible segment readers, manifest-visible read metadata, and published degree overlays.
+- **Bounded admission and durability.** Snapshot reads do not hold the commit coordinator while traversing records. Writes remain serialized through it and can wait for configured resource, maintenance and durability limits; this is not an unlimited or wait-free API.
 - **Process-local scope.** Multiple handles cloned from one open database are safe inside one process. Opening the same database directory independently from multiple processes is not supported.
 - **Background workers.** Flush and compaction still run on background threads, but their completed outputs are adopted through the coordinator before becoming visible to new read views.
 

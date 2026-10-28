@@ -1,6 +1,7 @@
+mod support;
+
 use overgraph::{
-    DatabaseEngine, DbOptions, Direction, NeighborOptions, PropValue, UpsertEdgeOptions,
-    UpsertNodeOptions,
+    DbOptions, Direction, NeighborOptions, PropValue, UpsertEdgeOptions, UpsertNodeOptions,
 };
 use std::collections::BTreeMap;
 use tempfile::TempDir;
@@ -13,7 +14,7 @@ fn test_large_graph_with_flush_and_cross_source_queries() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
 
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = support::open(&db_path, &DbOptions::default()).unwrap();
 
     // --- Batch 1: 10k nodes ---
     let mut node_ids = Vec::with_capacity(10_000);
@@ -173,7 +174,7 @@ fn test_flush_close_reopen_reads_from_segments() {
     let edge_ab;
     let edge_bc;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = support::open(&db_path, &DbOptions::default()).unwrap();
 
         // Build a small graph
         node_a = engine
@@ -253,7 +254,7 @@ fn test_flush_close_reopen_reads_from_segments() {
     // Reopen: segment data should be loaded. close() flushes post-flush data
     // to a second segment.
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = support::open(&db_path, &DbOptions::default()).unwrap();
         assert_eq!(engine.segment_count().unwrap(), 2);
 
         // Segment data accessible
@@ -316,7 +317,7 @@ fn test_multi_segment_survives_reopen() {
     let id_b;
     let id_c;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = support::open(&db_path, &DbOptions::default()).unwrap();
 
         // Segment 1
         id_a = engine
@@ -386,7 +387,7 @@ fn test_multi_segment_survives_reopen() {
     }
 
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = support::open(&db_path, &DbOptions::default()).unwrap();
         // close() flushes remaining memtable (3rd flush), which triggers
         // auto-compact (compact_after_n_flushes=3 default). Result: 1 segment.
         assert!(

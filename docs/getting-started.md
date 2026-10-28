@@ -4,6 +4,11 @@ This guide gets you up and running with OverGraph in Python, Node.js, or Rust. Y
 
 For full parameter documentation, see the [API Reference](api-reference.md).
 
+Version 0.18 uses the concurrent engine by default in all three languages. Reads
+capture a consistent committed snapshot while writes commit; writes still follow
+the configured admission and durability limits. Existing WAL and segment formats
+are retained. No on-disk migration is introduced.
+
 ## Install
 
 **Python**

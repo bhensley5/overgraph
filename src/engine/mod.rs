@@ -60,7 +60,7 @@ use crate::sparse_postings::sparse_dot_score;
 use crate::types::*;
 #[cfg(test)]
 use crate::wal::wal_generation_path;
-use crate::wal::{remove_wal_generation, truncate_wal_generation_to, WalReader, WalWriter};
+use crate::wal::{truncate_wal_generation_to, WalReader, WalWriter};
 use crate::wal_sync::{shutdown_sync_thread, sync_thread_loop, WalSyncState};
 use arc_swap::ArcSwap;
 use std::cmp::Reverse;
@@ -74,6 +74,46 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::thread::JoinHandle;
 use std::time::SystemTime;
+
+#[cfg(feature = "production-concurrency")]
+mod append_slice;
+pub(crate) mod bounds;
+mod completion;
+mod concurrency_lifecycle;
+#[cfg(all(test, feature = "production-concurrency"))]
+mod concurrency_proofs;
+mod directory_identity;
+mod durability;
+#[cfg(feature = "production-concurrency")]
+mod durable_transition;
+#[cfg(feature = "production-concurrency")]
+pub(crate) mod participant;
+pub(crate) mod payload;
+mod preflight;
+pub(crate) mod reclamation;
+pub(crate) mod storage_bounds;
+mod worker;
+use durability::ManifestLock;
+#[cfg(feature = "production-concurrency")]
+include!("candidate_integration.rs");
+#[cfg(feature = "production-concurrency")]
+include!("candidate_ddl.rs");
+#[cfg(feature = "production-concurrency")]
+mod binding_bridge;
+#[cfg(feature = "binding-test-hooks")]
+mod binding_test_hooks;
+#[cfg(feature = "production-concurrency")]
+pub use binding_bridge::{BindingCloseHandle, BindingStatsHandle};
+#[cfg(feature = "binding-test-hooks")]
+pub use binding_test_hooks::BindingTestHandle;
+pub(crate) mod shared;
+use shared::SharedArc;
+
+pub(crate) fn validate_concurrency_options(
+    options: &ConcurrencyOptions,
+) -> Result<(), EngineError> {
+    reclamation::ReclaimDomain::validate_options(options)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SecondaryIndexTargetDiscriminant {
@@ -185,7 +225,7 @@ fn secondary_index_fields_sort_key(target: &SecondaryIndexTarget) -> Vec<(u8, St
 }
 
 #[derive(Default)]
-struct SecondaryIndexCatalog {
+pub(crate) struct SecondaryIndexCatalog {
     by_identity: HashMap<SecondaryIndexLookupKey, SecondaryIndexManifestEntry>,
     node_property: PropertyIndexCatalog,
     edge_property: PropertyIndexCatalog,
@@ -491,7 +531,7 @@ fn normalize_secondary_index_manifest(manifest: &mut ManifestState) -> Result<bo
     Ok(dirty)
 }
 
-fn build_secondary_index_catalog(
+pub(crate) fn build_secondary_index_catalog(
     entries: &[SecondaryIndexManifestEntry],
 ) -> Result<SecondaryIndexCatalog, EngineError> {
     let mut catalog = SecondaryIndexCatalog {
@@ -1147,14 +1187,14 @@ enum LabelFilterResolution {
 
 fn merge_runtime_label_catalog_into_manifest(
     manifest: &mut ManifestState,
-    label_catalog: &Arc<RwLock<RuntimeLabelCatalog>>,
+    label_catalog: &SharedArc<RwLock<RuntimeLabelCatalog>>,
 ) {
     label_catalog.read().unwrap().apply_to_manifest(manifest);
 }
 
 fn merge_checkpointed_label_catalog_into_manifest(
     manifest: &mut ManifestState,
-    label_catalog: &Arc<RwLock<RuntimeLabelCatalog>>,
+    label_catalog: &SharedArc<RwLock<RuntimeLabelCatalog>>,
     max_wal_generation: Option<u64>,
 ) {
     label_catalog
@@ -1166,17 +1206,17 @@ fn merge_checkpointed_label_catalog_into_manifest(
 #[allow(clippy::too_many_arguments)]
 fn update_secondary_index_manifest_runtime(
     db_dir: &Path,
-    manifest_write_lock: &Arc<Mutex<()>>,
-    catalog_lock: &Arc<RwLock<SecondaryIndexCatalog>>,
-    entries_lock: &Arc<RwLock<SecondaryIndexEntries>>,
+    manifest_write_lock: &Arc<ManifestLock>,
+    catalog_lock: &SharedArc<RwLock<SecondaryIndexCatalog>>,
+    entries_lock: &SharedArc<RwLock<SecondaryIndexEntries>>,
     next_node_id_seen: &AtomicU64,
     next_edge_id_seen: &AtomicU64,
     engine_seq_seen: &AtomicU64,
-    label_catalog: Option<&Arc<RwLock<RuntimeLabelCatalog>>>,
+    label_catalog: Option<&SharedArc<RwLock<RuntimeLabelCatalog>>>,
     max_token_checkpoint_wal_generation: Option<u64>,
     mutate: impl FnOnce(&mut ManifestState) -> Result<(), EngineError>,
 ) -> Result<(), EngineError> {
-    let _guard = manifest_write_lock.lock().unwrap();
+    let _guard = manifest_write_lock.gate()?;
     let mut manifest = load_manifest_readonly(db_dir)?
         .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
     mutate(&mut manifest)?;
@@ -1193,7 +1233,7 @@ fn update_secondary_index_manifest_runtime(
             max_token_checkpoint_wal_generation,
         );
     }
-    write_manifest(db_dir, &manifest)?;
+    _guard.persist(db_dir, &manifest)?;
     sync_secondary_index_runtime_state(catalog_lock, entries_lock, &manifest.secondary_indexes)?;
     Ok(())
 }
@@ -1323,13 +1363,13 @@ fn reconcile_background_output_range_declarations(
 #[allow(clippy::too_many_arguments)]
 fn mark_secondary_index_failed(
     db_dir: &Path,
-    manifest_write_lock: &Arc<Mutex<()>>,
-    catalog_lock: &Arc<RwLock<SecondaryIndexCatalog>>,
-    entries_lock: &Arc<RwLock<SecondaryIndexEntries>>,
+    manifest_write_lock: &Arc<ManifestLock>,
+    catalog_lock: &SharedArc<RwLock<SecondaryIndexCatalog>>,
+    entries_lock: &SharedArc<RwLock<SecondaryIndexEntries>>,
     next_node_id_seen: &AtomicU64,
     next_edge_id_seen: &AtomicU64,
     engine_seq_seen: &AtomicU64,
-    label_catalog: &Arc<RwLock<RuntimeLabelCatalog>>,
+    label_catalog: &SharedArc<RwLock<RuntimeLabelCatalog>>,
     index_id: u64,
     error: &EngineError,
 ) {
@@ -1665,10 +1705,10 @@ impl SecondaryIndexReadyApplied {
 
 fn load_secondary_eq_build_snapshot(
     db_dir: &Path,
-    manifest_write_lock: &Arc<Mutex<()>>,
+    manifest_write_lock: &Arc<ManifestLock>,
     index_id: u64,
 ) -> Result<Option<SecondaryEqBuildSnapshot>, EngineError> {
-    let _guard = manifest_write_lock.lock().unwrap();
+    let _guard = manifest_write_lock.gate()?;
     let manifest = load_manifest_readonly(db_dir)?
         .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
     let Some(entry) = manifest
@@ -1899,13 +1939,13 @@ fn validate_secondary_eq_snapshot_coverage(
 #[allow(clippy::too_many_arguments)]
 fn finalize_secondary_eq_build_snapshot(
     db_dir: &Path,
-    manifest_write_lock: &Arc<Mutex<()>>,
-    catalog_lock: &Arc<RwLock<SecondaryIndexCatalog>>,
-    entries_lock: &Arc<RwLock<SecondaryIndexEntries>>,
+    manifest_write_lock: &Arc<ManifestLock>,
+    catalog_lock: &SharedArc<RwLock<SecondaryIndexCatalog>>,
+    entries_lock: &SharedArc<RwLock<SecondaryIndexEntries>>,
     next_node_id_seen: &AtomicU64,
     next_edge_id_seen: &AtomicU64,
     engine_seq_seen: &AtomicU64,
-    label_catalog: &Arc<RwLock<RuntimeLabelCatalog>>,
+    label_catalog: &SharedArc<RwLock<RuntimeLabelCatalog>>,
     index_id: u64,
     snapshot: &SecondaryEqBuildSnapshot,
     coverage: &SecondaryEqCoverageStatus,
@@ -1979,10 +2019,10 @@ fn finalize_secondary_eq_build_snapshot(
 
 fn load_secondary_range_build_snapshot(
     db_dir: &Path,
-    manifest_write_lock: &Arc<Mutex<()>>,
+    manifest_write_lock: &Arc<ManifestLock>,
     index_id: u64,
 ) -> Result<Option<SecondaryRangeBuildSnapshot>, EngineError> {
-    let _guard = manifest_write_lock.lock().unwrap();
+    let _guard = manifest_write_lock.gate()?;
     let manifest = load_manifest_readonly(db_dir)?
         .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
     let Some(entry) = manifest
@@ -2214,13 +2254,13 @@ fn validate_secondary_range_snapshot_coverage(
 #[allow(clippy::too_many_arguments)]
 fn finalize_secondary_range_build_snapshot(
     db_dir: &Path,
-    manifest_write_lock: &Arc<Mutex<()>>,
-    catalog_lock: &Arc<RwLock<SecondaryIndexCatalog>>,
-    entries_lock: &Arc<RwLock<SecondaryIndexEntries>>,
+    manifest_write_lock: &Arc<ManifestLock>,
+    catalog_lock: &SharedArc<RwLock<SecondaryIndexCatalog>>,
+    entries_lock: &SharedArc<RwLock<SecondaryIndexEntries>>,
     next_node_id_seen: &AtomicU64,
     next_edge_id_seen: &AtomicU64,
     engine_seq_seen: &AtomicU64,
-    label_catalog: &Arc<RwLock<RuntimeLabelCatalog>>,
+    label_catalog: &SharedArc<RwLock<RuntimeLabelCatalog>>,
     index_id: u64,
     snapshot: &SecondaryRangeBuildSnapshot,
     coverage: &SecondaryRangeCoverageStatus,
@@ -2384,10 +2424,10 @@ fn compound_edge_metas_for_single_segment(
 
 fn load_compound_secondary_build_snapshot(
     db_dir: &Path,
-    manifest_write_lock: &Arc<Mutex<()>>,
+    manifest_write_lock: &Arc<ManifestLock>,
     index_id: u64,
 ) -> Result<Option<CompoundSecondaryBuildSnapshot>, EngineError> {
-    let _guard = manifest_write_lock.lock().unwrap();
+    let _guard = manifest_write_lock.gate()?;
     let manifest = load_manifest_readonly(db_dir)?
         .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
     let Some(entry) = manifest
@@ -2446,7 +2486,7 @@ fn build_compound_sidecars_for_snapshot(
             snapshot.dense_config.as_ref(),
             &snapshot.secondary_indexes,
         ) {
-            Ok(segment) => Arc::new(segment),
+            Ok(segment) => SharedArc::new(segment),
             Err(error) if is_not_found_io_error(&error) => continue,
             Err(error) => return Err(error),
         };
@@ -2455,7 +2495,7 @@ fn build_compound_sidecars_for_snapshot(
             continue;
         }
 
-        let source_segments = vec![Arc::clone(&segment)];
+        let source_segments = vec![Clone::clone(&segment)];
         let sidecar_entries = match &snapshot.entry.target {
             SecondaryIndexTarget::NodeFieldIndex { .. } => {
                 let node_metas =
@@ -2541,13 +2581,13 @@ fn validate_compound_secondary_snapshot_coverage(
 #[allow(clippy::too_many_arguments)]
 fn finalize_compound_secondary_build_snapshot(
     db_dir: &Path,
-    manifest_write_lock: &Arc<Mutex<()>>,
-    catalog_lock: &Arc<RwLock<SecondaryIndexCatalog>>,
-    entries_lock: &Arc<RwLock<SecondaryIndexEntries>>,
+    manifest_write_lock: &Arc<ManifestLock>,
+    catalog_lock: &SharedArc<RwLock<SecondaryIndexCatalog>>,
+    entries_lock: &SharedArc<RwLock<SecondaryIndexEntries>>,
     next_node_id_seen: &AtomicU64,
     next_edge_id_seen: &AtomicU64,
     engine_seq_seen: &AtomicU64,
-    label_catalog: &Arc<RwLock<RuntimeLabelCatalog>>,
+    label_catalog: &SharedArc<RwLock<RuntimeLabelCatalog>>,
     index_id: u64,
     snapshot: &CompoundSecondaryBuildSnapshot,
     coverage: &CompoundSecondaryCoverageStatus,
@@ -2623,13 +2663,13 @@ fn finalize_compound_secondary_build_snapshot(
 #[allow(clippy::too_many_arguments)]
 fn process_secondary_index_build(
     db_dir: &Path,
-    manifest_write_lock: &Arc<Mutex<()>>,
-    catalog_lock: &Arc<RwLock<SecondaryIndexCatalog>>,
-    entries_lock: &Arc<RwLock<SecondaryIndexEntries>>,
+    manifest_write_lock: &Arc<ManifestLock>,
+    catalog_lock: &SharedArc<RwLock<SecondaryIndexCatalog>>,
+    entries_lock: &SharedArc<RwLock<SecondaryIndexEntries>>,
     next_node_id_seen: &AtomicU64,
     next_edge_id_seen: &AtomicU64,
     engine_seq_seen: &AtomicU64,
-    label_catalog: &Arc<RwLock<RuntimeLabelCatalog>>,
+    label_catalog: &SharedArc<RwLock<RuntimeLabelCatalog>>,
     #[cfg(test)] build_pause: &Arc<Mutex<Option<SecondaryIndexBuildPauseHook>>>,
     index_id: u64,
     cancel: &AtomicBool,
@@ -2753,10 +2793,10 @@ struct TargetedStatsRefreshSnapshot {
 
 fn load_targeted_stats_refresh_snapshot(
     db_dir: &Path,
-    manifest_write_lock: &Arc<Mutex<()>>,
+    manifest_write_lock: &Arc<ManifestLock>,
     ready: &SecondaryIndexReadyApplied,
 ) -> Result<Option<TargetedStatsRefreshSnapshot>, EngineError> {
-    let _guard = manifest_write_lock.lock().unwrap();
+    let _guard = manifest_write_lock.gate()?;
     let manifest = load_manifest_readonly(db_dir)?
         .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
     let Some(target_entry) = manifest
@@ -2809,7 +2849,7 @@ fn load_targeted_stats_refresh_snapshot(
 
 fn targeted_refresh_snapshot_contains_segment(
     db_dir: &Path,
-    manifest_write_lock: &Arc<Mutex<()>>,
+    manifest_write_lock: &Arc<ManifestLock>,
     ready: &SecondaryIndexReadyApplied,
     segment_id: u64,
 ) -> Result<Option<TargetedStatsRefreshSnapshot>, EngineError> {
@@ -2855,10 +2895,10 @@ fn target_secondary_sidecar_is_valid(
 
 fn refresh_ready_secondary_index_planner_stats(
     db_dir: &Path,
-    manifest_write_lock: &Arc<Mutex<()>>,
+    manifest_write_lock: &Arc<ManifestLock>,
     ready: &SecondaryIndexReadyApplied,
     cancel: &AtomicBool,
-) -> Vec<(u64, Arc<SegmentReader>)> {
+) -> Vec<(u64, SharedArc<SegmentReader>)> {
     const TARGETED_STATS_REFRESH_MAX_ATTEMPTS: usize = 4;
 
     let Some(initial_snapshot) =
@@ -2903,7 +2943,7 @@ fn refresh_ready_secondary_index_planner_stats(
                 Err(_) => continue,
             };
             if target_secondary_sidecar_is_valid(&latest_segment, ready).unwrap_or(false) {
-                refreshed.push((segment_id, Arc::new(latest_segment)));
+                refreshed.push((segment_id, SharedArc::new(latest_segment)));
             }
         }
         return refreshed;
@@ -3018,7 +3058,7 @@ fn refresh_ready_secondary_index_planner_stats(
             refreshed_reader.warm_declared_index_runtime_coverage(entry);
         }
         if target_secondary_sidecar_is_valid(&refreshed_reader, ready).unwrap_or(false) {
-            refreshed.push((segment_id, Arc::new(refreshed_reader)));
+            refreshed.push((segment_id, SharedArc::new(refreshed_reader)));
         }
     }
 
@@ -3068,13 +3108,13 @@ fn bg_secondary_index_worker(
     cancel: Arc<AtomicBool>,
     runtime: Option<std::sync::Weak<DbRuntime>>,
     db_dir: PathBuf,
-    manifest_write_lock: Arc<Mutex<()>>,
-    catalog_lock: Arc<RwLock<SecondaryIndexCatalog>>,
-    entries_lock: Arc<RwLock<SecondaryIndexEntries>>,
+    manifest_write_lock: Arc<ManifestLock>,
+    catalog_lock: SharedArc<RwLock<SecondaryIndexCatalog>>,
+    entries_lock: SharedArc<RwLock<SecondaryIndexEntries>>,
     next_node_id_seen: Arc<AtomicU64>,
     next_edge_id_seen: Arc<AtomicU64>,
     engine_seq_seen: Arc<AtomicU64>,
-    label_catalog: Arc<RwLock<RuntimeLabelCatalog>>,
+    label_catalog: SharedArc<RwLock<RuntimeLabelCatalog>>,
     #[cfg(test)] build_pause: Arc<Mutex<Option<SecondaryIndexBuildPauseHook>>>,
 ) {
     while let Ok(job) = rx.recv() {
@@ -3082,6 +3122,14 @@ fn bg_secondary_index_worker(
             break;
         }
         match job {
+            #[cfg(feature = "production-concurrency")]
+            SecondaryIndexJob::CandidateBuild { work, result } => {
+                let built = build_candidate_index(work);
+                let _ = result.send(built);
+                if let Some(runtime) = runtime.as_ref().and_then(Weak::upgrade) {
+                    runtime.notify_lifecycle_work();
+                }
+            }
             SecondaryIndexJob::Build { index_id } => {
                 let ready_applied = match process_secondary_index_build(
                     &db_dir,
@@ -3426,6 +3474,8 @@ fn is_cache_bypass_edge(valid_from: i64, valid_to: i64, created_at: i64) -> bool
 
 #[derive(Clone)]
 struct ReadManifestState {
+    #[cfg(feature = "production-concurrency")]
+    declared_prune_policies: BTreeMap<String, PrunePolicy>,
     prune_policies: BTreeMap<String, ResolvedPrunePolicy>,
     dense_vector: Option<DenseVectorConfig>,
 }
@@ -3437,15 +3487,42 @@ struct PublishedSchemaCatalogSnapshot {
     edge_schemas: Vec<EdgeSchemaManifestEntry>,
 }
 
+#[cfg_attr(
+    feature = "production-concurrency",
+    expect(
+        clippy::large_enum_variant,
+        reason = "Preserve inline legacy catalog ownership and the accounted fixed-catalog handle"
+    )
+)]
+enum CapturedSecondaryCatalog {
+    Legacy(SecondaryIndexCatalog),
+    #[cfg(feature = "production-concurrency")]
+    Fixed(SharedArc<crate::memtable::secondary::FixedCatalog>),
+}
+impl std::ops::Deref for CapturedSecondaryCatalog {
+    type Target = SecondaryIndexCatalog;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Legacy(c) => c,
+            #[cfg(feature = "production-concurrency")]
+            Self::Fixed(c) => &c.query,
+        }
+    }
+}
+impl From<SecondaryIndexCatalog> for CapturedSecondaryCatalog {
+    fn from(c: SecondaryIndexCatalog) -> Self {
+        Self::Legacy(c)
+    }
+}
 pub(crate) struct PublishedReadSources {
     manifest: ReadManifestState,
-    memtable: Arc<Memtable>,
+    memtable: SharedArc<Memtable>,
     immutable_epochs: Vec<ReadViewImmutableEpoch>,
-    segments: Vec<Arc<SegmentReader>>,
-    secondary_index_catalog: SecondaryIndexCatalog,
+    segments: Vec<SharedArc<SegmentReader>>,
+    secondary_index_catalog: CapturedSecondaryCatalog,
     secondary_index_entries: SecondaryIndexEntries,
-    pub(crate) declared_index_runtime_coverage: Arc<DeclaredIndexRuntimeCoverage>,
-    planner_stats: Arc<PlannerStatsView>,
+    pub(crate) declared_index_runtime_coverage: SharedArc<DeclaredIndexRuntimeCoverage>,
+    planner_stats: SharedArc<PlannerStatsView>,
     #[cfg(test)]
     planning_probe_counters: QueryPlanningProbeCounters,
     #[cfg(test)]
@@ -3471,6 +3548,8 @@ pub(crate) struct QueryPlanningProbeSnapshot {
 #[cfg(test)]
 #[derive(Default)]
 struct QueryExecutionCounters {
+    dense_scope_count_passes: AtomicUsize,
+    dense_scope_exact_routes: AtomicUsize,
     node_record_hydration_reads: AtomicUsize,
     node_visibility_meta_reads: AtomicUsize,
     edge_record_hydration_reads: AtomicUsize,
@@ -3530,6 +3609,8 @@ struct QueryExecutionCounters {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct QueryExecutionCounterSnapshot {
+    pub dense_scope_count_passes: usize,
+    pub dense_scope_exact_routes: usize,
     pub node_record_hydration_reads: usize,
     pub node_visibility_meta_reads: usize,
     pub edge_record_hydration_reads: usize,
@@ -3717,18 +3798,18 @@ fn note_prepared_edge_endpoint_visibility_resolutions(resolutions: usize) {
 /// Published read-visible snapshot for CP1 point/dedup reads.
 #[derive(Clone)]
 pub(crate) struct ReadView {
-    sources: Arc<PublishedReadSources>,
+    sources: SharedArc<PublishedReadSources>,
     snapshot_seq: u64,
-    active_degree_overlay: Arc<DegreeOverlaySnapshot>,
-    label_catalog: Arc<ReadLabelCatalogSnapshot>,
+    active_degree_overlay: SharedArc<DegreeOverlaySnapshot>,
+    label_catalog: SharedArc<ReadLabelCatalogSnapshot>,
 }
 
 pub(crate) type ReadViewImmutableEpoch = ImmutableEpoch;
 
 struct PublishedReadState {
     view: Arc<ReadView>,
-    label_catalog: Arc<ReadLabelCatalogSnapshot>,
-    schema_catalog: Arc<PublishedSchemaCatalogSnapshot>,
+    label_catalog: SharedArc<ReadLabelCatalogSnapshot>,
+    schema_catalog: SharedArc<PublishedSchemaCatalogSnapshot>,
     edge_uniqueness: bool,
     #[cfg(test)]
     engine_seq: u64,
@@ -3773,6 +3854,7 @@ struct RuntimeLifecycleState {
     closed: bool,
     close_in_progress: bool,
     mutating_barrier_active: bool,
+    mutating_barrier_thread: Option<std::thread::ThreadId>,
     lifecycle_work_ready: bool,
     coordinator_shutdown_requested: bool,
     coordinator_stopped: bool,
@@ -3781,8 +3863,14 @@ struct RuntimeLifecycleState {
     coordinator_active_command: bool,
     pending_secondary_index_followups: HashSet<SecondaryIndexReadFollowupKey>,
     progress_seq: u64,
+    // The coordinator and the exclusive compaction barrier serialize production
+    // flush waits. Retain one completion only for that live barrier.
+    awaited_flush: Option<AwaitedFlush>,
+    #[cfg(test)]
     completed_flushes_by_epoch: HashMap<u64, SegmentInfo>,
+    #[cfg(test)]
     completed_flush_order: VecDeque<u64>,
+    #[cfg(test)]
     completed_bg_compactions: VecDeque<CompactionStats>,
 }
 
@@ -3795,6 +3883,7 @@ impl Default for RuntimeLifecycleState {
             closed: false,
             close_in_progress: false,
             mutating_barrier_active: false,
+            mutating_barrier_thread: None,
             lifecycle_work_ready: false,
             coordinator_shutdown_requested: false,
             coordinator_stopped: false,
@@ -3803,9 +3892,51 @@ impl Default for RuntimeLifecycleState {
             coordinator_active_command: false,
             pending_secondary_index_followups: HashSet::new(),
             progress_seq: 0,
+            awaited_flush: None,
+            #[cfg(test)]
             completed_flushes_by_epoch: HashMap::new(),
+            #[cfg(test)]
             completed_flush_order: VecDeque::new(),
+            #[cfg(test)]
             completed_bg_compactions: VecDeque::new(),
+        }
+    }
+}
+
+struct AwaitedFlush {
+    epoch_id: u64,
+    completed: Option<SegmentInfo>,
+}
+
+struct RuntimeFlushWait<'a> {
+    runtime: &'a DbRuntime,
+    epoch_id: u64,
+}
+
+impl Drop for RuntimeFlushWait<'_> {
+    fn drop(&mut self) {
+        let mut lifecycle = self.runtime.lifecycle.lock().unwrap();
+        debug_assert!(lifecycle
+            .awaited_flush
+            .as_ref()
+            .is_some_and(|wait| wait.epoch_id == self.epoch_id));
+        lifecycle.awaited_flush = None;
+    }
+}
+
+impl RuntimeLifecycleState {
+    fn release_closed_backing(&mut self) {
+        debug_assert!(self.awaited_flush.is_none());
+        debug_assert!(self.pending_core_writes.is_empty());
+        debug_assert!(self.pending_secondary_index_followups.is_empty());
+        self.awaited_flush = None;
+        self.pending_core_writes = VecDeque::new();
+        self.pending_secondary_index_followups = HashSet::new();
+        #[cfg(test)]
+        {
+            self.completed_flushes_by_epoch = HashMap::new();
+            self.completed_flush_order = VecDeque::new();
+            self.completed_bg_compactions = VecDeque::new();
         }
     }
 }
@@ -3847,12 +3978,32 @@ impl Drop for RuntimeMutatingBarrierGuard<'_> {
     fn drop(&mut self) {
         let mut lifecycle = self.runtime.lifecycle.lock().unwrap();
         lifecycle.mutating_barrier_active = false;
+        lifecycle.mutating_barrier_thread = None;
         lifecycle.active_non_read_ops = lifecycle.active_non_read_ops.saturating_sub(1);
         self.runtime.lifecycle_cv.notify_all();
     }
 }
 
+#[cfg(feature = "production-concurrency")]
+struct CandidateRuntime {
+    index_followups: Arc<CandidateIndexFollowups>,
+    cleanup_pending: AtomicBool,
+    session: Mutex<Option<completion::DirectorySession>>,
+    stats: reclamation::ReclamationStatsHandle,
+    lifetime: concurrency_lifecycle::LifecycleRef,
+    pressure: Arc<concurrency_lifecycle::Pressure<8>>,
+    options: ConcurrencyOptions,
+    close_fast: AtomicBool,
+    close_result: BindingCloseHandle,
+}
+
 struct DbRuntime {
+    #[cfg(all(test, feature = "production-concurrency"))]
+    manual_compaction_waits: AtomicUsize,
+    #[cfg(feature = "binding-test-hooks")]
+    binding_hooks: BindingTestHandle,
+    #[cfg(feature = "production-concurrency")]
+    candidate: Option<CandidateRuntime>,
     db_dir: PathBuf,
     core: Mutex<Option<EngineCore>>,
     published: ArcSwap<PublishedReadState>,
@@ -3871,6 +4022,8 @@ struct DbRuntime {
     publish_counters: PublishCounters,
     #[cfg(test)]
     write_publish_pause: Mutex<Option<RuntimePublishPauseHook>>,
+    #[cfg(any(test, feature = "binding-test-hooks"))]
+    force_publication_error: AtomicBool,
     #[cfg(test)]
     read_admission_pause: Mutex<Option<RuntimeReadPauseHook>>,
     #[cfg(test)]
@@ -3953,6 +4106,16 @@ enum SecondaryIndexReadFollowupKey {
 }
 
 impl SecondaryIndexReadFollowup {
+    #[cfg(feature = "production-concurrency")]
+    fn index_id(&self) -> u64 {
+        match self {
+            Self::EqualitySidecarFailure { index_id, .. }
+            | Self::RangeSidecarFailure { index_id, .. }
+            | Self::CompoundEqualitySidecarFailure { index_id, .. }
+            | Self::CompoundRangeSidecarFailure { index_id, .. } => *index_id,
+        }
+    }
+
     fn dedup_key(&self) -> SecondaryIndexReadFollowupKey {
         match self {
             SecondaryIndexReadFollowup::EqualitySidecarFailure { index_id, error } => match error {
@@ -4142,6 +4305,7 @@ enum CoreWriteReply {
     VecU64(Vec<u64>),
     Unit,
     OptionEdge(Option<EdgeRecord>),
+    OptionEdgeWithCatalog(Option<EdgeRecord>, SharedArc<ReadLabelCatalogSnapshot>),
     PatchResult(PatchResult),
     TxnCommitResult(TxnCommitResult),
     TxnCommitResultWithReadView(TxnCommitResult, Arc<ReadView>),
@@ -4156,12 +4320,37 @@ enum CoreWriteReply {
     OptionCompactionStats(Option<CompactionStats>),
 }
 
+impl Drop for CoreWriteRequest {
+    fn drop(&mut self) {
+        use payload::Drain;
+        match self {
+            Self::UpsertNode { options, .. } => options.drain_payload(),
+            Self::UpsertEdge { options, .. } => options.drain_payload(),
+            Self::BatchUpsertNodes { inputs } => inputs.drain_payload(),
+            Self::BatchUpsertEdges { inputs } => inputs.drain_payload(),
+            Self::GraphPatch { patch } => patch.drain_payload(),
+            #[cfg(test)]
+            Self::WriteOp { op } => op.drain_payload(),
+            #[cfg(test)]
+            Self::WriteOpBatch { ops } => ops.drain_payload(),
+            _ => {}
+        }
+    }
+}
+
 struct CoreWritePlan {
     ops: Vec<WalOp>,
     reply: CoreWriteReply,
     auto_flush: bool,
     track_ids: bool,
     label_catalog_changed: bool,
+}
+
+impl Drop for CoreWritePlan {
+    fn drop(&mut self) {
+        use payload::Drain;
+        self.ops.drain_payload();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4178,6 +4367,8 @@ struct PlannedCoreWrite {
 }
 
 struct QueuedCoreWrite {
+    #[cfg(feature = "production-concurrency")]
+    admission: Option<CandidateWriteAdmission>,
     request: CoreWriteRequest,
     reply_tx: Option<std::sync::mpsc::SyncSender<Result<CoreWriteReply, EngineError>>>,
     followup_key: Option<SecondaryIndexReadFollowupKey>,
@@ -4198,6 +4389,12 @@ impl DbRuntime {
     fn new(db_dir: PathBuf, core: EngineCore) -> Self {
         let published = Arc::new(core.published_read_state());
         Self {
+            #[cfg(all(test, feature = "production-concurrency"))]
+            manual_compaction_waits: AtomicUsize::new(0),
+            #[cfg(feature = "binding-test-hooks")]
+            binding_hooks: BindingTestHandle::default(),
+            #[cfg(feature = "production-concurrency")]
+            candidate: None,
             db_dir,
             core: Mutex::new(Some(core)),
             published: ArcSwap::new(published),
@@ -4216,6 +4413,8 @@ impl DbRuntime {
             publish_counters: PublishCounters::default(),
             #[cfg(test)]
             write_publish_pause: Mutex::new(None),
+            #[cfg(any(test, feature = "binding-test-hooks"))]
+            force_publication_error: AtomicBool::new(false),
             #[cfg(test)]
             read_admission_pause: Mutex::new(None),
             #[cfg(test)]
@@ -4240,7 +4439,7 @@ impl DbRuntime {
     }
 
     fn open_state(&self) -> RuntimeOpenState {
-        match self.open_state.load(Ordering::Acquire) {
+        match self.open_state.load(Ordering::SeqCst) {
             x if x == RuntimeOpenState::Open as u8 => RuntimeOpenState::Open,
             x if x == RuntimeOpenState::Closing as u8 => RuntimeOpenState::Closing,
             _ => RuntimeOpenState::Closed,
@@ -4248,23 +4447,25 @@ impl DbRuntime {
     }
 
     fn set_open_state(&self, state: RuntimeOpenState) {
-        self.open_state.store(state as u8, Ordering::Release);
+        self.open_state.store(state as u8, Ordering::SeqCst);
     }
 
     fn finish_read_operation(&self) {
-        let previous = self.active_read_ops.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.active_read_ops.fetch_sub(1, Ordering::SeqCst);
         debug_assert!(previous > 0, "read guard underflow");
         if previous == 1 && self.open_state() == RuntimeOpenState::Closing {
+            let _guard = self.read_drain.lock().unwrap();
             self.read_drain_cv.notify_all();
+            self.lifecycle_cv.notify_all();
         }
     }
 
     fn wait_for_reads_to_drain(&self) {
-        if self.active_read_ops.load(Ordering::Acquire) == 0 {
+        if self.active_read_ops.load(Ordering::SeqCst) == 0 {
             return;
         }
         let mut guard = self.read_drain.lock().unwrap();
-        while self.active_read_ops.load(Ordering::Acquire) > 0 {
+        while self.active_read_ops.load(Ordering::SeqCst) > 0 {
             guard = self.read_drain_cv.wait(guard).unwrap();
         }
     }
@@ -4273,7 +4474,7 @@ impl DbRuntime {
         if self.open_state() != RuntimeOpenState::Open {
             return Err(EngineError::DatabaseClosed);
         }
-        self.active_read_ops.fetch_add(1, Ordering::AcqRel);
+        self.active_read_ops.fetch_add(1, Ordering::SeqCst);
         if self.open_state() != RuntimeOpenState::Open {
             self.finish_read_operation();
             return Err(EngineError::DatabaseClosed);
@@ -4283,7 +4484,10 @@ impl DbRuntime {
             let _ = hook.ready_tx.send(());
             let _ = hook.release_rx.recv();
         }
-        Ok(RuntimeReadGuard { runtime: self })
+        let guard = RuntimeReadGuard { runtime: self };
+        #[cfg(feature = "binding-test-hooks")]
+        self.binding_hooks.hit("read");
+        Ok(guard)
     }
 
     #[cfg(test)]
@@ -4318,6 +4522,7 @@ impl DbRuntime {
             }
             if !lifecycle.mutating_barrier_active {
                 lifecycle.mutating_barrier_active = true;
+                lifecycle.mutating_barrier_thread = Some(std::thread::current().id());
                 lifecycle.active_non_read_ops += 1;
                 #[cfg(test)]
                 self.lifecycle_cv.notify_all();
@@ -4345,15 +4550,103 @@ impl DbRuntime {
         Ok((guard, snapshot))
     }
 
-    fn submit_core_write(&self, request: CoreWriteRequest) -> Result<CoreWriteReply, EngineError> {
+    fn submit_core_write_with(
+        &self,
+        prepare: impl FnOnce() -> CoreWriteRequest,
+    ) -> Result<CoreWriteReply, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        let scope = self
+            .candidate
+            .as_ref()
+            .map(|_| CandidatePreparationScope::enter(self))
+            .transpose()?;
+        #[cfg(feature = "production-concurrency")]
+        let admission = self.admit_candidate_write()?;
+        let request = prepare();
+        #[cfg(feature = "production-concurrency")]
+        drop(scope);
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &self.candidate {
+            let count = match &request {
+                CoreWriteRequest::BatchUpsertNodes { inputs } => inputs.len(),
+                CoreWriteRequest::BatchUpsertEdges { inputs } => inputs.len(),
+                CoreWriteRequest::GraphPatch { patch } => patch
+                    .upsert_nodes
+                    .len()
+                    .saturating_add(patch.upsert_edges.len())
+                    .saturating_add(patch.invalidate_edges.len())
+                    .saturating_add(patch.delete_node_ids.len())
+                    .saturating_add(patch.delete_edge_ids.len()),
+                CoreWriteRequest::TxnCommit { request, .. } => request
+                    .entries
+                    .len()
+                    .saturating_add(request.record_replacements.len()),
+                #[cfg(test)]
+                CoreWriteRequest::WriteOpBatch { ops } => ops.len(),
+                _ => 1,
+            };
+            if count > candidate.options.max_batch_operations {
+                return Err(EngineError::ResourceLimit {
+                    resource: "max_batch_operations",
+                    requested: count as u64,
+                    limit: candidate.options.max_batch_operations as u64,
+                    retryable: false,
+                });
+            }
+        }
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &self.candidate {
+            validate_candidate_input(&request, candidate.options.max_batch_bytes)?;
+        }
         let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
         let mut request = Some(request);
         let mut lifecycle = self.lifecycle.lock().unwrap();
         loop {
-            if lifecycle.closing || lifecycle.closed {
+            if lifecycle.closed {
                 return Err(EngineError::DatabaseClosed);
             }
+            #[cfg(not(feature = "production-concurrency"))]
+            if lifecycle.closing {
+                return Err(EngineError::DatabaseClosed);
+            }
+            #[cfg(feature = "production-concurrency")]
+            if lifecycle.closing && admission.is_none() {
+                return Err(EngineError::DatabaseClosed);
+            }
+            #[cfg(feature = "production-concurrency")]
+            if let Some(admission) = &admission {
+                if admission.deadline.expired() {
+                    #[cfg(test)]
+                    maintenance_diagnostic::admission(&self.db_dir, "before_enqueue", format!("age_ms={} ticket={} head={:?} queued={} progress={} lifecycle_ready={}", admission.deadline.started().elapsed().as_millis(), admission.position.ticket(), admission.position.is_head(), lifecycle.pending_core_writes.len(), lifecycle.progress_seq, lifecycle.lifecycle_work_ready));
+                    return Err(EngineError::ResourceLimit {
+                        resource: "admission_deadline",
+                        requested: 1,
+                        limit: 0,
+                        retryable: true,
+                    });
+                }
+            }
             if lifecycle.mutating_barrier_active {
+                #[cfg(feature = "production-concurrency")]
+                if self.candidate.is_some()
+                    && lifecycle.mutating_barrier_thread == Some(std::thread::current().id())
+                {
+                    return Err(EngineError::InvalidOperation(
+                        "self-dependent write from active mutation callback".into(),
+                    ));
+                }
+                #[cfg(feature = "production-concurrency")]
+                if let Some(admission) = &admission {
+                    lifecycle = self
+                        .lifecycle_cv
+                        .wait_timeout(
+                            lifecycle,
+                            admission.deadline.remaining().unwrap_or_default(),
+                        )
+                        .unwrap()
+                        .0;
+                    continue;
+                }
                 lifecycle = self.lifecycle_cv.wait(lifecycle).unwrap();
                 continue;
             }
@@ -4363,6 +4656,8 @@ impl DbRuntime {
                 lifecycle.active_non_read_ops += 1;
                 lifecycle.active_mutating_ops += 1;
                 lifecycle.pending_core_writes.push_back(QueuedCoreWrite {
+                    #[cfg(feature = "production-concurrency")]
+                    admission,
                     request: request
                         .take()
                         .expect("queued core write request should only enqueue once"),
@@ -4371,6 +4666,18 @@ impl DbRuntime {
                 });
                 self.lifecycle_cv.notify_all();
                 break;
+            }
+            #[cfg(feature = "production-concurrency")]
+            if let Some(admission) = &admission {
+                lifecycle = self
+                    .lifecycle_cv
+                    .wait_timeout(
+                        lifecycle,
+                        admission.deadline.remaining().unwrap_or_default(),
+                    )
+                    .unwrap()
+                    .0;
+                continue;
             }
             lifecycle = self.lifecycle_cv.wait(lifecycle).unwrap();
         }
@@ -4381,7 +4688,49 @@ impl DbRuntime {
             .map_err(|_| EngineError::InvalidOperation("coordinator thread died".into()))?
     }
 
-    fn enqueue_secondary_index_read_followup(&self, followup: SecondaryIndexReadFollowup) {
+    fn enqueue_secondary_index_read_followup(
+        &self,
+        followup: SecondaryIndexReadFollowup,
+        _sources: &PublishedReadSources,
+    ) {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &self.candidate {
+            let id = followup.index_id();
+            if let CapturedSecondaryCatalog::Fixed(catalog) = &_sources.secondary_index_catalog {
+                if let Some(&incarnation) = catalog.incarnations.get(&id) {
+                    // One pending repair per declaration. Read completion never
+                    // parks behind the eight ordinary mutation positions.
+                    let components = candidate_index_components(&_sources.segments, id);
+                    let published = self.published.load_full();
+                    let CapturedSecondaryCatalog::Fixed(current) =
+                        &published.view.sources.secondary_index_catalog
+                    else {
+                        return;
+                    };
+                    if current.incarnations.get(&id) != Some(&incarnation)
+                        || candidate_index_components(&published.view.sources.segments, id)
+                            != components
+                    {
+                        return;
+                    }
+                    let queue = &candidate.index_followups;
+                    let mut pending = queue.pending.lock().unwrap();
+                    if queue.in_flight.load(Ordering::Acquire) == id {
+                        return;
+                    }
+                    pending.entry(id).or_insert(CandidateIndexFollowup {
+                        incarnation,
+                        components,
+                        followup,
+                    });
+                    queue.ready.store(true, Ordering::Release);
+                    drop(pending);
+                    self.notify_lifecycle_work();
+                }
+            }
+            return;
+        }
+
         let followup_key = followup.dedup_key();
         let mut lifecycle = self.lifecycle.lock().unwrap();
         loop {
@@ -4407,6 +4756,8 @@ impl DbRuntime {
                     .pending_secondary_index_followups
                     .insert(followup_key.clone());
                 lifecycle.pending_core_writes.push_back(QueuedCoreWrite {
+                    #[cfg(feature = "production-concurrency")]
+                    admission: None,
                     request: CoreWriteRequest::ApplySecondaryIndexReadFollowup { followup },
                     reply_tx: None,
                     followup_key: Some(followup_key),
@@ -4459,12 +4810,36 @@ impl DbRuntime {
         self.lifecycle_cv.notify_all();
     }
 
+    // Called with core held, before it can expose epoch removal. Production
+    // barriers are serialized by the coordinator or the mutating barrier.
+    fn register_flush_wait(&self, epoch_id: u64) -> RuntimeFlushWait<'_> {
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        assert!(
+            lifecycle.awaited_flush.is_none(),
+            "overlapping flush barriers"
+        );
+        lifecycle.awaited_flush = Some(AwaitedFlush {
+            epoch_id,
+            completed: None,
+        });
+        RuntimeFlushWait {
+            runtime: self,
+            epoch_id,
+        }
+    }
+
     fn take_completed_flush_for_epoch(&self, epoch_id: u64) -> Option<SegmentInfo> {
-        self.lifecycle
-            .lock()
-            .unwrap()
-            .completed_flushes_by_epoch
-            .remove(&epoch_id)
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        let result = lifecycle
+            .awaited_flush
+            .as_mut()
+            .filter(|wait| wait.epoch_id == epoch_id)
+            .and_then(|wait| wait.completed.take());
+        #[cfg(test)]
+        if result.is_some() {
+            lifecycle.completed_flushes_by_epoch.remove(&epoch_id);
+        }
+        result
     }
 
     #[cfg(test)]
@@ -4545,7 +4920,27 @@ impl DbRuntime {
             }
         }
 
+        #[cfg(any(test, feature = "binding-test-hooks"))]
+        if impact != PublishImpact::NoPublish
+            && self.force_publication_error.swap(false, Ordering::AcqRel)
+        {
+            core.manifest_write_lock.establish();
+            return Err(EngineError::CommitOutcome {
+                state: CommitOutcomeState::Indeterminate,
+                message: "injected post-acceptance publication failure".into(),
+            });
+        }
+        if core.manifest_write_lock.fenced() && impact != PublishImpact::NoPublish {
+            return Err(EngineError::CommitOutcome {
+                state: CommitOutcomeState::Indeterminate,
+                message: "publication refused after fence".into(),
+            });
+        }
         if impact == PublishImpact::NoPublish {
+            #[cfg(feature = "production-concurrency")]
+            if let Some(candidate) = &mut core.candidate {
+                candidate.deadline = None;
+            }
             core.retry_deferred_segment_cleanup();
             return Ok(());
         }
@@ -4558,12 +4953,35 @@ impl DbRuntime {
             }
         }
 
+        #[cfg(feature = "production-concurrency")]
+        let authority = core.manifest_write_lock.clone();
+        // Default views retain their old publication cost; the candidate gate
+        // makes publication-before-fence versus fence-before-publication explicit.
+        #[cfg(feature = "production-concurrency")]
+        let _publication_gate = if core.candidate.is_some() {
+            Some(authority.gate().map_err(|_| EngineError::CommitOutcome {
+                state: CommitOutcomeState::Indeterminate,
+                message: "publication refused after fence".into(),
+            })?)
+        } else {
+            None
+        };
+        #[cfg(feature = "production-concurrency")]
         if impact == PublishImpact::RebuildSources {
-            core.rebuild_published_read_sources()?;
+            core.guard_current_graphs()?;
+        } else if let Some(candidate) = &core.candidate {
+            core.active_degree_overlay
+                .guard(&candidate.domain, reclamation::ResourceClass::Catalog)?;
+        }
+        match impact {
+            PublishImpact::RebuildSources => core.rebuild_published_read_sources()?,
+            PublishImpact::SnapshotWithLabelCatalog => core.refresh_catalog_snapshots(),
+            PublishImpact::SnapshotOnly => core.refresh_schema_snapshot(),
+            PublishImpact::NoPublish => unreachable!("NoPublish returned before refresh"),
         }
 
         let label_catalog = match impact {
-            PublishImpact::SnapshotOnly => Arc::clone(&self.published.load_full().label_catalog),
+            PublishImpact::SnapshotOnly => Clone::clone(&self.published.load_full().label_catalog),
             PublishImpact::SnapshotWithLabelCatalog | PublishImpact::RebuildSources => {
                 core.read_label_catalog_snapshot()
             }
@@ -4573,6 +4991,12 @@ impl DbRuntime {
         // Publish before releasing the core mutex so later writers cannot overtake
         // this committed snapshot and install an older view afterward.
         self.published.store(published);
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &mut core.candidate {
+            candidate.accepted = false;
+        }
+        #[cfg(feature = "production-concurrency")]
+        drop(_publication_gate);
         core.retry_deferred_segment_cleanup();
         Ok(())
     }
@@ -4616,7 +5040,7 @@ impl DbRuntime {
     fn republish_secondary_index_state_and_refreshed_stats_if_open(
         &self,
         ready: &SecondaryIndexReadyApplied,
-        refreshed_readers: Vec<(u64, Arc<SegmentReader>)>,
+        refreshed_readers: Vec<(u64, SharedArc<SegmentReader>)>,
     ) {
         let mut core_guard = self.core.lock().unwrap();
         let Some(core) = core_guard.as_mut() else {
@@ -4681,7 +5105,24 @@ impl DbRuntime {
             lifecycle.coordinator_shutdown_requested = false;
             lifecycle.coordinator_stopped = false;
         }
-        let runtime = Arc::clone(self);
+        let runtime = Clone::clone(self);
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &self.candidate {
+            let session = candidate.session.lock().unwrap();
+            session
+                .as_ref()
+                .unwrap()
+                .registration()
+                .spawn(
+                    completion::Role::Coordinator,
+                    "overgraph-coordinator",
+                    move |_| runtime.coordinator_loop(),
+                )
+                .unwrap_or_else(|e| {
+                    concurrency_lifecycle::fail_stop(&format!("coordinator start failed: {e:?}"))
+                });
+            return;
+        }
         *coordinator_guard = Some(std::thread::spawn(move || runtime.coordinator_loop()));
     }
 
@@ -4703,6 +5144,10 @@ impl DbRuntime {
     }
 
     fn coordinator_loop(self: Arc<Self>) {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &self.candidate {
+            candidate.lifetime.register_coordinator();
+        }
         let mut current_command: Option<QueuedCoreWrite> = None;
         let mut waiting_for_lifecycle = false;
         loop {
@@ -4715,9 +5160,71 @@ impl DbRuntime {
                     && ((current_command.is_none() && lifecycle.pending_core_writes.is_empty())
                         || waiting_for_lifecycle)
                 {
+                    #[cfg(feature = "production-concurrency")]
+                    if waiting_for_lifecycle
+                        && current_command
+                            .as_ref()
+                            .and_then(|c| c.admission.as_ref())
+                            .is_some_and(|a| a.deadline.expired())
+                    {
+                        waiting_for_lifecycle = false;
+                        break;
+                    }
+                    #[cfg(feature = "production-concurrency")]
+                    if let Some(candidate) = &self.candidate {
+                        if candidate.lifetime.close_requested() {
+                            lifecycle.closing = true;
+                            self.set_open_state(RuntimeOpenState::Closing);
+                            if candidate.pressure.occupied() == 0
+                                && !candidate.lifetime.has_admitted()
+                                && lifecycle.active_non_read_ops == 0
+                                && self.active_read_ops.load(Ordering::SeqCst) == 0
+                            {
+                                drop(lifecycle);
+                                self.finish_candidate_shutdown();
+                                return;
+                            }
+                        }
+                        lifecycle = self
+                            .lifecycle_cv
+                            .wait_timeout(lifecycle, std::time::Duration::from_millis(10))
+                            .unwrap()
+                            .0;
+                        if candidate.cleanup_pending.load(Ordering::Acquire) {
+                            lifecycle.lifecycle_work_ready = true;
+                        }
+                        continue;
+                    }
                     lifecycle = self.lifecycle_cv.wait(lifecycle).unwrap();
                 }
                 if current_command.is_none() {
+                    #[cfg(feature = "production-concurrency")]
+                    lifecycle
+                        .pending_core_writes
+                        .make_contiguous()
+                        .sort_by_key(|command| {
+                            command
+                                .admission
+                                .as_ref()
+                                .map_or(u64::MAX, |a| a.position.ticket())
+                        });
+                    #[cfg(feature = "production-concurrency")]
+                    let ready = lifecycle.pending_core_writes.front().is_none_or(|command| {
+                        command.admission.as_ref().is_none_or(|a| {
+                            a.deadline.expired() || a.position.is_head().unwrap_or(false)
+                        })
+                    });
+                    #[cfg(not(feature = "production-concurrency"))]
+                    let ready = true;
+                    if !ready {
+                        lifecycle = self
+                            .lifecycle_cv
+                            .wait_timeout(lifecycle, std::time::Duration::from_millis(10))
+                            .unwrap()
+                            .0;
+                        drop(lifecycle);
+                        continue;
+                    }
                     if let Some(command) = lifecycle.pending_core_writes.pop_front() {
                         lifecycle.coordinator_active_command = true;
                         current_command = Some(command);
@@ -4772,6 +5279,8 @@ impl DbRuntime {
                     if let Some(reply_tx) = command.reply_tx {
                         let _ = reply_tx.send(result);
                     }
+                    #[cfg(feature = "production-concurrency")]
+                    drop(command.admission);
                     self.lifecycle_cv.notify_all();
                 }
                 QueuedWriteProgress::WaitForLifecycle { command } => {
@@ -4783,6 +5292,37 @@ impl DbRuntime {
     }
 
     fn execute_core_write_command(&self, command: QueuedCoreWrite) -> QueuedWriteProgress {
+        #[cfg(feature = "production-concurrency")]
+        if command
+            .admission
+            .as_ref()
+            .is_some_and(|a| a.deadline.expired())
+        {
+            #[cfg(test)]
+            {
+                let admission = command.admission.as_ref().unwrap();
+                if let Ok(core) = self.core.try_lock() {
+                    if let Some(core) = core.as_ref() {
+                        core.trace_candidate_admission_for_test(
+                            "coordinator_head",
+                            Some(admission.deadline),
+                        );
+                    }
+                }
+                if let Ok(lifecycle) = self.lifecycle.try_lock() {
+                    maintenance_diagnostic::admission(&self.db_dir, "coordinator_queue", format!("age_ms={} ticket={} head={:?} queued={} progress={} lifecycle_ready={}", admission.deadline.started().elapsed().as_millis(), admission.position.ticket(), admission.position.is_head(), lifecycle.pending_core_writes.len(), lifecycle.progress_seq, lifecycle.lifecycle_work_ready));
+                }
+            }
+            return QueuedWriteProgress::Complete {
+                command,
+                result: Err(EngineError::ResourceLimit {
+                    resource: "admission_deadline",
+                    requested: 1,
+                    limit: 0,
+                    retryable: true,
+                }),
+            };
+        }
         match &command.request {
             CoreWriteRequest::Sync => {
                 let result = {
@@ -4829,6 +5369,39 @@ impl DbRuntime {
             };
         };
 
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &mut core.candidate {
+            candidate.deadline = command.admission.as_ref().map(|a| a.deadline);
+        }
+        #[cfg(feature = "production-concurrency")]
+        if core
+            .candidate
+            .as_ref()
+            .is_some_and(|c| c.heavy.load(Ordering::Acquire) || !core.immutable_epochs.is_empty())
+            && matches!(
+                &command.request,
+                CoreWriteRequest::EnsureNodePropertyIndex { .. }
+                    | CoreWriteRequest::DropNodePropertyIndex { .. }
+                    | CoreWriteRequest::EnsureEdgePropertyIndex { .. }
+                    | CoreWriteRequest::DropEdgePropertyIndex { .. }
+                    | CoreWriteRequest::ApplySecondaryIndexReadFollowup { .. }
+            )
+        {
+            // A deferred DDL request needs pending frozen input drained even if
+            // no automatic flush worker was configured. Ordinary manual freezes
+            // retain their existing schedule until work actually requests flush.
+            if !core.immutable_epochs.is_empty() {
+                core.ensure_bg_flush_worker();
+                if let Err(error) = core.enqueue_all_non_in_flight() {
+                    return QueuedWriteProgress::Complete {
+                        command,
+                        result: Err(error),
+                    };
+                }
+            }
+            drop(core_guard);
+            return QueuedWriteProgress::WaitForLifecycle { command };
+        }
         let uses_write_backpressure = matches!(
             &command.request,
             CoreWriteRequest::UpsertNode { .. }
@@ -4873,6 +5446,17 @@ impl DbRuntime {
             }
         }
 
+        #[cfg(feature = "production-concurrency")]
+        let participants = core.memtable.participant_handle();
+        #[cfg(feature = "production-concurrency")]
+        let mut primary_install = PrimaryInstall {
+            participant: participants.as_ref(),
+            session: None,
+            prepared: None,
+            postcommit_maintenance: false,
+            existing_node_limit: core.next_node_id,
+            existing_edge_limit: core.next_edge_id,
+        };
         let (result, request_publish_impact) = match &command.request {
             CoreWriteRequest::SetPrunePolicy { name, policy } => {
                 match core.set_prune_policy(name, policy.clone()) {
@@ -4983,11 +5567,66 @@ impl DbRuntime {
             CoreWriteRequest::IngestMode => (Ok(CoreWriteReply::Unit), core.ingest_mode()),
             _ => core
                 .plan_core_write(&command.request)
-                .map(|plan| core.commit_core_write_plan(plan))
+                .map(|plan| {
+                    core.commit_core_write_plan(
+                        plan,
+                        #[cfg(feature = "production-concurrency")]
+                        &mut primary_install,
+                    )
+                })
                 .unwrap_or_else(|err| (Err(err), PublishImpact::NoPublish)),
         };
+        #[cfg(feature = "production-concurrency")]
+        let result = if result.is_err() && core.candidate.as_ref().is_some_and(|c| c.accepted) {
+            core.manifest_write_lock.establish();
+            Err(EngineError::CommitOutcome {
+                state: CommitOutcomeState::Indeterminate,
+                message: format!(
+                    "accepted mutation did not finish runtime publication: {}",
+                    result.err().unwrap()
+                ),
+            })
+        } else {
+            result
+        };
+        #[cfg(feature = "production-concurrency")]
+        if matches!(
+            &result,
+            Err(EngineError::ResourceLimit {
+                resource: "index_build_suffix",
+                ..
+            })
+        ) {
+            drop(primary_install.session.take());
+            drop(core_guard);
+            return QueuedWriteProgress::WaitForLifecycle { command };
+        }
         publish_impact = publish_impact.combine(request_publish_impact);
+        #[cfg(feature = "binding-test-hooks")]
+        if core
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.accepted)
+        {
+            self.binding_hooks.hit("accepted");
+        }
         let publish_result = self.publish_locked(core, publish_impact, true);
+        #[cfg(feature = "production-concurrency")]
+        let publish_result = publish_result.map_err(|error| {
+            if core
+                .candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.accepted)
+            {
+                core.manifest_write_lock.establish();
+                EngineError::CommitOutcome {
+                    state: CommitOutcomeState::Indeterminate,
+                    message: format!("accepted write publication incomplete: {error}"),
+                }
+            } else {
+                error
+            }
+        });
         let return_read_view = matches!(
             &command.request,
             CoreWriteRequest::TxnCommit {
@@ -4996,16 +5635,81 @@ impl DbRuntime {
             }
         );
         let read_view = if return_read_view && result.is_ok() && publish_result.is_ok() {
-            Some(Arc::clone(&self.published.load_full().view))
+            Some(Clone::clone(&self.published.load_full().view))
         } else {
             None
         };
+        let edge_reply_catalog =
+            if matches!(&result, Ok(CoreWriteReply::OptionEdge(_))) && publish_result.is_ok() {
+                Some(self.published.load_full().label_catalog.clone())
+            } else {
+                None
+            };
+        #[cfg(feature = "production-concurrency")]
+        let (result, publish_result) = {
+            drop(primary_install.session.take());
+            #[cfg(feature = "binding-test-hooks")]
+            let postcommit_maintenance =
+                primary_install.postcommit_maintenance || self.binding_hooks.maintenance_pending();
+            #[cfg(not(feature = "binding-test-hooks"))]
+            let postcommit_maintenance = primary_install.postcommit_maintenance;
+            if result.is_ok() && publish_result.is_ok() && postcommit_maintenance {
+                let (maintenance, impact) = core.maybe_auto_flush();
+                #[cfg(feature = "binding-test-hooks")]
+                let maintenance = if self.binding_hooks.take_maintenance_error() {
+                    Err(EngineError::IoError(std::io::Error::other(
+                        "injected postcommit maintenance failure",
+                    )))
+                } else {
+                    maintenance
+                };
+                let publication = self.publish_locked(core, impact, true);
+                let error = maintenance.and(publication).err();
+                match error {
+                    Some(error) => {
+                        let indeterminate = matches!(
+                            &error,
+                            EngineError::CommitOutcome {
+                                state: CommitOutcomeState::Indeterminate,
+                                ..
+                            }
+                        );
+                        let state = if indeterminate || core.manifest_write_lock.fenced() {
+                            core.manifest_write_lock.establish();
+                            CommitOutcomeState::Indeterminate
+                        } else {
+                            CommitOutcomeState::Committed
+                        };
+                        (
+                            Err(EngineError::CommitOutcome {
+                                state,
+                                message: format!("postcommit maintenance: {error}"),
+                            }),
+                            Ok(()),
+                        )
+                    }
+                    None => (result, publish_result),
+                }
+            } else {
+                (result, publish_result)
+            }
+        };
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &mut core.candidate {
+            candidate.deadline = None;
+        }
         drop(core_guard);
         let result = match (result, publish_result) {
             (Err(err), _) => Err(err),
             (Ok(CoreWriteReply::TxnCommitResult(result)), Ok(())) if return_read_view => {
                 let view = read_view.expect("published read view captured for txn commit");
                 Ok(CoreWriteReply::TxnCommitResultWithReadView(result, view))
+            }
+            (Ok(CoreWriteReply::OptionEdge(edge)), Ok(())) => {
+                Ok(CoreWriteReply::OptionEdgeWithCatalog(
+                    edge,
+                    edge_reply_catalog.expect("exact edge reply catalog"),
+                ))
             }
             (Ok(reply), Ok(())) => Ok(reply),
             (Ok(_), Err(err)) => Err(err),
@@ -5014,8 +5718,9 @@ impl DbRuntime {
     }
 
     fn execute_flush_barrier(&self) -> Result<Option<SegmentInfo>, EngineError> {
-        let mut target_epoch: Option<u64> = None;
+        let mut waiter: Option<RuntimeFlushWait<'_>> = None;
         loop {
+            let target_epoch = waiter.as_ref().map(|wait| wait.epoch_id);
             if let Some(epoch_id) = target_epoch {
                 if let Some(info) = self.take_completed_flush_for_epoch(epoch_id) {
                     return Ok(Some(info));
@@ -5026,6 +5731,7 @@ impl DbRuntime {
             let mut core_guard = self.core.lock().unwrap();
             let core = core_guard.as_mut().ok_or(EngineError::DatabaseClosed)?;
 
+            core.ensure_maintenance_unfenced()?;
             core.maybe_surface_or_retry_flush_pipeline_error()?;
 
             if target_epoch.is_none() {
@@ -5058,7 +5764,10 @@ impl DbRuntime {
                     drop(core_guard);
                     return Err(error);
                 }
-                target_epoch = core.immutable_epochs.first().map(|epoch| epoch.epoch_id);
+                waiter = core
+                    .immutable_epochs
+                    .first()
+                    .map(|epoch| self.register_flush_wait(epoch.epoch_id));
                 if mutated {
                     self.publish_locked(core, PublishImpact::RebuildSources, true)?;
                 }
@@ -5107,10 +5816,35 @@ impl DbRuntime {
             let wait_seq = self.lifecycle_progress_seq();
             let mut core_guard = self.core.lock().unwrap();
             let core = core_guard.as_mut().ok_or(EngineError::DatabaseClosed)?;
+            core.ensure_maintenance_unfenced()?;
+            #[cfg(feature = "production-concurrency")]
+            if let Some(error) = core
+                .candidate
+                .as_mut()
+                .and_then(|c| c.maintenance_error.take())
+            {
+                return Err(error);
+            }
 
             if !core.memtable.is_empty() || !core.immutable_epochs.is_empty() {
                 drop(core_guard);
                 self.execute_flush_barrier()?;
+                continue;
+            }
+
+            #[cfg(feature = "production-concurrency")]
+            if core
+                .candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.heavy.load(Ordering::Acquire))
+            {
+                #[cfg(test)]
+                self.manual_compaction_waits.fetch_add(1, Ordering::Release);
+                drop(core_guard);
+                if self.run_lifecycle_batch_if_open() {
+                    continue;
+                }
+                self.wait_for_lifecycle_event(wait_seq)?;
                 continue;
             }
 
@@ -5123,6 +5857,8 @@ impl DbRuntime {
                 continue;
             }
 
+            #[cfg(feature = "production-concurrency")]
+            let _heavy = core.acquire_heavy_job();
             let result = core.compact_with_progress(&mut progress);
             let publish_impact = if matches!(result, Ok(Some(_))) {
                 PublishImpact::RebuildSources
@@ -5140,7 +5876,40 @@ impl DbRuntime {
         let Some(core) = core_guard.as_mut() else {
             return false;
         };
-
+        // Fencing forbids adoption, not terminal bookkeeping. Drain failure
+        // events so admitted barriers and native shutdown can finish.
+        #[cfg(feature = "production-concurrency")]
+        let index_progressed = if core.candidate.is_some() {
+            match core.service_candidate_index_build() {
+                Ok(progressed) => progressed,
+                Err(error) => {
+                    if core.candidate.as_ref().is_some_and(|c| c.accepted) {
+                        core.manifest_write_lock.establish();
+                    }
+                    core.candidate.as_mut().unwrap().maintenance_error = Some(error);
+                    true
+                }
+            }
+        } else {
+            false
+        };
+        #[cfg(feature = "production-concurrency")]
+        let index_followup_progressed = if core.candidate.is_some() {
+            match core.service_candidate_index_followup() {
+                Ok(changed) => changed,
+                Err(error) => {
+                    if core.candidate.as_ref().is_some_and(|c| c.accepted) {
+                        core.manifest_write_lock.establish();
+                    }
+                    core.record_candidate_maintenance_error(error);
+                    true
+                }
+            }
+        } else {
+            false
+        };
+        #[cfg(feature = "production-concurrency")]
+        let index_progressed = index_progressed || index_followup_progressed;
         let flush_result = core.drain_ready_bg_flush_events_for_runtime();
         let compaction_finished = core
             .bg_compact
@@ -5151,7 +5920,27 @@ impl DbRuntime {
         } else {
             None
         };
+        #[cfg(feature = "production-concurrency")]
+        if core.candidate.is_some() && !core.manifest_write_lock.fenced() {
+            if !core.immutable_epochs.is_empty() && core.pending_candidate_index().is_some() {
+                core.ensure_bg_flush_worker();
+            }
+            if core.bg_flush.is_some() && core.immutable_epochs.iter().any(|e| !e.in_flight) {
+                if let Err(error) = core.enqueue_all_non_in_flight() {
+                    eprintln!("candidate flush scheduling: {error}");
+                }
+            }
+            core.cleanup_candidate_components();
+            if let Err(error) = core.start_pending_candidate_index_build() {
+                eprintln!("candidate index scheduling: {error}");
+            }
+            if let Err(error) = core.maybe_schedule_bg_compact() {
+                eprintln!("candidate compaction scheduling: {error}");
+            }
+        }
         let progressed = flush_result.progressed || compaction_finished;
+        #[cfg(feature = "production-concurrency")]
+        let progressed = progressed || index_progressed;
         let publish_impact = flush_result
             .publish_impact
             .combine(if compaction_stats.is_some() {
@@ -5159,18 +5948,55 @@ impl DbRuntime {
             } else {
                 PublishImpact::NoPublish
             });
-        let _ = self.publish_locked(core, publish_impact, false);
+        #[cfg(feature = "production-concurrency")]
+        let publish_impact = if index_progressed {
+            publish_impact.combine(PublishImpact::SnapshotWithLabelCatalog)
+        } else {
+            publish_impact
+        };
+        #[cfg(all(test, feature = "production-concurrency"))]
+        let apply_pause = index_progressed;
+        #[cfg(not(all(test, feature = "production-concurrency")))]
+        let apply_pause = false;
+        let publication = self.publish_locked(core, publish_impact, apply_pause);
+        #[cfg(feature = "production-concurrency")]
+        if index_followup_progressed {
+            core.candidate
+                .as_ref()
+                .unwrap()
+                .ddl
+                .followups
+                .in_flight
+                .store(0, Ordering::Release);
+        }
+        #[cfg(feature = "production-concurrency")]
+        if publication.is_err() && core.candidate.as_ref().is_some_and(|c| c.accepted) {
+            core.manifest_write_lock.establish();
+        }
+        #[cfg(not(feature = "production-concurrency"))]
+        let _ = publication;
 
         // Keep epoch removal and completion recording atomic to core observers.
         // Nested locks follow the existing core -> lifecycle order.
         if progressed {
             let mut lifecycle = self.lifecycle.lock().unwrap();
             for (epoch_id, seg_info) in flush_result.completed_flushes {
-                lifecycle.completed_flush_order.push_back(epoch_id);
-                lifecycle
-                    .completed_flushes_by_epoch
-                    .insert(epoch_id, seg_info);
+                if let Some(wait) = lifecycle
+                    .awaited_flush
+                    .as_mut()
+                    .filter(|wait| wait.epoch_id == epoch_id)
+                {
+                    wait.completed = Some(seg_info.clone());
+                }
+                #[cfg(test)]
+                {
+                    lifecycle.completed_flush_order.push_back(epoch_id);
+                    lifecycle
+                        .completed_flushes_by_epoch
+                        .insert(epoch_id, seg_info);
+                }
             }
+            #[cfg(test)]
             if let Some(stats) = compaction_stats {
                 lifecycle.completed_bg_compactions.push_back(stats);
             }
@@ -5182,6 +6008,10 @@ impl DbRuntime {
     }
 
     fn close(&self, fast: bool) -> Result<(), EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_some() {
+            return self.request_candidate_close(fast, false)?.wait();
+        }
         let mut lifecycle = self.lifecycle.lock().unwrap();
         if lifecycle.closed || lifecycle.closing || lifecycle.close_in_progress {
             return Err(EngineError::DatabaseClosed);
@@ -5202,7 +6032,7 @@ impl DbRuntime {
         self.request_coordinator_shutdown();
         self.join_coordinator();
 
-        let core = {
+        let mut core = {
             let mut core_guard = self.core.lock().unwrap();
             core_guard.take().ok_or(EngineError::DatabaseClosed)?
         };
@@ -5214,6 +6044,7 @@ impl DbRuntime {
 
         self.set_open_state(RuntimeOpenState::Closed);
         let mut lifecycle = self.lifecycle.lock().unwrap();
+        lifecycle.release_closed_backing();
         lifecycle.closed = true;
         lifecycle.close_in_progress = false;
         self.lifecycle_cv.notify_all();
@@ -5251,11 +6082,12 @@ impl DbRuntime {
             let mut core_guard = self.core.lock().unwrap();
             core_guard.take()
         };
-        if let Some(core) = maybe_core {
+        if let Some(mut core) = maybe_core {
             let _ = core.close_fast();
         }
         self.set_open_state(RuntimeOpenState::Closed);
         let mut lifecycle = self.lifecycle.lock().unwrap();
+        lifecycle.release_closed_backing();
         lifecycle.closed = true;
         lifecycle.close_in_progress = false;
         self.lifecycle_cv.notify_all();
@@ -5433,10 +6265,10 @@ impl DbRuntime {
 
 impl ReadView {
     fn from_published_sources(
-        sources: Arc<PublishedReadSources>,
+        sources: SharedArc<PublishedReadSources>,
         snapshot_seq: u64,
-        active_degree_overlay: Arc<DegreeOverlaySnapshot>,
-        label_catalog: Arc<ReadLabelCatalogSnapshot>,
+        active_degree_overlay: SharedArc<DegreeOverlaySnapshot>,
+        label_catalog: SharedArc<ReadLabelCatalogSnapshot>,
     ) -> Self {
         debug_assert!(
             sources.declared_index_runtime_coverage.entry_count()
@@ -6020,12 +6852,7 @@ impl EngineCore {
         self.read_view().nodes_by_label_id_raw(label_id)
     }
 
-    fn collect_tombstones(
-        &self,
-    ) -> (
-        HashSet<u64, NodeIdBuildHasher>,
-        HashSet<u64, NodeIdBuildHasher>,
-    ) {
+    fn collect_tombstones(&self) -> Result<(NodeIdSet, NodeIdSet), EngineError> {
         self.read_view().collect_tombstones()
     }
 
@@ -6196,17 +7023,44 @@ impl EngineCore {
 }
 
 /// Cloneable shared-handle database runtime for OverGraph.
-#[derive(Clone)]
 pub struct DatabaseEngine {
     runtime: Arc<DbRuntime>,
+    #[cfg(feature = "production-concurrency")]
+    client: Option<concurrency_lifecycle::RuntimeOwnerPermit>,
 }
 
 impl DatabaseEngine {
     pub fn open(path: &Path, options: &DbOptions) -> Result<Self, EngineError> {
-        let core = EngineCore::open(path, options)?;
-        let runtime = Arc::new(DbRuntime::new(path.to_path_buf(), core));
-        runtime.install_core_runtime_handle();
-        Ok(Self { runtime })
+        #[cfg(feature = "production-concurrency")]
+        {
+            Self::open_with_concurrency_options(path, options, &ConcurrencyOptions::default())
+        }
+        #[cfg(not(feature = "production-concurrency"))]
+        {
+            let core = EngineCore::open(path, options)?;
+            let runtime = Arc::new(DbRuntime::new(path.to_path_buf(), core));
+            runtime.install_core_runtime_handle();
+            Ok(Self { runtime })
+        }
+    }
+
+    #[cfg(feature = "production-concurrency")]
+    pub fn open_with_concurrency_options(
+        path: &Path,
+        options: &DbOptions,
+        limits: &ConcurrencyOptions,
+    ) -> Result<Self, EngineError> {
+        Self::open_candidate(path, options, limits)
+    }
+
+    #[cfg(feature = "production-concurrency")]
+    pub fn reclamation_stats(&self) -> Result<ReclamationStats, EngineError> {
+        self.runtime
+            .candidate
+            .as_ref()
+            .expect("candidate runtime")
+            .stats
+            .read_full()
     }
 
     fn with_core_ref<T>(
@@ -6227,7 +7081,7 @@ impl DatabaseEngine {
     pub fn ensure_node_label(&self, label: &str) -> Result<u32, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::EnsureNodeLabel {
+            .submit_core_write_with(|| CoreWriteRequest::EnsureNodeLabel {
                 label: label.to_string(),
             })? {
             CoreWriteReply::U32(label_id) => Ok(label_id),
@@ -6238,7 +7092,7 @@ impl DatabaseEngine {
     pub fn ensure_edge_label(&self, label: &str) -> Result<u32, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::EnsureEdgeLabel {
+            .submit_core_write_with(|| CoreWriteRequest::EnsureEdgeLabel {
                 label: label.to_string(),
             })? {
             CoreWriteReply::U32(label_id) => Ok(label_id),
@@ -6248,96 +7102,66 @@ impl DatabaseEngine {
 
     pub fn get_node_label_id(&self, label: &str) -> Result<Option<u32>, EngineError> {
         validate_label_token_name(label)?;
-        self.with_core_ref(|core| {
-            Ok(core
-                .label_catalog
-                .read()
-                .unwrap()
-                .node_label_to_id
-                .get(label)
-                .copied())
-        })
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        Ok(published.label_catalog.node_label_to_id.get(label).copied())
     }
-
     pub fn get_edge_label_id(&self, label: &str) -> Result<Option<u32>, EngineError> {
         validate_label_token_name(label)?;
-        self.with_core_ref(|core| {
-            Ok(core
-                .label_catalog
-                .read()
-                .unwrap()
-                .edge_label_to_id
-                .get(label)
-                .copied())
-        })
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        Ok(published.label_catalog.edge_label_to_id.get(label).copied())
     }
-
     pub fn get_node_label(&self, label_id: u32) -> Result<Option<String>, EngineError> {
-        self.with_core_ref(|core| {
-            Ok(core
-                .label_catalog
-                .read()
-                .unwrap()
-                .node_id_to_label
-                .get(&label_id)
-                .cloned())
-        })
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        Ok(published
+            .label_catalog
+            .node_id_to_label
+            .get(label_id)
+            .map(str::to_owned))
     }
-
     pub fn get_edge_label(&self, label_id: u32) -> Result<Option<String>, EngineError> {
-        self.with_core_ref(|core| {
-            Ok(core
-                .label_catalog
-                .read()
-                .unwrap()
-                .edge_id_to_label
-                .get(&label_id)
-                .cloned())
-        })
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        Ok(published
+            .label_catalog
+            .edge_id_to_label
+            .get(label_id)
+            .map(str::to_owned))
     }
 
     pub fn list_node_labels(&self) -> Result<Vec<NodeLabelInfo>, EngineError> {
-        self.with_core_ref(|core| {
-            let mut labels: Vec<NodeLabelInfo> = core
-                .label_catalog
-                .read()
-                .unwrap()
-                .node_label_to_id
-                .iter()
-                .map(|(label, &label_id)| NodeLabelInfo {
-                    label: label.clone(),
-                    label_id,
-                })
-                .collect();
-            labels.sort_by(|a, b| {
-                a.label_id
-                    .cmp(&b.label_id)
-                    .then_with(|| a.label.cmp(&b.label))
-            });
-            Ok(labels)
-        })
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        let mut labels: Vec<_> = published
+            .label_catalog
+            .node_label_to_id
+            .iter()
+            .map(|(name, &id)| NodeLabelInfo {
+                label: name.clone(),
+                label_id: id,
+            })
+            .collect();
+        labels.sort_by(|a, b| {
+            a.label_id
+                .cmp(&b.label_id)
+                .then_with(|| a.label.cmp(&b.label))
+        });
+        Ok(labels)
     }
-
     pub fn list_edge_labels(&self) -> Result<Vec<EdgeLabelInfo>, EngineError> {
-        self.with_core_ref(|core| {
-            let mut edge_labels: Vec<EdgeLabelInfo> = core
-                .label_catalog
-                .read()
-                .unwrap()
-                .edge_label_to_id
-                .iter()
-                .map(|(label, &label_id)| EdgeLabelInfo {
-                    label: label.clone(),
-                    label_id,
-                })
-                .collect();
-            edge_labels.sort_by(|a, b| {
-                a.label_id
-                    .cmp(&b.label_id)
-                    .then_with(|| a.label.cmp(&b.label))
-            });
-            Ok(edge_labels)
-        })
+        let (_guard, published) = self.runtime.published_snapshot()?;
+        let mut labels: Vec<_> = published
+            .label_catalog
+            .edge_label_to_id
+            .iter()
+            .map(|(name, &id)| EdgeLabelInfo {
+                label: name.clone(),
+                label_id: id,
+            })
+            .collect();
+        labels.sort_by(|a, b| {
+            a.label_id
+                .cmp(&b.label_id)
+                .then_with(|| a.label.cmp(&b.label))
+        });
+        Ok(labels)
     }
 
     pub fn upsert_node<L>(
@@ -6349,12 +7173,13 @@ impl DatabaseEngine {
     where
         L: IntoNodeLabels,
     {
+        let options = payload::Owned::new(options);
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::UpsertNode {
+            .submit_core_write_with(|| CoreWriteRequest::UpsertNode {
                 labels: labels.into_node_labels(),
                 key: key.to_string(),
-                options,
+                options: options.into_inner(),
             })? {
             CoreWriteReply::U64(id) => Ok(id),
             _ => unreachable!("upsert_node must return a node id"),
@@ -6368,13 +7193,14 @@ impl DatabaseEngine {
         label: &str,
         options: UpsertEdgeOptions,
     ) -> Result<u64, EngineError> {
+        let options = payload::Owned::new(options);
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::UpsertEdge {
+            .submit_core_write_with(|| CoreWriteRequest::UpsertEdge {
                 from,
                 to,
                 label: label.to_string(),
-                options,
+                options: options.into_inner(),
             })? {
             CoreWriteReply::U64(id) => Ok(id),
             _ => unreachable!("upsert_edge must return an edge id"),
@@ -6384,7 +7210,7 @@ impl DatabaseEngine {
     pub fn add_node_label(&self, id: u64, label: &str) -> Result<bool, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::AddNodeLabel {
+            .submit_core_write_with(|| CoreWriteRequest::AddNodeLabel {
                 id,
                 label: label.to_string(),
             })? {
@@ -6396,7 +7222,7 @@ impl DatabaseEngine {
     pub fn remove_node_label(&self, id: u64, label: &str) -> Result<bool, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::RemoveNodeLabel {
+            .submit_core_write_with(|| CoreWriteRequest::RemoveNodeLabel {
                 id,
                 label: label.to_string(),
             })? {
@@ -6406,20 +7232,24 @@ impl DatabaseEngine {
     }
 
     pub fn batch_upsert_nodes(&self, inputs: Vec<NodeInput>) -> Result<Vec<u64>, EngineError> {
+        let inputs = payload::Owned::new(inputs);
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::BatchUpsertNodes { inputs })?
-        {
+            .submit_core_write_with(|| CoreWriteRequest::BatchUpsertNodes {
+                inputs: inputs.into_inner(),
+            })? {
             CoreWriteReply::VecU64(ids) => Ok(ids),
             _ => unreachable!("batch_upsert_nodes must return node ids"),
         }
     }
 
     pub fn batch_upsert_edges(&self, inputs: Vec<EdgeInput>) -> Result<Vec<u64>, EngineError> {
+        let inputs = payload::Owned::new(inputs);
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::BatchUpsertEdges { inputs })?
-        {
+            .submit_core_write_with(|| CoreWriteRequest::BatchUpsertEdges {
+                inputs: inputs.into_inner(),
+            })? {
             CoreWriteReply::VecU64(ids) => Ok(ids),
             _ => unreachable!("batch_upsert_edges must return edge ids"),
         }
@@ -6428,7 +7258,7 @@ impl DatabaseEngine {
     pub fn delete_node(&self, id: u64) -> Result<(), EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::DeleteNode { id })?
+            .submit_core_write_with(|| CoreWriteRequest::DeleteNode { id })?
         {
             CoreWriteReply::Unit => Ok(()),
             _ => unreachable!("delete_node must return unit"),
@@ -6438,7 +7268,7 @@ impl DatabaseEngine {
     pub fn delete_edge(&self, id: u64) -> Result<(), EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::DeleteEdge { id })?
+            .submit_core_write_with(|| CoreWriteRequest::DeleteEdge { id })?
         {
             CoreWriteReply::Unit => Ok(()),
             _ => unreachable!("delete_edge must return unit"),
@@ -6446,32 +7276,35 @@ impl DatabaseEngine {
     }
 
     pub fn invalidate_edge(&self, id: u64, valid_to: i64) -> Result<Option<EdgeView>, EngineError> {
-        let edge = match self
+        let (edge, label_catalog) = match self
             .runtime
-            .submit_core_write(CoreWriteRequest::InvalidateEdge { id, valid_to })?
+            .submit_core_write_with(|| CoreWriteRequest::InvalidateEdge { id, valid_to })?
         {
-            CoreWriteReply::OptionEdge(edge) => edge,
+            CoreWriteReply::OptionEdgeWithCatalog(edge, catalog) => (edge, catalog),
             _ => unreachable!("invalidate_edge must return an optional edge"),
         };
-        let (_guard, published) = self.runtime.published_snapshot()?;
-        edge.map(|edge| edge_view_from_record(edge, published.label_catalog.as_ref()))
+        edge.map(|edge| edge_view_from_record(edge, label_catalog.as_ref()))
             .transpose()
     }
 
     pub fn graph_patch(&self, patch: GraphPatch) -> Result<PatchResult, EngineError> {
+        let patch = payload::Owned::new(patch);
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::GraphPatch { patch })?
-        {
+            .submit_core_write_with(|| CoreWriteRequest::GraphPatch {
+                patch: patch.into_inner(),
+            })? {
             CoreWriteReply::PatchResult(result) => Ok(result),
             _ => unreachable!("graph_patch must return patch results"),
         }
     }
 
     pub fn prune(&self, policy: &PrunePolicy) -> Result<PruneResult, EngineError> {
-        match self.runtime.submit_core_write(CoreWriteRequest::Prune {
-            policy: policy.clone(),
-        })? {
+        match self
+            .runtime
+            .submit_core_write_with(|| CoreWriteRequest::Prune {
+                policy: policy.clone(),
+            })? {
             CoreWriteReply::PruneResult(result) => Ok(result),
             _ => unreachable!("prune must return prune results"),
         }
@@ -6480,7 +7313,7 @@ impl DatabaseEngine {
     pub fn set_prune_policy(&self, name: &str, policy: PrunePolicy) -> Result<(), EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::SetPrunePolicy {
+            .submit_core_write_with(|| CoreWriteRequest::SetPrunePolicy {
                 name: name.to_string(),
                 policy,
             })? {
@@ -6492,7 +7325,7 @@ impl DatabaseEngine {
     pub fn remove_prune_policy(&self, name: &str) -> Result<bool, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::RemovePrunePolicy {
+            .submit_core_write_with(|| CoreWriteRequest::RemovePrunePolicy {
                 name: name.to_string(),
             })? {
             CoreWriteReply::Bool(removed) => Ok(removed),
@@ -6501,6 +7334,20 @@ impl DatabaseEngine {
     }
 
     pub fn list_prune_policies(&self) -> Result<Vec<PrunePolicyInfo>, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.runtime.candidate.is_some() {
+            let (_guard, published) = self.runtime.published_snapshot()?;
+            return Ok(published
+                .view
+                .manifest
+                .declared_prune_policies
+                .iter()
+                .map(|(name, policy)| PrunePolicyInfo {
+                    name: name.clone(),
+                    policy: policy.clone(),
+                })
+                .collect());
+        }
         self.with_core_ref(|core| core.list_prune_policies())
     }
 
@@ -6511,7 +7358,7 @@ impl DatabaseEngine {
     ) -> Result<NodePropertyIndexInfo, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::EnsureNodePropertyIndex {
+            .submit_core_write_with(|| CoreWriteRequest::EnsureNodePropertyIndex {
                 label: label.to_string(),
                 spec,
             })? {
@@ -6527,7 +7374,7 @@ impl DatabaseEngine {
     ) -> Result<bool, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::DropNodePropertyIndex {
+            .submit_core_write_with(|| CoreWriteRequest::DropNodePropertyIndex {
                 label: label.to_string(),
                 spec,
             })? {
@@ -6577,7 +7424,7 @@ impl DatabaseEngine {
     ) -> Result<EdgePropertyIndexInfo, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::EnsureEdgePropertyIndex {
+            .submit_core_write_with(|| CoreWriteRequest::EnsureEdgePropertyIndex {
                 label: label.to_string(),
                 spec,
             })? {
@@ -6593,7 +7440,7 @@ impl DatabaseEngine {
     ) -> Result<bool, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::DropEdgePropertyIndex {
+            .submit_core_write_with(|| CoreWriteRequest::DropEdgePropertyIndex {
                 label: label.to_string(),
                 spec,
             })? {
@@ -7014,7 +7861,8 @@ impl DatabaseEngine {
             .find_nodes_outcome(label_id, prop_key, prop_value)?;
         self.runtime.record_property_query_route(outcome.route);
         if let Some(followup) = outcome.followup {
-            self.runtime.enqueue_secondary_index_read_followup(followup);
+            self.runtime
+                .enqueue_secondary_index_read_followup(followup, &published.view.sources);
         }
         Ok(outcome.value)
     }
@@ -7039,7 +7887,8 @@ impl DatabaseEngine {
             .find_nodes_paged_outcome(label_id, prop_key, prop_value, page)?;
         self.runtime.record_property_query_route(outcome.route);
         if let Some(followup) = outcome.followup {
-            self.runtime.enqueue_secondary_index_read_followup(followup);
+            self.runtime
+                .enqueue_secondary_index_read_followup(followup, &published.view.sources);
         }
         Ok(outcome.value)
     }
@@ -7066,7 +7915,8 @@ impl DatabaseEngine {
         )?;
         self.runtime.record_property_query_route(outcome.route);
         if let Some(followup) = outcome.followup {
-            self.runtime.enqueue_secondary_index_read_followup(followup);
+            self.runtime
+                .enqueue_secondary_index_read_followup(followup, &published.view.sources);
         }
         Ok(outcome.value.items)
     }
@@ -7093,7 +7943,8 @@ impl DatabaseEngine {
             .find_nodes_range_paged_outcome(label_id, prop_key, lower, upper, page)?;
         self.runtime.record_property_query_route(outcome.route);
         if let Some(followup) = outcome.followup {
-            self.runtime.enqueue_secondary_index_read_followup(followup);
+            self.runtime
+                .enqueue_secondary_index_read_followup(followup, &published.view.sources);
         }
         Ok(outcome.value)
     }
@@ -7324,14 +8175,20 @@ impl DatabaseEngine {
     }
 
     pub fn sync(&self) -> Result<(), EngineError> {
-        match self.runtime.submit_core_write(CoreWriteRequest::Sync)? {
+        match self
+            .runtime
+            .submit_core_write_with(|| CoreWriteRequest::Sync)?
+        {
             CoreWriteReply::Unit => Ok(()),
             _ => unreachable!("sync must return unit"),
         }
     }
 
     pub fn flush(&self) -> Result<Option<SegmentInfo>, EngineError> {
-        match self.runtime.submit_core_write(CoreWriteRequest::Flush)? {
+        match self
+            .runtime
+            .submit_core_write_with(|| CoreWriteRequest::Flush)?
+        {
             CoreWriteReply::OptionSegmentInfo(info) => Ok(info),
             _ => unreachable!("flush must return optional segment info"),
         }
@@ -7340,7 +8197,7 @@ impl DatabaseEngine {
     pub fn ingest_mode(&self) -> Result<(), EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::IngestMode)?
+            .submit_core_write_with(|| CoreWriteRequest::IngestMode)?
         {
             CoreWriteReply::Unit => Ok(()),
             _ => unreachable!("ingest_mode must return unit"),
@@ -7350,7 +8207,7 @@ impl DatabaseEngine {
     pub fn end_ingest(&self) -> Result<Option<CompactionStats>, EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::EndIngest)?
+            .submit_core_write_with(|| CoreWriteRequest::EndIngest)?
         {
             CoreWriteReply::OptionCompactionStats(stats) => Ok(stats),
             _ => unreachable!("end_ingest must return optional compaction stats"),
@@ -7358,7 +8215,10 @@ impl DatabaseEngine {
     }
 
     pub fn compact(&self) -> Result<Option<CompactionStats>, EngineError> {
-        match self.runtime.submit_core_write(CoreWriteRequest::Compact)? {
+        match self
+            .runtime
+            .submit_core_write_with(|| CoreWriteRequest::Compact)?
+        {
             CoreWriteReply::OptionCompactionStats(stats) => Ok(stats),
             _ => unreachable!("compact must return optional compaction stats"),
         }
@@ -7388,7 +8248,7 @@ impl DatabaseEngine {
     pub(crate) fn write_op(&self, op: &WalOp) -> Result<(), EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::WriteOp { op: op.clone() })?
+            .submit_core_write_with(|| CoreWriteRequest::WriteOp { op: op.clone() })?
         {
             CoreWriteReply::Unit => Ok(()),
             _ => unreachable!("write_op must return unit"),
@@ -7399,7 +8259,7 @@ impl DatabaseEngine {
     pub(crate) fn write_op_batch(&self, ops: &[WalOp]) -> Result<(), EngineError> {
         match self
             .runtime
-            .submit_core_write(CoreWriteRequest::WriteOpBatch { ops: ops.to_vec() })?
+            .submit_core_write_with(|| CoreWriteRequest::WriteOpBatch { ops: ops.to_vec() })?
         {
             CoreWriteReply::Unit => Ok(()),
             _ => unreachable!("write_op_batch must return unit"),
@@ -7521,7 +8381,7 @@ impl DatabaseEngine {
         published.view.get_nodes_raw(ids)
     }
 
-    pub(crate) fn segments_for_test(&self) -> Vec<Arc<SegmentReader>> {
+    pub(crate) fn segments_for_test(&self) -> Vec<SharedArc<SegmentReader>> {
         self.with_core_ref(|core| Ok(core.segments.clone()))
             .unwrap_or_else(|_| self.published_state().view.segments.clone())
     }
@@ -7592,16 +8452,16 @@ impl DatabaseEngine {
     }
 
     pub(crate) fn published_read_view_for_test(&self) -> Arc<ReadView> {
-        Arc::clone(&self.published_state().view)
+        Clone::clone(&self.published_state().view)
     }
 
     #[cfg(test)]
-    fn published_label_catalog_snapshot_for_test(&self) -> Arc<ReadLabelCatalogSnapshot> {
-        Arc::clone(&self.published_state().label_catalog)
+    fn published_label_catalog_snapshot_for_test(&self) -> SharedArc<ReadLabelCatalogSnapshot> {
+        Clone::clone(&self.published_state().label_catalog)
     }
 
-    pub(crate) fn planner_stats_view_for_test(&self) -> Arc<PlannerStatsView> {
-        Arc::clone(&self.published_state().view.planner_stats)
+    pub(crate) fn planner_stats_view_for_test(&self) -> SharedArc<PlannerStatsView> {
+        Clone::clone(&self.published_state().view.planner_stats)
     }
 
     #[cfg(test)]
@@ -7650,15 +8510,15 @@ impl DatabaseEngine {
                 segment_id
             )));
         };
-        core.segments[position] = Arc::new(reader);
+        core.segments[position] = SharedArc::new(reader);
         self.runtime
             .publish_locked(core, PublishImpact::RebuildSources, false)?;
         Ok(())
     }
 
-    pub(crate) fn active_degree_overlay_for_test(&self) -> Arc<DegreeOverlaySnapshot> {
-        self.with_core_ref(|core| Ok(Arc::clone(&core.active_degree_overlay)))
-            .unwrap_or_else(|_| Arc::clone(&self.published_state().view.active_degree_overlay))
+    pub(crate) fn active_degree_overlay_for_test(&self) -> SharedArc<DegreeOverlaySnapshot> {
+        self.with_core_ref(|core| Ok(Clone::clone(&core.active_degree_overlay)))
+            .unwrap_or_else(|_| Clone::clone(&self.published_state().view.active_degree_overlay))
     }
 
     pub(crate) fn immutable_memtable_count(&self) -> usize {
@@ -7676,19 +8536,21 @@ impl DatabaseEngine {
             .unwrap_or_else(|_| self.published_state().engine_seq)
     }
 
-    pub(crate) fn active_memtable(&self) -> Memtable {
-        self.with_core_ref(|core| Ok(core.active_memtable().clone()))
-            .unwrap_or_else(|_| self.published_state().view.memtable.as_ref().clone())
+    pub(crate) fn active_memtable(&self) -> SharedArc<Memtable> {
+        self.with_core_ref(|core| Ok(core.memtable.clone()))
+            .unwrap_or_else(|_| self.published_state().view.memtable.clone())
     }
 
-    pub(crate) fn immutable_memtable(&self, idx: usize) -> Memtable {
-        self.with_core_ref(|core| Ok(core.immutable_memtable(idx).clone()))
+    pub(crate) fn immutable_memtable(&self, idx: usize) -> SharedArc<Memtable> {
+        self.with_core_ref(|core| Ok(core.immutable_epochs.get(idx).map(|e| e.memtable.clone())))
             .unwrap_or_else(|_| {
-                self.published_state().view.immutable_epochs[idx]
-                    .memtable
-                    .as_ref()
-                    .clone()
+                self.published_state()
+                    .view
+                    .immutable_epochs
+                    .get(idx)
+                    .map(|e| e.memtable.clone())
             })
+            .expect("test requested an immutable epoch which has already retired")
     }
 
     pub(crate) fn property_query_route_snapshot(&self) -> PropertyQueryRouteSnapshot {
@@ -7768,6 +8630,16 @@ impl DatabaseEngine {
     ) -> QueryExecutionCounterSnapshot {
         let published = self.published_state();
         QueryExecutionCounterSnapshot {
+            dense_scope_count_passes: published
+                .view
+                .query_execution_counters
+                .dense_scope_count_passes
+                .load(Ordering::Relaxed),
+            dense_scope_exact_routes: published
+                .view
+                .query_execution_counters
+                .dense_scope_exact_routes
+                .load(Ordering::Relaxed),
             node_record_hydration_reads: published
                 .view
                 .query_execution_counters
@@ -8069,6 +8941,16 @@ impl DatabaseEngine {
     #[cfg(test)]
     pub(crate) fn reset_query_execution_counters_for_test(&self) {
         let published = self.published_state();
+        published
+            .view
+            .query_execution_counters
+            .dense_scope_count_passes
+            .store(0, Ordering::Relaxed);
+        published
+            .view
+            .query_execution_counters
+            .dense_scope_exact_routes
+            .store(0, Ordering::Relaxed);
         published
             .view
             .query_execution_counters
@@ -8487,6 +9369,12 @@ impl DatabaseEngine {
     }
 
     pub(crate) fn pending_secondary_index_followup_count_for_test(&self) -> usize {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &self.runtime.candidate {
+            return candidate.index_followups.pending.lock().unwrap().len()
+                + usize::from(candidate.index_followups.in_flight.load(Ordering::Acquire) != 0);
+        }
+
         let lifecycle = self.runtime.lifecycle.lock().unwrap();
         lifecycle.pending_secondary_index_followups.len()
     }
@@ -8503,6 +9391,7 @@ impl DatabaseEngine {
         self.runtime.wait_one_flush_public()
     }
 
+    #[cfg(not(feature = "production-concurrency"))]
     pub(crate) fn wait_for_bg_compaction(&self) -> Option<CompactionStats> {
         self.runtime.wait_for_bg_compaction_public()
     }
@@ -8542,6 +9431,7 @@ impl DatabaseEngine {
         self.with_core_mut(|core| core.rebuild_secondary_index_catalog())
     }
 
+    #[cfg(not(feature = "production-concurrency"))]
     pub(crate) fn seed_secondary_index_entry(
         &self,
         entry: &SecondaryIndexManifestEntry,
@@ -8592,7 +9482,44 @@ impl DatabaseEngine {
 }
 
 /// The mutable shared engine core.
+#[cfg(feature = "production-concurrency")]
+struct PrimaryInstall<'a> {
+    participant: Option<&'a participant::ParticipantHandle>,
+    session: Option<participant::Session<'a>>,
+    prepared: Option<crate::memtable::primary::PreparedPrimary>,
+    postcommit_maintenance: bool,
+    existing_node_limit: u64,
+    existing_edge_limit: u64,
+}
+
+#[cfg(feature = "production-concurrency")]
+struct CandidateCore {
+    maintenance_error: Option<EngineError>,
+    domain: reclamation::DomainHandle,
+    options: ConcurrencyOptions,
+    generation_operations: usize,
+    generation_bytes: usize,
+    prepared_frames: Vec<u8>,
+    encode_scratch: Vec<u8>,
+    accepted: bool,
+    deadline: Option<concurrency_lifecycle::Deadline>,
+    heavy: Arc<AtomicBool>,
+    ddl: CandidateDdl,
+    last_segment_cleanup: Option<Instant>,
+    #[cfg(test)]
+    segment_cleanup_now: Option<Instant>,
+}
+
 struct EngineCore {
+    #[cfg(test)]
+    force_next_wal_open_error: bool,
+    #[cfg(test)]
+    wal_cap_wait_for_test: Option<std::sync::mpsc::Sender<()>>,
+    #[cfg(test)]
+    post45_work: [usize; 5], // label constructions, component reads, cleanup gates/inventories, pending entries
+    shutdown_complete: bool,
+    #[cfg(feature = "production-concurrency")]
+    candidate: Option<CandidateCore>,
     db_dir: PathBuf,
     manifest: ManifestState,
     /// In Immediate mode, the WAL writer is stored here directly.
@@ -8603,9 +9530,9 @@ struct EngineCore {
     wal_state: Option<Arc<(Mutex<WalSyncState>, Condvar)>>,
     /// Background sync thread handle (GroupCommit mode only).
     sync_thread: Option<JoinHandle<()>>,
-    memtable: Arc<Memtable>,
+    memtable: SharedArc<Memtable>,
     /// Open segment readers, ordered newest-first for read merging.
-    segments: Vec<Arc<SegmentReader>>,
+    segments: Vec<SharedArc<SegmentReader>>,
     /// Running node ID counter. Monotonically increasing.
     next_node_id: u64,
     /// Running edge ID counter. Monotonically increasing.
@@ -8635,7 +9562,7 @@ struct EngineCore {
     /// Timestamp of the last completed compaction (manual or background).
     last_compaction_ms: Option<i64>,
     /// Published active-WAL/memtable degree delta overlay.
-    active_degree_overlay: Arc<DegreeOverlaySnapshot>,
+    active_degree_overlay: SharedArc<DegreeOverlaySnapshot>,
     /// Monotonic engine sequence counter. Incremented per WAL op.
     /// Assigned to records and tombstones via `last_write_seq`.
     engine_seq: u64,
@@ -8654,13 +9581,13 @@ struct EngineCore {
     engine_seq_seen: Arc<AtomicU64>,
     /// Shared runtime node-label/edge-label catalog. Manifest writers merge this
     /// before checkpointing so token WAL generations are not retired early.
-    label_catalog: Arc<RwLock<RuntimeLabelCatalog>>,
+    label_catalog: SharedArc<RwLock<RuntimeLabelCatalog>>,
     /// Compiled schema catalog keyed by numeric label IDs. Schema management stores it but
     /// does not consume it from write admission yet.
     #[allow(dead_code)]
     runtime_schema_catalog: RuntimeSchemaCatalog,
     /// Serialize all manifest writes across engine, flush publisher, and compaction.
-    manifest_write_lock: Arc<Mutex<()>>,
+    manifest_write_lock: Arc<ManifestLock>,
     /// Frozen memtable epochs awaiting or undergoing flush, newest-first.
     /// Single source of truth: entries stay here until the output segment is
     /// published, keeping frozen data visible to reads throughout the flush.
@@ -8673,12 +9600,20 @@ struct EngineCore {
     active_wal_generation_id: u64,
     /// Handle for the persistent background flush worker thread.
     bg_flush: Option<BgFlushHandle>,
+    /// Producer custody for the fixed catalog outlives every current generation.
+    /// Generations and published sources retain passive shared reads; they do not
+    /// retire the live catalog when startup or a frozen generation is released.
+    #[cfg(feature = "production-concurrency")]
+    fixed_secondary_catalog: Option<SharedArc<crate::memtable::secondary::FixedCatalog>>,
     /// Runtime declaration catalog keyed by logical target kind, label, ordered fields, and kind.
-    secondary_index_catalog: Arc<RwLock<SecondaryIndexCatalog>>,
+    secondary_index_catalog: SharedArc<RwLock<SecondaryIndexCatalog>>,
     /// Runtime declaration entries kept in sync with background state changes.
-    secondary_index_entries: Arc<RwLock<SecondaryIndexEntries>>,
+    secondary_index_entries: SharedArc<RwLock<SecondaryIndexEntries>>,
     /// Cached published read-visible source bundle reused by ordinary writes.
-    published_read_sources: Option<Arc<PublishedReadSources>>,
+    published_read_sources: Option<SharedArc<PublishedReadSources>>,
+    current_label_snapshot: Option<SharedArc<ReadLabelCatalogSnapshot>>,
+    current_schema_snapshot: Option<SharedArc<PublishedSchemaCatalogSnapshot>>,
+    schema_snapshot_dirty: bool,
     /// Monotonic generation for rebuilt read-source bundles and their stats rollup.
     published_read_sources_generation: u64,
     /// Counts read-source bundle rebuilds so tests can catch accidental helper-read rebuilds.
@@ -8765,6 +9700,8 @@ struct BgCompactHandle {
 }
 
 struct BgCompactCompletionSignal {
+    #[cfg(all(test, feature = "production-concurrency"))]
+    diagnostic_id: Option<u64>,
     completed: Arc<AtomicBool>,
     runtime: Option<Weak<DbRuntime>>,
 }
@@ -8772,6 +9709,8 @@ struct BgCompactCompletionSignal {
 impl Drop for BgCompactCompletionSignal {
     fn drop(&mut self) {
         self.completed.store(true, Ordering::Release);
+        #[cfg(all(test, feature = "production-concurrency"))]
+        maintenance_diagnostic::stage_id(self.diagnostic_id, "compact_completion_ready");
         if let Some(runtime) = self.runtime.as_ref().and_then(Weak::upgrade) {
             runtime.notify_lifecycle_work();
         }
@@ -8780,6 +9719,8 @@ impl Drop for BgCompactCompletionSignal {
 
 /// Result returned by the background compaction worker thread.
 struct BgCompactResult {
+    #[cfg(feature = "production-concurrency")]
+    heavy: Option<CandidateHeavyLease>,
     seg_info: SegmentInfo,
     reader: SegmentReader,
     old_seg_dirs: Vec<PathBuf>,
@@ -8788,6 +9729,31 @@ struct BgCompactResult {
     maintained_equality_index_ids: NodeIdSet,
     maintained_range_index_ids: NodeIdSet,
     secondary_index_report: SecondaryIndexMaintenanceReport,
+}
+
+// Shared actual compaction persistence/cleanup boundary. Default routing keeps
+// its prior policy; the fenced candidate must preserve possibly authoritative
+// output on ANY returned manifest uncertainty. Broader core fencing is a3.
+#[cfg(feature = "production-concurrency")]
+fn persist_compaction_manifest_encoded(
+    db_dir: &Path,
+    bytes: &[u8],
+    output_id: u64,
+) -> Result<(), EngineError> {
+    let result = crate::manifest::write_manifest_encoded(db_dir, bytes);
+    finish_compaction_manifest(db_dir, output_id, true, result)
+}
+
+fn finish_compaction_manifest(
+    db_dir: &Path,
+    output_id: u64,
+    preserve_uncertain: bool,
+    result: Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    if result.is_err() && !preserve_uncertain {
+        let _ = std::fs::remove_dir_all(segment_dir(db_dir, output_id));
+    }
+    result
 }
 
 /// Handle for the split async flush pipeline.
@@ -8816,9 +9782,25 @@ struct SecondaryIndexLookupKey {
     kind: SecondaryIndexKind,
 }
 
+#[cfg_attr(
+    feature = "production-concurrency",
+    expect(
+        clippy::large_enum_variant,
+        reason = "Keep queued build work inline without adding unaccounted per-job allocations"
+    )
+)]
 enum SecondaryIndexJob {
-    Build { index_id: u64 },
-    DropCleanup { entry: SecondaryIndexManifestEntry },
+    #[cfg(feature = "production-concurrency")]
+    CandidateBuild {
+        work: CandidateIndexWork,
+        result: std::sync::mpsc::SyncSender<Result<CandidateIndexBuilt, EngineError>>,
+    },
+    Build {
+        index_id: u64,
+    },
+    DropCleanup {
+        entry: SecondaryIndexManifestEntry,
+    },
     Shutdown,
 }
 
@@ -8947,9 +9929,11 @@ pub(crate) struct DegreeQueryRouteSnapshot {
 
 /// Work item sent to the background build worker.
 struct BgFlushWork {
+    #[cfg(feature = "production-concurrency")]
+    heavy: Option<CandidateHeavyLease>,
     epoch_id: u64,
-    frozen: Arc<Memtable>,
-    degree_overlay: Arc<DegreeOverlaySnapshot>,
+    frozen: SharedArc<Memtable>,
+    degree_overlay: SharedArc<DegreeOverlaySnapshot>,
     seg_id: u64,
     tmp_dir: PathBuf,
     final_dir: PathBuf,
@@ -8961,8 +9945,46 @@ struct BgFlushWork {
     force_write_error: bool,
 }
 
+// A fixed Ready catalog cannot silently become Building when a maintenance
+// output lacks real physical coverage. Reject it before any manifest adoption.
+#[cfg(feature = "production-concurrency")]
+fn validate_fixed_ready_output(
+    reader: &SegmentReader,
+    entries: &[SecondaryIndexManifestEntry],
+) -> Result<(), EngineError> {
+    for entry in entries
+        .iter()
+        .filter(|e| e.state == SecondaryIndexState::Ready)
+    {
+        reader.warm_declared_index_runtime_coverage(entry);
+        let kind = match entry.kind {
+            SecondaryIndexKind::Equality => {
+                crate::planner_stats::PlannerStatsDeclaredIndexKind::Equality
+            }
+            SecondaryIndexKind::Range => crate::planner_stats::PlannerStatsDeclaredIndexKind::Range,
+        };
+        if reader.declared_index_runtime_coverage_state_for_target(
+            entry.index_id,
+            crate::planner_stats::planner_stats_declared_index_target(entry),
+            kind,
+        ) != crate::planner_stats::DeclaredIndexRuntimeCoverageState::Available
+        {
+            return Err(EngineError::CorruptRecord(format!(
+                "candidate fixed Ready index {} output coverage is incomplete",
+                entry.index_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Segment built durably on disk and ready for publisher-thread manifest work.
 struct BuiltFlushResult {
+    frozen: SharedArc<Memtable>,
+    #[cfg(feature = "production-concurrency")]
+    heavy: Option<CandidateHeavyLease>,
+    #[cfg(feature = "production-concurrency")]
+    fixed_catalog: Option<SharedArc<crate::memtable::secondary::FixedCatalog>>,
     epoch_id: u64,
     wal_gen_to_retire: u64,
     seg_info: SegmentInfo,
@@ -8976,6 +9998,9 @@ struct BuiltFlushResult {
 
 /// Cheap foreground-only adoption payload. No disk I/O remains at this stage.
 struct PublishedFlushAdoption {
+    frozen: SharedArc<Memtable>,
+    #[cfg(feature = "production-concurrency")]
+    _heavy: Option<CandidateHeavyLease>,
     epoch_id: u64,
     wal_gen_to_retire: u64,
     seg_info: SegmentInfo,
@@ -9025,6 +10050,16 @@ struct RuntimeFlushDrainResult {
     completed_flushes: Vec<(u64, SegmentInfo)>,
 }
 
+impl Default for RuntimeFlushDrainResult {
+    fn default() -> Self {
+        Self {
+            progressed: false,
+            publish_impact: PublishImpact::NoPublish,
+            completed_flushes: Vec::new(),
+        }
+    }
+}
+
 /// A frozen memtable epoch awaiting (or undergoing) background flush.
 /// Stays visible to reads until the output segment is published and the
 /// epoch is retired. Single source of truth for frozen-memtable lifecycle.
@@ -9037,8 +10072,8 @@ pub(crate) struct ImmutableEpoch {
     /// WAL generation that contains this epoch's data. Used to retire the
     /// WAL file after the segment is published.
     pub(crate) wal_generation_id: u64,
-    pub(crate) memtable: Arc<Memtable>,
-    pub(crate) degree_overlay: Arc<DegreeOverlaySnapshot>,
+    pub(crate) memtable: SharedArc<Memtable>,
+    pub(crate) degree_overlay: SharedArc<DegreeOverlaySnapshot>,
     pub(crate) in_flight: bool,
 }
 
@@ -9088,7 +10123,40 @@ enum CompactionPath {
 
 impl EngineCore {
     /// Open or create a database at the given directory path.
+    #[cfg_attr(feature = "production-concurrency", allow(dead_code))] // Legacy fixed-catalog test preparation.
     pub fn open(path: &Path, options: &DbOptions) -> Result<Self, EngineError> {
+        Self::open_startup(path, options, None, None)
+    }
+
+    fn open_startup(
+        path: &Path,
+        options: &DbOptions,
+        startup: Option<(ManifestState, Vec<SegmentReader>)>,
+        protected: Option<&reclamation::ReclaimDomain>,
+    ) -> Result<Self, EngineError> {
+        let candidate_startup = startup.is_some();
+        #[cfg(feature = "production-concurrency")]
+        let primary_participants = if let Some(domain) = protected {
+            let stats = domain.stats();
+            let participants = if let Some(handle) = stats.participant_handle() {
+                handle
+            } else {
+                let value = participant::ParticipantAdmission::new(256).map_err(|_| {
+                    EngineError::ResourceLimit {
+                        resource: "participants",
+                        requested: 1,
+                        limit: 256,
+                        retryable: true,
+                    }
+                })?;
+                let handle = participant::ParticipantHandle::new(value, domain.identity());
+                stats.bind_participants(&handle)?;
+                handle
+            };
+            Some(participants)
+        } else {
+            None
+        };
         // Create directory if needed
         if !path.exists() {
             if options.create_if_missing {
@@ -9099,7 +10167,10 @@ impl EngineCore {
         }
 
         // Load or create manifest
-        let loaded_manifest = load_manifest(path)?;
+        let (loaded_manifest, startup_readers) = match startup {
+            Some((manifest, readers)) => (Some(manifest), Some(readers)),
+            None => (load_manifest(path)?, None),
+        };
         let created_manifest = loaded_manifest.is_none();
         if created_manifest {
             let artifacts = manifestless_database_artifacts(path)?;
@@ -9140,16 +10211,31 @@ impl EngineCore {
         // must exist and be readable on reopen. Otherwise we'd lose both the
         // segment and the retained WAL recovery path.
         let mut segments = Vec::new();
+        let mut startup_readers = startup_readers;
         for seg_info in manifest.segments.iter().rev() {
             let seg_path = segment_dir(path, seg_info.id);
             if seg_path.exists() {
-                let reader = SegmentReader::open_with_info(
-                    &seg_path,
-                    seg_info,
-                    manifest.dense_vector.as_ref(),
-                    &manifest.secondary_indexes,
-                )?;
-                segments.push(Arc::new(reader));
+                let reader = if let Some(readers) = startup_readers.as_mut() {
+                    let index = readers
+                        .iter()
+                        .position(|r| r.segment_id == seg_info.id)
+                        .ok_or_else(|| {
+                            EngineError::InvalidOperation("preflight reader missing".into())
+                        })?;
+                    readers.remove(index)
+                } else {
+                    SegmentReader::open_with_info(
+                        &seg_path,
+                        seg_info,
+                        manifest.dense_vector.as_ref(),
+                        &manifest.secondary_indexes,
+                    )?
+                };
+                #[cfg(feature = "production-concurrency")]
+                if protected.is_some() {
+                    reader.retain_secondary_payloads(None);
+                }
+                segments.push(SharedArc::new(reader));
             } else if manifest.pending_flush_epochs.iter().any(|e| {
                 e.state == FlushEpochState::PublishedPendingRetire
                     && e.segment_id == Some(seg_info.id)
@@ -9189,13 +10275,24 @@ impl EngineCore {
             manifest
                 .pending_flush_epochs
                 .retain(|e| e.state != FlushEpochState::PublishedPendingRetire);
-            for gen_id in &published_gen_ids {
-                let _ = remove_wal_generation(path, *gen_id);
-            }
             write_manifest(path, &manifest)?;
+            cleanup_orphan_wal_files(path, &manifest);
         }
 
         let mut runtime_label_catalog = RuntimeLabelCatalog::from_manifest(&manifest)?;
+
+        #[cfg(feature = "production-concurrency")]
+        let fixed_secondary_catalog = if primary_participants.is_some() {
+            let mut catalog = SharedArc::new(crate::memtable::secondary::FixedCatalog::new(
+                &manifest.secondary_indexes,
+            )?);
+            if let Some(domain) = protected {
+                catalog.guard(domain, reclamation::ResourceClass::Catalog)?;
+            }
+            Some(catalog)
+        } else {
+            None
+        };
 
         // --- Replay WAL generations ---
         // Frozen epochs are replayed into separate immutable memtables so their
@@ -9221,17 +10318,26 @@ impl EngineCore {
                 manifest.dense_vector.as_ref(),
                 &mut runtime_label_catalog,
                 &mut engine_seq,
-                &immutable_epochs_on_open,
-                &segments,
+                (&immutable_epochs_on_open, &segments),
+                #[cfg(feature = "production-concurrency")]
+                primary_participants.as_ref(),
+                #[cfg(feature = "production-concurrency")]
+                fixed_secondary_catalog.as_ref(),
+                #[cfg(feature = "production-concurrency")]
+                protected,
             )?;
             immutable_bytes_on_open += frozen_mt.estimated_size();
             // Newest-first: insert at front so older epochs are at the back.
+            #[cfg(feature = "production-concurrency")]
+            if frozen_mt.is_candidate() {
+                frozen_mt.seal_export(engine_seq);
+            }
             immutable_epochs_on_open.insert(
                 0,
                 ImmutableEpoch {
                     epoch_id,
                     wal_generation_id: wal_gen_id,
-                    memtable: Arc::new(frozen_mt),
+                    memtable: SharedArc::new(frozen_mt),
                     degree_overlay,
                     in_flight: false,
                 },
@@ -9247,8 +10353,13 @@ impl EngineCore {
                 manifest.dense_vector.as_ref(),
                 &mut runtime_label_catalog,
                 &mut engine_seq,
-                &immutable_epochs_on_open,
-                &segments,
+                (&immutable_epochs_on_open, &segments),
+                #[cfg(feature = "production-concurrency")]
+                primary_participants.as_ref(),
+                #[cfg(feature = "production-concurrency")]
+                fixed_secondary_catalog.as_ref(),
+                #[cfg(feature = "production-concurrency")]
+                protected,
             )?;
         truncate_wal_generation_to(
             path,
@@ -9283,8 +10394,8 @@ impl EngineCore {
         // manifest doesn't reference is left over from a crash (between segment
         // write and manifest update, or between bg compact output and apply).
         // Safe to delete. The manifest is the source of truth.
-        cleanup_orphan_segments(path, &manifest);
-        cleanup_orphan_optional_refresh_files(path, &manifest);
+        cleanup_orphan_segments(path, &manifest, protected);
+        cleanup_orphan_optional_refresh_files(path, &manifest, protected);
         cleanup_orphan_wal_files(path, &manifest);
 
         // Open WAL writer for the active generation
@@ -9320,6 +10431,9 @@ impl EngineCore {
             }
         }
 
+        let manifest_write_lock = Arc::new(ManifestLock::new(
+            cfg!(feature = "production-concurrency") && candidate_startup,
+        ));
         // Initialize WAL sync based on mode
         let wal_sync_mode = options.wal_sync_mode.clone();
         let (wal_writer_immediate, wal_state, sync_thread) = match &wal_sync_mode {
@@ -9333,10 +10447,15 @@ impl EngineCore {
                     poisoned: None,
                 };
                 let arc = Arc::new((Mutex::new(state), Condvar::new()));
-                let arc_clone = Arc::clone(&arc);
+                let arc_clone = Clone::clone(&arc);
                 let interval = std::time::Duration::from_millis(*interval_ms);
+                let sync_authority = manifest_write_lock.clone();
                 let handle = std::thread::spawn(move || {
-                    sync_thread_loop(arc_clone, interval);
+                    if cfg!(feature = "production-concurrency") && candidate_startup {
+                        durability::sync_thread_loop_fenced(arc_clone, interval, sync_authority);
+                    } else {
+                        sync_thread_loop(arc_clone, interval);
+                    }
                 });
                 (None, Some(arc), Some(handle))
             }
@@ -9346,15 +10465,21 @@ impl EngineCore {
         let next_node_id_seen = Arc::new(AtomicU64::new(next_node_id));
         let next_edge_id_seen = Arc::new(AtomicU64::new(next_edge_id));
         let engine_seq_seen = Arc::new(AtomicU64::new(engine_seq));
-        let label_catalog = Arc::new(RwLock::new(runtime_label_catalog));
-        let manifest_write_lock = Arc::new(Mutex::new(()));
+        let label_catalog = SharedArc::new(RwLock::new(runtime_label_catalog));
         let mut engine = EngineCore {
+            #[cfg(test)]
+            force_next_wal_open_error: false,
+            #[cfg(test)]
+            wal_cap_wait_for_test: None,
+            shutdown_complete: false,
+            #[cfg(feature = "production-concurrency")]
+            candidate: None,
             db_dir: path.to_path_buf(),
             manifest,
             wal_writer_immediate,
             wal_state,
             sync_thread,
-            memtable: Arc::new(memtable),
+            memtable: SharedArc::new(memtable),
             segments,
             next_node_id,
             next_edge_id,
@@ -9388,12 +10513,19 @@ impl EngineCore {
             immutable_bytes_total: immutable_bytes_on_open,
             active_wal_generation_id,
             bg_flush: None,
-            secondary_index_catalog: Arc::new(RwLock::new(SecondaryIndexCatalog::default())),
-            secondary_index_entries: Arc::new(RwLock::new(Vec::new())),
+            #[cfg(feature = "production-concurrency")]
+            fixed_secondary_catalog,
+            secondary_index_catalog: SharedArc::new(RwLock::new(SecondaryIndexCatalog::default())),
+            secondary_index_entries: SharedArc::new(RwLock::new(Vec::new())),
             published_read_sources: None,
+            current_label_snapshot: None,
+            current_schema_snapshot: None,
+            schema_snapshot_dirty: true,
             published_read_sources_generation: 0,
             #[cfg(test)]
             published_read_source_builds: AtomicUsize::new(0),
+            #[cfg(test)]
+            post45_work: [0; 5],
             deferred_segment_dir_cleanup: Vec::new(),
             secondary_index_bg: None,
             runtime: None,
@@ -9416,8 +10548,30 @@ impl EngineCore {
         };
 
         engine.recover_secondary_index_states_on_open()?;
+        #[cfg(feature = "production-concurrency")]
+        if let Some(domain) = protected {
+            let mut fixed = SharedArc::new(crate::memtable::secondary::FixedCatalog::new(
+                &engine.manifest.secondary_indexes,
+            )?);
+            fixed.guard(domain, reclamation::ResourceClass::Catalog)?;
+            engine.memtable = SharedArc::new(engine.memtable.rebind_secondary(
+                fixed.clone(),
+                None,
+                domain,
+            )?);
+            for epoch in &mut engine.immutable_epochs {
+                epoch.memtable = SharedArc::new(epoch.memtable.rebind_secondary(
+                    fixed.clone(),
+                    None,
+                    domain,
+                )?);
+            }
+            engine.fixed_secondary_catalog = Some(fixed);
+        }
         engine.rebuild_secondary_index_catalog()?;
-        engine.seed_secondary_indexes_from_manifest()?;
+        if !engine.memtable.is_candidate() {
+            engine.seed_secondary_indexes_from_manifest()?;
+        }
         engine.warm_declared_index_runtime_coverage_for_current_readers();
         engine.rebuild_published_read_sources()?;
 
@@ -9429,7 +10583,15 @@ impl EngineCore {
     /// background compaction, and writes the final manifest.
     /// After close() returns, no immutable memtables or retained WAL
     /// generations remain.
-    pub fn close(mut self) -> Result<(), EngineError> {
+    pub fn close(&mut self) -> Result<(), EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_some() {
+            self.cancel_candidate_index_build();
+        }
+
+        if self.manifest_write_lock.fenced() {
+            return self.close_fenced();
+        }
         self.try_apply_all_bg_flushes();
         let mut first_error: Option<EngineError> = None;
 
@@ -9442,9 +10604,7 @@ impl EngineCore {
         }
 
         self.wait_for_bg_compact();
-        for event in self.shutdown_bg_flush() {
-            let _ = self.process_bg_flush_event(event);
-        }
+        self.settle_bg_flush_shutdown();
         self.shutdown_secondary_index_worker();
         let close_result = self.close_inner();
         match (first_error, close_result) {
@@ -9458,20 +10618,54 @@ impl EngineCore {
     /// instead of waiting for it to finish. Syncs the active WAL and persists
     /// manifest with retained WAL generations. Use this for fast shutdown when
     /// you don't need the bg compaction result.
-    pub fn close_fast(mut self) -> Result<(), EngineError> {
+    pub fn close_fast(&mut self) -> Result<(), EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_some() {
+            self.cancel_candidate_index_build();
+        }
+
+        if self.manifest_write_lock.fenced() {
+            return self.close_fenced();
+        }
         self.cancel_bg_compact();
         self.try_apply_all_bg_flushes();
-        for event in self.shutdown_bg_flush() {
-            let _ = self.process_bg_flush_event(event);
-        }
+        self.settle_bg_flush_shutdown();
         self.shutdown_secondary_index_worker();
         self.close_inner()?;
         self.current_flush_pipeline_error().map_or(Ok(()), Err)
     }
 
+    fn close_fenced(&mut self) -> Result<(), EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_some() {
+            self.cancel_candidate_index_build();
+        }
+
+        self.cancel_bg_compact();
+        self.shutdown_bg_flush(); // Never adopt any result or retire recovery sources.
+        self.reset_all_flush_in_flight();
+        self.shutdown_secondary_index_worker();
+        match &self.wal_sync_mode {
+            WalSyncMode::Immediate => {
+                if let Some(writer) = &mut self.wal_writer_immediate {
+                    writer.sync()?;
+                }
+            }
+            WalSyncMode::GroupCommit { .. } => {
+                if let Some(state) = &self.wal_state {
+                    shutdown_sync_thread(state, &mut self.sync_thread)?;
+                }
+            }
+        }
+        Err(EngineError::CommitOutcome {
+            state: CommitOutcomeState::Indeterminate,
+            message: "fenced shutdown; durable authority and recovery files preserved".into(),
+        })
+    }
+
     /// Shared close logic: sync WAL, write manifest.
     fn close_inner(&mut self) -> Result<(), EngineError> {
-        self.retry_deferred_segment_cleanup();
+        self.retry_deferred_segment_cleanup_at(true, Instant::now);
         match &self.wal_sync_mode {
             WalSyncMode::Immediate => {
                 if let Some(ref mut w) = self.wal_writer_immediate {
@@ -9488,7 +10682,17 @@ impl EngineCore {
         self.with_synced_runtime_manifest_write(|manifest| {
             manifest.active_wal_generation_id = active_wal_generation_id;
             Ok(())
-        })
+        })?;
+        let authority = self.manifest_write_lock.clone();
+        let gate = authority.gate()?;
+        if let Err(error) = gate.retire_unreferenced_wals(&self.db_dir) {
+            gate.fence();
+            return Err(EngineError::CommitOutcome {
+                state: CommitOutcomeState::Indeterminate,
+                message: format!("close WAL retirement failed after durable manifest: {error}"),
+            });
+        }
+        Ok(())
     }
 
     fn active_memtable(&self) -> &Memtable {
@@ -9506,6 +10710,8 @@ impl EngineCore {
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         Ok(ReadManifestState {
+            #[cfg(feature = "production-concurrency")]
+            declared_prune_policies: self.manifest.prune_policies.clone(),
             prune_policies,
             dense_vector: self.manifest.dense_vector.clone(),
         })
@@ -9536,53 +10742,112 @@ impl EngineCore {
         }
     }
 
+    fn share<T: Send + Sync + 'static>(
+        &self,
+        value: T,
+        _class: reclamation::ResourceClass,
+    ) -> SharedArc<T> {
+        let shared = SharedArc::new(value);
+        #[cfg(feature = "production-concurrency")]
+        let mut shared = shared;
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &self.candidate {
+            shared.guard(&candidate.domain, _class).unwrap_or_else(|e| {
+                concurrency_lifecycle::fail_stop(&format!("live graph adoption failed: {e}"))
+            });
+        }
+        shared
+    }
+
     fn build_published_read_sources(
         &self,
         generation: u64,
-    ) -> Result<Arc<PublishedReadSources>, EngineError> {
+    ) -> Result<SharedArc<PublishedReadSources>, EngineError> {
+        self.build_published_read_sources_for(
+            generation,
+            &self.memtable,
+            &self.immutable_epochs,
+            &self.segments,
+        )
+    }
+    fn build_published_read_sources_for(
+        &self,
+        generation: u64,
+        memtable: &SharedArc<Memtable>,
+        epochs: &[ImmutableEpoch],
+        segments: &[SharedArc<SegmentReader>],
+    ) -> Result<SharedArc<PublishedReadSources>, EngineError> {
         #[cfg(test)]
         self.published_read_source_builds
             .fetch_add(1, Ordering::Relaxed);
 
-        let secondary_index_entries = self.secondary_index_entries_snapshot();
-        let secondary_index_catalog = build_secondary_index_catalog(&secondary_index_entries)
-            .expect("secondary index runtime state must stay internally consistent");
-        let declared_index_runtime_coverage = Arc::new(DeclaredIndexRuntimeCoverage::from_readers(
-            &self.segments,
-            &secondary_index_entries,
-        ));
-        let planner_stats = Arc::new(PlannerStatsView::build_from_readers(
-            generation,
-            &self.segments,
-            &secondary_index_entries,
-            declared_index_runtime_coverage.as_ref(),
-        ));
-        Ok(Arc::new(PublishedReadSources {
-            manifest: self.build_read_manifest_state()?,
-            memtable: Arc::clone(&self.memtable),
-            immutable_epochs: self.immutable_epochs.clone(),
-            segments: self.segments.iter().map(Arc::clone).collect(),
-            secondary_index_catalog,
-            secondary_index_entries,
-            declared_index_runtime_coverage,
-            planner_stats,
-            #[cfg(test)]
-            planning_probe_counters: QueryPlanningProbeCounters::default(),
-            #[cfg(test)]
-            query_execution_counters: QueryExecutionCounters::default(),
-        }))
+        #[cfg(feature = "production-concurrency")]
+        let fixed = memtable.fixed_secondary_catalog();
+        let secondary_index_entries = {
+            #[cfg(feature = "production-concurrency")]
+            if let Some(c) = &fixed {
+                c.entries.clone()
+            } else {
+                self.secondary_index_entries_snapshot()
+            }
+            #[cfg(not(feature = "production-concurrency"))]
+            self.secondary_index_entries_snapshot()
+        };
+        let secondary_index_catalog = {
+            #[cfg(feature = "production-concurrency")]
+            if let Some(c) = fixed {
+                CapturedSecondaryCatalog::Fixed(c)
+            } else {
+                build_secondary_index_catalog(&secondary_index_entries)?.into()
+            }
+            #[cfg(not(feature = "production-concurrency"))]
+            {
+                build_secondary_index_catalog(&secondary_index_entries)?.into()
+            }
+        };
+        let declared_index_runtime_coverage = self.share(
+            DeclaredIndexRuntimeCoverage::from_readers(segments, &secondary_index_entries),
+            reclamation::ResourceClass::Catalog,
+        );
+        let planner_stats = self.share(
+            PlannerStatsView::build_from_readers(
+                generation,
+                segments,
+                &secondary_index_entries,
+                declared_index_runtime_coverage.as_ref(),
+            ),
+            reclamation::ResourceClass::Catalog,
+        );
+        Ok(self.share(
+            PublishedReadSources {
+                manifest: self.build_read_manifest_state()?,
+                memtable: memtable.clone(),
+                immutable_epochs: epochs.to_vec(),
+                segments: segments.iter().map(Clone::clone).collect(),
+                secondary_index_catalog,
+                secondary_index_entries,
+                declared_index_runtime_coverage,
+                planner_stats,
+                #[cfg(test)]
+                planning_probe_counters: QueryPlanningProbeCounters::default(),
+                #[cfg(test)]
+                query_execution_counters: QueryExecutionCounters::default(),
+            },
+            reclamation::ResourceClass::Sources,
+        ))
     }
 
     fn rebuild_published_read_sources(&mut self) -> Result<(), EngineError> {
         let generation = self.published_read_sources_generation.saturating_add(1);
+        self.refresh_catalog_snapshots();
         let sources = self.build_published_read_sources(generation)?;
         self.published_read_sources_generation = generation;
         self.published_read_sources = Some(sources);
         Ok(())
     }
 
-    fn current_published_read_sources(&self) -> Arc<PublishedReadSources> {
-        Arc::clone(
+    fn current_published_read_sources(&self) -> SharedArc<PublishedReadSources> {
+        Clone::clone(
             self.published_read_sources
                 .as_ref()
                 .expect("published read sources must be initialized before publish"),
@@ -9590,28 +10855,123 @@ impl EngineCore {
     }
 
     fn defer_segment_dir_cleanup(&mut self, dirs: impl IntoIterator<Item = PathBuf>) {
+        #[cfg(feature = "production-concurrency")]
+        let previous_len = self.deferred_segment_dir_cleanup.len();
         self.deferred_segment_dir_cleanup.extend(dirs);
+        #[cfg(feature = "production-concurrency")]
+        if self.deferred_segment_dir_cleanup.len() != previous_len {
+            if let Some(candidate) = &mut self.candidate {
+                candidate.last_segment_cleanup = None;
+            }
+        }
+        #[cfg(feature = "production-concurrency")]
+        if let Some(runtime) = self.runtime.as_ref().and_then(Weak::upgrade) {
+            if let Some(candidate) = &runtime.candidate {
+                candidate.cleanup_pending.store(
+                    !self.deferred_segment_dir_cleanup.is_empty()
+                        || self
+                            .candidate
+                            .as_ref()
+                            .is_some_and(|c| !c.ddl.cleanup_paths.is_empty()),
+                    Ordering::Release,
+                );
+                runtime.notify_lifecycle_work();
+            }
+        }
     }
 
     fn retry_deferred_segment_cleanup(&mut self) {
-        if self.deferred_segment_dir_cleanup.is_empty() {
+        #[cfg(all(test, feature = "production-concurrency"))]
+        if let Some(now) = self.candidate.as_ref().and_then(|c| c.segment_cleanup_now) {
+            self.retry_deferred_segment_cleanup_at(false, || now);
+            return;
+        }
+        self.retry_deferred_segment_cleanup_at(false, Instant::now);
+    }
+
+    fn retry_deferred_segment_cleanup_at(
+        &mut self,
+        _final_attempt: bool,
+        _now: impl FnOnce() -> Instant,
+    ) {
+        if self.manifest_write_lock.fenced() || self.deferred_segment_dir_cleanup.is_empty() {
             return;
         }
 
+        // No clock read for empty/default/fenced paths. Final attempts bypass
+        // only cadence; durable authority and physical pins below still govern.
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &mut self.candidate {
+            let now = _now();
+            if !_final_attempt
+                && candidate.last_segment_cleanup.is_some_and(|last| {
+                    now.saturating_duration_since(last) < std::time::Duration::from_millis(10)
+                })
+            {
+                return;
+            }
+            candidate.last_segment_cleanup = Some(now);
+        }
+
+        #[cfg(test)]
+        {
+            self.post45_work[2] += 1;
+        }
+        let authority = self.manifest_write_lock.clone();
+        let Ok(gate) = authority.gate() else { return };
+        let Ok(references) = gate.recovery_references(&self.db_dir) else {
+            return;
+        };
+        #[cfg(test)]
+        {
+            self.post45_work[3] += 1;
+        }
+        #[cfg(feature = "production-concurrency")]
+        let protected_ids = self
+            .candidate
+            .as_ref()
+            .map(|c| c.domain.storage_pins())
+            .unwrap_or_default();
         let mut still_pending = Vec::new();
         for dir in self.deferred_segment_dir_cleanup.drain(..) {
+            let id = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("seg_"))
+                .and_then(|n| n.parse::<u64>().ok());
+            let protected_by_manifest = id.is_none_or(|id| references.segments.contains(&id));
+            #[cfg(feature = "production-concurrency")]
+            let protected_by_reader = id.is_some_and(|id| protected_ids.contains(&id));
+            #[cfg(not(feature = "production-concurrency"))]
+            let protected_by_reader = false;
+            if protected_by_manifest || protected_by_reader {
+                still_pending.push(dir);
+                continue;
+            }
             if dir.exists() && std::fs::remove_dir_all(&dir).is_err() {
                 still_pending.push(dir);
             }
         }
         self.deferred_segment_dir_cleanup = still_pending;
+        #[cfg(feature = "production-concurrency")]
+        if let Some(runtime) = self.runtime.as_ref().and_then(Weak::upgrade) {
+            if let Some(candidate) = &runtime.candidate {
+                candidate.cleanup_pending.store(
+                    !self.deferred_segment_dir_cleanup.is_empty()
+                        || self
+                            .candidate
+                            .as_ref()
+                            .is_some_and(|c| !c.ddl.cleanup_paths.is_empty()),
+                    Ordering::Release,
+                );
+            }
+        }
     }
-
     fn read_view(&self) -> ReadView {
         ReadView::from_published_sources(
             self.current_published_read_sources(),
             self.engine_seq,
-            Arc::clone(&self.active_degree_overlay),
+            Clone::clone(&self.active_degree_overlay),
             self.read_label_catalog_snapshot(),
         )
     }
@@ -9622,21 +10982,21 @@ impl EngineCore {
 
     fn published_read_state_with_catalog(
         &self,
-        label_catalog: Arc<ReadLabelCatalogSnapshot>,
+        label_catalog: SharedArc<ReadLabelCatalogSnapshot>,
     ) -> PublishedReadState {
         PublishedReadState {
             view: Arc::new(ReadView::from_published_sources(
                 self.current_published_read_sources(),
                 self.engine_seq,
-                Arc::clone(&self.active_degree_overlay),
-                Arc::clone(&label_catalog),
+                Clone::clone(&self.active_degree_overlay),
+                Clone::clone(&label_catalog),
             )),
             label_catalog,
-            schema_catalog: Arc::new(PublishedSchemaCatalogSnapshot {
-                next_schema_id: self.manifest.next_schema_id,
-                node_schemas: self.manifest.node_schemas.clone(),
-                edge_schemas: self.manifest.edge_schemas.clone(),
-            }),
+            schema_catalog: self
+                .current_schema_snapshot
+                .as_ref()
+                .expect("schema snapshot initialized")
+                .clone(),
             edge_uniqueness: self.edge_uniqueness,
             #[cfg(test)]
             engine_seq: self.engine_seq,
@@ -9645,9 +11005,38 @@ impl EngineCore {
         }
     }
 
-    fn read_label_catalog_snapshot(&self) -> Arc<ReadLabelCatalogSnapshot> {
+    fn read_label_catalog_snapshot(&self) -> SharedArc<ReadLabelCatalogSnapshot> {
+        self.current_label_snapshot
+            .as_ref()
+            .expect("label snapshot initialized")
+            .clone()
+    }
+
+    fn refresh_catalog_snapshots(&mut self) {
+        #[cfg(test)]
+        {
+            self.post45_work[0] += 1;
+        }
         let catalog = self.label_catalog.read().unwrap();
-        Arc::new(ReadLabelCatalogSnapshot::from_runtime(&catalog))
+        self.current_label_snapshot = Some(self.share(
+            ReadLabelCatalogSnapshot::from_runtime(&catalog),
+            reclamation::ResourceClass::Catalog,
+        ));
+        drop(catalog);
+        self.refresh_schema_snapshot();
+    }
+    fn refresh_schema_snapshot(&mut self) {
+        if self.schema_snapshot_dirty {
+            self.current_schema_snapshot = Some(self.share(
+                PublishedSchemaCatalogSnapshot {
+                    next_schema_id: self.manifest.next_schema_id,
+                    node_schemas: self.manifest.node_schemas.clone(),
+                    edge_schemas: self.manifest.edge_schemas.clone(),
+                },
+                reclamation::ResourceClass::Catalog,
+            ));
+            self.schema_snapshot_dirty = false;
+        }
     }
 
     fn secondary_index_entries_snapshot(&self) -> SecondaryIndexEntries {
@@ -9659,7 +11048,23 @@ impl EngineCore {
             &self.secondary_index_catalog,
             &self.secondary_index_entries,
             &self.manifest.secondary_indexes,
-        )
+        )?;
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_some()
+            && self
+                .memtable
+                .fixed_secondary_catalog()
+                .is_some_and(|c| c.entries != self.manifest.secondary_indexes)
+        {
+            let fixed = self.candidate_catalog(&self.manifest.secondary_indexes, None)?;
+            let bindings = self.candidate_bindings(
+                fixed,
+                None,
+                self.segments.iter().map(SharedArc::fork_owner).collect(),
+            )?;
+            self.install_candidate_bindings(bindings);
+        }
+        Ok(())
     }
 
     fn recover_secondary_index_states_on_open(&mut self) -> Result<(), EngineError> {
@@ -9739,11 +11144,11 @@ impl EngineCore {
 
         if dirty {
             let new_manifest = {
-                let _guard = self.manifest_write_lock.lock().unwrap();
+                let _guard = self.manifest_write_lock.gate()?;
                 let mut manifest = self.load_current_manifest_for_write()?;
                 manifest.secondary_indexes = self.manifest.secondary_indexes.clone();
                 self.merge_checkpointed_runtime_manifest_state(&mut manifest);
-                write_manifest(&self.db_dir, &manifest)?;
+                _guard.persist(&self.db_dir, &manifest)?;
                 manifest
             };
             self.manifest = new_manifest;
@@ -9754,12 +11159,12 @@ impl EngineCore {
     fn seed_secondary_indexes_from_manifest(&mut self) -> Result<(), EngineError> {
         let entries = self.secondary_index_entries_snapshot();
         for entry in &entries {
-            self.active_memtable().register_secondary_index(entry);
+            self.active_memtable().register_secondary_index(entry)?;
         }
         for epoch in &self.immutable_epochs {
             let memtable = epoch.memtable.as_ref();
             for entry in &entries {
-                memtable.register_secondary_index(entry);
+                memtable.register_secondary_index(entry)?;
             }
         }
         self.refresh_immutable_bytes_total();
@@ -9770,10 +11175,10 @@ impl EngineCore {
         &mut self,
         entry: &SecondaryIndexManifestEntry,
     ) -> Result<(), EngineError> {
-        self.active_memtable().register_secondary_index(entry);
+        self.active_memtable().register_secondary_index(entry)?;
         for epoch in &self.immutable_epochs {
             let memtable = epoch.memtable.as_ref();
-            memtable.register_secondary_index(entry);
+            memtable.register_secondary_index(entry)?;
         }
         self.refresh_immutable_bytes_total();
         Ok(())
@@ -9798,35 +11203,45 @@ impl EngineCore {
         }
         let (job_tx, job_rx) = std::sync::mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_clone = Arc::clone(&cancel);
+        let cancel_clone = Clone::clone(&cancel);
         let runtime = self.runtime.clone();
         let db_dir = self.db_dir.clone();
-        let manifest_write_lock = Arc::clone(&self.manifest_write_lock);
-        let catalog_lock = Arc::clone(&self.secondary_index_catalog);
-        let entries_lock = Arc::clone(&self.secondary_index_entries);
-        let next_node_id_seen = Arc::clone(&self.next_node_id_seen);
-        let next_edge_id_seen = Arc::clone(&self.next_edge_id_seen);
-        let engine_seq_seen = Arc::clone(&self.engine_seq_seen);
-        let label_catalog = Arc::clone(&self.label_catalog);
+        let manifest_write_lock = Clone::clone(&self.manifest_write_lock);
+        let catalog_lock = Clone::clone(&self.secondary_index_catalog);
+        let entries_lock = Clone::clone(&self.secondary_index_entries);
+        let next_node_id_seen = Clone::clone(&self.next_node_id_seen);
+        let next_edge_id_seen = Clone::clone(&self.next_edge_id_seen);
+        let engine_seq_seen = Clone::clone(&self.engine_seq_seen);
+        let label_catalog = Clone::clone(&self.label_catalog);
         #[cfg(test)]
-        let build_pause = Arc::clone(&self.secondary_index_build_pause);
-        let handle = std::thread::spawn(move || {
-            bg_secondary_index_worker(
-                job_rx,
-                cancel_clone,
-                runtime,
-                db_dir,
-                manifest_write_lock,
-                catalog_lock,
-                entries_lock,
-                next_node_id_seen,
-                next_edge_id_seen,
-                engine_seq_seen,
-                label_catalog,
-                #[cfg(test)]
-                build_pause,
-            )
-        });
+        let build_pause = Clone::clone(&self.secondary_index_build_pause);
+        #[cfg(feature = "production-concurrency")]
+        let builder = if self.candidate.is_some() {
+            worker::builder("overgraph-index-builder")
+        } else {
+            std::thread::Builder::new()
+        };
+        #[cfg(not(feature = "production-concurrency"))]
+        let builder = std::thread::Builder::new();
+        let handle = builder
+            .spawn(move || {
+                bg_secondary_index_worker(
+                    job_rx,
+                    cancel_clone,
+                    runtime,
+                    db_dir,
+                    manifest_write_lock,
+                    catalog_lock,
+                    entries_lock,
+                    next_node_id_seen,
+                    next_edge_id_seen,
+                    engine_seq_seen,
+                    label_catalog,
+                    #[cfg(test)]
+                    build_pause,
+                )
+            })
+            .expect("secondary index worker spawn");
         self.secondary_index_bg = Some(SecondaryIndexBgHandle {
             job_tx,
             handle: Some(handle),
@@ -9846,6 +11261,16 @@ impl EngineCore {
     }
 
     fn enqueue_secondary_index_job(&mut self, job: SecondaryIndexJob) {
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_some() {
+            // Building declarations are the candidate's pending-work list. Never
+            // dispatch the released mutable-manifest worker for a candidate.
+            if let Some(runtime) = self.runtime.as_ref().and_then(Weak::upgrade) {
+                runtime.notify_lifecycle_work();
+            }
+            return;
+        }
+
         self.ensure_secondary_index_worker();
         if let Some(bg) = &self.secondary_index_bg {
             let _ = bg.job_tx.send(job);
@@ -9853,6 +11278,14 @@ impl EngineCore {
     }
 
     fn schedule_building_secondary_indexes(&mut self) {
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_some() {
+            if let Some(runtime) = self.runtime.as_ref().and_then(Weak::upgrade) {
+                runtime.notify_lifecycle_work();
+            }
+            return;
+        }
+
         let building_ids: Vec<u64> = self
             .secondary_index_entries_snapshot()
             .into_iter()
@@ -9961,7 +11394,7 @@ impl EngineCore {
         &mut self,
         mutate: impl FnOnce(&mut ManifestState) -> Result<T, EngineError>,
     ) -> Result<T, EngineError> {
-        let _guard = self.manifest_write_lock.lock().unwrap();
+        let _guard = self.manifest_write_lock.gate()?;
         let mut manifest = self.load_current_manifest_for_write()?;
         let result = mutate(&mut manifest)?;
         self.merge_checkpointed_runtime_manifest_state(&mut manifest);
@@ -9972,7 +11405,14 @@ impl EngineCore {
                 "test forced runtime manifest write failure".to_string(),
             ));
         }
-        write_manifest(&self.db_dir, &manifest)?;
+        _guard.persist(&self.db_dir, &manifest)?;
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &mut self.candidate {
+            candidate.accepted = true;
+        }
+        self.schema_snapshot_dirty |= self.manifest.next_schema_id != manifest.next_schema_id
+            || self.manifest.node_schemas != manifest.node_schemas
+            || self.manifest.edge_schemas != manifest.edge_schemas;
         self.manifest = manifest;
         Ok(result)
     }
@@ -9981,7 +11421,7 @@ impl EngineCore {
         &mut self,
         mutate: impl FnOnce(&mut ManifestState) -> Result<T, EngineError>,
     ) -> Result<T, EngineError> {
-        let _guard = self.manifest_write_lock.lock().unwrap();
+        let _guard = self.manifest_write_lock.gate()?;
         let mut manifest = self.load_current_manifest_for_synced_write()?;
         let result = mutate(&mut manifest)?;
         self.merge_synced_runtime_manifest_state(&mut manifest);
@@ -9992,7 +11432,14 @@ impl EngineCore {
                 "test forced runtime manifest write failure".to_string(),
             ));
         }
-        write_manifest(&self.db_dir, &manifest)?;
+        _guard.persist(&self.db_dir, &manifest)?;
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &mut self.candidate {
+            candidate.accepted = true;
+        }
+        self.schema_snapshot_dirty |= self.manifest.next_schema_id != manifest.next_schema_id
+            || self.manifest.node_schemas != manifest.node_schemas
+            || self.manifest.edge_schemas != manifest.edge_schemas;
         self.manifest = manifest;
         Ok(result)
     }
@@ -10163,7 +11610,7 @@ impl EngineCore {
         if deltas.is_empty() {
             return;
         }
-        let mut edit = DegreeOverlayEdit::new(Arc::clone(&self.active_degree_overlay));
+        let mut edit = DegreeOverlayEdit::new(Clone::clone(&self.active_degree_overlay));
         for (node_id, delta) in deltas {
             edit.add_delta(node_id, delta);
         }
@@ -10222,49 +11669,179 @@ impl EngineCore {
     }
 
     /// Internal helper that handles WAL append + memtable apply for both sync modes.
-    fn append_and_apply_normalized(&mut self, ops: &[WalOp]) -> Result<(), EngineError> {
+    fn append_and_apply_normalized(
+        &mut self,
+        ops: &[WalOp],
+        #[cfg(feature = "production-concurrency")] install: &mut PrimaryInstall<'_>,
+    ) -> Result<(), EngineError> {
         // Assign sequences before WAL write so the WAL persists exact seqs.
         let base_seq = self.engine_seq;
-        let sequenced: Vec<(u64, WalOp)> = ops
-            .iter()
-            .enumerate()
-            .map(|(i, op)| (base_seq + 1 + i as u64, op.clone()))
-            .collect();
+        let sequenced: Vec<(u64, WalOp)> = {
+            #[cfg(feature = "production-concurrency")]
+            if self.candidate.is_some() {
+                Vec::new()
+            } else {
+                ops.iter()
+                    .enumerate()
+                    .map(|(i, op)| (base_seq + 1 + i as u64, op.clone()))
+                    .collect()
+            }
+            #[cfg(not(feature = "production-concurrency"))]
+            {
+                ops.iter()
+                    .enumerate()
+                    .map(|(i, op)| (base_seq + 1 + i as u64, op.clone()))
+                    .collect()
+            }
+        };
         let mut edge_states = self.capture_batch_edge_states(ops)?;
         let mut degree_deltas: NodeIdMap<DegreeDelta> = NodeIdMap::default();
+        #[cfg(feature = "production-concurrency")]
+        let mut suffix_batch = None;
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_some() {
+            let frames = std::mem::take(&mut self.candidate.as_mut().unwrap().prepared_frames);
+            let target = self
+                .candidate
+                .as_ref()
+                .and_then(|c| c.ddl.build.as_ref())
+                .map(|b| b.target.clone());
+            let mut prepared = self.active_memtable().prepare_primary_with_build(
+                ops,
+                base_seq + 1,
+                Some(&self.sources()),
+                install.existing_node_limit,
+                install.existing_edge_limit,
+                target.as_deref(),
+            )?;
+            suffix_batch = self.prepare_candidate_suffix(
+                prepared.as_mut().expect("candidate preparation"),
+                base_seq + 1,
+                base_seq + ops.len() as u64,
+            )?;
+            let handle = install.participant.expect("candidate participant");
+            let result = self.wal_append_admitted(
+                || {
+                    handle
+                        .try_acquire()
+                        .map_err(crate::memtable::primary::participant_error)
+                },
+                |w| w.append_prepared(&frames),
+            );
+            self.candidate.as_mut().unwrap().prepared_frames = frames;
+            install.session = Some(result?);
+            install.prepared = prepared;
+        } else {
+            self.wal_append(|w| w.append_batch(&sequenced))?;
+        }
+        #[cfg(not(feature = "production-concurrency"))]
         self.wal_append(|w| w.append_batch(&sequenced))?;
-        for (seq, op) in &sequenced {
-            self.engine_seq = *seq;
+        for (i, op) in ops.iter().enumerate() {
+            let seq = base_seq + 1 + i as u64;
+            self.engine_seq = seq;
             let edge_id = Self::edge_id_for_degree_op(op);
             let old_edge = edge_id
                 .and_then(|id| edge_states.get(&id).copied().flatten())
                 .map(OldEdgeInfo::from_core);
             self.apply_label_token_op_after_wal_append(op)?;
-            self.active_memtable().apply_op(op, *seq);
+            #[cfg(feature = "production-concurrency")]
+            if self.candidate.is_none() {
+                self.active_memtable().apply_op(op, seq);
+            }
+            #[cfg(not(feature = "production-concurrency"))]
+            self.active_memtable().apply_op(op, seq);
             Self::collect_degree_delta_for_op(op, old_edge, &mut degree_deltas);
             if let Some(edge_id) = edge_id {
                 edge_states.insert(edge_id, Self::edge_core_after_op(op));
             }
         }
+        #[cfg(feature = "production-concurrency")]
+        if let Some(prepared) = install.prepared.take() {
+            self.active_memtable().install_primary(
+                install.session.as_ref().expect("pre-WAL session"),
+                prepared,
+                ops,
+            )?;
+        }
+        #[cfg(feature = "production-concurrency")]
+        self.append_candidate_suffix(base_seq + 1, suffix_batch);
         self.apply_degree_deltas_to_active_overlay(degree_deltas);
         self.update_engine_seq_seen();
         Ok(())
     }
 
     /// Internal helper for a single pre-normalized WAL op.
-    fn append_and_apply_one_normalized(&mut self, op: &WalOp) -> Result<(), EngineError> {
+    fn append_and_apply_one_normalized(
+        &mut self,
+        op: &WalOp,
+        #[cfg(feature = "production-concurrency")] install: &mut PrimaryInstall<'_>,
+    ) -> Result<(), EngineError> {
         let seq = self.engine_seq + 1;
         let old_edge = Self::edge_id_for_degree_op(op)
             .map(|id| self.get_edge_core_for_cache(id))
             .transpose()?
             .flatten()
             .map(OldEdgeInfo::from_core);
+        #[cfg(feature = "production-concurrency")]
+        let mut suffix_batch = None;
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_some() {
+            let frames = std::mem::take(&mut self.candidate.as_mut().unwrap().prepared_frames);
+            let target = self
+                .candidate
+                .as_ref()
+                .and_then(|c| c.ddl.build.as_ref())
+                .map(|b| b.target.clone());
+            let mut prepared = self.active_memtable().prepare_primary_with_build(
+                std::slice::from_ref(op),
+                seq,
+                Some(&self.sources()),
+                install.existing_node_limit,
+                install.existing_edge_limit,
+                target.as_deref(),
+            )?;
+            suffix_batch = self.prepare_candidate_suffix(
+                prepared.as_mut().expect("candidate preparation"),
+                seq,
+                seq,
+            )?;
+            let handle = install.participant.expect("candidate participant");
+            let result = self.wal_append_admitted(
+                || {
+                    handle
+                        .try_acquire()
+                        .map_err(crate::memtable::primary::participant_error)
+                },
+                |w| w.append_prepared(&frames),
+            );
+            self.candidate.as_mut().unwrap().prepared_frames = frames;
+            install.session = Some(result?);
+            install.prepared = prepared;
+        } else {
+            self.wal_append(|w| w.append(op, seq))?;
+        }
+        #[cfg(not(feature = "production-concurrency"))]
         self.wal_append(|w| w.append(op, seq))?;
         self.engine_seq = seq;
         self.apply_label_token_op_after_wal_append(op)?;
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_none() {
+            self.active_memtable().apply_op(op, seq);
+        }
+        #[cfg(not(feature = "production-concurrency"))]
         self.active_memtable().apply_op(op, seq);
         let mut degree_deltas: NodeIdMap<DegreeDelta> = NodeIdMap::default();
         Self::collect_degree_delta_for_op(op, old_edge, &mut degree_deltas);
+        #[cfg(feature = "production-concurrency")]
+        if let Some(prepared) = install.prepared.take() {
+            self.active_memtable().install_primary(
+                install.session.as_ref().expect("pre-WAL session"),
+                prepared,
+                std::slice::from_ref(op),
+            )?;
+        }
+        #[cfg(feature = "production-concurrency")]
+        self.append_candidate_suffix(seq, suffix_batch);
         self.apply_degree_deltas_to_active_overlay(degree_deltas);
         self.update_engine_seq_seen();
         Ok(())
@@ -10278,73 +11855,205 @@ impl EngineCore {
     where
         F: FnOnce(&mut WalWriter) -> Result<usize, EngineError>,
     {
-        match &self.wal_sync_mode {
-            WalSyncMode::Immediate => {
-                let w = self
-                    .wal_writer_immediate
-                    .as_mut()
-                    .expect("immediate WAL writer");
-                f(w)?;
-                w.sync()?;
+        self.wal_append_admitted(|| Ok(()), f)
+    }
+
+    fn wal_append_admitted<F, T>(
+        &mut self,
+        admit: impl FnOnce() -> Result<T, EngineError>,
+        f: F,
+    ) -> Result<T, EngineError>
+    where
+        F: FnOnce(&mut WalWriter) -> Result<usize, EngineError>,
+    {
+        let authority = self.manifest_write_lock.clone();
+        let (_gate, mut wal_state) = loop {
+            #[cfg(feature = "production-concurrency")]
+            if self
+                .candidate
+                .as_ref()
+                .is_some_and(|c| c.deadline.is_some_and(|deadline| deadline.expired()))
+            {
+                #[cfg(test)]
+                self.trace_candidate_admission_for_test(
+                    "wal_gate",
+                    self.candidate.as_ref().and_then(|c| c.deadline),
+                );
+                return Err(EngineError::ResourceLimit {
+                    resource: "admission_deadline",
+                    requested: 1,
+                    limit: 0,
+                    retryable: true,
+                });
             }
-            WalSyncMode::GroupCommit {
-                soft_trigger_bytes,
-                hard_cap_bytes,
-                ..
-            } => {
-                let soft = *soft_trigger_bytes;
-                let hard = *hard_cap_bytes;
-                let arc = self.wal_state.as_ref().expect("group commit WAL state");
-                let (lock, cvar) = &**arc;
+            // Healthy writes acquire gate -> WAL once. Never carry the WAL
+            // mutex across gate acquisition: the sync thread uses this order too.
+            let gate = authority.gate()?;
+            if let WalSyncMode::GroupCommit { hard_cap_bytes, .. } = &self.wal_sync_mode {
+                let (lock, cvar) = &**self.wal_state.as_ref().expect("group commit WAL state");
                 let mut state = lock.lock().unwrap();
-
-                // Check poison
-                if let Some(ref msg) = state.poisoned {
-                    return Err(EngineError::WalSyncFailed(msg.clone()));
+                if let Some(message) = &state.poisoned {
+                    return Err(EngineError::WalSyncFailed(message.clone()));
                 }
+                if state.buffered_bytes >= *hard_cap_bytes {
+                    // Sync needs the gate to free buffer space. Keep the WAL
+                    // predicate protected until the condvar atomically releases
+                    // it, so a sync/poison notification cannot be lost.
+                    drop(gate);
+                    while state.buffered_bytes >= *hard_cap_bytes && state.poisoned.is_none() {
+                        #[cfg(test)]
+                        if let Some(waiting) = &self.wal_cap_wait_for_test {
+                            let _ = waiting.send(());
+                        }
+                        #[cfg(feature = "production-concurrency")]
+                        if let Some(deadline) = self.candidate.as_ref().and_then(|c| c.deadline) {
+                            let Some(remaining) = deadline.remaining() else {
+                                #[cfg(test)]
+                                self.trace_candidate_admission_for_test(
+                                    "wal_cap_wait",
+                                    Some(deadline),
+                                );
+                                return Err(EngineError::ResourceLimit {
+                                    resource: "admission_deadline",
+                                    requested: 1,
+                                    limit: 0,
+                                    retryable: true,
+                                });
+                            };
+                            state = cvar.wait_timeout(state, remaining).unwrap().0;
+                            continue;
+                        }
+                        state = cvar.wait(state).unwrap();
+                    }
+                    if let Some(message) = &state.poisoned {
+                        return Err(EngineError::WalSyncFailed(message.clone()));
+                    }
+                    drop(state);
+                    // Recheck the original deadline and fence on every retry.
+                    continue;
+                }
+                break (gate, Some(state));
+            }
+            break (gate, None);
+        };
+        #[cfg(feature = "production-concurrency")]
+        if self
+            .candidate
+            .as_ref()
+            .is_some_and(|c| c.deadline.is_some_and(|d| d.expired()))
+        {
+            #[cfg(test)]
+            self.trace_candidate_admission_for_test(
+                "wal_before_accept",
+                self.candidate.as_ref().and_then(|c| c.deadline),
+            );
+            return Err(EngineError::ResourceLimit {
+                resource: "admission_deadline",
+                requested: 1,
+                limit: 0,
+                retryable: true,
+            });
+        }
+        let custody = admit()?;
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &mut self.candidate {
+            candidate.accepted = true;
+        }
+        let result = (|| -> Result<(), EngineError> {
+            match &self.wal_sync_mode {
+                WalSyncMode::Immediate => {
+                    let w = self
+                        .wal_writer_immediate
+                        .as_mut()
+                        .expect("immediate WAL writer");
+                    f(w)?;
+                    w.sync()?;
+                }
+                WalSyncMode::GroupCommit {
+                    soft_trigger_bytes,
+                    hard_cap_bytes,
+                    ..
+                } => {
+                    let soft = *soft_trigger_bytes;
+                    let arc = self.wal_state.as_ref().expect("group commit WAL state");
+                    let (_, cvar) = &**arc;
+                    let mut state = wal_state.take().expect("group commit WAL guard");
+                    debug_assert!(state.buffered_bytes < *hard_cap_bytes);
 
-                // Backpressure: block if at hard cap
-                while state.buffered_bytes >= hard {
-                    state = cvar.wait(state).unwrap();
-                    if let Some(ref msg) = state.poisoned {
-                        return Err(EngineError::WalSyncFailed(msg.clone()));
+                    // Append to WAL (in-memory BufWriter only, no fsync)
+                    let bytes_written = f(&mut state.wal_writer)?;
+                    state.buffered_bytes += bytes_written;
+
+                    // Notify sync thread if soft trigger hit
+                    if state.buffered_bytes >= soft {
+                        cvar.notify_all();
                     }
                 }
-
-                // Append to WAL (in-memory BufWriter only, no fsync)
-                let bytes_written = f(&mut state.wal_writer)?;
-                state.buffered_bytes += bytes_written;
-
-                // Notify sync thread if soft trigger hit
-                if state.buffered_bytes >= soft {
-                    cvar.notify_all();
-                }
             }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            #[cfg(feature = "production-concurrency")]
+            if self.candidate.is_some() {
+                _gate.fence();
+                return Err(EngineError::CommitOutcome {
+                    state: CommitOutcomeState::Indeterminate,
+                    message: format!(
+                        "WAL append/sync uncertain; recovery files preserved: {error}"
+                    ),
+                });
+            }
+            return Err(error);
         }
-        Ok(())
+        Ok(custody)
     }
 
     /// Force an immediate WAL fsync. Blocks until the sync completes.
     /// In Immediate mode, this is a no-op (every write already syncs).
     pub fn sync(&self) -> Result<(), EngineError> {
-        match &self.wal_sync_mode {
-            WalSyncMode::Immediate => Ok(()),
-            WalSyncMode::GroupCommit { .. } => {
-                let arc = self.wal_state.as_ref().expect("group commit WAL state");
-                let (lock, cvar) = &**arc;
-                let mut state = lock.lock().unwrap();
-                if let Some(ref msg) = state.poisoned {
-                    return Err(EngineError::WalSyncFailed(msg.clone()));
+        let gate = self.manifest_write_lock.gate()?;
+        let result = (|| -> Result<(), EngineError> {
+            match &self.wal_sync_mode {
+                WalSyncMode::Immediate => Ok(()),
+                WalSyncMode::GroupCommit { .. } => {
+                    let arc = self.wal_state.as_ref().expect("group commit WAL state");
+                    let (lock, cvar) = &**arc;
+                    let mut state = lock.lock().unwrap();
+                    if let Some(ref msg) = state.poisoned {
+                        return Err(EngineError::WalSyncFailed(msg.clone()));
+                    }
+                    if state.buffered_bytes > 0 {
+                        state.wal_writer.sync()?;
+                        state.buffered_bytes = 0;
+                        state.sync_error_count = 0;
+                        cvar.notify_all();
+                    }
+                    Ok(())
                 }
-                if state.buffered_bytes > 0 {
-                    state.wal_writer.sync()?;
-                    state.buffered_bytes = 0;
-                    state.sync_error_count = 0;
-                    cvar.notify_all();
-                }
-                Ok(())
             }
+        })();
+        self.finish_wal_sync(&gate, result)
+    }
+
+    fn finish_wal_sync(
+        &self,
+        _gate: &durability::ManifestGate<'_>,
+        result: Result<(), EngineError>,
+    ) -> Result<(), EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self.candidate.is_some() {
+            if let Err(error) = result {
+                _gate.fence();
+                return Err(EngineError::CommitOutcome {
+                    state: CommitOutcomeState::Indeterminate,
+                    message: format!(
+                        "WAL durability/transition uncertain; sources preserved: {error}"
+                    ),
+                });
+            }
+            return Ok(());
         }
+        result
     }
 
     // --- Flush pipeline ---
@@ -10356,33 +12065,75 @@ impl EngineCore {
     /// No-op if the active memtable is empty.
     pub(crate) fn freeze_memtable(&mut self) -> Result<(), EngineError> {
         if self.memtable.is_empty() {
+            #[cfg(feature = "production-concurrency")]
+            if self
+                .candidate
+                .as_ref()
+                .is_some_and(|c| c.generation_operations > 0)
+            {
+                // WAL-only label operations are a nonempty logical generation.
+            } else {
+                return Ok(());
+            }
+            #[cfg(not(feature = "production-concurrency"))]
             return Ok(());
         }
 
-        // 1. Sync current active WAL generation
-        match &self.wal_sync_mode {
-            WalSyncMode::Immediate => {
-                self.wal_writer_immediate
-                    .as_mut()
-                    .expect("immediate WAL writer")
-                    .sync()?;
-            }
-            WalSyncMode::GroupCommit { .. } => {
-                let arc = self.wal_state.as_ref().expect("group commit WAL state");
-                let (lock, cvar) = &**arc;
-                let mut state = lock.lock().unwrap();
-                if let Some(ref msg) = state.poisoned {
-                    return Err(EngineError::WalSyncFailed(msg.clone()));
+        {
+            let gate = self.manifest_write_lock.gate()?;
+            let result = (|| -> Result<(), EngineError> {
+                // 1. Sync current active WAL generation
+                match &self.wal_sync_mode {
+                    WalSyncMode::Immediate => {
+                        self.wal_writer_immediate
+                            .as_mut()
+                            .expect("immediate WAL writer")
+                            .sync()?;
+                    }
+                    WalSyncMode::GroupCommit { .. } => {
+                        let arc = self.wal_state.as_ref().expect("group commit WAL state");
+                        let (lock, cvar) = &**arc;
+                        let mut state = lock.lock().unwrap();
+                        if let Some(ref msg) = state.poisoned {
+                            return Err(EngineError::WalSyncFailed(msg.clone()));
+                        }
+                        if state.buffered_bytes > 0 {
+                            state.wal_writer.sync()?;
+                            state.buffered_bytes = 0;
+                            state.sync_error_count = 0;
+                            cvar.notify_all();
+                        }
+                    }
                 }
-                if state.buffered_bytes > 0 {
-                    state.wal_writer.sync()?;
-                    state.buffered_bytes = 0;
-                    state.sync_error_count = 0;
-                    cvar.notify_all();
-                }
-            }
+                Ok(())
+            })();
+            self.finish_wal_sync(&gate, result)?;
         }
         self.update_engine_seq_seen();
+
+        let next_memtable = self.share(
+            {
+                #[cfg(feature = "production-concurrency")]
+                {
+                    if let Some(handle) = self.memtable.participant_handle() {
+                        Memtable::new_candidate_with_catalog(
+                            handle,
+                            self.memtable
+                                .fixed_secondary_catalog()
+                                .expect("candidate fixed catalog"),
+                            &self.candidate.as_ref().expect("candidate domain").domain,
+                        )?
+                    } else {
+                        Memtable::new()
+                    }
+                }
+                #[cfg(not(feature = "production-concurrency"))]
+                {
+                    Memtable::new()
+                }
+            },
+            reclamation::ResourceClass::Generation,
+        );
 
         // 2. Allocate new WAL generation
         let old_wal_gen = self.active_wal_generation_id;
@@ -10400,25 +12151,52 @@ impl EngineCore {
             Ok(new_wal_gen)
         })?;
 
-        // 4. Open new WAL writer (after manifest is durable)
-        match &self.wal_sync_mode {
-            WalSyncMode::Immediate => {
-                self.wal_writer_immediate =
-                    Some(WalWriter::open_generation(&self.db_dir, new_wal_gen)?);
+        let authority = self.manifest_write_lock.clone();
+        let gate = authority.gate()?;
+        let opened = (|| -> Result<(), EngineError> {
+            #[cfg(test)]
+            if self.force_next_wal_open_error {
+                self.force_next_wal_open_error = false;
+                return Err(std::io::Error::other("injected next WAL open failure").into());
             }
-            WalSyncMode::GroupCommit { .. } => {
-                let arc = self.wal_state.as_ref().expect("group commit WAL state");
-                let (lock, _cvar) = &**arc;
-                let mut state = lock.lock().unwrap();
-                state.wal_writer = WalWriter::open_generation(&self.db_dir, new_wal_gen)?;
+            // 4. Open new WAL writer (after manifest is durable)
+            match &self.wal_sync_mode {
+                WalSyncMode::Immediate => {
+                    self.wal_writer_immediate =
+                        Some(WalWriter::open_generation(&self.db_dir, new_wal_gen)?);
+                }
+                WalSyncMode::GroupCommit { .. } => {
+                    let arc = self.wal_state.as_ref().expect("group commit WAL state");
+                    let (lock, _cvar) = &**arc;
+                    let mut state = lock.lock().unwrap();
+                    state.wal_writer = WalWriter::open_generation(&self.db_dir, new_wal_gen)?;
+                }
+            }
+
+            Ok(())
+        })();
+        self.finish_wal_sync(&gate, opened)?;
+        drop(gate);
+
+        // Legacy catalogs can finish mutable index builds during rotation.
+        // Keep their original late capture; candidate shells already retain
+        // the fixed immutable catalog prepared before durable acceptance.
+        if !next_memtable.is_candidate() {
+            for entry in self.secondary_index_entries_snapshot() {
+                next_memtable.register_secondary_index(&entry)?;
             }
         }
 
         // 5. Swap memtable to immutable queue (newest-first = insert at front)
         self.active_wal_generation_id = new_wal_gen;
-        let next_memtable = Arc::new(Memtable::new());
-        for entry in self.secondary_index_entries_snapshot() {
-            next_memtable.register_secondary_index(&entry);
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &mut self.candidate {
+            candidate.generation_operations = 0;
+            candidate.generation_bytes = 0;
+        }
+        #[cfg(feature = "production-concurrency")]
+        if self.memtable.is_candidate() {
+            self.memtable.seal_export(self.engine_seq);
         }
         let frozen = std::mem::replace(&mut self.memtable, next_memtable);
         let frozen_degree_overlay = std::mem::replace(
@@ -10487,7 +12265,12 @@ impl EngineCore {
         self.enqueue_all_non_in_flight()?;
 
         let mut last_seg_info = None;
-        while self.immutable_epochs.iter().any(|e| e.in_flight) {
+        while !self.immutable_epochs.is_empty() {
+            self.enqueue_all_non_in_flight()?;
+            if !self.immutable_epochs.iter().any(|e| e.in_flight) {
+                self.wait_for_bg_compact();
+                self.enqueue_all_non_in_flight()?;
+            }
             match self.wait_for_one_flush() {
                 Ok(Some(info)) => {
                     last_seg_info = Some(info);
@@ -10587,10 +12370,10 @@ impl EngineCore {
         let cancel = Arc::new(AtomicBool::new(false));
         let events_ready = Arc::new(AtomicUsize::new(0));
 
-        let build_cancel = Arc::clone(&cancel);
-        let build_events_ready = Arc::clone(&events_ready);
+        let build_cancel = Clone::clone(&cancel);
+        let build_events_ready = Clone::clone(&events_ready);
         let build_event_tx = event_tx.clone();
-        let build_secondary_indexes = Arc::clone(&self.secondary_index_entries);
+        let build_secondary_indexes = Clone::clone(&self.secondary_index_entries);
         let build_runtime = self.runtime.clone();
         let build_handle = std::thread::spawn(move || {
             bg_flush_build_worker(
@@ -10604,19 +12387,19 @@ impl EngineCore {
             );
         });
 
-        let publish_cancel = Arc::clone(&cancel);
-        let publish_events_ready = Arc::clone(&events_ready);
+        let publish_cancel = Clone::clone(&cancel);
+        let publish_events_ready = Clone::clone(&events_ready);
         let db_dir = self.db_dir.clone();
-        let manifest_write_lock = Arc::clone(&self.manifest_write_lock);
-        let publish_catalog = Arc::clone(&self.secondary_index_catalog);
-        let publish_entries = Arc::clone(&self.secondary_index_entries);
-        let next_node_id_seen = Arc::clone(&self.next_node_id_seen);
-        let next_edge_id_seen = Arc::clone(&self.next_edge_id_seen);
-        let engine_seq_seen = Arc::clone(&self.engine_seq_seen);
-        let label_catalog = Arc::clone(&self.label_catalog);
+        let manifest_write_lock = Clone::clone(&self.manifest_write_lock);
+        let publish_catalog = Clone::clone(&self.secondary_index_catalog);
+        let publish_entries = Clone::clone(&self.secondary_index_entries);
+        let next_node_id_seen = Clone::clone(&self.next_node_id_seen);
+        let next_edge_id_seen = Clone::clone(&self.next_edge_id_seen);
+        let engine_seq_seen = Clone::clone(&self.engine_seq_seen);
+        let label_catalog = Clone::clone(&self.label_catalog);
         let publish_runtime = self.runtime.clone();
         #[cfg(test)]
-        let publish_pause = Arc::clone(&self.flush_publish_pause);
+        let publish_pause = Clone::clone(&self.flush_publish_pause);
         let publish_handle = std::thread::spawn(move || {
             bg_flush_publish_worker(
                 db_dir,
@@ -10652,6 +12435,16 @@ impl EngineCore {
     /// to the background build worker. The epoch stays in `immutable_epochs`
     /// until a later cheap adoption event removes it after durable publish.
     fn enqueue_flush(&mut self) -> Result<(), EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        if self
+            .candidate
+            .as_ref()
+            .is_some_and(|c| c.heavy.load(Ordering::Acquire))
+        {
+            // Keep the epoch queued, with its WAL/ownership intact. Adoption
+            // releases the one heavy lease and the independent lane retries it.
+            return Ok(());
+        }
         let bg = self
             .bg_flush
             .as_ref()
@@ -10666,8 +12459,8 @@ impl EngineCore {
 
         let epoch_id = self.immutable_epochs[epoch_idx].epoch_id;
         let wal_gen_id = self.immutable_epochs[epoch_idx].wal_generation_id;
-        let frozen = Arc::clone(&self.immutable_epochs[epoch_idx].memtable);
-        let degree_overlay = Arc::clone(&self.immutable_epochs[epoch_idx].degree_overlay);
+        let frozen = Clone::clone(&self.immutable_epochs[epoch_idx].memtable);
+        let degree_overlay = Clone::clone(&self.immutable_epochs[epoch_idx].degree_overlay);
 
         let seg_id = self.next_segment_id;
 
@@ -10675,6 +12468,8 @@ impl EngineCore {
         std::fs::create_dir_all(&segments_dir)?;
 
         let work = BgFlushWork {
+            #[cfg(feature = "production-concurrency")]
+            heavy: self.acquire_heavy_job(),
             epoch_id,
             frozen,
             degree_overlay,
@@ -10693,6 +12488,8 @@ impl EngineCore {
             },
         };
 
+        #[cfg(all(test, feature = "production-concurrency"))]
+        maintenance_diagnostic::stage(&self.db_dir, seg_id, "flush_enqueue");
         bg.work_tx
             .send(work)
             .map_err(|_| EngineError::InvalidOperation("bg flush worker died".into()))?;
@@ -10709,6 +12506,14 @@ impl EngineCore {
     /// Enqueue all non-in-flight immutable epochs to the background flush worker.
     fn enqueue_all_non_in_flight(&mut self) -> Result<(), EngineError> {
         while self.immutable_epochs.iter().any(|e| !e.in_flight) {
+            #[cfg(feature = "production-concurrency")]
+            if self
+                .candidate
+                .as_ref()
+                .is_some_and(|c| c.heavy.load(Ordering::Acquire))
+            {
+                break;
+            }
             self.enqueue_flush()?;
         }
         Ok(())
@@ -10743,9 +12548,7 @@ impl EngineCore {
     }
 
     fn drain_ready_bg_flush_events_for_runtime(&mut self) -> RuntimeFlushDrainResult {
-        let mut completed_flushes = Vec::new();
-        let mut progressed = false;
-        let mut publish_impact = PublishImpact::NoPublish;
+        let mut result = RuntimeFlushDrainResult::default();
         loop {
             let event = {
                 let bg = match self.bg_flush.as_ref() {
@@ -10762,30 +12565,14 @@ impl EngineCore {
                     Err(_) => break,
                 }
             };
-            progressed = true;
             if let Some(bg) = self.bg_flush.as_mut() {
                 bg.events_applied += 1;
             }
-            let completed_epoch_id = match &event {
-                BgFlushEvent::Adopt(adoption) => Some(adoption.epoch_id),
-                BgFlushEvent::Failed(_) => None,
-            };
-            match self.process_bg_flush_event(event) {
-                Ok(Some(seg_info)) => {
-                    publish_impact = publish_impact.combine(PublishImpact::RebuildSources);
-                    if let Some(epoch_id) = completed_epoch_id {
-                        completed_flushes.push((epoch_id, seg_info));
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("drain_ready_bg_flush_events_for_runtime: {}", e),
+            if let Err(error) = self.process_bg_flush_event_into(event, &mut result) {
+                eprintln!("drain_ready_bg_flush_events_for_runtime: {}", error);
             }
         }
-        RuntimeFlushDrainResult {
-            progressed,
-            publish_impact,
-            completed_flushes,
-        }
+        result
     }
 
     /// Blocking: wait for one flush result from the background worker.
@@ -10810,11 +12597,7 @@ impl EngineCore {
                 result
             }
             Err(_) => {
-                let shutdown_events = self.shutdown_bg_flush();
-                for event in shutdown_events {
-                    let _ = self.process_bg_flush_event(event);
-                }
-                self.reset_all_flush_in_flight();
+                self.settle_bg_flush_shutdown();
                 if let Some(err) = self.current_flush_pipeline_error() {
                     Err(err)
                 } else {
@@ -10828,8 +12611,62 @@ impl EngineCore {
         &mut self,
         event: BgFlushEvent,
     ) -> Result<Option<SegmentInfo>, EngineError> {
+        self.process_bg_flush_event_into(event, &mut RuntimeFlushDrainResult::default())
+    }
+
+    fn process_bg_flush_event_into(
+        &mut self,
+        event: BgFlushEvent,
+        drain: &mut RuntimeFlushDrainResult,
+    ) -> Result<Option<SegmentInfo>, EngineError> {
+        drain.progressed = true;
+        if self.manifest_write_lock.fenced() {
+            let error = match event {
+                BgFlushEvent::Failed(error) => error,
+                BgFlushEvent::Adopt(adoption) => FlushPipelineError {
+                    epoch_id: adoption.epoch_id,
+                    wal_generation_id: adoption.wal_gen_to_retire,
+                    stage: FlushPipelineStage::PublishManifest,
+                    message: "fenced flush adoption; sources preserved".into(),
+                },
+            };
+            self.record_flush_pipeline_error(error);
+            // Cancel/join producers and consume their remaining terminal events.
+            // Dropping an adoption releases its reader/heavy lease without any
+            // manifest update, source replacement or recovery-file deletion.
+            if self.bg_flush.is_some() {
+                for event in self.shutdown_bg_flush() {
+                    if let BgFlushEvent::Failed(error) = event {
+                        self.record_flush_pipeline_error(error);
+                    }
+                }
+                self.reset_all_flush_in_flight();
+            }
+            return self.ensure_maintenance_unfenced().map(|()| None);
+        }
         match event {
             BgFlushEvent::Adopt(adoption) => {
+                #[cfg(all(test, feature = "production-concurrency"))]
+                maintenance_diagnostic::stage_id(
+                    adoption
+                        ._heavy
+                        .as_ref()
+                        .and_then(|lease| lease.diagnostic_id),
+                    "flush_adoption_start",
+                );
+                if !self.immutable_epochs.iter().any(|epoch| {
+                    epoch.epoch_id == adoption.epoch_id
+                        && epoch.wal_generation_id == adoption.wal_gen_to_retire
+                        && epoch.in_flight
+                        && SharedArc::ptr_eq(&epoch.memtable, &adoption.frozen)
+                }) {
+                    if let Ok(gate) = self.manifest_write_lock.gate() {
+                        gate.fence();
+                    }
+                    return Err(EngineError::InvalidOperation(
+                        "stale flush adoption source identity; durable output preserved".into(),
+                    ));
+                }
                 let seg_info = adoption.seg_info.clone();
                 for index_id in &adoption.rebuild_equality_index_ids {
                     if let Some(entry) = self
@@ -10874,12 +12711,12 @@ impl EngineCore {
                         && epoch.wal_generation_id == adoption.wal_gen_to_retire)
                 });
                 self.warm_declared_index_runtime_coverage_for_reader(&adoption.reader);
-                self.segments.insert(0, Arc::new(adoption.reader));
-                if let Some(idx) = self
-                    .immutable_epochs
-                    .iter()
-                    .position(|epoch| epoch.epoch_id == adoption.epoch_id)
-                {
+                self.segments.insert(0, SharedArc::new(adoption.reader));
+                if let Some(idx) = self.immutable_epochs.iter().position(|epoch| {
+                    epoch.epoch_id == adoption.epoch_id
+                        && epoch.wal_generation_id == adoption.wal_gen_to_retire
+                        && SharedArc::ptr_eq(&epoch.memtable, &adoption.frozen)
+                }) {
                     let removed = self.immutable_epochs.remove(idx);
                     self.immutable_bytes_total = self
                         .immutable_bytes_total
@@ -10922,14 +12759,27 @@ impl EngineCore {
                     self.enqueue_secondary_index_job(SecondaryIndexJob::Build { index_id });
                 }
 
+                #[cfg(all(test, feature = "production-concurrency"))]
+                maintenance_diagnostic::stage_id(
+                    adoption
+                        ._heavy
+                        .as_ref()
+                        .and_then(|lease| lease.diagnostic_id),
+                    "flush_adopted",
+                );
+                drain.publish_impact = drain.publish_impact.combine(PublishImpact::RebuildSources);
+                drain.completed_flushes.push((adoption.epoch_id, seg_info.clone()));
                 Ok(Some(seg_info))
             }
             BgFlushEvent::Failed(err) => {
                 self.record_flush_pipeline_error(err.clone());
-                self.reset_all_flush_in_flight();
-                let shutdown_events = self.shutdown_bg_flush();
-                for shutdown_event in shutdown_events {
-                    let _ = self.process_bg_flush_event(shutdown_event);
+                // An outer shutdown batch already owns all terminal events once
+                // bg_flush is gone. Do not clear custody before its next event.
+                if self.bg_flush.is_some() {
+                    let nested = self.settle_bg_flush_shutdown();
+                    drain.progressed |= nested.progressed;
+                    drain.publish_impact = drain.publish_impact.combine(nested.publish_impact);
+                    drain.completed_flushes.extend(nested.completed_flushes);
                 }
                 Err(err.to_engine_error())
             }
@@ -10972,6 +12822,17 @@ impl EngineCore {
         }
     }
 
+    fn ensure_maintenance_unfenced(&self) -> Result<(), EngineError> {
+        if self.manifest_write_lock.fenced() {
+            return Err(EngineError::CommitOutcome {
+                state: CommitOutcomeState::Indeterminate,
+                message: "fenced maintenance; durable authority and recovery files preserved"
+                    .into(),
+            });
+        }
+        Ok(())
+    }
+
     fn maybe_surface_or_retry_flush_pipeline_error(&mut self) -> Result<(), EngineError> {
         if let Some(err) = self.flush_pipeline_error.clone() {
             if !self.flush_pipeline_error_reported {
@@ -10993,9 +12854,22 @@ impl EngineCore {
         })
     }
 
-    /// Shut down the background flush workers, if running, and return any
-    /// already-queued completion events so callers can perform lazy adoption.
-    /// Any remaining epochs are no longer in flight once the worker is gone.
+    /// Settle joined producers' terminal events against their original custody,
+    /// then clear only residual canceled epochs. Failed-event handling cannot
+    /// recursively reset an outer batch because shutdown has taken bg_flush.
+    fn settle_bg_flush_shutdown(&mut self) -> RuntimeFlushDrainResult {
+        let events = self.shutdown_bg_flush();
+        let mut result = RuntimeFlushDrainResult::default();
+        for event in events {
+            let _ = self.process_bg_flush_event_into(event, &mut result);
+        }
+        self.reset_all_flush_in_flight();
+        result
+    }
+
+    /// Join the workers and return queued terminal events. Preserve in-flight
+    /// identity until callers settle those events; an empty batch can release
+    /// residual canceled custody immediately.
     fn shutdown_bg_flush(&mut self) -> Vec<BgFlushEvent> {
         let events = if let Some(mut bg) = self.bg_flush.take() {
             bg.cancel.store(true, Ordering::Relaxed);
@@ -11015,7 +12889,9 @@ impl EngineCore {
         } else {
             Vec::new()
         };
-        self.reset_all_flush_in_flight();
+        if events.is_empty() {
+            self.reset_all_flush_in_flight();
+        }
         events
     }
 
@@ -11033,6 +12909,9 @@ impl EngineCore {
             return Ok(());
         }
         self.start_bg_compact()?;
+        if self.bg_compact.is_none() {
+            return Ok(());
+        }
         #[cfg(test)]
         {
             self.bg_compact
@@ -11057,6 +12936,16 @@ impl EngineCore {
             return Ok(());
         }
 
+        #[cfg(feature = "production-concurrency")]
+        if self
+            .candidate
+            .as_ref()
+            .is_some_and(|c| c.heavy.load(Ordering::Acquire) || !self.immutable_epochs.is_empty())
+        {
+            return Ok(());
+        }
+        #[cfg(feature = "production-concurrency")]
+        let heavy = self.acquire_heavy_job();
         // Snapshot current root SegmentInfo and paths for the background thread.
         let input_segments: Vec<(SegmentInfo, PathBuf)> = self
             .segments
@@ -11084,18 +12973,22 @@ impl EngineCore {
         let dense_vector = self.manifest.dense_vector.clone();
         let secondary_indexes = self.secondary_index_entries_snapshot();
         let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_clone = Arc::clone(&cancel);
+        let cancel_clone = Clone::clone(&cancel);
         let runtime = self.runtime.clone();
         let completed = Arc::new(AtomicBool::new(false));
-        let completed_clone = Arc::clone(&completed);
+        let completed_clone = Clone::clone(&completed);
         #[cfg(test)]
-        let compact_pause = Arc::clone(&self.bg_compact_pause);
+        let compact_pause = Clone::clone(&self.bg_compact_pause);
+        #[cfg(all(test, feature = "production-concurrency"))]
+        maintenance_diagnostic::stage(&db_dir, seg_id, "compact_enqueue");
         let handle = std::thread::spawn(move || {
             let _completion_signal = BgCompactCompletionSignal {
+                #[cfg(all(test, feature = "production-concurrency"))]
+                diagnostic_id: heavy.as_ref().and_then(|lease| lease.diagnostic_id),
                 completed: completed_clone,
                 runtime,
             };
-            bg_compact_worker(
+            let result = bg_compact_worker(
                 db_dir,
                 seg_id,
                 input_segments,
@@ -11105,7 +12998,14 @@ impl EngineCore {
                 &cancel_clone,
                 #[cfg(test)]
                 &compact_pause,
-            )
+            );
+            #[cfg(feature = "production-concurrency")]
+            let mut result = result;
+            #[cfg(feature = "production-concurrency")]
+            if let Ok(value) = &mut result {
+                value.heavy = heavy;
+            }
+            result
         });
 
         self.bg_compact = Some(BgCompactHandle {
@@ -11170,10 +13070,14 @@ impl EngineCore {
             Ok(Ok(result)) => self.apply_bg_compact_result(result),
             Ok(Err(e)) => {
                 eprintln!("Background compaction failed: {}", e);
+                self.record_candidate_maintenance_error(e);
                 None
             }
             Err(_) => {
                 eprintln!("Background compaction thread panicked");
+                self.record_candidate_maintenance_error(EngineError::InvalidOperation(
+                    "background compaction worker panicked".into(),
+                ));
                 None
             }
         };
@@ -11193,12 +13097,39 @@ impl EngineCore {
     /// Apply a completed background compaction result: update manifest, swap
     /// segments, and delete old segment directories.
     fn apply_bg_compact_result(&mut self, result: BgCompactResult) -> Option<CompactionStats> {
+        #[cfg(all(test, feature = "production-concurrency"))]
+        let diagnostic_id = result.heavy.as_ref().and_then(|lease| lease.diagnostic_id);
+        #[cfg(all(test, feature = "production-concurrency"))]
+        maintenance_diagnostic::stage_id(diagnostic_id, "compact_adoption_start");
+        #[cfg(feature = "production-concurrency")]
+        if let Some(catalog) = self.memtable.fixed_secondary_catalog() {
+            if let Err(error) = validate_fixed_ready_output(&result.reader, &catalog.entries) {
+                self.record_candidate_maintenance_error(error);
+                let _ = std::fs::remove_dir_all(segment_dir(
+                    &self.db_dir,
+                    result.stats.output_segment_id,
+                ));
+                return None;
+            }
+        }
+        #[cfg(all(test, feature = "production-concurrency"))]
+        maintenance_diagnostic::stage_id(diagnostic_id, "compact_wait_manifest_gate");
         let (updated_manifest, rebuild_equality_index_ids, rebuild_range_index_ids) = {
-            let _guard = self.manifest_write_lock.lock().unwrap();
+            let authority = self.manifest_write_lock.clone();
+            let _guard = match authority.gate() {
+                Ok(gate) => gate,
+                Err(error) => {
+                    self.record_candidate_maintenance_error(error);
+                    return None;
+                }
+            };
+            #[cfg(all(test, feature = "production-concurrency"))]
+            maintenance_diagnostic::stage_id(diagnostic_id, "compact_manifest_persistence");
             let mut manifest = match self.load_current_manifest_for_write() {
                 Ok(manifest) => manifest,
                 Err(e) => {
                     eprintln!("Background compaction: manifest load failed: {}", e);
+                    self.record_candidate_maintenance_error(e);
                     let output_dir = segment_dir(&self.db_dir, result.stats.output_segment_id);
                     let _ = std::fs::remove_dir_all(output_dir);
                     return None;
@@ -11226,7 +13157,10 @@ impl EngineCore {
             manifest
                 .segments
                 .retain(|s| !input_segment_ids.contains(&s.id));
-            manifest.segments.push(result.seg_info.clone());
+            // Durable segments are oldest-first, opposite to live readers.
+            // Inputs captured before a concurrent flush compact to the oldest
+            // source; retain newer survivors in their existing relative order.
+            manifest.segments.insert(0, result.seg_info.clone());
             apply_secondary_index_failure_report(&mut manifest, &result.secondary_index_report);
             let rebuild_equality_index_ids = reconcile_background_output_equality_declarations(
                 &mut manifest,
@@ -11238,10 +13172,22 @@ impl EngineCore {
             );
             self.merge_checkpointed_runtime_manifest_state(&mut manifest);
 
-            if let Err(e) = write_manifest(&self.db_dir, &manifest) {
+            if let Err(e) = finish_compaction_manifest(
+                &self.db_dir,
+                result.stats.output_segment_id,
+                cfg!(feature = "production-concurrency"),
+                _guard.persist(&self.db_dir, &manifest),
+            ) {
                 eprintln!("Background compaction: manifest write failed: {}", e);
-                let output_dir = segment_dir(&self.db_dir, result.stats.output_segment_id);
-                let _ = std::fs::remove_dir_all(output_dir);
+                // Known preacceptance refusal rejects the private output.
+                // Indeterminate persistence already fenced and must preserve it.
+                if !authority.fenced() {
+                    let _ = std::fs::remove_dir_all(segment_dir(
+                        &self.db_dir,
+                        result.stats.output_segment_id,
+                    ));
+                }
+                self.record_candidate_maintenance_error(e);
                 return None;
             }
             (
@@ -11252,11 +13198,24 @@ impl EngineCore {
         };
 
         self.manifest = updated_manifest;
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &mut self.candidate {
+            candidate.accepted = true;
+        }
         if let Err(error) = self.rebuild_secondary_index_catalog() {
             eprintln!(
                 "Background compaction: secondary index runtime sync failed: {}",
                 error
             );
+            #[cfg(feature = "production-concurrency")]
+            if self.candidate.is_some() {
+                self.manifest_write_lock.establish();
+                self.record_candidate_maintenance_error(EngineError::CommitOutcome {
+                    state: CommitOutcomeState::Indeterminate,
+                    message: format!("accepted compaction runtime install failed: {error}"),
+                });
+                return None;
+            }
         }
         // Remove input segments, keep any new segments added by flushes during
         // background compaction (they have different IDs).
@@ -11269,7 +13228,7 @@ impl EngineCore {
             .retain(|s| !input_segment_ids.contains(&s.segment_id));
         // Compacted segment is oldest; push to end (segments are newest-first).
         self.warm_declared_index_runtime_coverage_for_reader(&result.reader);
-        self.segments.push(Arc::new(result.reader));
+        self.segments.push(SharedArc::new(result.reader));
 
         // Defer old segment cleanup until after the new published snapshot is
         // installed. Windows keeps mmap-backed files locked while old readers
@@ -11287,7 +13246,20 @@ impl EngineCore {
 
         let _ = self.maybe_schedule_bg_compact();
 
+        #[cfg(all(test, feature = "production-concurrency"))]
+        maintenance_diagnostic::stage_id(diagnostic_id, "compact_adopted");
         Some(result.stats)
+    }
+
+    fn record_candidate_maintenance_error(&mut self, error: EngineError) {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(candidate) = &mut self.candidate {
+            if candidate.maintenance_error.is_none() {
+                candidate.maintenance_error = Some(error);
+            }
+            return;
+        }
+        let _ = error;
     }
 
     // --- Compaction ---
@@ -11463,6 +13435,15 @@ impl EngineCore {
             )));
         }
 
+        #[cfg(feature = "production-concurrency")]
+        if let Some(catalog) = self.memtable.fixed_secondary_catalog() {
+            if let Err(error) = validate_fixed_ready_output(&new_reader, &catalog.entries) {
+                self.next_segment_id -= 1;
+                let _ = std::fs::remove_dir_all(&final_dir);
+                return Err(error);
+            }
+        }
+
         // Collect old segment info for cleanup
         let old_seg_ids: NodeIdSet = self.segments.iter().map(|s| s.segment_id).collect();
         let old_seg_dirs: Vec<PathBuf> = old_seg_ids
@@ -11471,13 +13452,13 @@ impl EngineCore {
             .collect();
 
         let new_manifest = {
-            let _guard = self.manifest_write_lock.lock().unwrap();
+            let _guard = self.manifest_write_lock.gate()?;
             let mut manifest = self.load_current_manifest_for_write()?;
             manifest.segments.retain(|s| !old_seg_ids.contains(&s.id));
             manifest.segments.push(seg_info.clone());
             apply_secondary_index_failure_report(&mut manifest, &secondary_index_report);
             self.merge_checkpointed_runtime_manifest_state(&mut manifest);
-            write_manifest(&self.db_dir, &manifest)?;
+            _guard.persist(&self.db_dir, &manifest)?;
             manifest
         };
 
@@ -11486,7 +13467,7 @@ impl EngineCore {
         self.rebuild_secondary_index_catalog()?;
         self.segments.clear();
         self.warm_declared_index_runtime_coverage_for_reader(&new_reader);
-        self.segments.push(Arc::new(new_reader));
+        self.segments.push(SharedArc::new(new_reader));
 
         // Defer old segment cleanup until after the new published snapshot is
         // installed. Windows keeps mmap-backed files locked while old readers
@@ -11753,18 +13734,37 @@ impl EngineCore {
             WalSyncMode::GroupCommit { .. } => "group-commit".to_string(),
         };
         let immutable_memtable_bytes = self.immutable_bytes_total;
-        let oldest_retained_wal_gen = self
+        let known_oldest_wal_gen = self
             .manifest
             .pending_flush_epochs
             .iter()
             .map(|e| e.wal_generation_id)
             .min()
             .unwrap_or(self.active_wal_generation_id);
+        // Fallback manifests can retain a flushed WAL beyond runtime adoption.
+        // Sample actual generation filenames; on diagnostic I/O failure retain
+        // the known runtime lower frontier rather than inventing a zero.
+        let oldest_retained_wal_gen = std::fs::read_dir(&self.db_dir)
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .filter_map(|e| {
+                        let e = e.ok()?;
+                        let name = e.file_name();
+                        name.to_str()?
+                            .strip_prefix("wal_")?
+                            .strip_suffix(".wal")?
+                            .parse::<u64>()
+                            .ok()
+                    })
+                    .min()
+            })
+            .unwrap_or(known_oldest_wal_gen);
         DbStats {
             pending_wal_bytes,
             segment_count: self.segments.len(),
-            node_tombstone_count: self.memtable.deleted_nodes().len(),
-            edge_tombstone_count: self.memtable.deleted_edges().len(),
+            node_tombstone_count: self.memtable.current_tombstone_counts().0,
+            edge_tombstone_count: self.memtable.current_tombstone_counts().1,
             last_compaction_ms: self.last_compaction_ms,
             wal_sync_mode: sync_mode_str,
             active_memtable_bytes: self.memtable.estimated_size(),
@@ -11835,30 +13835,16 @@ impl EngineCore {
 fn get_edge_core_from_sources(
     memtable: &Memtable,
     immutable_epochs: &[ImmutableEpoch],
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     id: u64,
 ) -> Result<Option<EdgeCore>, EngineError> {
-    if let Some((from, to, created_at, updated_at, weight, valid_from, valid_to)) =
-        memtable.get_edge_core_at(id, u64::MAX)
+    for source in
+        std::iter::once(memtable).chain(immutable_epochs.iter().map(|e| e.memtable.as_ref()))
     {
-        return Ok(Some(EdgeCore {
-            from,
-            to,
-            created_at,
-            updated_at,
-            weight,
-            valid_from,
-            valid_to,
-        }));
-    }
-    if memtable.is_edge_deleted_at(id, u64::MAX) {
-        return Ok(None);
-    }
-    for epoch in immutable_epochs {
-        if let Some((from, to, created_at, updated_at, weight, valid_from, valid_to)) =
-            epoch.memtable.get_edge_core_at(id, u64::MAX)
-        {
-            return Ok(Some(EdgeCore {
+        match source.edge_core_opinion_at(id, u64::MAX)? {
+            crate::memtable::PrimaryOpinion::Missing => {}
+            crate::memtable::PrimaryOpinion::Removed(_) => return Ok(None),
+            crate::memtable::PrimaryOpinion::Live((
                 from,
                 to,
                 created_at,
@@ -11866,10 +13852,17 @@ fn get_edge_core_from_sources(
                 weight,
                 valid_from,
                 valid_to,
-            }));
-        }
-        if epoch.memtable.is_edge_deleted_at(id, u64::MAX) {
-            return Ok(None);
+            )) => {
+                return Ok(Some(EdgeCore {
+                    from,
+                    to,
+                    created_at,
+                    updated_at,
+                    weight,
+                    valid_from,
+                    valid_to,
+                }))
+            }
         }
     }
     for seg in segments {
@@ -11944,16 +13937,42 @@ fn replay_apply_normalized_op(
     seq: u64,
     op: &WalOp,
     old_edge: Option<OldEdgeInfo>,
-) {
+    _sources: (&[ImmutableEpoch], &[SharedArc<SegmentReader>]),
+) -> Result<(), EngineError> {
     *engine_seq = (*engine_seq).max(seq);
+    #[cfg(feature = "production-concurrency")]
+    if let Some(prepared) = memtable.prepare_primary(
+        std::slice::from_ref(op),
+        seq,
+        Some(&SourceList {
+            active: memtable,
+            immutable: _sources.0,
+            segments: _sources.1,
+            snapshot_seq: u64::MAX,
+            #[cfg(test)]
+            selected_field_read_counters: None,
+        }),
+        u64::MAX,
+        u64::MAX,
+    )? {
+        let handle = memtable.participant_handle().expect("replay candidate");
+        let session = handle
+            .try_acquire()
+            .map_err(crate::memtable::primary::participant_error)?;
+        memtable.install_primary(&session, prepared, std::slice::from_ref(op))?;
+    } else {
+        memtable.apply_op(op, seq);
+    }
+    #[cfg(not(feature = "production-concurrency"))]
     memtable.apply_op(op, seq);
     EngineCore::collect_degree_delta_for_op(op, old_edge, degree_deltas);
+    Ok(())
 }
 
 fn capture_replay_batch_edge_states(
     memtable: &Memtable,
     immutable_epochs: &[ImmutableEpoch],
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     ops: &[(u64, WalOp)],
 ) -> Result<NodeIdMap<Option<EdgeCore>>, EngineError> {
     let mut states: NodeIdMap<Option<EdgeCore>> = NodeIdMap::default();
@@ -11982,7 +14001,7 @@ fn replay_apply_committed_atomic_batch(
     engine_seq: &mut u64,
     wal_generation_id: u64,
     immutable_epochs: &[ImmutableEpoch],
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
 ) -> Result<(), EngineError> {
     let normalized_ops: Vec<(u64, WalOp)> = batch
         .ops
@@ -12004,7 +14023,15 @@ fn replay_apply_committed_atomic_batch(
         let old_edge = edge_id
             .and_then(|id| edge_states.get(&id).copied().flatten())
             .map(OldEdgeInfo::from_core);
-        replay_apply_normalized_op(memtable, degree_deltas, engine_seq, seq, &op, old_edge);
+        replay_apply_normalized_op(
+            memtable,
+            degree_deltas,
+            engine_seq,
+            seq,
+            &op,
+            old_edge,
+            (immutable_epochs, segments),
+        )?;
         if let Some(edge_id) = edge_id {
             edge_states.insert(edge_id, EngineCore::edge_core_after_op(&op));
         }
@@ -12013,16 +14040,44 @@ fn replay_apply_committed_atomic_batch(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Replay receives explicit storage, generation, catalog and reclamation context"
+)]
 fn replay_wal_generation_to_memtable_and_overlay(
     db_dir: &Path,
     wal_generation_id: u64,
     dense_config: Option<&DenseVectorConfig>,
     label_catalog: &mut RuntimeLabelCatalog,
     engine_seq: &mut u64,
-    immutable_epochs: &[ImmutableEpoch],
-    segments: &[Arc<SegmentReader>],
-) -> Result<(Memtable, Arc<DegreeOverlaySnapshot>, u64), EngineError> {
-    let memtable = Memtable::new();
+    sources: (&[ImmutableEpoch], &[SharedArc<SegmentReader>]),
+    #[cfg(feature = "production-concurrency")] participants: Option<
+        &participant::ParticipantHandle,
+    >,
+    #[cfg(feature = "production-concurrency")] catalog: Option<
+        &SharedArc<crate::memtable::secondary::FixedCatalog>,
+    >,
+    #[cfg(feature = "production-concurrency")] domain: Option<&reclamation::ReclaimDomain>,
+) -> Result<(Memtable, SharedArc<DegreeOverlaySnapshot>, u64), EngineError> {
+    let (immutable_epochs, segments) = sources;
+    let memtable = {
+        #[cfg(feature = "production-concurrency")]
+        {
+            if let Some(p) = participants {
+                Memtable::new_candidate_with_catalog(
+                    p.clone(),
+                    catalog.expect("catalog before replay").clone(),
+                    domain.expect("domain before replay"),
+                )?
+            } else {
+                Memtable::new()
+            }
+        }
+        #[cfg(not(feature = "production-concurrency"))]
+        {
+            Memtable::new()
+        }
+    };
     let mut degree_deltas: NodeIdMap<DegreeDelta> = NodeIdMap::default();
     let mut open_batch: Option<ReplayAtomicBatch> = None;
     let read_result = WalReader::read_generation_recoverable(db_dir, wal_generation_id)?;
@@ -12086,7 +14141,8 @@ fn replay_wal_generation_to_memtable_and_overlay(
                     seq,
                     &op,
                     old_edge,
-                );
+                    (immutable_epochs, segments),
+                )?;
             }
         }
     }
@@ -12100,15 +14156,22 @@ fn replay_wal_generation_to_memtable_and_overlay(
 
 impl Drop for EngineCore {
     fn drop(&mut self) {
+        if self.shutdown_complete {
+            return;
+        }
+        if self.manifest_write_lock.fenced() {
+            let _ = self.close_fenced();
+            return;
+        }
         // Best-effort: wait for background compaction to finish.
         // Errors are swallowed. Drop must not panic.
         self.wait_for_bg_compact();
 
         // Best-effort: drain any completed bg flush results, then shut down worker.
         self.drain_bg_flush();
-        self.shutdown_bg_flush();
+        self.settle_bg_flush_shutdown();
         self.shutdown_secondary_index_worker();
-        self.retry_deferred_segment_cleanup();
+        self.retry_deferred_segment_cleanup_at(true, Instant::now);
 
         // Best-effort: shut down sync thread and flush buffered data.
         if self.sync_thread.is_some() {
@@ -12119,8 +14182,22 @@ impl Drop for EngineCore {
     }
 }
 
+impl Clone for DatabaseEngine {
+    fn clone(&self) -> Self {
+        Self {
+            runtime: self.runtime.clone(),
+            #[cfg(feature = "production-concurrency")]
+            client: self.client.clone(),
+        }
+    }
+}
+
 impl Drop for DatabaseEngine {
     fn drop(&mut self) {
+        #[cfg(feature = "production-concurrency")]
+        if self.runtime.candidate.is_some() {
+            return;
+        }
         if Arc::strong_count(&self.runtime) <= 2 {
             self.runtime.best_effort_shutdown();
         }
@@ -12171,13 +14248,24 @@ fn fsync_dir(dir: &Path) -> Result<(), EngineError> {
 /// These are orphans from crashes between segment write and manifest update
 /// (or between background compaction output and apply). Best-effort: I/O errors
 /// during cleanup are silently ignored; the orphan just wastes space.
-fn cleanup_orphan_segments(db_dir: &Path, manifest: &ManifestState) {
+fn cleanup_orphan_segments(
+    db_dir: &Path,
+    manifest: &ManifestState,
+    protected: Option<&reclamation::ReclaimDomain>,
+) {
     let seg_parent = db_dir.join("segments");
     let entries = match std::fs::read_dir(&seg_parent) {
         Ok(e) => e,
         Err(_) => return,
     };
-    let manifest_ids: NodeIdSet = manifest.segments.iter().map(|s| s.id).collect();
+    let Ok(references) = crate::manifest::recovery_file_references(db_dir) else {
+        return;
+    };
+    let mut manifest_ids = references.segments;
+    manifest_ids.extend(manifest.segments.iter().map(|s| s.id));
+    let protected_ids = protected
+        .map(reclamation::ReclaimDomain::storage_pins)
+        .unwrap_or_default();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -12188,7 +14276,7 @@ fn cleanup_orphan_segments(db_dir: &Path, manifest: &ManifestState) {
                 continue;
             }
             if let Ok(id) = id_str.parse::<u64>() {
-                if !manifest_ids.contains(&id) {
+                if !manifest_ids.contains(&id) && !protected_ids.contains(&id) {
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
@@ -12196,9 +14284,40 @@ fn cleanup_orphan_segments(db_dir: &Path, manifest: &ManifestState) {
     }
 }
 
-fn cleanup_orphan_optional_refresh_files(db_dir: &Path, manifest: &ManifestState) {
+fn cleanup_orphan_optional_refresh_files(
+    db_dir: &Path,
+    manifest: &ManifestState,
+    protected: Option<&reclamation::ReclaimDomain>,
+) {
+    // Failure to read any recoverable root leaves its file references unknown.
+    // As with segment/WAL cleanup, retain files until the union is established.
+    let Ok(fallback) = crate::manifest::recovery_file_references(db_dir) else {
+        return;
+    };
+    let mut pins: HashSet<PathBuf> = protected
+        .map(|d| {
+            d.component_pins()
+                .into_iter()
+                .map(|(id, _, relative)| segment_dir(db_dir, id).join(relative))
+                .collect()
+        })
+        .unwrap_or_default();
     for segment in &manifest.segments {
-        cleanup_orphan_optional_component_files(&segment_dir(db_dir, segment.id));
+        for entry in fallback.secondary_indexes.values().filter(|e| {
+            !manifest
+                .secondary_indexes
+                .iter()
+                .any(|now| now.index_id == e.index_id)
+        }) {
+            pins.extend(secondary_index_sidecar_paths_for_entry(
+                &segment_dir(db_dir, segment.id),
+                entry,
+            ));
+        }
+        crate::segment_writer::cleanup_orphan_optional_component_files_with_pins(
+            &segment_dir(db_dir, segment.id),
+            &pins,
+        );
     }
 }
 
@@ -12206,12 +14325,17 @@ fn cleanup_orphan_optional_refresh_files(db_dir: &Path, manifest: &ManifestState
 /// Orphan WAL files can appear when a crash occurs after WAL retirement completes
 /// on disk but before the manifest is updated, or from other interrupted sequences.
 fn cleanup_orphan_wal_files(db_dir: &Path, manifest: &ManifestState) {
-    // Collect all WAL gen IDs that the manifest knows about
-    let mut live_gens: NodeIdSet = NodeIdSet::default();
+    let Ok(references) = crate::manifest::recovery_file_references(db_dir) else {
+        return;
+    };
+    let mut live_gens = references.wal_generations;
     live_gens.insert(manifest.active_wal_generation_id);
-    for epoch in &manifest.pending_flush_epochs {
-        live_gens.insert(epoch.wal_generation_id);
-    }
+    live_gens.extend(
+        manifest
+            .pending_flush_epochs
+            .iter()
+            .map(|e| e.wal_generation_id),
+    );
     let entries = match std::fs::read_dir(db_dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -12248,10 +14372,6 @@ impl EngineCore {
 
     pub(crate) fn engine_seq_for_test(&self) -> u64 {
         self.engine_seq
-    }
-
-    pub(crate) fn immutable_memtable(&self, idx: usize) -> &Memtable {
-        &self.immutable_epochs[idx].memtable
     }
 
     /// Set a one-shot pause hook. Consumed by the next enqueue_flush call.
@@ -12374,7 +14494,7 @@ impl EngineCore {
 /// Check if all segments have non-overlapping node and edge ID ranges.
 /// Returns true when every record ID appears in at most one segment,
 /// the common case for append-only workloads without updates.
-fn segments_are_non_overlapping(segments: &[Arc<SegmentReader>]) -> bool {
+fn segments_are_non_overlapping(segments: &[SharedArc<SegmentReader>]) -> bool {
     // Check node ID ranges
     let mut node_ranges: Vec<(u64, u64)> =
         segments.iter().filter_map(|s| s.node_id_range()).collect();
@@ -12399,7 +14519,7 @@ fn segments_are_non_overlapping(segments: &[Arc<SegmentReader>]) -> bool {
 }
 
 fn select_compaction_path(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     has_tombstones: bool,
     has_active_prune_policies: bool,
 ) -> CompactionPath {
@@ -12416,8 +14536,18 @@ fn send_bg_flush_event(
     runtime: &Option<std::sync::Weak<DbRuntime>>,
     event: BgFlushEvent,
 ) {
+    #[cfg(all(test, feature = "production-concurrency"))]
+    let diagnostic_id = match &event {
+        BgFlushEvent::Adopt(adoption) => adoption
+            ._heavy
+            .as_ref()
+            .and_then(|lease| lease.diagnostic_id),
+        BgFlushEvent::Failed(_) => None,
+    };
     if tx.send(event).is_ok() {
         events_ready.fetch_add(1, Ordering::Release);
+        #[cfg(all(test, feature = "production-concurrency"))]
+        maintenance_diagnostic::stage_id(diagnostic_id, "flush_completion_ready");
         if let Some(runtime) = runtime.as_ref().and_then(|weak| weak.upgrade()) {
             runtime.notify_lifecycle_work();
         }
@@ -12433,9 +14563,11 @@ fn bg_flush_build_worker(
     cancel: Arc<AtomicBool>,
     events_ready: Arc<AtomicUsize>,
     runtime: Option<std::sync::Weak<DbRuntime>>,
-    secondary_index_entries: Arc<RwLock<SecondaryIndexEntries>>,
+    secondary_index_entries: SharedArc<RwLock<SecondaryIndexEntries>>,
 ) {
     while let Ok(work) = rx.recv() {
+        #[cfg(all(test, feature = "production-concurrency"))]
+        maintenance_diagnostic::output_stage(&work.tmp_dir, work.seg_id, "flush_start");
         if cancel.load(Ordering::Relaxed) {
             break;
         }
@@ -12469,34 +14601,66 @@ fn bg_flush_build_worker(
             let _ = std::fs::create_dir_all(parent);
         }
 
-        let current_secondary_indexes = secondary_index_entries.read().unwrap().clone();
-        let needs_reseed = current_secondary_indexes.iter().any(|entry| {
-            !work
-                .frozen
-                .secondary_index_declarations()
-                .contains_key(&entry.index_id)
-        });
-        let reseeded_frozen = needs_reseed.then(|| {
-            let memtable = (*work.frozen).clone();
-            for entry in &current_secondary_indexes {
-                memtable.register_secondary_index(entry);
+        let current_secondary_indexes = if work.frozen.is_candidate() {
+            #[cfg(feature = "production-concurrency")]
+            {
+                work.frozen
+                    .fixed_secondary_catalog()
+                    .expect("frozen fixed catalog")
+                    .entries
+                    .clone()
             }
-            memtable
-        });
-        let frozen_ref: &Memtable = if let Some(memtable) = reseeded_frozen.as_ref() {
-            memtable
+            #[cfg(not(feature = "production-concurrency"))]
+            {
+                unreachable!()
+            }
         } else {
-            work.frozen.as_ref()
+            secondary_index_entries.read().unwrap().clone()
         };
+        #[cfg(all(test, feature = "production-concurrency"))]
+        maintenance_diagnostic::output_stage(&work.tmp_dir, work.seg_id, "flush_build_segment");
+        let segment_build = (|| -> Result<SegmentInfo, EngineError> {
+            let needs_reseed = if work.frozen.is_candidate() {
+                false
+            } else {
+                let installed = work.frozen.secondary_index_declarations();
+                current_secondary_indexes
+                    .iter()
+                    .any(|entry| !installed.contains_key(&entry.index_id))
+            };
+            let reseeded_frozen = if needs_reseed {
+                Some({
+                    let memtable = (*work.frozen).clone();
+                    for entry in &current_secondary_indexes {
+                        memtable.register_secondary_index(entry)?;
+                    }
+                    memtable
+                })
+            } else {
+                None
+            };
+            let frozen_ref: &Memtable = if let Some(memtable) = reseeded_frozen.as_ref() {
+                memtable
+            } else {
+                work.frozen.as_ref()
+            };
 
-        let built_result = match write_segment_with_degree_overlay_and_secondary_indexes(
+            write_segment_with_degree_overlay_and_secondary_indexes(
+                &work.tmp_dir,
+                work.seg_id,
+                frozen_ref,
+                work.dense_config.as_ref(),
+                work.degree_overlay.as_ref(),
+                &current_secondary_indexes,
+            )
+        })();
+        #[cfg(all(test, feature = "production-concurrency"))]
+        maintenance_diagnostic::output_stage(
             &work.tmp_dir,
             work.seg_id,
-            frozen_ref,
-            work.dense_config.as_ref(),
-            work.degree_overlay.as_ref(),
-            &current_secondary_indexes,
-        ) {
+            "flush_persist_rename_fsync",
+        );
+        let built_result = match segment_build {
             Ok(seg_info) => match std::fs::rename(&work.tmp_dir, &work.final_dir) {
                 Ok(()) => {
                     if let Some(parent) = work.final_dir.parent() {
@@ -12543,6 +14707,11 @@ fn bg_flush_build_worker(
                                     }
                                 };
                             BuiltFlushResult {
+                                frozen: work.frozen.clone(),
+                                #[cfg(feature = "production-concurrency")]
+                                heavy: work.heavy,
+                                #[cfg(feature = "production-concurrency")]
+                                fixed_catalog: work.frozen.fixed_secondary_catalog(),
                                 epoch_id: work.epoch_id,
                                 wal_gen_to_retire: work.wal_gen_id,
                                 seg_info,
@@ -12607,6 +14776,12 @@ fn bg_flush_build_worker(
             }
         };
 
+        #[cfg(all(test, feature = "production-concurrency"))]
+        maintenance_diagnostic::output_stage(
+            &built_result.final_dir,
+            built_result.seg_id,
+            "flush_built_handoff",
+        );
         if built_tx.send(built_result).is_err() {
             break;
         }
@@ -12620,19 +14795,21 @@ fn bg_flush_publish_worker(
     db_dir: PathBuf,
     rx: std::sync::mpsc::Receiver<BuiltFlushResult>,
     event_tx: std::sync::mpsc::SyncSender<BgFlushEvent>,
-    manifest_write_lock: Arc<Mutex<()>>,
-    secondary_index_catalog: Arc<RwLock<SecondaryIndexCatalog>>,
-    secondary_index_entries: Arc<RwLock<SecondaryIndexEntries>>,
+    manifest_write_lock: Arc<ManifestLock>,
+    secondary_index_catalog: SharedArc<RwLock<SecondaryIndexCatalog>>,
+    secondary_index_entries: SharedArc<RwLock<SecondaryIndexEntries>>,
     next_node_id_seen: Arc<AtomicU64>,
     next_edge_id_seen: Arc<AtomicU64>,
     engine_seq_seen: Arc<AtomicU64>,
-    label_catalog: Arc<RwLock<RuntimeLabelCatalog>>,
+    label_catalog: SharedArc<RwLock<RuntimeLabelCatalog>>,
     cancel: Arc<AtomicBool>,
     events_ready: Arc<AtomicUsize>,
     runtime: Option<std::sync::Weak<DbRuntime>>,
     #[cfg(test)] publish_pause: Arc<Mutex<Option<FlushPublishPauseHook>>>,
 ) {
     while let Ok(result) = rx.recv() {
+        #[cfg(all(test, feature = "production-concurrency"))]
+        maintenance_diagnostic::stage(&db_dir, result.seg_id, "flush_open_reader");
         if cancel.load(Ordering::Relaxed) {
             break;
         }
@@ -12660,6 +14837,24 @@ fn bg_flush_publish_worker(
                 break;
             }
         };
+        #[cfg(feature = "production-concurrency")]
+        if let Some(catalog) = &result.fixed_catalog {
+            if let Err(error) = validate_fixed_ready_output(&reader, &catalog.entries) {
+                send_bg_flush_event(
+                    &event_tx,
+                    &events_ready,
+                    &runtime,
+                    BgFlushEvent::Failed(FlushPipelineError {
+                        epoch_id: result.epoch_id,
+                        wal_generation_id: result.wal_gen_to_retire,
+                        stage: FlushPipelineStage::PublishOpenReader,
+                        message: error.to_string(),
+                    }),
+                );
+                cancel.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
         if !reader.degree_delta_available() {
             send_bg_flush_event(
                 &event_tx,
@@ -12685,8 +14880,12 @@ fn bg_flush_publish_worker(
             let _ = hook.release_rx.recv();
         }
 
+        #[cfg(all(test, feature = "production-concurrency"))]
+        maintenance_diagnostic::stage(&db_dir, result.seg_id, "flush_wait_manifest_gate");
         let publish_result: Result<(Vec<u64>, Vec<u64>), EngineError> = (|| {
-            let _guard = manifest_write_lock.lock().unwrap();
+            let _guard = manifest_write_lock.gate()?;
+            #[cfg(all(test, feature = "production-concurrency"))]
+            maintenance_diagnostic::stage(&db_dir, result.seg_id, "flush_manifest_persistence");
             let mut manifest = load_manifest_readonly(&db_dir)?
                 .ok_or_else(|| EngineError::ManifestError("manifest missing".into()))?;
             if !manifest
@@ -12733,12 +14932,16 @@ fn bg_flush_publish_worker(
                 &mut manifest,
                 &result.maintained_range_index_ids,
             );
-            write_manifest(&db_dir, &manifest)?;
+            _guard.persist(&db_dir, &manifest)?;
             sync_secondary_index_runtime_state(
                 &secondary_index_catalog,
                 &secondary_index_entries,
                 &manifest.secondary_indexes,
             )?;
+            if let Err(error) = _guard.retire_unreferenced_wals(&db_dir) {
+                _guard.fence();
+                return Err(error);
+            }
             Ok((rebuild_equality_index_ids, rebuild_range_index_ids))
         })();
 
@@ -12761,18 +14964,22 @@ fn bg_flush_publish_worker(
             }
         };
 
-        let _ = remove_wal_generation(&db_dir, result.wal_gen_to_retire);
         {
             let entries = secondary_index_entries.read().unwrap().clone();
             for entry in &entries {
                 reader.warm_declared_index_runtime_coverage(entry);
             }
         }
+        #[cfg(all(test, feature = "production-concurrency"))]
+        maintenance_diagnostic::stage(&db_dir, result.seg_id, "flush_ready_for_adoption");
         send_bg_flush_event(
             &event_tx,
             &events_ready,
             &runtime,
             BgFlushEvent::Adopt(PublishedFlushAdoption {
+                frozen: result.frozen,
+                #[cfg(feature = "production-concurrency")]
+                _heavy: result.heavy,
                 epoch_id: result.epoch_id,
                 wal_gen_to_retire: result.wal_gen_to_retire,
                 seg_info: result.seg_info,
@@ -12799,6 +15006,8 @@ fn bg_compact_worker(
     #[cfg(test)] compact_pause: &Arc<Mutex<Option<BgCompactPauseHook>>>,
 ) -> Result<BgCompactResult, EngineError> {
     let compact_start = std::time::Instant::now();
+    #[cfg(all(test, feature = "production-concurrency"))]
+    maintenance_diagnostic::stage(&db_dir, seg_id, "compact_start_open_inputs");
 
     #[cfg(test)]
     if let Some(hook) = compact_pause.lock().unwrap().take() {
@@ -12810,7 +15019,7 @@ fn bg_compact_worker(
     // with the main thread's readers of the same files).
     let mut segments = Vec::with_capacity(input_segments.len());
     for (info, path) in &input_segments {
-        segments.push(Arc::new(SegmentReader::open_with_info(
+        segments.push(SharedArc::new(SegmentReader::open_with_info(
             path,
             info,
             dense_vector.as_ref(),
@@ -12833,6 +15042,8 @@ fn bg_compact_worker(
     let tmp_dir = segment_tmp_dir(&db_dir, seg_id);
     let final_dir = segment_dir(&db_dir, seg_id);
 
+    #[cfg(all(test, feature = "production-concurrency"))]
+    maintenance_diagnostic::stage(&db_dir, seg_id, "compact_merge");
     let (seg_info, nodes_auto_pruned, edges_auto_pruned, secondary_index_report) =
         match compaction_path {
             CompactionPath::FastMerge => {
@@ -12869,6 +15080,8 @@ fn bg_compact_worker(
             },
         };
 
+    #[cfg(all(test, feature = "production-concurrency"))]
+    maintenance_diagnostic::stage(&db_dir, seg_id, "compact_persist_rename_fsync");
     // Atomic rename tmp → final
     if let Err(e) = std::fs::rename(&tmp_dir, &final_dir) {
         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -12891,6 +15104,8 @@ fn bg_compact_worker(
         }
     };
 
+    #[cfg(all(test, feature = "production-concurrency"))]
+    maintenance_diagnostic::stage(&db_dir, seg_id, "compact_open_output");
     // Open the output segment reader (will be sent back to the main thread).
     let reader = match SegmentReader::open_with_info(
         &final_dir,
@@ -12936,7 +15151,11 @@ fn bg_compact_worker(
         edges_auto_pruned,
     };
 
+    #[cfg(all(test, feature = "production-concurrency"))]
+    maintenance_diagnostic::stage(&db_dir, seg_id, "compact_ready_for_adoption");
     Ok(BgCompactResult {
+        #[cfg(feature = "production-concurrency")]
+        heavy: None,
         seg_info,
         reader,
         old_seg_dirs,
@@ -13023,7 +15242,7 @@ fn matches_any_prune_policy_meta(
 /// filtering, prune policy evaluation, and edge cascade, all from metadata
 /// fields without decoding full records.
 fn v3_plan_winners(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     prune_policies: &[ResolvedPrunePolicy],
     deleted_nodes: &NodeIdMap<usize>,
     deleted_edges: &NodeIdMap<usize>,
@@ -13163,7 +15382,7 @@ fn v3_plan_winners(
 fn v3_build_output(
     tmp_dir: &Path,
     seg_id: u64,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     plan: &V3Plan,
     dense_config: Option<&DenseVectorConfig>,
     write_degree_sidecar: bool,
@@ -13183,6 +15402,8 @@ fn v3_build_output(
         .map(|(&id, w)| (id, w.seg_idx, w.data_offset, w.data_len))
         .collect();
 
+    #[cfg(all(test, feature = "production-concurrency"))]
+    maintenance_diagnostic::output_stage(tmp_dir, seg_id, "compact_write_core");
     let mut core_writer = create_compaction_core_writer(tmp_dir, seg_id)?;
 
     // Raw-copy winning records to output data files
@@ -13275,6 +15496,8 @@ fn v3_build_output(
     )?;
 
     // Build all secondary indexes and sidecars from metadata
+    #[cfg(all(test, feature = "production-concurrency"))]
+    maintenance_diagnostic::output_stage(tmp_dir, seg_id, "compact_build_write_indexes");
     let component_output = write_indexes_from_metadata_with_secondary_indexes(
         seg_id,
         tmp_dir,
@@ -13289,17 +15512,21 @@ fn v3_build_output(
         source_groups,
     )?;
     let mut records = component_output.records;
+    #[cfg(all(test, feature = "production-concurrency"))]
+    maintenance_diagnostic::output_stage(tmp_dir, seg_id, "compact_finish_core_persistence");
     records.extend(finish_compaction_core_writer(core_writer)?);
 
     let node_count = plan.node_winners.len() as u64;
     let edge_count = plan.edge_winners.len() as u64;
+    #[cfg(all(test, feature = "production-concurrency"))]
+    maintenance_diagnostic::output_stage(tmp_dir, seg_id, "compact_finalize_segment_persistence");
     let seg_info = finalize_compaction_segment(tmp_dir, seg_id, node_count, edge_count, records)?;
 
     Ok((seg_info, component_output.report))
 }
 
 fn collect_fast_merge_node_metas(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     copy_info: &[FastMergeCopyInfo],
 ) -> Result<Vec<CompactNodeMeta>, EngineError> {
     let mut metas = Vec::new();
@@ -13361,7 +15588,7 @@ fn collect_fast_merge_node_metas(
 }
 
 fn collect_fast_merge_edge_metas(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     copy_info: &[FastMergeCopyInfo],
 ) -> Result<Vec<CompactEdgeMeta>, EngineError> {
     let mut metas = Vec::new();
@@ -13429,12 +15656,14 @@ fn collect_fast_merge_edge_metas(
 fn build_fast_merge_output(
     tmp_dir: &Path,
     seg_id: u64,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     dense_config: Option<&DenseVectorConfig>,
     secondary_indexes: &[SecondaryIndexManifestEntry],
 ) -> Result<(SegmentInfo, SecondaryIndexMaintenanceReport), EngineError> {
     std::fs::create_dir_all(tmp_dir)?;
 
+    #[cfg(all(test, feature = "production-concurrency"))]
+    maintenance_diagnostic::output_stage(tmp_dir, seg_id, "compact_write_core");
     let mut core_writer = create_compaction_core_writer(tmp_dir, seg_id)?;
     let (node_record, node_copy_info) = write_merged_nodes_dat(&mut core_writer, segments)?;
     let (edge_record, edge_copy_info) = write_merged_edges_dat(&mut core_writer, segments)?;
@@ -13451,6 +15680,8 @@ fn build_fast_merge_output(
         &edge_metas,
     )?;
 
+    #[cfg(all(test, feature = "production-concurrency"))]
+    maintenance_diagnostic::output_stage(tmp_dir, seg_id, "compact_build_write_indexes");
     let component_output = write_indexes_from_metadata_with_secondary_indexes(
         seg_id,
         tmp_dir,
@@ -13465,7 +15696,11 @@ fn build_fast_merge_output(
         source_groups,
     )?;
     let mut records = component_output.records;
+    #[cfg(all(test, feature = "production-concurrency"))]
+    maintenance_diagnostic::output_stage(tmp_dir, seg_id, "compact_finish_core_persistence");
     records.extend(finish_compaction_core_writer(core_writer)?);
+    #[cfg(all(test, feature = "production-concurrency"))]
+    maintenance_diagnostic::output_stage(tmp_dir, seg_id, "compact_finalize_segment_persistence");
     let seg_info = finalize_compaction_segment(
         tmp_dir,
         seg_id,
@@ -13481,7 +15716,7 @@ fn build_fast_merge_output(
 /// Same algorithm as compact_standard but with cancel flag instead of progress callback.
 /// Returns `(SegmentInfo, nodes_auto_pruned, edges_auto_pruned)`.
 fn bg_fast_merge(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     tmp_dir: &Path,
     seg_id: u64,
     dense_config: Option<&DenseVectorConfig>,
@@ -13507,7 +15742,7 @@ fn bg_fast_merge(
 /// Returns `(SegmentInfo, nodes_auto_pruned, edges_auto_pruned)`.
 #[allow(clippy::too_many_arguments)]
 fn bg_standard_merge(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     tmp_dir: &Path,
     seg_id: u64,
     has_tombstones: bool,
@@ -13541,6 +15776,8 @@ fn bg_standard_merge(
     }
 
     // V3 plan: metadata-only winner selection
+    #[cfg(all(test, feature = "production-concurrency"))]
+    maintenance_diagnostic::output_stage(tmp_dir, seg_id, "compact_plan_winners");
     let plan = v3_plan_winners(segments, prune_policies, &deleted_nodes, &deleted_edges)?;
 
     if cancel.load(Ordering::Relaxed) {
@@ -13550,6 +15787,8 @@ fn bg_standard_merge(
     let nodes_auto_pruned = plan.pruned_node_ids.len() as u64;
     let edges_auto_pruned = plan.edges_auto_pruned;
 
+    #[cfg(all(test, feature = "production-concurrency"))]
+    maintenance_diagnostic::output_stage(tmp_dir, seg_id, "compact_write_output");
     let (seg_info, secondary_index_report) = v3_build_output(
         tmp_dir,
         seg_id,
@@ -13585,6 +15824,9 @@ include!("graph_row_production.rs");
 include!("pipeline_ir.rs");
 include!("pipeline_exec.rs");
 include!("query.rs");
+
+#[cfg(test)]
+pub(crate) use tests::open_index_protocol_fixture;
 
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
@@ -14180,6 +16422,79 @@ mod tests {
         );
     }
 
+    /// Candidate Drop is nonblocking and close completion precedes native exit.
+    /// Recovery/parity fixtures wait only for the exact prior session/native
+    /// custody to become reusable; retained old passive graphs need not drain.
+    pub(super) fn open_after_native_shutdown(
+        path: &Path,
+        options: &DbOptions,
+    ) -> Result<DatabaseEngine, EngineError> {
+        #[cfg(feature = "production-concurrency")]
+        {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match DatabaseEngine::open(path, options) {
+                    Err(EngineError::InvalidOperation(message))
+                        if message == "candidate directory admission: Busy"
+                            || message == "candidate directory admission: ActiveSession" =>
+                    {
+                        if std::time::Instant::now() >= until {
+                            return Err(EngineError::InvalidOperation(message));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(error @ EngineError::ResourceLimit {
+                        resource: "participants",
+                        retryable: true,
+                        ..
+                    }) => {
+                        // Functional first opens can race the process collector's
+                        // nonblocking initializer. No operation has been accepted.
+                        if std::time::Instant::now() >= until {
+                            return Err(error);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    result => return result,
+                }
+            }
+        }
+        #[cfg(not(feature = "production-concurrency"))]
+        DatabaseEngine::open(path, options)
+    }
+
+    /// Offline corruption fixtures must release native mmap/file custody before
+    /// modifying persisted bytes. Keep normal close durability semantics.
+    fn close_and_wait_for_native_shutdown(db: DatabaseEngine) {
+        db.close().unwrap();
+        wait_for_native_shutdown(&db);
+    }
+
+    fn wait_for_native_shutdown(db: &DatabaseEngine) {
+        #[cfg(feature = "production-concurrency")]
+        {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let stats = db.reclamation_stats().unwrap();
+                if matches!(stats.close_state, ReclamationCloseState::Drained) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < until, "unfinished {stats:?}");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        #[cfg(not(feature = "production-concurrency"))]
+        let _ = db;
+    }
+
+    /// Exercise actual public index lifecycle in each selected engine mode.
+    pub(crate) fn open_index_protocol_fixture(
+        path: &Path,
+        options: &DbOptions,
+    ) -> Result<DatabaseEngine, EngineError> {
+        open_after_native_shutdown(path, options)
+    }
+
     include!("tests/label_catalog.rs");
     include!("tests/wal_atomic.rs");
     include!("tests/lifecycle.rs");
@@ -14193,6 +16508,9 @@ mod tests {
     include!("tests/adjacency_stream.rs");
     include!("tests/prepared_edge_outcomes.rs");
     include!("tests/query_planner.rs");
+    mod targeted_query;
+    mod targeted_vector;
+    mod targeted_write_open;
     include!("tests/projection.rs");
     include!("tests/gql_execution.rs");
 }

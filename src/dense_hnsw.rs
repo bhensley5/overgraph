@@ -109,6 +109,40 @@ struct BuildSearchScratch {
     return_buffer: Vec<ScoredPoint>,
 }
 
+// This state is initialized inside a Rayon leaf folder, never captured by a
+// queued split job. The closed insertion callback does not enter Rayon again.
+struct BuildWorkspace {
+    search: BuildSearchScratch,
+    prune: BuildPruneScratch,
+    // Last field drops only after both sets of real buffers are destroyed.
+    #[cfg(test)]
+    _observation: WorkspaceObservation,
+}
+
+#[cfg(test)]
+static WORKSPACE_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static WORKSPACE_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static WORKSPACE_CREATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+struct WorkspaceObservation;
+#[cfg(test)]
+impl WorkspaceObservation {
+    fn new() -> Self {
+        WORKSPACE_CREATED.fetch_add(1, AtomicOrdering::Relaxed);
+        let live = WORKSPACE_LIVE.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+        WORKSPACE_PEAK.fetch_max(live, AtomicOrdering::AcqRel);
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for WorkspaceObservation {
+    fn drop(&mut self) {
+        WORKSPACE_LIVE.fetch_sub(1, AtomicOrdering::AcqRel);
+    }
+}
+
 impl BuildSearchScratch {
     fn new(point_count: usize, ef_capacity: usize) -> Self {
         Self {
@@ -791,13 +825,15 @@ fn build_hnsw(
         use rayon::prelude::*;
 
         (1..point_count).into_par_iter().for_each_init(
-            || {
-                (
-                    BuildSearchScratch::new(point_count, config.hnsw.ef_construction as usize),
-                    BuildPruneScratch::new(config.hnsw.ef_construction as usize),
-                )
+            || BuildWorkspace {
+                search: BuildSearchScratch::new(point_count, config.hnsw.ef_construction as usize),
+                prune: BuildPruneScratch::new(config.hnsw.ef_construction as usize),
+                #[cfg(test)]
+                _observation: WorkspaceObservation::new(),
             },
-            |(search_scratch, prune_scratch), point_idx| {
+            |workspace, point_idx| {
+                let search_scratch = &mut workspace.search;
+                let prune_scratch = &mut workspace.prune;
                 let (ep, ml) = unpack_entry_state(entry_state.load(AtomicOrdering::Relaxed));
                 let point_level = levels[point_idx] as usize;
 
@@ -1150,6 +1186,10 @@ fn prune_neighbors_with_scratch(
     );
     neighbors.clear();
     neighbors.extend(scratch.scored.iter().map(|candidate| candidate.point));
+}
+
+pub(crate) fn storage_bound_level(node_id: u64, m: u16) -> u8 {
+    assign_level(node_id, m)
 }
 
 fn assign_level(node_id: u64, m: u16) -> u8 {
@@ -1824,6 +1864,19 @@ fn write_hnsw_payloads(
     config: &DenseVectorConfig,
     built: &BuiltHnsw,
 ) -> Result<(), EngineError> {
+    // Degree is stored as u16, while the level-zero build limit is 2*m.
+    // Check the actual graph before emitting either payload. A large m remains
+    // supported when its constructed lists fit; silently narrowing a count
+    // would shift every following level and produce an unreadable sidecar.
+    for levels in &built.graph {
+        for neighbors in levels {
+            if u16::try_from(neighbors.len()).is_err() {
+                return Err(EngineError::InvalidOperation(
+                    "dense HNSW neighbor count exceeds the u16 sidecar field".into(),
+                ));
+            }
+        }
+    }
     meta_w.write_all(&DENSE_HNSW_MAGIC)?;
     write_u32(meta_w, DENSE_HNSW_VERSION)?;
     write_u64(meta_w, built.header.point_count)?;
@@ -2011,6 +2064,98 @@ mod tests {
             metric: DenseMetric::Cosine,
             hnsw: HnswConfig::default(),
         }
+    }
+
+    #[test]
+    fn p45a2_hnsw_workspace_lifetimes_are_bounded_by_fixed_pool_child() {
+        const CHILD: &str = "OVERGRAPH_P45A2_HNSW_WORKSPACE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "dense_hnsw::tests::p45a2_hnsw_workspace_lifetimes_are_bounded_by_fixed_pool_child", "--nocapture"])
+                .env(CHILD,"1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let threads = crate::parallel::engine_cpu_threads();
+        let mut config = dense_config(2);
+        config.hnsw.m = 8;
+        config.hnsw.ef_construction = 16;
+        for count in [257, 1025] {
+            WORKSPACE_PEAK.store(0, AtomicOrdering::Release);
+            WORKSPACE_CREATED.store(0, AtomicOrdering::Release);
+            let points = (0..count)
+                .map(|id| DensePointInput {
+                    node_id: id as u64 + 1,
+                    dense_vector_offset: id as u64 * 8,
+                    values: vec![id as f32 + 1.0, (id % 13) as f32 + 1.0],
+                })
+                .collect::<Vec<_>>();
+            let built = build_dense_hnsw_from_points(points, &config)
+                .unwrap()
+                .unwrap();
+            assert_eq!(built.point_metas.len(), count);
+            let created = WORKSPACE_CREATED.load(AtomicOrdering::Acquire);
+            let peak = WORKSPACE_PEAK.load(AtomicOrdering::Acquire);
+            assert!(created >= 1 && peak >= 1 && peak <= threads);
+            assert_eq!(
+                WORKSPACE_LIVE.load(AtomicOrdering::Acquire),
+                0,
+                "all real search/prune buffers have dropped"
+            );
+            eprintln!("HNSW workspaces: points={count} configured_pool={threads} created={created} simultaneous={peak} retained=0");
+        }
+    }
+
+    #[test]
+    fn p45a2_hnsw_wire_counts_refuse_before_emission_and_keep_large_m() {
+        let config = DenseVectorConfig {
+            dimension: 1,
+            metric: DenseMetric::Euclidean,
+            hnsw: HnswConfig {
+                m: u16::MAX,
+                ef_construction: u16::MAX,
+            },
+        };
+        let mut built = BuiltHnsw {
+            header: DenseHnswHeader {
+                point_count: 1,
+                entry_point: 0,
+                max_level: 0,
+                m: config.hnsw.m,
+                ef_construction: config.hnsw.ef_construction,
+                metric: config.metric,
+                dimension: config.dimension,
+            },
+            point_metas: vec![PointMeta {
+                node_id: 1,
+                dense_vector_offset: 0,
+                level_offset: 0,
+                max_level: 0,
+            }],
+            graph: vec![vec![vec![0; u16::MAX as usize + 1]]],
+        };
+        let mut meta = vec![17];
+        let mut graph = vec![23];
+        assert!(matches!(
+            write_hnsw_payloads(&mut meta, &mut graph, &config, &built),
+            Err(EngineError::InvalidOperation(_))
+        ));
+        assert_eq!(meta, [17]);
+        assert_eq!(graph, [23]);
+
+        built.graph[0][0].truncate(u16::MAX as usize);
+        meta.clear();
+        graph.clear();
+        write_hnsw_payloads(&mut meta, &mut graph, &config, &built).unwrap();
+        assert_eq!(read_u16_at(&graph, 0).unwrap(), u16::MAX);
+        assert_eq!(graph.len(), 4 + 4 * u16::MAX as usize);
+        assert_eq!(read_u16_at(&meta, 22).unwrap(), config.hnsw.m);
     }
 
     fn node(id: u64, key: &str, dense: Vec<f32>) -> NodeRecord {

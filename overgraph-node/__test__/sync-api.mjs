@@ -1,3 +1,4 @@
+import { drainAfterClose } from './helpers/native-lifecycle.mjs';
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -657,6 +658,7 @@ describe('flush / compact', () => {
       assert.equal(typeof stats.edgesKept, 'number');
     } finally {
       testDb.close();
+      drainAfterClose(testDb);
       rmSync(testDir, { recursive: true, force: true });
     }
   });
@@ -748,6 +750,7 @@ describe('error handling', () => {
     const dbPath = join(tmpDir, 'closed');
     const closedDb = OverGraph.open(dbPath);
     closedDb.close();
+    drainAfterClose(closedDb);
     assert.throws(() => closedDb.upsertNode('Person', 'fail'), /closed/i);
   });
 });
@@ -768,7 +771,7 @@ describe('persistence round-trip', () => {
     const dst = db1.upsertNode('Person', 'persist-dst');
     const eid = db1.upsertEdge(nid, dst, 'DEPENDS_ON', { props: { kind: 'test' } });
     db1.close();
-
+    drainAfterClose(db1);
     // Read phase
     const db2 = OverGraph.open(dbPath);
     const n = db2.getNode(nid);
@@ -782,6 +785,8 @@ describe('persistence round-trip', () => {
     assert.equal(e.props.kind, 'test');
 
     db2.close();
+
+    drainAfterClose(db2);
   });
 });
 

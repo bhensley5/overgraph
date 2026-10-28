@@ -4,6 +4,7 @@ import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { OverGraph } from '../index.js';
+import { drainAfterClose } from './helpers/native-lifecycle.mjs';
 
 function freshDb(tmpDir, name) {
   return OverGraph.open(join(tmpDir, name));
@@ -237,6 +238,7 @@ describe('degree sidecar persistence (sync)', () => {
     assert.ok(Math.abs(db.avgEdgeWeight(a) - 3.0) < 1e-6);
     assert.equal(db.degrees([a, b, c]).find(r => r.nodeId === a)?.degree, 2);
     db.close();
+    drainAfterClose(db);
 
     db = OverGraph.open(dbPath);
     assert.equal(db.degree(a), 2);
@@ -244,6 +246,7 @@ describe('degree sidecar persistence (sync)', () => {
     assert.ok(Math.abs(db.avgEdgeWeight(a) - 3.0) < 1e-6);
     assert.equal(db.degrees([a, b, c]).find(r => r.nodeId === a)?.degree, 2);
     db.close();
+    drainAfterClose(db);
     rmSync(tmpDir, { recursive: true, force: true });
   });
 

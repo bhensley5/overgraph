@@ -2,7 +2,9 @@
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
-use napi::JsString;
+use napi::{JsString, JsValue};
+mod concurrency;
+use concurrency::engine_error;
 use napi_derive::napi;
 use overgraph::types::{
     CompoundIndexPlanDetails, GqlPath, GraphAggregateFunction, QueryPlanCompoundTargetKind,
@@ -374,7 +376,7 @@ impl ToNapiValue for GraphJsValue {
         graph_value_to_napi(env, val.0)
     }
 }
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -387,11 +389,15 @@ struct InnerDb {
 }
 
 #[napi]
-pub fn scrub_path(path: String, options: Option<ScrubPathOptions>) -> Result<DatabaseScrubReport> {
+pub fn scrub_path(
+    env: Env,
+    path: String,
+    options: Option<ScrubPathOptions>,
+) -> Result<DatabaseScrubReport> {
     let options = js_scrub_path_options_to_rust(options);
     overgraph::scrub_path_with_options(Path::new(&path), &options)
         .map(DatabaseScrubReport::from)
-        .map_err(|e| napi::Error::from_reason(e.to_string()))
+        .map_err(|e| engine_error(env, e))
 }
 
 #[napi(ts_return_type = "Promise<DatabaseScrubReport>")]
@@ -402,9 +408,15 @@ pub fn scrub_path_async(path: String, options: Option<ScrubPathOptions>) -> Asyn
     })
 }
 
-#[napi]
+#[napi(custom_finalize)]
 pub struct OverGraph {
     inner: Arc<Mutex<Option<InnerDb>>>,
+    #[cfg(feature = "production-concurrency")]
+    stats_handle: overgraph::BindingStatsHandle,
+    #[cfg(feature = "production-concurrency")]
+    close_handle: overgraph::BindingCloseHandle,
+    #[cfg(feature = "production-concurrency")]
+    pending_close: Mutex<Option<concurrency::PendingClose>>,
 }
 
 #[napi]
@@ -412,80 +424,137 @@ impl OverGraph {
     // --- Lifecycle ---
 
     #[napi(factory)]
-    pub fn open(path: String, options: Option<DbOptions>) -> Result<OverGraph> {
+    pub fn open(env: Env, path: String, options: Option<DbOptions>) -> Result<OverGraph> {
+        let concurrency_value = options.as_ref().and_then(|o| o.concurrency.as_ref());
+        #[cfg(not(feature = "production-concurrency"))]
+        if concurrency_value.is_some() {
+            return Err(napi::Error::from_reason(
+                "concurrency options require production-concurrency",
+            ));
+        }
+        #[cfg(feature = "production-concurrency")]
+        let concurrency_options = concurrency::options(concurrency_value);
         let opts = options.map(|o| o.into()).unwrap_or_default();
-        let engine = DatabaseEngine::open(Path::new(&path), &opts)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        #[cfg(feature = "production-concurrency")]
+        let engine = DatabaseEngine::open_with_concurrency_options(
+            Path::new(&path),
+            &opts,
+            &concurrency_options,
+        );
+        #[cfg(not(feature = "production-concurrency"))]
+        let engine = DatabaseEngine::open(Path::new(&path), &opts);
+        let engine = engine.map_err(|e| engine_error(env, e))?;
         Ok(OverGraph {
+            #[cfg(feature = "production-concurrency")]
+            stats_handle: engine.binding_stats_handle(),
+            #[cfg(feature = "production-concurrency")]
+            close_handle: engine.binding_close_handle(),
+            #[cfg(feature = "production-concurrency")]
+            pending_close: Mutex::new(None),
             inner: Arc::new(Mutex::new(Some(InnerDb { engine }))),
         })
     }
 
     #[napi]
-    pub fn close(&self, options: Option<CloseOptions>) -> Result<()> {
+    pub fn close(&self, env: Env, options: Option<CloseOptions>) -> Result<()> {
         let force = options.as_ref().and_then(|o| o.force).unwrap_or(false);
-        let engine = {
-            let mut guard = self
+        #[cfg(feature = "production-concurrency")]
+        {
+            let engine = {
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                if let Some(db) = guard.as_ref() {
+                    db.engine
+                        .binding_request_close(force)
+                        .map_err(|e| engine_error(env, e))?;
+                } else if self.close_handle.is_complete() {
+                    return Ok(());
+                }
+                guard.take()
+            };
+            drop(engine);
+            self.close_handle.wait().map_err(|e| engine_error(env, e))
+        }
+        #[cfg(not(feature = "production-concurrency"))]
+        {
+            let engine = self
                 .inner
                 .lock()
-                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-            guard.take().map(|db| db.engine)
-        };
-        if let Some(engine) = engine {
-            if force {
-                engine
-                    .close_fast()
-                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-            } else {
-                engine
-                    .close()
-                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?
+                .take();
+            if let Some(db) = engine {
+                (if force {
+                    db.engine.close_fast()
+                } else {
+                    db.engine.close()
+                })
+                .map_err(|e| engine_error(env, e))?;
             }
+            Ok(())
         }
-        Ok(())
+    }
+
+    #[napi(ts_return_type = "ReclamationStats")]
+    pub fn reclamation_stats(&self, env: Env) -> Result<concurrency::BindingStats> {
+        #[cfg(feature = "production-concurrency")]
+        {
+            self.stats_handle
+                .read()
+                .map(concurrency::BindingStats)
+                .map_err(|e| engine_error(env, e))
+        }
+        #[cfg(not(feature = "production-concurrency"))]
+        {
+            let _ = env;
+            Err(napi::Error::from_reason(
+                "reclamationStats requires production-concurrency",
+            ))
+        }
     }
 
     // --- Catalog diagnostics ---
 
     #[napi]
-    pub fn ensure_node_label(&self, label: String) -> Result<u32> {
-        with_engine(self, |eng| eng.ensure_node_label(&label))
+    pub fn ensure_node_label(&self, env: Env, label: String) -> Result<u32> {
+        with_engine(env, self, |eng| eng.ensure_node_label(&label))
     }
 
     #[napi]
-    pub fn ensure_edge_label(&self, label: String) -> Result<u32> {
-        with_engine(self, |eng| eng.ensure_edge_label(&label))
+    pub fn ensure_edge_label(&self, env: Env, label: String) -> Result<u32> {
+        with_engine(env, self, |eng| eng.ensure_edge_label(&label))
     }
 
     #[napi]
-    pub fn get_node_label_id(&self, label: String) -> Result<Option<u32>> {
-        with_engine_ref(self, |eng| eng.get_node_label_id(&label))
+    pub fn get_node_label_id(&self, env: Env, label: String) -> Result<Option<u32>> {
+        with_engine_ref(env, self, |eng| eng.get_node_label_id(&label))
     }
 
     #[napi]
-    pub fn get_edge_label_id(&self, label: String) -> Result<Option<u32>> {
-        with_engine_ref(self, |eng| eng.get_edge_label_id(&label))
+    pub fn get_edge_label_id(&self, env: Env, label: String) -> Result<Option<u32>> {
+        with_engine_ref(env, self, |eng| eng.get_edge_label_id(&label))
     }
 
     #[napi]
-    pub fn get_node_label(&self, label_id: u32) -> Result<Option<String>> {
-        with_engine_ref(self, |eng| eng.get_node_label(label_id))
+    pub fn get_node_label(&self, env: Env, label_id: u32) -> Result<Option<String>> {
+        with_engine_ref(env, self, |eng| eng.get_node_label(label_id))
     }
 
     #[napi]
-    pub fn get_edge_label(&self, label_id: u32) -> Result<Option<String>> {
-        with_engine_ref(self, |eng| eng.get_edge_label(label_id))
+    pub fn get_edge_label(&self, env: Env, label_id: u32) -> Result<Option<String>> {
+        with_engine_ref(env, self, |eng| eng.get_edge_label(label_id))
     }
 
     #[napi]
-    pub fn list_node_labels(&self) -> Result<Vec<NodeLabelInfo>> {
-        let infos = with_engine_ref(self, |eng| eng.list_node_labels())?;
+    pub fn list_node_labels(&self, env: Env) -> Result<Vec<NodeLabelInfo>> {
+        let infos = with_engine_ref(env, self, |eng| eng.list_node_labels())?;
         Ok(infos.into_iter().map(Into::into).collect())
     }
 
     #[napi]
-    pub fn list_edge_labels(&self) -> Result<Vec<EdgeLabelInfo>> {
-        let infos = with_engine_ref(self, |eng| eng.list_edge_labels())?;
+    pub fn list_edge_labels(&self, env: Env) -> Result<Vec<EdgeLabelInfo>> {
+        let infos = with_engine_ref(env, self, |eng| eng.list_edge_labels())?;
         Ok(infos.into_iter().map(Into::into).collect())
     }
 
@@ -497,13 +566,14 @@ impl OverGraph {
     )]
     pub fn set_node_schema(
         &self,
+        env: Env,
         label: String,
         schema: Unknown<'_>,
         options: Option<SchemaSetOptions>,
     ) -> Result<NodeSchemaInfoPayload> {
         let schema = parse_js_node_schema(schema, "setNodeSchema schema")?;
         let options = schema_set_options_to_core(options)?;
-        let info = with_engine(self, |eng| {
+        let info = with_engine(env, self, |eng| {
             eng.set_node_schema_with_options(&label, schema, options)
         })?;
         Ok(NodeSchemaInfoPayload(info))
@@ -515,30 +585,37 @@ impl OverGraph {
     )]
     pub fn check_node_schema(
         &self,
+        env: Env,
         label: String,
         schema: Unknown<'_>,
         options: Option<SchemaCheckOptions>,
     ) -> Result<SchemaValidationReportPayload> {
         let schema = parse_js_node_schema(schema, "checkNodeSchema schema")?;
         let options = schema_check_options_to_core(options)?;
-        let report = with_engine_ref(self, |eng| eng.check_node_schema(&label, schema, options))?;
+        let report = with_engine_ref(env, self, |eng| {
+            eng.check_node_schema(&label, schema, options)
+        })?;
         Ok(SchemaValidationReportPayload(report))
     }
 
     #[napi]
-    pub fn drop_node_schema(&self, label: String) -> Result<bool> {
-        with_engine(self, |eng| eng.drop_node_schema(&label))
+    pub fn drop_node_schema(&self, env: Env, label: String) -> Result<bool> {
+        with_engine(env, self, |eng| eng.drop_node_schema(&label))
     }
 
     #[napi(ts_return_type = "import('./schema-types').NodeSchemaInfo | null")]
-    pub fn get_node_schema(&self, label: String) -> Result<Option<NodeSchemaInfoPayload>> {
-        let info = with_engine_ref(self, |eng| eng.get_node_schema(&label))?;
+    pub fn get_node_schema(
+        &self,
+        env: Env,
+        label: String,
+    ) -> Result<Option<NodeSchemaInfoPayload>> {
+        let info = with_engine_ref(env, self, |eng| eng.get_node_schema(&label))?;
         Ok(info.map(NodeSchemaInfoPayload))
     }
 
     #[napi(ts_return_type = "Array<import('./schema-types').NodeSchemaInfo>")]
-    pub fn list_node_schemas(&self) -> Result<Vec<NodeSchemaInfoPayload>> {
-        let infos = with_engine_ref(self, |eng| eng.list_node_schemas())?;
+    pub fn list_node_schemas(&self, env: Env) -> Result<Vec<NodeSchemaInfoPayload>> {
+        let infos = with_engine_ref(env, self, |eng| eng.list_node_schemas())?;
         Ok(infos.into_iter().map(NodeSchemaInfoPayload).collect())
     }
 
@@ -548,13 +625,14 @@ impl OverGraph {
     )]
     pub fn set_edge_schema(
         &self,
+        env: Env,
         label: String,
         schema: Unknown<'_>,
         options: Option<SchemaSetOptions>,
     ) -> Result<EdgeSchemaInfoPayload> {
         let schema = parse_js_edge_schema(schema, "setEdgeSchema schema")?;
         let options = schema_set_options_to_core(options)?;
-        let info = with_engine(self, |eng| {
+        let info = with_engine(env, self, |eng| {
             eng.set_edge_schema_with_options(&label, schema, options)
         })?;
         Ok(EdgeSchemaInfoPayload(info))
@@ -566,30 +644,37 @@ impl OverGraph {
     )]
     pub fn check_edge_schema(
         &self,
+        env: Env,
         label: String,
         schema: Unknown<'_>,
         options: Option<SchemaCheckOptions>,
     ) -> Result<SchemaValidationReportPayload> {
         let schema = parse_js_edge_schema(schema, "checkEdgeSchema schema")?;
         let options = schema_check_options_to_core(options)?;
-        let report = with_engine_ref(self, |eng| eng.check_edge_schema(&label, schema, options))?;
+        let report = with_engine_ref(env, self, |eng| {
+            eng.check_edge_schema(&label, schema, options)
+        })?;
         Ok(SchemaValidationReportPayload(report))
     }
 
     #[napi]
-    pub fn drop_edge_schema(&self, label: String) -> Result<bool> {
-        with_engine(self, |eng| eng.drop_edge_schema(&label))
+    pub fn drop_edge_schema(&self, env: Env, label: String) -> Result<bool> {
+        with_engine(env, self, |eng| eng.drop_edge_schema(&label))
     }
 
     #[napi(ts_return_type = "import('./schema-types').EdgeSchemaInfo | null")]
-    pub fn get_edge_schema(&self, label: String) -> Result<Option<EdgeSchemaInfoPayload>> {
-        let info = with_engine_ref(self, |eng| eng.get_edge_schema(&label))?;
+    pub fn get_edge_schema(
+        &self,
+        env: Env,
+        label: String,
+    ) -> Result<Option<EdgeSchemaInfoPayload>> {
+        let info = with_engine_ref(env, self, |eng| eng.get_edge_schema(&label))?;
         Ok(info.map(EdgeSchemaInfoPayload))
     }
 
     #[napi(ts_return_type = "Array<import('./schema-types').EdgeSchemaInfo>")]
-    pub fn list_edge_schemas(&self) -> Result<Vec<EdgeSchemaInfoPayload>> {
-        let infos = with_engine_ref(self, |eng| eng.list_edge_schemas())?;
+    pub fn list_edge_schemas(&self, env: Env) -> Result<Vec<EdgeSchemaInfoPayload>> {
+        let infos = with_engine_ref(env, self, |eng| eng.list_edge_schemas())?;
         Ok(infos.into_iter().map(EdgeSchemaInfoPayload).collect())
     }
 
@@ -599,12 +684,13 @@ impl OverGraph {
     )]
     pub fn set_graph_schema(
         &self,
+        env: Env,
         schema: Unknown<'_>,
         options: Option<SchemaSetOptions>,
     ) -> Result<GraphSchemaPublishResultPayload> {
         let schema = parse_js_graph_schema(schema, "setGraphSchema schema")?;
         let options = graph_schema_set_options_to_core(options)?;
-        let result = with_engine(self, |eng| eng.set_graph_schema(schema, options))?;
+        let result = with_engine(env, self, |eng| eng.set_graph_schema(schema, options))?;
         Ok(GraphSchemaPublishResultPayload(result))
     }
 
@@ -614,13 +700,14 @@ impl OverGraph {
     )]
     pub fn alter_graph_schema(
         &self,
+        env: Env,
         operations: Unknown<'_>,
         options: Option<SchemaSetOptions>,
     ) -> Result<GraphSchemaPublishResultPayload> {
         let operations =
             parse_js_graph_schema_operations(operations, "alterGraphSchema operations")?;
         let options = graph_schema_set_options_to_core(options)?;
-        let result = with_engine(self, |eng| eng.alter_graph_schema(operations, options))?;
+        let result = with_engine(env, self, |eng| eng.alter_graph_schema(operations, options))?;
         Ok(GraphSchemaPublishResultPayload(result))
     }
 
@@ -630,12 +717,13 @@ impl OverGraph {
     )]
     pub fn check_graph_schema_set(
         &self,
+        env: Env,
         schema: Unknown<'_>,
         options: Option<SchemaCheckOptions>,
     ) -> Result<GraphSchemaCheckReportPayload> {
         let schema = parse_js_graph_schema(schema, "checkGraphSchemaSet schema")?;
         let options = graph_schema_check_options_to_core(options)?;
-        let report = with_engine_ref(self, |eng| eng.check_graph_schema_set(schema, options))?;
+        let report = with_engine_ref(env, self, |eng| eng.check_graph_schema_set(schema, options))?;
         Ok(GraphSchemaCheckReportPayload(report))
     }
 
@@ -645,18 +733,19 @@ impl OverGraph {
     )]
     pub fn check_graph_schema_add(
         &self,
+        env: Env,
         schema: Unknown<'_>,
         options: Option<SchemaCheckOptions>,
     ) -> Result<GraphSchemaCheckReportPayload> {
         let schema = parse_js_graph_schema(schema, "checkGraphSchemaAdd schema")?;
         let options = graph_schema_check_options_to_core(options)?;
-        let report = with_engine_ref(self, |eng| eng.check_graph_schema_add(schema, options))?;
+        let report = with_engine_ref(env, self, |eng| eng.check_graph_schema_add(schema, options))?;
         Ok(GraphSchemaCheckReportPayload(report))
     }
 
     #[napi(ts_return_type = "import('./schema-types').GraphSchemaPublishResult")]
-    pub fn drop_graph_schema(&self) -> Result<GraphSchemaPublishResultPayload> {
-        let result = with_engine(self, |eng| eng.drop_graph_schema())?;
+    pub fn drop_graph_schema(&self, env: Env) -> Result<GraphSchemaPublishResultPayload> {
+        let result = with_engine(env, self, |eng| eng.drop_graph_schema())?;
         Ok(GraphSchemaPublishResultPayload(result))
     }
 
@@ -667,6 +756,7 @@ impl OverGraph {
     )]
     pub fn upsert_node(
         &self,
+        env: Env,
         labels: serde_json::Value,
         key: String,
         options: Option<UpsertNodeOptions>,
@@ -687,25 +777,26 @@ impl OverGraph {
                     .collect()
             }),
         };
-        let id = with_engine(self, |eng| eng.upsert_node(labels, &key, opts))?;
+        let id = with_engine(env, self, |eng| eng.upsert_node(labels, &key, opts))?;
         u64_to_f64(id)
     }
 
     #[napi]
-    pub fn add_node_label(&self, node_id: f64, label: String) -> Result<bool> {
+    pub fn add_node_label(&self, env: Env, node_id: f64, label: String) -> Result<bool> {
         let node_id = f64_to_u64(node_id)?;
-        with_engine(self, |eng| eng.add_node_label(node_id, &label))
+        with_engine(env, self, |eng| eng.add_node_label(node_id, &label))
     }
 
     #[napi]
-    pub fn remove_node_label(&self, node_id: f64, label: String) -> Result<bool> {
+    pub fn remove_node_label(&self, env: Env, node_id: f64, label: String) -> Result<bool> {
         let node_id = f64_to_u64(node_id)?;
-        with_engine(self, |eng| eng.remove_node_label(node_id, &label))
+        with_engine(env, self, |eng| eng.remove_node_label(node_id, &label))
     }
 
     #[napi]
     pub fn upsert_edge(
         &self,
+        env: Env,
         from: f64,
         to: f64,
         label: String,
@@ -724,28 +815,28 @@ impl OverGraph {
             valid_from,
             valid_to,
         };
-        let id = with_engine(self, |eng| eng.upsert_edge(from, to, &label, opts))?;
+        let id = with_engine(env, self, |eng| eng.upsert_edge(from, to, &label, opts))?;
         u64_to_f64(id)
     }
 
     // --- Batch upserts (JSON object path) ---
 
     #[napi]
-    pub fn batch_upsert_nodes(&self, nodes: Vec<NodeInput>) -> Result<Float64Array> {
+    pub fn batch_upsert_nodes(&self, env: Env, nodes: Vec<NodeInput>) -> Result<Float64Array> {
         let inputs: Vec<CoreNodeInput> = nodes
             .into_iter()
             .map(NodeInput::try_into)
             .collect::<Result<Vec<_>>>()?;
-        let ids = with_engine(self, |eng| eng.batch_upsert_nodes(inputs))?;
+        let ids = with_engine(env, self, |eng| eng.batch_upsert_nodes(inputs))?;
         ids_to_float64_array(&ids)
     }
 
     #[napi]
-    pub fn batch_upsert_edges(&self, edges: Vec<EdgeInput>) -> Result<Float64Array> {
+    pub fn batch_upsert_edges(&self, env: Env, edges: Vec<EdgeInput>) -> Result<Float64Array> {
         let inputs: std::result::Result<Vec<CoreEdgeInput>, _> =
             edges.into_iter().map(|e| e.try_into()).collect();
         let inputs = inputs?;
-        let ids = with_engine(self, |eng| eng.batch_upsert_edges(inputs))?;
+        let ids = with_engine(env, self, |eng| eng.batch_upsert_edges(inputs))?;
         ids_to_float64_array(&ids)
     }
 
@@ -759,9 +850,9 @@ impl OverGraph {
     ///     [label_count: u8] repeated [label_len: u16][label: utf8][weight: f32]
     ///     [key_len: u16][key: utf8][props_len: u32][props: json utf8]
     #[napi]
-    pub fn batch_upsert_nodes_binary(&self, buffer: Buffer) -> Result<Float64Array> {
+    pub fn batch_upsert_nodes_binary(&self, env: Env, buffer: Buffer) -> Result<Float64Array> {
         let inputs = decode_node_batch(&buffer)?;
-        let ids = with_engine(self, |eng| eng.batch_upsert_nodes(inputs))?;
+        let ids = with_engine(env, self, |eng| eng.batch_upsert_nodes(inputs))?;
         ids_to_float64_array(&ids)
     }
 
@@ -775,58 +866,64 @@ impl OverGraph {
     /// In this packed format, valid_from=0 and valid_to=0 are sentinels for
     /// engine defaults (created_at and no expiration), not explicit epoch 0.
     #[napi]
-    pub fn batch_upsert_edges_binary(&self, buffer: Buffer) -> Result<Float64Array> {
+    pub fn batch_upsert_edges_binary(&self, env: Env, buffer: Buffer) -> Result<Float64Array> {
         let inputs = decode_edge_batch(&buffer)?;
-        let ids = with_engine(self, |eng| eng.batch_upsert_edges(inputs))?;
+        let ids = with_engine(env, self, |eng| eng.batch_upsert_edges(inputs))?;
         ids_to_float64_array(&ids)
     }
 
     // --- Gets ---
 
     #[napi]
-    pub fn get_node(&self, id: f64) -> Result<Option<NodeView>> {
+    pub fn get_node(&self, env: Env, id: f64) -> Result<Option<NodeView>> {
         let id = f64_to_u64(id)?;
-        let raw = with_engine_ref(self, |eng| eng.get_node(id))?;
+        let raw = with_engine_ref(env, self, |eng| eng.get_node(id))?;
         raw.map(NodeView::try_from).transpose()
     }
 
     #[napi]
-    pub fn get_edge(&self, id: f64) -> Result<Option<EdgeView>> {
+    pub fn get_edge(&self, env: Env, id: f64) -> Result<Option<EdgeView>> {
         let id = f64_to_u64(id)?;
-        let raw = with_engine_ref(self, |eng| eng.get_edge(id))?;
+        let raw = with_engine_ref(env, self, |eng| eng.get_edge(id))?;
         raw.map(EdgeView::try_from).transpose()
     }
 
     // --- Key/triple lookups ---
 
     #[napi]
-    pub fn get_node_by_key(&self, label: String, key: String) -> Result<Option<NodeView>> {
-        let raw = with_engine_ref(self, |eng| eng.get_node_by_key(&label, &key))?;
+    pub fn get_node_by_key(
+        &self,
+        env: Env,
+        label: String,
+        key: String,
+    ) -> Result<Option<NodeView>> {
+        let raw = with_engine_ref(env, self, |eng| eng.get_node_by_key(&label, &key))?;
         raw.map(NodeView::try_from).transpose()
     }
 
     #[napi]
     pub fn get_edge_by_triple(
         &self,
+        env: Env,
         from: f64,
         to: f64,
         label: String,
     ) -> Result<Option<EdgeView>> {
         let from = f64_to_u64(from)?;
         let to = f64_to_u64(to)?;
-        let raw = with_engine_ref(self, |eng| eng.get_edge_by_triple(from, to, &label))?;
+        let raw = with_engine_ref(env, self, |eng| eng.get_edge_by_triple(from, to, &label))?;
         raw.map(EdgeView::try_from).transpose()
     }
 
     // --- Bulk reads ---
 
     #[napi]
-    pub fn get_nodes(&self, ids: Vec<f64>) -> Result<Vec<Option<NodeView>>> {
+    pub fn get_nodes(&self, env: Env, ids: Vec<f64>) -> Result<Vec<Option<NodeView>>> {
         let ids: Vec<u64> = ids
             .into_iter()
             .map(f64_to_u64)
             .collect::<Result<Vec<_>>>()?;
-        let results = with_engine_ref(self, |eng| eng.get_nodes(&ids))?;
+        let results = with_engine_ref(env, self, |eng| eng.get_nodes(&ids))?;
         results
             .into_iter()
             .map(|r| r.map(NodeView::try_from).transpose())
@@ -834,12 +931,16 @@ impl OverGraph {
     }
 
     #[napi]
-    pub fn get_nodes_by_keys(&self, keys: Vec<KeyQuery>) -> Result<Vec<Option<NodeView>>> {
+    pub fn get_nodes_by_keys(
+        &self,
+        env: Env,
+        keys: Vec<KeyQuery>,
+    ) -> Result<Vec<Option<NodeView>>> {
         let owned: Vec<NodeKeyQuery> = keys
             .into_iter()
             .map(KeyQuery::try_into)
             .collect::<Result<Vec<_>>>()?;
-        let results = with_engine_ref(self, |eng| eng.get_nodes_by_keys(&owned))?;
+        let results = with_engine_ref(env, self, |eng| eng.get_nodes_by_keys(&owned))?;
         results
             .into_iter()
             .map(|r| r.map(NodeView::try_from).transpose())
@@ -847,12 +948,12 @@ impl OverGraph {
     }
 
     #[napi]
-    pub fn get_edges(&self, ids: Vec<f64>) -> Result<Vec<Option<EdgeView>>> {
+    pub fn get_edges(&self, env: Env, ids: Vec<f64>) -> Result<Vec<Option<EdgeView>>> {
         let ids: Vec<u64> = ids
             .into_iter()
             .map(f64_to_u64)
             .collect::<Result<Vec<_>>>()?;
-        let results = with_engine_ref(self, |eng| eng.get_edges(&ids))?;
+        let results = with_engine_ref(env, self, |eng| eng.get_edges(&ids))?;
         results
             .into_iter()
             .map(|r| r.map(EdgeView::try_from).transpose())
@@ -862,30 +963,30 @@ impl OverGraph {
     // --- Deletes ---
 
     #[napi]
-    pub fn delete_node(&self, id: f64) -> Result<()> {
+    pub fn delete_node(&self, env: Env, id: f64) -> Result<()> {
         let id = f64_to_u64(id)?;
-        with_engine(self, |eng| eng.delete_node(id))
+        with_engine(env, self, |eng| eng.delete_node(id))
     }
 
     #[napi]
-    pub fn delete_edge(&self, id: f64) -> Result<()> {
+    pub fn delete_edge(&self, env: Env, id: f64) -> Result<()> {
         let id = f64_to_u64(id)?;
-        with_engine(self, |eng| eng.delete_edge(id))
+        with_engine(env, self, |eng| eng.delete_edge(id))
     }
 
     // --- Temporal invalidation ---
 
     #[napi]
-    pub fn invalidate_edge(&self, id: f64, valid_to: i64) -> Result<Option<EdgeView>> {
+    pub fn invalidate_edge(&self, env: Env, id: f64, valid_to: i64) -> Result<Option<EdgeView>> {
         let id = f64_to_u64(id)?;
-        let raw = with_engine(self, |eng| eng.invalidate_edge(id, valid_to))?;
+        let raw = with_engine(env, self, |eng| eng.invalidate_edge(id, valid_to))?;
         raw.map(EdgeView::try_from).transpose()
     }
 
     #[napi]
-    pub fn graph_patch(&self, patch: GraphPatch) -> Result<PatchResult> {
+    pub fn graph_patch(&self, env: Env, patch: GraphPatch) -> Result<PatchResult> {
         let rust_patch = js_patch_to_rust(patch)?;
-        let result = with_engine(self, |eng| eng.graph_patch(rust_patch))?;
+        let result = with_engine(env, self, |eng| eng.graph_patch(rust_patch))?;
         Ok(PatchResult {
             node_ids: ids_to_float64_array(&result.node_ids)?,
             edge_ids: ids_to_float64_array(&result.edge_ids)?,
@@ -893,8 +994,8 @@ impl OverGraph {
     }
 
     #[napi]
-    pub fn begin_write_txn(&self) -> Result<WriteTxn> {
-        let txn = with_engine_ref(self, |eng| eng.begin_write_txn())?;
+    pub fn begin_write_txn(&self, env: Env) -> Result<WriteTxn> {
+        let txn = with_engine_ref(env, self, |eng| eng.begin_write_txn())?;
         Ok(write_txn_to_js(txn))
     }
 
@@ -910,9 +1011,9 @@ impl OverGraph {
     // --- Retention / Forgetting ---
 
     #[napi]
-    pub fn prune(&self, policy: PrunePolicy) -> Result<PruneResult> {
+    pub fn prune(&self, env: Env, policy: PrunePolicy) -> Result<PruneResult> {
         let rust_policy = js_prune_policy_to_rust(policy, "prune")?;
-        with_engine(self, |eng| {
+        with_engine(env, self, |eng| {
             let result = eng.prune(&rust_policy)?;
             Ok(PruneResult {
                 nodes_pruned: result.nodes_pruned as i64,
@@ -924,22 +1025,22 @@ impl OverGraph {
     // --- Named prune policies (compaction-filter auto-prune) ---
 
     #[napi]
-    pub fn set_prune_policy(&self, name: String, policy: PrunePolicy) -> Result<()> {
+    pub fn set_prune_policy(&self, env: Env, name: String, policy: PrunePolicy) -> Result<()> {
         let rust_policy = js_prune_policy_to_rust(policy, "setPrunePolicy")?;
-        with_engine(self, |eng| {
+        with_engine(env, self, |eng| {
             eng.set_prune_policy(&name, rust_policy)?;
             Ok(())
         })
     }
 
     #[napi]
-    pub fn remove_prune_policy(&self, name: String) -> Result<bool> {
-        with_engine(self, |eng| eng.remove_prune_policy(&name))
+    pub fn remove_prune_policy(&self, env: Env, name: String) -> Result<bool> {
+        with_engine(env, self, |eng| eng.remove_prune_policy(&name))
     }
 
     #[napi]
-    pub fn list_prune_policies(&self) -> Result<Vec<NamedPrunePolicy>> {
-        with_engine_ref(self, |eng| {
+    pub fn list_prune_policies(&self, env: Env) -> Result<Vec<NamedPrunePolicy>> {
+        with_engine_ref(env, self, |eng| {
             Ok(eng
                 .list_prune_policies()?
                 .into_iter()
@@ -1012,6 +1113,7 @@ impl OverGraph {
     #[napi]
     pub fn neighbors(
         &self,
+        env: Env,
         node_id: f64,
         options: Option<NeighborsOptions>,
     ) -> Result<Vec<NeighborEntry>> {
@@ -1036,13 +1138,14 @@ impl OverGraph {
             at_epoch,
             decay_lambda: decay,
         };
-        let entries = with_engine_ref(self, |eng| eng.neighbors(node_id, &opts))?;
+        let entries = with_engine_ref(env, self, |eng| eng.neighbors(node_id, &opts))?;
         neighbor_entries_to_js(entries)
     }
 
     #[napi]
     pub fn traverse(
         &self,
+        env: Env,
         start_node_id: f64,
         max_depth: u32,
         options: Option<TraverseOptions>,
@@ -1085,13 +1188,16 @@ impl OverGraph {
             limit: limit.map(|v| v as usize),
             cursor,
         };
-        let page = with_engine_ref(self, |eng| eng.traverse(start_node_id, max_depth, &opts))?;
+        let page = with_engine_ref(env, self, |eng| {
+            eng.traverse(start_node_id, max_depth, &opts)
+        })?;
         traversal_page_to_js(page)
     }
 
     #[napi]
     pub fn top_k_neighbors(
         &self,
+        env: Env,
         node_id: f64,
         k: u32,
         options: Option<TopKNeighborsOptions>,
@@ -1115,13 +1221,16 @@ impl OverGraph {
             scoring: scoring_mode,
             at_epoch,
         };
-        let entries = with_engine_ref(self, |eng| eng.top_k_neighbors(node_id, k as usize, &opts))?;
+        let entries = with_engine_ref(env, self, |eng| {
+            eng.top_k_neighbors(node_id, k as usize, &opts)
+        })?;
         neighbor_entries_to_js(entries)
     }
 
     #[napi]
     pub fn extract_subgraph(
         &self,
+        env: Env,
         start_node_id: f64,
         max_depth: u32,
         options: Option<ExtractSubgraphOptions>,
@@ -1145,7 +1254,9 @@ impl OverGraph {
             node_label_filter,
             at_epoch,
         };
-        let sg = with_engine_ref(self, |eng| eng.extract_subgraph(start, max_depth, &opts))?;
+        let sg = with_engine_ref(env, self, |eng| {
+            eng.extract_subgraph(start, max_depth, &opts)
+        })?;
         subgraph_to_js(sg)
     }
 
@@ -1154,6 +1265,7 @@ impl OverGraph {
     #[napi]
     pub fn neighbors_batch(
         &self,
+        env: Env,
         node_ids: Vec<f64>,
         options: Option<NeighborsBatchOptions>,
     ) -> Result<Vec<NeighborBatchEntry>> {
@@ -1174,14 +1286,14 @@ impl OverGraph {
             at_epoch,
             decay_lambda: decay,
         };
-        let map = with_engine_ref(self, |eng| eng.neighbors_batch(&ids, &opts))?;
+        let map = with_engine_ref(env, self, |eng| eng.neighbors_batch(&ids, &opts))?;
         convert_batch_result(map)
     }
 
     // --- Degree counts + aggregations (Phase 18a) ---
 
     #[napi]
-    pub fn degree(&self, node_id: f64, options: Option<DegreeOptions>) -> Result<i64> {
+    pub fn degree(&self, env: Env, node_id: f64, options: Option<DegreeOptions>) -> Result<i64> {
         let node_id = f64_to_u64(node_id)?;
         let (direction, edge_label_filter, at_epoch) = match options {
             Some(o) => (o.direction, o.edge_label_filter, o.at_epoch),
@@ -1193,13 +1305,14 @@ impl OverGraph {
             edge_label_filter,
             at_epoch,
         };
-        let count: u64 = with_engine_ref(self, |eng| eng.degree(node_id, &opts))?;
+        let count: u64 = with_engine_ref(env, self, |eng| eng.degree(node_id, &opts))?;
         u64_to_safe_i64(count)
     }
 
     #[napi]
     pub fn sum_edge_weights(
         &self,
+        env: Env,
         node_id: f64,
         options: Option<SumEdgeWeightsOptions>,
     ) -> Result<f64> {
@@ -1214,12 +1327,13 @@ impl OverGraph {
             edge_label_filter,
             at_epoch,
         };
-        with_engine_ref(self, |eng| eng.sum_edge_weights(node_id, &opts))
+        with_engine_ref(env, self, |eng| eng.sum_edge_weights(node_id, &opts))
     }
 
     #[napi]
     pub fn avg_edge_weight(
         &self,
+        env: Env,
         node_id: f64,
         options: Option<AvgEdgeWeightOptions>,
     ) -> Result<Option<f64>> {
@@ -1234,12 +1348,13 @@ impl OverGraph {
             edge_label_filter,
             at_epoch,
         };
-        with_engine_ref(self, |eng| eng.avg_edge_weight(node_id, &opts))
+        with_engine_ref(env, self, |eng| eng.avg_edge_weight(node_id, &opts))
     }
 
     #[napi]
     pub fn degrees(
         &self,
+        env: Env,
         node_ids: Vec<f64>,
         options: Option<DegreesOptions>,
     ) -> Result<Vec<DegreeBatchEntry>> {
@@ -1257,7 +1372,7 @@ impl OverGraph {
             edge_label_filter,
             at_epoch,
         };
-        let map = with_engine_ref(self, |eng| eng.degrees(&ids, &opts))?;
+        let map = with_engine_ref(env, self, |eng| eng.degrees(&ids, &opts))?;
         let mut entries: Vec<DegreeBatchEntry> = map
             .into_iter()
             .map(|(node_id, degree)| {
@@ -1276,6 +1391,7 @@ impl OverGraph {
     #[napi]
     pub fn shortest_path(
         &self,
+        env: Env,
         from: f64,
         to: f64,
         options: Option<ShortestPathOptions>,
@@ -1304,13 +1420,14 @@ impl OverGraph {
             max_cost,
         };
         let result: Option<CoreShortestPath> =
-            with_engine_ref(self, |eng| eng.shortest_path(from, to, &opts))?;
+            with_engine_ref(env, self, |eng| eng.shortest_path(from, to, &opts))?;
         result.map(shortest_path_to_js).transpose()
     }
 
     #[napi]
     pub fn is_connected(
         &self,
+        env: Env,
         from: f64,
         to: f64,
         options: Option<IsConnectedOptions>,
@@ -1328,12 +1445,13 @@ impl OverGraph {
             at_epoch,
             max_depth,
         };
-        with_engine_ref(self, |eng| eng.is_connected(from, to, &opts))
+        with_engine_ref(env, self, |eng| eng.is_connected(from, to, &opts))
     }
 
     #[napi]
     pub fn all_shortest_paths(
         &self,
+        env: Env,
         from: f64,
         to: f64,
         options: Option<AllShortestPathsOptions>,
@@ -1364,19 +1482,20 @@ impl OverGraph {
             max_paths: max_paths.map(|n| n as usize),
         };
         let paths: Vec<CoreShortestPath> =
-            with_engine_ref(self, |eng| eng.all_shortest_paths(from, to, &opts))?;
+            with_engine_ref(env, self, |eng| eng.all_shortest_paths(from, to, &opts))?;
         paths.into_iter().map(shortest_path_to_js).collect()
     }
 
     #[napi]
     pub fn find_nodes(
         &self,
+        env: Env,
         label: String,
         prop_key: String,
         prop_value: serde_json::Value,
     ) -> Result<Float64Array> {
         let pv = json_to_prop_value(&prop_value);
-        let ids = with_engine_ref(self, |eng| eng.find_nodes(&label, &prop_key, &pv))?;
+        let ids = with_engine_ref(env, self, |eng| eng.find_nodes(&label, &prop_key, &pv))?;
         ids_to_float64_array(&ids)
     }
 
@@ -1384,9 +1503,9 @@ impl OverGraph {
         ts_args_type = "request: import('./query-types').QueryNodeRequest",
         ts_return_type = "IdPageResult"
     )]
-    pub fn query_node_ids(&self, request: serde_json::Value) -> Result<IdPageResult> {
+    pub fn query_node_ids(&self, env: Env, request: serde_json::Value) -> Result<IdPageResult> {
         let query = parse_js_node_query(&request)?;
-        let result = with_engine_ref(self, |eng| eng.query_node_ids(&query))?;
+        let result = with_engine_ref(env, self, |eng| eng.query_node_ids(&query))?;
         query_node_ids_to_js(result)
     }
 
@@ -1394,9 +1513,9 @@ impl OverGraph {
         ts_args_type = "request: import('./query-types').QueryNodeRequest",
         ts_return_type = "NodePageResult"
     )]
-    pub fn query_nodes(&self, request: serde_json::Value) -> Result<NodePageResult> {
+    pub fn query_nodes(&self, env: Env, request: serde_json::Value) -> Result<NodePageResult> {
         let query = parse_js_node_query(&request)?;
-        let result = with_engine_ref(self, |eng| eng.query_nodes(&query))?;
+        let result = with_engine_ref(env, self, |eng| eng.query_nodes(&query))?;
         query_nodes_to_js(result)
     }
 
@@ -1404,9 +1523,9 @@ impl OverGraph {
         ts_args_type = "request: import('./query-types').QueryEdgeRequest",
         ts_return_type = "IdPageResult"
     )]
-    pub fn query_edge_ids(&self, request: serde_json::Value) -> Result<IdPageResult> {
+    pub fn query_edge_ids(&self, env: Env, request: serde_json::Value) -> Result<IdPageResult> {
         let query = parse_js_edge_query(&request)?;
-        let result = with_engine_ref(self, |eng| eng.query_edge_ids(&query))?;
+        let result = with_engine_ref(env, self, |eng| eng.query_edge_ids(&query))?;
         query_edge_ids_to_js(result)
     }
 
@@ -1414,9 +1533,9 @@ impl OverGraph {
         ts_args_type = "request: import('./query-types').QueryEdgeRequest",
         ts_return_type = "EdgePageResult"
     )]
-    pub fn query_edges(&self, request: serde_json::Value) -> Result<EdgePageResult> {
+    pub fn query_edges(&self, env: Env, request: serde_json::Value) -> Result<EdgePageResult> {
         let query = parse_js_edge_query(&request)?;
-        let result = with_engine_ref(self, |eng| eng.query_edges(&query))?;
+        let result = with_engine_ref(env, self, |eng| eng.query_edges(&query))?;
         query_edges_to_js(result)
     }
 
@@ -1424,10 +1543,14 @@ impl OverGraph {
         ts_args_type = "request: import('./query-types').GraphRowRequest",
         ts_return_type = "import('./query-types').GraphRowResult"
     )]
-    pub fn query_graph_rows(&self, request: serde_json::Value) -> Result<GraphRowResultPayload> {
+    pub fn query_graph_rows(
+        &self,
+        env: Env,
+        request: serde_json::Value,
+    ) -> Result<GraphRowResultPayload> {
         let query = parse_js_graph_row_query(&request)?;
         let compact_rows = query.output.compact_rows;
-        let result = with_engine_ref(self, |eng| eng.query_graph_rows(&query))?;
+        let result = with_engine_ref(env, self, |eng| eng.query_graph_rows(&query))?;
         Ok(GraphRowResultPayload {
             result,
             compact_rows,
@@ -1440,11 +1563,12 @@ impl OverGraph {
     )]
     pub fn query_graph_pipeline(
         &self,
+        env: Env,
         request: serde_json::Value,
     ) -> Result<GraphPipelineResultPayload> {
         let query = parse_js_graph_pipeline_query(&request)?;
         let compact_rows = query.output.compact_rows;
-        let result = with_engine_ref(self, |eng| eng.query_graph_pipeline(&query))?;
+        let result = with_engine_ref(env, self, |eng| eng.query_graph_pipeline(&query))?;
         Ok(GraphPipelineResultPayload {
             result,
             compact_rows,
@@ -1455,9 +1579,9 @@ impl OverGraph {
         ts_args_type = "request: import('./query-types').QueryNodeRequest",
         ts_return_type = "import('./query-types').QueryPlan"
     )]
-    pub fn explain_node_query(&self, request: serde_json::Value) -> Result<JsonPayload> {
+    pub fn explain_node_query(&self, env: Env, request: serde_json::Value) -> Result<JsonPayload> {
         let query = parse_js_node_query(&request)?;
-        let plan = with_engine_ref(self, |eng| eng.explain_node_query(&query))?;
+        let plan = with_engine_ref(env, self, |eng| eng.explain_node_query(&query))?;
         query_plan_to_js(plan)
     }
 
@@ -1465,9 +1589,9 @@ impl OverGraph {
         ts_args_type = "request: import('./query-types').QueryEdgeRequest",
         ts_return_type = "import('./query-types').QueryPlan"
     )]
-    pub fn explain_edge_query(&self, request: serde_json::Value) -> Result<JsonPayload> {
+    pub fn explain_edge_query(&self, env: Env, request: serde_json::Value) -> Result<JsonPayload> {
         let query = parse_js_edge_query(&request)?;
-        let plan = with_engine_ref(self, |eng| eng.explain_edge_query(&query))?;
+        let plan = with_engine_ref(env, self, |eng| eng.explain_edge_query(&query))?;
         query_plan_to_js(plan)
     }
 
@@ -1475,9 +1599,13 @@ impl OverGraph {
         ts_args_type = "request: import('./query-types').GraphRowRequest",
         ts_return_type = "import('./query-types').GraphRowExplain"
     )]
-    pub fn explain_graph_rows(&self, request: serde_json::Value) -> Result<GraphJsExplain> {
+    pub fn explain_graph_rows(
+        &self,
+        env: Env,
+        request: serde_json::Value,
+    ) -> Result<GraphJsExplain> {
         let query = parse_js_graph_row_query(&request)?;
-        let explain = with_engine_ref(self, |eng| eng.explain_graph_rows(&query))?;
+        let explain = with_engine_ref(env, self, |eng| eng.explain_graph_rows(&query))?;
         Ok(GraphJsExplain(explain))
     }
 
@@ -1487,10 +1615,11 @@ impl OverGraph {
     )]
     pub fn explain_graph_pipeline(
         &self,
+        env: Env,
         request: serde_json::Value,
     ) -> Result<GraphPipelineJsExplain> {
         let query = parse_js_graph_pipeline_query(&request)?;
-        let explain = with_engine_ref(self, |eng| eng.explain_graph_pipeline(&query))?;
+        let explain = with_engine_ref(env, self, |eng| eng.explain_graph_pipeline(&query))?;
         Ok(GraphPipelineJsExplain(explain))
     }
 
@@ -1500,15 +1629,16 @@ impl OverGraph {
     )]
     pub fn execute_gql(
         &self,
+        env: Env,
         query: String,
         params: Option<Unknown<'_>>,
         options: Option<GqlExecutionOptionsInput>,
     ) -> Result<GqlJsPayload> {
         let (options, compact_rows) = parse_js_gql_options(options)?;
-        let referenced_params = gql_referenced_param_names(&query, &options)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let referenced_params =
+            gql_referenced_param_names(&query, &options).map_err(|e| engine_error(env, e))?;
         let params = parse_js_gql_params(params, &referenced_params, &options)?;
-        let result = with_engine_ref(self, |eng| eng.execute_gql(&query, &params, &options))?;
+        let result = with_engine_ref(env, self, |eng| eng.execute_gql(&query, &params, &options))?;
         Ok(GqlJsPayload(GqlJsPayloadKind::Result(
             GqlExecutionResultPayload {
                 result,
@@ -1523,26 +1653,28 @@ impl OverGraph {
     )]
     pub fn explain_gql(
         &self,
+        env: Env,
         query: String,
         params: Option<Unknown<'_>>,
         options: Option<GqlExecutionOptionsInput>,
     ) -> Result<GqlJsPayload> {
         let (options, _) = parse_js_gql_options(options)?;
-        let referenced_params = gql_referenced_param_names(&query, &options)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let referenced_params =
+            gql_referenced_param_names(&query, &options).map_err(|e| engine_error(env, e))?;
         let params = parse_js_gql_params(params, &referenced_params, &options)?;
-        let explain = with_engine_ref(self, |eng| eng.explain_gql(&query, &params, &options))?;
+        let explain = with_engine_ref(env, self, |eng| eng.explain_gql(&query, &params, &options))?;
         Ok(GqlJsPayload(GqlJsPayloadKind::Explain(explain)))
     }
 
     #[napi]
     pub fn ensure_node_property_index(
         &self,
+        env: Env,
         label: String,
         spec: SecondaryIndexSpec,
     ) -> Result<NodePropertyIndexInfo> {
         let spec = js_secondary_index_spec_to_rust(spec, JsSecondaryIndexTargetKind::Node)?;
-        let info = with_engine(self, |eng| {
+        let info = with_engine(env, self, |eng| {
             eng.ensure_node_property_index(&label, spec.clone())
         })?;
         node_property_index_info_to_js(info)
@@ -1551,18 +1683,19 @@ impl OverGraph {
     #[napi]
     pub fn drop_node_property_index(
         &self,
+        env: Env,
         label: String,
         spec: SecondaryIndexSpec,
     ) -> Result<bool> {
         let spec = js_secondary_index_spec_to_rust(spec, JsSecondaryIndexTargetKind::Node)?;
-        with_engine(self, |eng| {
+        with_engine(env, self, |eng| {
             eng.drop_node_property_index(&label, spec.clone())
         })
     }
 
     #[napi]
-    pub fn list_node_property_indexes(&self) -> Result<Vec<NodePropertyIndexInfo>> {
-        let infos = with_engine_ref(self, |eng| eng.list_node_property_indexes())?;
+    pub fn list_node_property_indexes(&self, env: Env) -> Result<Vec<NodePropertyIndexInfo>> {
+        let infos = with_engine_ref(env, self, |eng| eng.list_node_property_indexes())?;
         infos
             .into_iter()
             .map(node_property_index_info_to_js)
@@ -1572,11 +1705,12 @@ impl OverGraph {
     #[napi]
     pub fn ensure_edge_property_index(
         &self,
+        env: Env,
         label: String,
         spec: SecondaryIndexSpec,
     ) -> Result<EdgePropertyIndexInfo> {
         let spec = js_secondary_index_spec_to_rust(spec, JsSecondaryIndexTargetKind::Edge)?;
-        let info = with_engine(self, |eng| {
+        let info = with_engine(env, self, |eng| {
             eng.ensure_edge_property_index(&label, spec.clone())
         })?;
         edge_property_index_info_to_js(info)
@@ -1585,18 +1719,19 @@ impl OverGraph {
     #[napi]
     pub fn drop_edge_property_index(
         &self,
+        env: Env,
         label: String,
         spec: SecondaryIndexSpec,
     ) -> Result<bool> {
         let spec = js_secondary_index_spec_to_rust(spec, JsSecondaryIndexTargetKind::Edge)?;
-        with_engine(self, |eng| {
+        with_engine(env, self, |eng| {
             eng.drop_edge_property_index(&label, spec.clone())
         })
     }
 
     #[napi]
-    pub fn list_edge_property_indexes(&self) -> Result<Vec<EdgePropertyIndexInfo>> {
-        let infos = with_engine_ref(self, |eng| eng.list_edge_property_indexes())?;
+    pub fn list_edge_property_indexes(&self, env: Env) -> Result<Vec<EdgePropertyIndexInfo>> {
+        let infos = with_engine_ref(env, self, |eng| eng.list_edge_property_indexes())?;
         infos
             .into_iter()
             .map(edge_property_index_info_to_js)
@@ -1605,23 +1740,27 @@ impl OverGraph {
 
     /// Return all node IDs containing every supplied node label (unpaged).
     #[napi(ts_args_type = "labels: string | string[]")]
-    pub fn nodes_by_labels(&self, labels: serde_json::Value) -> Result<Float64Array> {
+    pub fn nodes_by_labels(&self, env: Env, labels: serde_json::Value) -> Result<Float64Array> {
         let labels = parse_js_node_labels_arg(&labels, "nodesByLabels labels")?;
-        let ids = with_engine_ref(self, |eng| eng.nodes_by_labels(labels))?;
+        let ids = with_engine_ref(env, self, |eng| eng.nodes_by_labels(labels))?;
         ids_to_float64_array(&ids)
     }
 
     /// Return all edge IDs of a given label (unpaged).
     #[napi]
-    pub fn edges_by_label(&self, label: String) -> Result<Float64Array> {
-        let ids = with_engine_ref(self, |eng| eng.edges_by_label(&label))?;
+    pub fn edges_by_label(&self, env: Env, label: String) -> Result<Float64Array> {
+        let ids = with_engine_ref(env, self, |eng| eng.edges_by_label(&label))?;
         ids_to_float64_array(&ids)
     }
 
     #[napi(ts_args_type = "labels: string | string[]")]
-    pub fn get_nodes_by_labels(&self, labels: serde_json::Value) -> Result<Vec<NodeView>> {
+    pub fn get_nodes_by_labels(
+        &self,
+        env: Env,
+        labels: serde_json::Value,
+    ) -> Result<Vec<NodeView>> {
         let labels = parse_js_node_labels_arg(&labels, "getNodesByLabels labels")?;
-        let records = with_engine_ref(self, |eng| eng.get_nodes_by_labels(labels))?;
+        let records = with_engine_ref(env, self, |eng| eng.get_nodes_by_labels(labels))?;
         records
             .into_iter()
             .map(NodeView::try_from)
@@ -1629,8 +1768,8 @@ impl OverGraph {
     }
 
     #[napi]
-    pub fn get_edges_by_label(&self, label: String) -> Result<Vec<EdgeView>> {
-        let records = with_engine_ref(self, |eng| eng.get_edges_by_label(&label))?;
+    pub fn get_edges_by_label(&self, env: Env, label: String) -> Result<Vec<EdgeView>> {
+        let records = with_engine_ref(env, self, |eng| eng.get_edges_by_label(&label))?;
         records
             .into_iter()
             .map(EdgeView::try_from)
@@ -1638,14 +1777,20 @@ impl OverGraph {
     }
 
     #[napi(ts_args_type = "labels: string | string[]")]
-    pub fn count_nodes_by_labels(&self, labels: serde_json::Value) -> Result<i64> {
+    pub fn count_nodes_by_labels(&self, env: Env, labels: serde_json::Value) -> Result<i64> {
         let labels = parse_js_node_labels_arg(&labels, "countNodesByLabels labels")?;
-        with_engine_ref(self, |eng| Ok(eng.count_nodes_by_labels(labels)? as i64))
+        with_engine_ref(env, self, |eng| {
+            Ok(eng.count_nodes_by_labels(labels)? as i64)
+        })
     }
 
     #[napi]
-    pub fn count_edges_by_label(&self, label: String) -> Result<i64> {
-        with_engine_ref(self, |eng| Ok(eng.count_edges_by_label(&label)? as i64))
+    pub fn count_edges_by_label(&self, env: Env, label: String) -> Result<i64> {
+        with_engine_ref(
+            env,
+            self,
+            |eng| Ok(eng.count_edges_by_label(&label)? as i64),
+        )
     }
 
     // --- Paginated queries (sync) ---
@@ -1655,25 +1800,27 @@ impl OverGraph {
     )]
     pub fn nodes_by_labels_paged(
         &self,
+        env: Env,
         labels: serde_json::Value,
         limit: Option<u32>,
         after: Option<f64>,
     ) -> Result<IdPageResult> {
         let labels = parse_js_node_labels_arg(&labels, "nodesByLabelsPaged labels")?;
         let page = make_page_request(limit, after)?;
-        let raw = with_engine_ref(self, |eng| eng.nodes_by_labels_paged(labels, &page))?;
+        let raw = with_engine_ref(env, self, |eng| eng.nodes_by_labels_paged(labels, &page))?;
         id_page_to_js(raw)
     }
 
     #[napi]
     pub fn edges_by_label_paged(
         &self,
+        env: Env,
         label: String,
         limit: Option<u32>,
         after: Option<f64>,
     ) -> Result<IdPageResult> {
         let page = make_page_request(limit, after)?;
-        let raw = with_engine_ref(self, |eng| eng.edges_by_label_paged(&label, &page))?;
+        let raw = with_engine_ref(env, self, |eng| eng.edges_by_label_paged(&label, &page))?;
         id_page_to_js(raw)
     }
 
@@ -1682,31 +1829,36 @@ impl OverGraph {
     )]
     pub fn get_nodes_by_labels_paged(
         &self,
+        env: Env,
         labels: serde_json::Value,
         limit: Option<u32>,
         after: Option<f64>,
     ) -> Result<NodePageResult> {
         let labels = parse_js_node_labels_arg(&labels, "getNodesByLabelsPaged labels")?;
         let page = make_page_request(limit, after)?;
-        let raw = with_engine_ref(self, |eng| eng.get_nodes_by_labels_paged(labels, &page))?;
+        let raw = with_engine_ref(env, self, |eng| {
+            eng.get_nodes_by_labels_paged(labels, &page)
+        })?;
         node_page_to_js(raw)
     }
 
     #[napi]
     pub fn get_edges_by_label_paged(
         &self,
+        env: Env,
         label: String,
         limit: Option<u32>,
         after: Option<f64>,
     ) -> Result<EdgePageResult> {
         let page = make_page_request(limit, after)?;
-        let raw = with_engine_ref(self, |eng| eng.get_edges_by_label_paged(&label, &page))?;
+        let raw = with_engine_ref(env, self, |eng| eng.get_edges_by_label_paged(&label, &page))?;
         edge_page_to_js(raw)
     }
 
     #[napi]
     pub fn find_nodes_paged(
         &self,
+        env: Env,
         label: String,
         prop_key: String,
         prop_value: serde_json::Value,
@@ -1718,7 +1870,7 @@ impl OverGraph {
             None => (None, None),
         };
         let page = make_page_request(limit, after)?;
-        let raw = with_engine_ref(self, |eng| {
+        let raw = with_engine_ref(env, self, |eng| {
             eng.find_nodes_paged(&label, &prop_key, &pv, &page)
         })?;
         id_page_to_js(raw)
@@ -1727,11 +1879,12 @@ impl OverGraph {
     #[napi]
     pub fn find_nodes_by_time_range(
         &self,
+        env: Env,
         label: String,
         from_ms: i64,
         to_ms: i64,
     ) -> Result<Float64Array> {
-        let ids = with_engine_ref(self, |eng| {
+        let ids = with_engine_ref(env, self, |eng| {
             eng.find_nodes_by_time_range(&label, from_ms, to_ms)
         })?;
         ids_to_float64_array(&ids)
@@ -1740,6 +1893,7 @@ impl OverGraph {
     #[napi]
     pub fn find_nodes_range(
         &self,
+        env: Env,
         label: String,
         prop_key: String,
         lower: Option<PropertyRangeBound>,
@@ -1753,7 +1907,7 @@ impl OverGraph {
             .as_ref()
             .map(js_property_range_bound_to_rust)
             .transpose()?;
-        let ids = with_engine_ref(self, |eng| {
+        let ids = with_engine_ref(env, self, |eng| {
             eng.find_nodes_range(&label, &prop_key, lower.as_ref(), upper.as_ref())
         })?;
         ids_to_float64_array(&ids)
@@ -1762,6 +1916,7 @@ impl OverGraph {
     #[napi]
     pub fn find_nodes_by_time_range_paged(
         &self,
+        env: Env,
         label: String,
         from_ms: i64,
         to_ms: i64,
@@ -1772,7 +1927,7 @@ impl OverGraph {
             None => (None, None),
         };
         let page = make_page_request(limit, after)?;
-        let raw = with_engine_ref(self, |eng| {
+        let raw = with_engine_ref(env, self, |eng| {
             eng.find_nodes_by_time_range_paged(&label, from_ms, to_ms, &page)
         })?;
         id_page_to_js(raw)
@@ -1781,6 +1936,7 @@ impl OverGraph {
     #[napi]
     pub fn find_nodes_range_paged(
         &self,
+        env: Env,
         label: String,
         prop_key: String,
         lower: Option<PropertyRangeBound>,
@@ -1796,7 +1952,7 @@ impl OverGraph {
             .map(js_property_range_bound_to_rust)
             .transpose()?;
         let page = make_property_range_page_request(options)?;
-        let raw = with_engine_ref(self, |eng| {
+        let raw = with_engine_ref(env, self, |eng| {
             eng.find_nodes_range_paged(&label, &prop_key, lower.as_ref(), upper.as_ref(), &page)
         })?;
         property_range_page_to_js(raw)
@@ -1805,6 +1961,7 @@ impl OverGraph {
     #[napi]
     pub fn personalized_pagerank(
         &self,
+        env: Env,
         seed_node_ids: Vec<f64>,
         options: Option<PersonalizedPagerankOptions>,
     ) -> Result<PprResult> {
@@ -1841,24 +1998,29 @@ impl OverGraph {
             &edge_label_filter,
             &max_results,
         )?;
-        let result = with_engine_ref(self, |eng| eng.personalized_pagerank(&seeds, &opts))?;
+        let result = with_engine_ref(env, self, |eng| eng.personalized_pagerank(&seeds, &opts))?;
         ppr_result_to_js(result)
     }
 
     #[napi]
-    pub fn export_adjacency(&self, options: Option<ExportOptions>) -> Result<AdjacencyExport> {
+    pub fn export_adjacency(
+        &self,
+        env: Env,
+        options: Option<ExportOptions>,
+    ) -> Result<AdjacencyExport> {
         let include_weights = options
             .as_ref()
             .and_then(|o| o.include_weights)
             .unwrap_or(true);
         let opts = js_export_options_to_rust(options)?;
-        let result = with_engine_ref(self, |eng| eng.export_adjacency(&opts))?;
+        let result = with_engine_ref(env, self, |eng| eng.export_adjacency(&opts))?;
         adjacency_export_to_js(result, include_weights)
     }
 
     #[napi]
     pub fn neighbors_paged(
         &self,
+        env: Env,
         node_id: f64,
         options: Option<NeighborsPagedOptions>,
     ) -> Result<NeighborPageResult> {
@@ -1884,7 +2046,7 @@ impl OverGraph {
             at_epoch,
             decay_lambda: decay,
         };
-        let page = with_engine_ref(self, |eng| eng.neighbors_paged(node_id, &opts, &page))?;
+        let page = with_engine_ref(env, self, |eng| eng.neighbors_paged(node_id, &opts, &page))?;
         neighbor_page_to_js(page)
     }
 
@@ -1893,6 +2055,7 @@ impl OverGraph {
     #[napi]
     pub fn connected_components(
         &self,
+        env: Env,
         options: Option<ConnectedComponentsOptions>,
     ) -> Result<Vec<ComponentEntry>> {
         let (edge_label_filter, node_label_filter, at_epoch) = match options {
@@ -1910,7 +2073,7 @@ impl OverGraph {
             node_label_filter,
             at_epoch,
         };
-        let map = with_engine_ref(self, |eng| eng.connected_components(&opts))?;
+        let map = with_engine_ref(env, self, |eng| eng.connected_components(&opts))?;
         let mut entries: Vec<ComponentEntry> = map
             .into_iter()
             .map(|(node_id, component_id)| {
@@ -1927,6 +2090,7 @@ impl OverGraph {
     #[napi]
     pub fn component_of(
         &self,
+        env: Env,
         node_id: f64,
         options: Option<ComponentOfOptions>,
     ) -> Result<Float64Array> {
@@ -1946,7 +2110,7 @@ impl OverGraph {
             node_label_filter,
             at_epoch,
         };
-        let members = with_engine_ref(self, |eng| eng.component_of(node_id, &opts))?;
+        let members = with_engine_ref(env, self, |eng| eng.component_of(node_id, &opts))?;
         ids_to_float64_array(&members)
     }
 
@@ -1955,6 +2119,7 @@ impl OverGraph {
     #[napi]
     pub fn vector_search(
         &self,
+        env: Env,
         mode: String,
         options: VectorSearchOptions,
     ) -> Result<Vec<VectorHit>> {
@@ -2000,7 +2165,7 @@ impl OverGraph {
             sparse_weight: sparse_weight.map(|v| v as f32),
             fusion_mode: fusion,
         };
-        let hits = with_engine_ref(self, |eng| eng.vector_search(&request))?;
+        let hits = with_engine_ref(env, self, |eng| eng.vector_search(&request))?;
         hits.into_iter()
             .map(|h| {
                 Ok(VectorHit {
@@ -2016,34 +2181,34 @@ impl OverGraph {
     /// Force an immediate WAL fsync. In GroupCommit mode, blocks until all
     /// buffered data is durable. In Immediate mode, this is a no-op.
     #[napi]
-    pub fn sync(&self) -> Result<()> {
-        with_engine(self, |eng| {
+    pub fn sync(&self, env: Env) -> Result<()> {
+        with_engine(env, self, |eng| {
             eng.sync()?;
             Ok(())
         })
     }
 
     #[napi]
-    pub fn flush(&self) -> Result<()> {
-        with_engine(self, |eng| {
+    pub fn flush(&self, env: Env) -> Result<()> {
+        with_engine(env, self, |eng| {
             eng.flush()?;
             Ok(())
         })
     }
 
     #[napi]
-    pub fn ingest_mode(&self) -> Result<()> {
-        with_engine(self, |eng| eng.ingest_mode())
+    pub fn ingest_mode(&self, env: Env) -> Result<()> {
+        with_engine(env, self, |eng| eng.ingest_mode())
     }
 
     #[napi]
-    pub fn end_ingest(&self) -> Result<Option<CompactionStats>> {
-        with_engine(self, |eng| Ok(eng.end_ingest()?.map(|s| s.into())))
+    pub fn end_ingest(&self, env: Env) -> Result<Option<CompactionStats>> {
+        with_engine(env, self, |eng| Ok(eng.end_ingest()?.map(|s| s.into())))
     }
 
     #[napi]
-    pub fn compact(&self) -> Result<Option<CompactionStats>> {
-        with_engine(self, |eng| Ok(eng.compact()?.map(|s| s.into())))
+    pub fn compact(&self, env: Env) -> Result<Option<CompactionStats>> {
+        with_engine(env, self, |eng| Ok(eng.compact()?.map(|s| s.into())))
     }
 
     /// Compact with a progress callback. The callback receives a progress object
@@ -2052,9 +2217,10 @@ impl OverGraph {
     #[napi(ts_args_type = "callback: (progress: CompactionProgress) => boolean")]
     pub fn compact_with_progress(
         &self,
+        env: Env,
         callback: Function<CompactionProgress, bool>,
     ) -> Result<Option<CompactionStats>> {
-        with_engine(self, |eng| {
+        with_engine(env, self, |eng| {
             let result = eng.compact_with_progress(|progress| {
                 let js_progress = CompactionProgress {
                     phase: match progress.phase {
@@ -2085,27 +2251,18 @@ impl OverGraph {
     }
 
     #[napi]
-    pub fn stats(&self) -> Result<DbStats> {
-        with_engine_ref(self, |eng| Ok(eng.stats()?.into()))
+    pub fn stats(&self, env: Env) -> Result<DbStats> {
+        with_engine_ref(env, self, |eng| Ok(eng.stats()?.into()))
     }
 
     #[napi]
-    pub fn scrub(&self) -> Result<ScrubReport> {
-        with_engine_ref(self, |eng| Ok(eng.scrub()?.into()))
+    pub fn scrub(&self, env: Env) -> Result<ScrubReport> {
+        with_engine_ref(env, self, |eng| Ok(eng.scrub()?.into()))
     }
 
     // ============================
     // Async API (Promise-returning)
     // ============================
-
-    #[napi(ts_return_type = "Promise<void>")]
-    pub fn close_async(&self, options: Option<CloseOptions>) -> AsyncTask<CloseOp> {
-        let force = options.as_ref().and_then(|o| o.force).unwrap_or(false);
-        AsyncTask::new(CloseOp {
-            db: self.inner.clone(),
-            force,
-        })
-    }
 
     #[napi(ts_return_type = "Promise<DbStats>")]
     pub fn stats_async(&self) -> AsyncTask<EngineReadOp<CoreDbStats, DbStats>> {
@@ -3125,13 +3282,14 @@ impl OverGraph {
     )]
     pub fn execute_gql_async(
         &self,
+        env: Env,
         query: String,
         params: Option<Unknown<'_>>,
         options: Option<GqlExecutionOptionsInput>,
     ) -> Result<AsyncTask<EngineOp<GqlExecutionResultPayload, GqlJsPayload>>> {
         let (options, compact_rows) = parse_js_gql_options(options)?;
-        let referenced_params = gql_referenced_param_names(&query, &options)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let referenced_params =
+            gql_referenced_param_names(&query, &options).map_err(|e| engine_error(env, e))?;
         let params = parse_js_gql_params(params, &referenced_params, &options)?;
         Ok(AsyncTask::new(EngineOp::new(
             self.inner.clone(),
@@ -3152,13 +3310,14 @@ impl OverGraph {
     )]
     pub fn explain_gql_async(
         &self,
+        env: Env,
         query: String,
         params: Option<Unknown<'_>>,
         options: Option<GqlExecutionOptionsInput>,
     ) -> Result<AsyncTask<EngineReadOp<GqlExecutionExplain, GqlJsPayload>>> {
         let (options, _) = parse_js_gql_options(options)?;
-        let referenced_params = gql_referenced_param_names(&query, &options)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let referenced_params =
+            gql_referenced_param_names(&query, &options).map_err(|e| engine_error(env, e))?;
         let params = parse_js_gql_params(params, &referenced_params, &options)?;
         Ok(AsyncTask::new(EngineReadOp::new(
             self.inner.clone(),
@@ -4064,9 +4223,126 @@ impl OverGraph {
         callback: ProgressTsfn,
     ) -> AsyncTask<CompactProgressOp> {
         AsyncTask::new(CompactProgressOp {
-            db: self.inner.clone(),
-            tsfn: callback,
+            db: Some(self.inner.clone()),
+            tsfn: Some(callback),
         })
+    }
+}
+
+#[cfg(feature = "binding-test-hooks")]
+#[napi]
+impl OverGraph {
+    #[napi]
+    pub fn binding_test_close_reference_held(&self) -> bool {
+        self.pending_close
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|pending| pending.has_reference())
+    }
+
+    #[napi]
+    pub fn binding_test_hold(&self, env: Env, point: String, path: String) -> Result<()> {
+        let engine = clone_engine_handle(&self.inner)?;
+        engine
+            .binding_test_handle()
+            .arm(&point, &path)
+            .map_err(|e| engine_error(env, e))
+    }
+    #[napi]
+    pub fn binding_test_fault(&self, env: Env, kind: String) -> Result<()> {
+        let engine = clone_engine_handle(&self.inner)?;
+        engine
+            .binding_test_fault(&kind)
+            .map_err(|e| engine_error(env, e))
+    }
+    #[napi]
+    pub fn binding_test_amount(&self, value: BigInt) -> Result<concurrency::DiagnosticAmount> {
+        let (negative, amount, lossless) = value.get_u64();
+        if negative || !lossless {
+            return Err(napi::Error::from_reason("test amount outside u64"));
+        }
+        Ok(concurrency::DiagnosticAmount(amount))
+    }
+}
+#[cfg(not(feature = "production-concurrency"))]
+#[napi]
+impl OverGraph {
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn close_async(&self, options: Option<CloseOptions>) -> AsyncTask<CloseOp> {
+        let force = options.as_ref().and_then(|o| o.force).unwrap_or(false);
+        AsyncTask::new(CloseOp {
+            db: Some(self.inner.clone()),
+            force,
+        })
+    }
+}
+#[cfg(feature = "production-concurrency")]
+#[napi]
+impl OverGraph {
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn close_async(&self, env: Env, options: Option<CloseOptions>) -> Result<Object<'static>> {
+        let mut pending = self
+            .pending_close
+            .lock()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        if let Some(close) = pending.as_ref() {
+            if !close.is_delivered() {
+                return close.get_promise(env);
+            }
+        }
+        if self.close_handle.is_complete() {
+            return concurrency::fulfilled(env);
+        }
+        let (promise, state) = concurrency::promise(env, self.close_handle.clone())?;
+        let force = options.as_ref().and_then(|o| o.force).unwrap_or(false);
+        let request = {
+            let mut guard = match self.inner.lock() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    self.close_handle.cancel_notification();
+                    state.discard(env)?;
+                    return Err(napi::Error::from_reason(error.to_string()));
+                }
+            };
+            match guard.as_ref() {
+                Some(db) => match db.engine.binding_request_close(force) {
+                    Ok(_) => Ok(guard.take()),
+                    Err(e) => Err(e),
+                },
+                None => Ok(None),
+            }
+        };
+        match request {
+            Ok(engine) => {
+                drop(engine);
+                if let Some(old) = pending.replace(state) {
+                    old.release(env)?;
+                }
+                Ok(promise)
+            }
+            Err(error) => {
+                self.close_handle.cancel_notification();
+                state.discard(env)?;
+                Err(engine_error(env, error))
+            }
+        }
+    }
+}
+
+impl ObjectFinalize for OverGraph {
+    fn finalize(self, env: Env) -> Result<()> {
+        #[cfg(feature = "production-concurrency")]
+        if let Some(pending) = self
+            .pending_close
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            pending.release(env)?;
+        }
+        #[cfg(not(feature = "production-concurrency"))]
+        let _ = env;
+        Ok(())
     }
 }
 
@@ -4084,6 +4360,7 @@ struct TxnAsyncOrder {
 struct TxnAsyncState {
     next_ticket: u64,
     serving_ticket: u64,
+    cancelled: BTreeSet<u64>,
 }
 
 impl TxnAsyncOrder {
@@ -4092,12 +4369,13 @@ impl TxnAsyncOrder {
             state: Mutex::new(TxnAsyncState {
                 next_ticket: 0,
                 serving_ticket: 0,
+                cancelled: BTreeSet::new(),
             }),
             cvar: Condvar::new(),
         }
     }
 
-    fn reserve_ticket(&self) -> Result<u64> {
+    fn reserve_ticket(self: &Arc<Self>) -> Result<TxnAsyncTicket> {
         let mut state = self
             .state
             .lock()
@@ -4106,10 +4384,13 @@ impl TxnAsyncOrder {
         state.next_ticket = state.next_ticket.checked_add(1).ok_or_else(|| {
             napi::Error::from_reason("transaction async queue overflow".to_string())
         })?;
-        Ok(ticket)
+        Ok(TxnAsyncTicket {
+            order: self.clone(),
+            ticket,
+        })
     }
 
-    fn wait_turn(self: &Arc<Self>, ticket: u64) -> Result<TxnAsyncTurn> {
+    fn wait_turn(&self, ticket: u64) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -4120,26 +4401,38 @@ impl TxnAsyncOrder {
                 .wait(state)
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         }
-        Ok(TxnAsyncTurn {
-            order: self.clone(),
-        })
+        Ok(())
     }
 
-    fn finish_turn(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.serving_ticket = state.serving_ticket.saturating_add(1);
-            self.cvar.notify_all();
+    fn finish_turn(&self, ticket: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if ticket == state.serving_ticket {
+            state.serving_ticket += 1;
+            loop {
+                let next = state.serving_ticket;
+                if !state.cancelled.remove(&next) {
+                    break;
+                }
+                state.serving_ticket += 1;
+            }
+        } else {
+            state.cancelled.insert(ticket);
         }
+        self.cvar.notify_all();
     }
 }
-
-struct TxnAsyncTurn {
+struct TxnAsyncTicket {
     order: Arc<TxnAsyncOrder>,
+    ticket: u64,
 }
-
-impl Drop for TxnAsyncTurn {
+impl TxnAsyncTicket {
+    fn wait(&self) -> Result<()> {
+        self.order.wait_turn(self.ticket)
+    }
+}
+impl Drop for TxnAsyncTicket {
     fn drop(&mut self) {
-        self.order.finish_turn();
+        self.order.finish_turn(self.ticket);
     }
 }
 
@@ -4150,6 +4443,17 @@ fn write_txn_to_js(txn: CoreWriteTxn) -> WriteTxn {
     }
 }
 
+#[cfg(feature = "binding-test-hooks")]
+#[napi]
+impl WriteTxn {
+    #[napi]
+    pub fn binding_test_cancel_ticket(&self) -> Result<()> {
+        let task = TxnAsyncOp::new(self, |_| Ok(()), napi_identity)?;
+        drop(task);
+        Ok(())
+    }
+}
+
 #[napi]
 impl WriteTxn {
     #[napi(
@@ -4157,6 +4461,7 @@ impl WriteTxn {
     )]
     pub fn upsert_node(
         &self,
+        env: Env,
         labels: serde_json::Value,
         key: String,
         options: Option<UpsertNodeOptions>,
@@ -4165,7 +4470,7 @@ impl WriteTxn {
         let ref_label = labels.first().cloned().ok_or_else(|| {
             napi::Error::from_reason("transaction upsertNode requires labels".to_string())
         })?;
-        with_txn(&self.inner, |txn| {
+        with_txn(env, &self.inner, |txn| {
             txn.upsert_node(labels, &key, js_upsert_node_options(options))
         })?;
         Ok(TxnNodeRef {
@@ -4181,33 +4486,37 @@ impl WriteTxn {
     )]
     pub fn upsert_node_as(
         &self,
+        env: Env,
         alias: String,
         labels: serde_json::Value,
         key: String,
         options: Option<UpsertNodeOptions>,
     ) -> Result<TxnNodeRef> {
         let labels = parse_js_node_labels_arg(&labels, "transaction upsertNodeAs labels")?;
-        let node_ref = with_txn(&self.inner, |txn| {
+        let node_ref = with_txn(env, &self.inner, |txn| {
             txn.upsert_node_as(&alias, labels, &key, js_upsert_node_options(options))
         })?;
         txn_node_ref_to_js(node_ref)
     }
 
     #[napi]
-    pub fn add_node_label(&self, target: TxnNodeRef, label: String) -> Result<bool> {
+    pub fn add_node_label(&self, env: Env, target: TxnNodeRef, label: String) -> Result<bool> {
         let target = js_txn_node_ref_to_rust(target)?;
-        with_txn(&self.inner, |txn| txn.add_node_label(target, &label))
+        with_txn(env, &self.inner, |txn| txn.add_node_label(target, &label))
     }
 
     #[napi]
-    pub fn remove_node_label(&self, target: TxnNodeRef, label: String) -> Result<bool> {
+    pub fn remove_node_label(&self, env: Env, target: TxnNodeRef, label: String) -> Result<bool> {
         let target = js_txn_node_ref_to_rust(target)?;
-        with_txn(&self.inner, |txn| txn.remove_node_label(target, &label))
+        with_txn(env, &self.inner, |txn| {
+            txn.remove_node_label(target, &label)
+        })
     }
 
     #[napi]
     pub fn upsert_edge(
         &self,
+        env: Env,
         from: TxnNodeRef,
         to: TxnNodeRef,
         label: String,
@@ -4215,7 +4524,7 @@ impl WriteTxn {
     ) -> Result<TxnEdgeRef> {
         let from_rust = js_txn_node_ref_to_rust(from.clone())?;
         let to_rust = js_txn_node_ref_to_rust(to.clone())?;
-        with_txn(&self.inner, |txn| {
+        with_txn(env, &self.inner, |txn| {
             txn.upsert_edge(from_rust, to_rust, &label, js_upsert_edge_options(options))
         })?;
         Ok(TxnEdgeRef {
@@ -4230,6 +4539,7 @@ impl WriteTxn {
     #[napi]
     pub fn upsert_edge_as(
         &self,
+        env: Env,
         alias: String,
         from: TxnNodeRef,
         to: TxnNodeRef,
@@ -4238,83 +4548,93 @@ impl WriteTxn {
     ) -> Result<TxnEdgeRef> {
         let from = js_txn_node_ref_to_rust(from)?;
         let to = js_txn_node_ref_to_rust(to)?;
-        let edge_ref = with_txn(&self.inner, |txn| {
+        let edge_ref = with_txn(env, &self.inner, |txn| {
             txn.upsert_edge_as(&alias, from, to, &label, js_upsert_edge_options(options))
         })?;
         txn_edge_ref_to_js(edge_ref)
     }
 
     #[napi]
-    pub fn delete_node(&self, target: TxnNodeRef) -> Result<()> {
+    pub fn delete_node(&self, env: Env, target: TxnNodeRef) -> Result<()> {
         let target = js_txn_node_ref_to_rust(target)?;
-        with_txn(&self.inner, |txn| txn.delete_node(target))
+        with_txn(env, &self.inner, |txn| txn.delete_node(target))
     }
 
     #[napi]
-    pub fn delete_edge(&self, target: TxnEdgeRef) -> Result<()> {
+    pub fn delete_edge(&self, env: Env, target: TxnEdgeRef) -> Result<()> {
         let target = js_txn_edge_ref_to_rust(target)?;
-        with_txn(&self.inner, |txn| txn.delete_edge(target))
+        with_txn(env, &self.inner, |txn| txn.delete_edge(target))
     }
 
     #[napi]
-    pub fn invalidate_edge(&self, target: TxnEdgeRef, valid_to: i64) -> Result<()> {
+    pub fn invalidate_edge(&self, env: Env, target: TxnEdgeRef, valid_to: i64) -> Result<()> {
         let target = js_txn_edge_ref_to_rust(target)?;
-        with_txn(&self.inner, |txn| txn.invalidate_edge(target, valid_to))
+        with_txn(env, &self.inner, |txn| {
+            txn.invalidate_edge(target, valid_to)
+        })
     }
 
     #[napi(
         ts_args_type = "operations: Array<{ op: 'upsertNode'; alias?: string; labels: string | string[]; key: string; props?: Record<string, any>; weight?: number; denseVector?: Array<number>; sparseVector?: Array<SparseEntry> } | { op: 'upsertEdge'; alias?: string; from: TxnNodeRef; to: TxnNodeRef; label: string; props?: Record<string, any>; weight?: number; validFrom?: number; validTo?: number } | { op: 'deleteNode'; target: TxnEdgeOrNodeRef } | { op: 'deleteEdge'; target: TxnEdgeOrNodeRef } | { op: 'invalidateEdge'; target: TxnEdgeOrNodeRef; validTo: number }>"
     )]
-    pub fn stage(&self, operations: Vec<serde_json::Value>) -> Result<()> {
+    pub fn stage(&self, env: Env, operations: Vec<serde_json::Value>) -> Result<()> {
         let intents = operations
             .into_iter()
             .map(js_txn_operation_to_rust)
             .collect::<Result<Vec<_>>>()?;
-        with_txn(&self.inner, |txn| txn.stage_intents(intents))
+        with_txn(env, &self.inner, |txn| txn.stage_intents(intents))
     }
 
     #[napi]
-    pub fn get_node(&self, target: TxnNodeRef) -> Result<Option<TxnNodeView>> {
+    pub fn get_node(&self, env: Env, target: TxnNodeRef) -> Result<Option<TxnNodeView>> {
         let target = js_txn_node_ref_to_rust(target)?;
-        let view = with_txn_ref(&self.inner, |txn| txn.get_node(target))?;
+        let view = with_txn_ref(env, &self.inner, |txn| txn.get_node(target))?;
         view.map(txn_node_view_to_js).transpose()
     }
 
     #[napi]
-    pub fn get_edge(&self, target: TxnEdgeRef) -> Result<Option<TxnEdgeView>> {
+    pub fn get_edge(&self, env: Env, target: TxnEdgeRef) -> Result<Option<TxnEdgeView>> {
         let target = js_txn_edge_ref_to_rust(target)?;
-        let view = with_txn_ref(&self.inner, |txn| txn.get_edge(target))?;
+        let view = with_txn_ref(env, &self.inner, |txn| txn.get_edge(target))?;
         view.map(txn_edge_view_to_js).transpose()
     }
 
     #[napi]
-    pub fn get_node_by_key(&self, label: String, key: String) -> Result<Option<TxnNodeView>> {
-        let view = with_txn_ref(&self.inner, |txn| txn.get_node_by_key(&label, &key))?;
+    pub fn get_node_by_key(
+        &self,
+        env: Env,
+        label: String,
+        key: String,
+    ) -> Result<Option<TxnNodeView>> {
+        let view = with_txn_ref(env, &self.inner, |txn| txn.get_node_by_key(&label, &key))?;
         view.map(txn_node_view_to_js).transpose()
     }
 
     #[napi]
     pub fn get_edge_by_triple(
         &self,
+        env: Env,
         from: TxnNodeRef,
         to: TxnNodeRef,
         label: String,
     ) -> Result<Option<TxnEdgeView>> {
         let from = js_txn_node_ref_to_rust(from)?;
         let to = js_txn_node_ref_to_rust(to)?;
-        let view = with_txn_ref(&self.inner, |txn| txn.get_edge_by_triple(from, to, &label))?;
+        let view = with_txn_ref(env, &self.inner, |txn| {
+            txn.get_edge_by_triple(from, to, &label)
+        })?;
         view.map(txn_edge_view_to_js).transpose()
     }
 
     #[napi]
-    pub fn commit(&self) -> Result<TxnCommitResult> {
-        let result = with_txn_take(&self.inner, |txn| txn.commit())?;
+    pub fn commit(&self, env: Env) -> Result<TxnCommitResult> {
+        let result = with_txn_take(env, &self.inner, |txn| txn.commit())?;
         txn_commit_result_to_js(result)
     }
 
     #[napi]
-    pub fn rollback(&self) -> Result<()> {
-        with_txn_take(&self.inner, |txn| txn.rollback())
+    pub fn rollback(&self, env: Env) -> Result<()> {
+        with_txn_take(env, &self.inner, |txn| txn.rollback())
     }
 
     #[napi(
@@ -4786,6 +5106,8 @@ pub struct FindNodesPagedOptions {
     pub after: Option<f64>,
 }
 
+// Precise discriminated declarations are retained in dts-header.d.ts;
+// scripts/finalize-declarations.mjs removes the generated wire interfaces.
 #[napi(object)]
 pub struct SecondaryIndexField {
     pub source: String,
@@ -4804,8 +5126,11 @@ pub struct NodePropertyIndexInfo {
     pub index_id: f64,
     pub label: String,
     pub fields: Vec<SecondaryIndexField>,
+    #[napi(ts_type = "SecondaryIndexKind")]
     pub kind: String,
+    #[napi(ts_type = "'building' | 'ready' | 'failed'")]
     pub state: String,
+    #[napi(ts_type = "string | null")]
     pub last_error: serde_json::Value,
     pub compound: bool,
 }
@@ -4815,8 +5140,11 @@ pub struct EdgePropertyIndexInfo {
     pub index_id: f64,
     pub label: String,
     pub fields: Vec<SecondaryIndexField>,
+    #[napi(ts_type = "SecondaryIndexKind")]
     pub kind: String,
+    #[napi(ts_type = "'building' | 'ready' | 'failed'")]
     pub state: String,
+    #[napi(ts_type = "string | null")]
     pub last_error: serde_json::Value,
     pub compound: bool,
 }
@@ -5045,6 +5373,7 @@ fn js_scrub_path_options_to_rust(options: Option<ScrubPathOptions>) -> CoreScrub
 
 #[napi(object)]
 pub struct DatabaseScrubReport {
+    #[napi(ts_type = "ManifestScrubSummary | null")]
     pub manifest: serde_json::Value,
     pub findings: Vec<DatabaseScrubFinding>,
     pub segments: Vec<SegmentScrubResult>,
@@ -5061,6 +5390,7 @@ pub struct DatabaseScrubReport {
 
 #[napi(object)]
 pub struct ManifestScrubSummary {
+    #[napi(ts_type = "ManifestScrubSource")]
     pub source: String,
     pub segment_count: f64,
     pub pending_flush_count: f64,
@@ -5071,7 +5401,9 @@ pub struct ManifestScrubSummary {
 #[napi(object)]
 pub struct DatabaseScrubFinding {
     pub component_kind: String,
+    #[napi(ts_type = "DatabaseScrubFindingType")]
     pub finding_type: String,
+    #[napi(ts_type = "DatabaseScrubSeverity")]
     pub severity: String,
     pub detail: String,
 }
@@ -5079,8 +5411,11 @@ pub struct DatabaseScrubFinding {
 #[napi(object)]
 pub struct WalScrubResult {
     pub generation_id: f64,
+    #[napi(ts_type = "WalScrubRole")]
     pub role: String,
+    #[napi(ts_type = "number | null")]
     pub epoch_id: serde_json::Value,
+    #[napi(ts_type = "number | null")]
     pub segment_id: serde_json::Value,
     pub file_len: f64,
     pub durable_len: f64,
@@ -5092,6 +5427,7 @@ pub struct WalScrubResult {
 
 #[napi(object)]
 pub struct OrphanSegmentScrubResult {
+    #[napi(ts_type = "number | null")]
     pub segment_id: serde_json::Value,
     pub path: String,
     pub findings: Vec<ComponentScrubFinding>,
@@ -5261,8 +5597,10 @@ pub struct DenseVectorConfig {
     pub metric: Option<String>,
 }
 
-#[napi(object)]
+#[napi(object, object_to_js = false)]
 pub struct DbOptions {
+    #[napi(ts_type = "ConcurrencyOptions | null")]
+    pub concurrency: Option<concurrency::ConcurrencyInput>,
     pub create_if_missing: Option<bool>,
     pub edge_uniqueness: Option<bool>,
     pub memtable_flush_threshold: Option<u32>,
@@ -11602,23 +11940,25 @@ pub struct ScrubPathOp {
 }
 
 impl Task for ScrubPathOp {
-    type Output = CoreDatabaseScrubReport;
+    type Output = std::result::Result<CoreDatabaseScrubReport, EngineError>;
     type JsValue = DatabaseScrubReport;
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
-        overgraph::scrub_path_with_options(&self.path, &self.options)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))
+        Ok(overgraph::scrub_path_with_options(
+            &self.path,
+            &self.options,
+        ))
     }
 
-    fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
-        Ok(output.into())
+    fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        Ok(output.map_err(|e| engine_error(env, e))?.into())
     }
 }
 
 /// Generic async task for write operations: runs on the libuv thread pool
 /// using a cloned shared engine handle, without holding the wrapper lock.
 pub struct EngineOp<T: Send + 'static, J: ToNapiValue + TypeName + 'static> {
-    db: Arc<Mutex<Option<InnerDb>>>,
+    db: Option<Arc<Mutex<Option<InnerDb>>>>,
     op: Option<Box<dyn FnOnce(&DatabaseEngine) -> std::result::Result<T, EngineError> + Send>>,
     convert: fn(T) -> napi::Result<J>,
 }
@@ -11630,7 +11970,7 @@ impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> EngineOp<T, J> {
         convert: fn(T) -> napi::Result<J>,
     ) -> Self {
         Self {
-            db,
+            db: Some(db),
             op: Some(Box::new(op)),
             convert,
         }
@@ -11638,26 +11978,37 @@ impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> EngineOp<T, J> {
 }
 
 impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> Task for EngineOp<T, J> {
-    type Output = T;
+    type Output = std::result::Result<T, EngineError>;
     type JsValue = J;
 
-    fn compute(&mut self) -> napi::Result<T> {
+    fn compute(&mut self) -> napi::Result<Self::Output> {
         let op = self.op.take().ok_or_else(|| {
             napi::Error::from_reason("EngineOp::compute called twice".to_string())
         })?;
-        let engine = clone_engine_handle(&self.db)?;
-        op(&engine).map_err(|e| napi::Error::from_reason(e.to_string()))
+        let db = self
+            .db
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("native task computed twice"))?;
+        let engine = clone_engine_handle(&db)?;
+        #[cfg(feature = "binding-test-hooks")]
+        let hooks = engine.binding_test_handle();
+        let result = op(&engine);
+        drop(engine);
+        drop(db);
+        #[cfg(feature = "binding-test-hooks")]
+        hooks.hit("handoff");
+        Ok(result)
     }
 
-    fn resolve(&mut self, _env: Env, output: T) -> napi::Result<J> {
-        (self.convert)(output)
+    fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<J> {
+        (self.convert)(output.map_err(|e| engine_error(env, e))?)
     }
 }
 
 /// Generic async task for read-only operations: runs on the libuv thread pool
 /// using a cloned shared engine handle, without holding the wrapper lock.
 pub struct EngineReadOp<T: Send + 'static, J: ToNapiValue + TypeName + 'static> {
-    db: Arc<Mutex<Option<InnerDb>>>,
+    db: Option<Arc<Mutex<Option<InnerDb>>>>,
     op: Option<Box<dyn FnOnce(&DatabaseEngine) -> std::result::Result<T, EngineError> + Send>>,
     convert: fn(T) -> napi::Result<J>,
 }
@@ -11669,7 +12020,7 @@ impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> EngineReadOp<T, J> 
         convert: fn(T) -> napi::Result<J>,
     ) -> Self {
         Self {
-            db,
+            db: Some(db),
             op: Some(Box::new(op)),
             convert,
         }
@@ -11677,36 +12028,50 @@ impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> EngineReadOp<T, J> 
 }
 
 impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> Task for EngineReadOp<T, J> {
-    type Output = T;
+    type Output = std::result::Result<T, EngineError>;
     type JsValue = J;
 
-    fn compute(&mut self) -> napi::Result<T> {
+    fn compute(&mut self) -> napi::Result<Self::Output> {
         let op = self.op.take().ok_or_else(|| {
             napi::Error::from_reason("EngineReadOp::compute called twice".to_string())
         })?;
-        let engine = clone_engine_handle(&self.db)?;
-        op(&engine).map_err(|e| napi::Error::from_reason(e.to_string()))
+        let db = self
+            .db
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("native task computed twice"))?;
+        let engine = clone_engine_handle(&db)?;
+        #[cfg(feature = "binding-test-hooks")]
+        let hooks = engine.binding_test_handle();
+        let result = op(&engine);
+        drop(engine);
+        drop(db);
+        #[cfg(feature = "binding-test-hooks")]
+        hooks.hit("handoff");
+        Ok(result)
     }
 
-    fn resolve(&mut self, _env: Env, output: T) -> napi::Result<J> {
-        (self.convert)(output)
+    fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<J> {
+        (self.convert)(output.map_err(|e| engine_error(env, e))?)
     }
 }
 
 /// Close task: takes ownership of the engine to call close(self) or close_fast(self).
 pub struct CloseOp {
-    db: Arc<Mutex<Option<InnerDb>>>,
+    db: Option<Arc<Mutex<Option<InnerDb>>>>,
     force: bool,
 }
 
 impl Task for CloseOp {
-    type Output = ();
+    type Output = std::result::Result<(), EngineError>;
     type JsValue = ();
 
-    fn compute(&mut self) -> napi::Result<()> {
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        let db = self
+            .db
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("native task computed twice"))?;
         let engine = {
-            let mut guard = self
-                .db
+            let mut guard = db
                 .lock()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
             guard.take().map(|db| db.engine)
@@ -11717,13 +12082,16 @@ impl Task for CloseOp {
             } else {
                 engine.close()
             };
-            result.map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            drop(engine);
+            drop(db);
+            return Ok(result);
         }
-        Ok(())
+        drop(db);
+        Ok(Ok(()))
     }
 
-    fn resolve(&mut self, _env: Env, _output: ()) -> napi::Result<()> {
-        Ok(())
+    fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<()> {
+        output.map_err(|e| engine_error(env, e))
     }
 }
 
@@ -11731,17 +12099,26 @@ impl Task for CloseOp {
 /// sends progress updates to the JS main thread via ThreadsafeFunction.
 /// Progress callback is fire-and-forget (void return, no cancellation).
 pub struct CompactProgressOp {
-    db: Arc<Mutex<Option<InnerDb>>>,
-    tsfn: ProgressTsfn,
+    db: Option<Arc<Mutex<Option<InnerDb>>>>,
+    tsfn: Option<ProgressTsfn>,
 }
 
 impl Task for CompactProgressOp {
-    type Output = Option<CoreCompactionStats>;
+    type Output = std::result::Result<Option<CoreCompactionStats>, EngineError>;
     type JsValue = Option<CompactionStats>;
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
-        let engine = clone_engine_handle(&self.db)?;
-        let tsfn = &self.tsfn;
+        let db = self
+            .db
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("native task computed twice"))?;
+        let tsfn = self
+            .tsfn
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("native task computed twice"))?;
+        let engine = clone_engine_handle(&db)?;
+        #[cfg(feature = "binding-test-hooks")]
+        let hooks = engine.binding_test_handle();
         let result = engine.compact_with_progress(|progress| {
             let js_progress = CompactionProgress {
                 phase: match progress.phase {
@@ -11760,20 +12137,24 @@ impl Task for CompactProgressOp {
             true
         });
 
-        result.map_err(|e| napi::Error::from_reason(e.to_string()))
+        drop(tsfn);
+        drop(engine);
+        drop(db);
+        #[cfg(feature = "binding-test-hooks")]
+        hooks.hit("handoff");
+        Ok(result)
     }
 
-    fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
-        Ok(output.map(|s| s.into()))
+    fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        Ok(output.map_err(|e| engine_error(env, e))?.map(|s| s.into()))
     }
 }
 
 /// Async task for stateful transaction operations. Tickets preserve JS call order
 /// even when libuv schedules multiple operations on the same transaction in parallel.
 pub struct TxnAsyncOp<T: Send + 'static, J: ToNapiValue + TypeName + 'static> {
-    inner: Arc<Mutex<Option<CoreWriteTxn>>>,
-    order: Arc<TxnAsyncOrder>,
-    ticket: u64,
+    inner: Option<Arc<Mutex<Option<CoreWriteTxn>>>>,
+    ticket: Option<TxnAsyncTicket>,
     op: Option<Box<dyn FnOnce(&mut CoreWriteTxn) -> std::result::Result<T, EngineError> + Send>>,
     convert: fn(T) -> napi::Result<J>,
 }
@@ -11786,9 +12167,8 @@ impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> TxnAsyncOp<T, J> {
     ) -> Result<Self> {
         let ticket = txn.async_order.reserve_ticket()?;
         Ok(Self {
-            inner: txn.inner.clone(),
-            order: txn.async_order.clone(),
-            ticket,
+            inner: Some(txn.inner.clone()),
+            ticket: Some(ticket),
             op: Some(Box::new(op)),
             convert,
         })
@@ -11796,34 +12176,48 @@ impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> TxnAsyncOp<T, J> {
 }
 
 impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> Task for TxnAsyncOp<T, J> {
-    type Output = T;
+    type Output = std::result::Result<T, EngineError>;
     type JsValue = J;
 
-    fn compute(&mut self) -> napi::Result<T> {
-        let _turn = self.order.wait_turn(self.ticket)?;
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        let ticket = self
+            .ticket
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("native task computed twice"))?;
+        let inner = self
+            .inner
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("native task computed twice"))?;
         let op = self.op.take().ok_or_else(|| {
             napi::Error::from_reason("TxnAsyncOp::compute called twice".to_string())
         })?;
-        let mut guard = self
-            .inner
+        ticket.wait()?;
+        let mut guard = inner
             .lock()
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         let txn = guard
             .as_mut()
             .ok_or_else(|| napi::Error::from_reason(EngineError::TxnClosed.to_string()))?;
-        op(txn).map_err(|e| napi::Error::from_reason(e.to_string()))
+        #[cfg(feature = "binding-test-hooks")]
+        let hooks = txn.binding_test_handle();
+        let result = op(txn);
+        drop(guard);
+        drop(inner);
+        drop(ticket);
+        #[cfg(feature = "binding-test-hooks")]
+        hooks.hit("handoff");
+        Ok(result)
     }
 
-    fn resolve(&mut self, _env: Env, output: T) -> napi::Result<J> {
-        (self.convert)(output)
+    fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<J> {
+        (self.convert)(output.map_err(|e| engine_error(env, e))?)
     }
 }
 
 /// Async task for transaction operations that consume the transaction handle.
 pub struct TxnAsyncTakeOp<T: Send + 'static, J: ToNapiValue + TypeName + 'static> {
-    inner: Arc<Mutex<Option<CoreWriteTxn>>>,
-    order: Arc<TxnAsyncOrder>,
-    ticket: u64,
+    inner: Option<Arc<Mutex<Option<CoreWriteTxn>>>>,
+    ticket: Option<TxnAsyncTicket>,
     op: Option<Box<dyn FnOnce(&mut CoreWriteTxn) -> std::result::Result<T, EngineError> + Send>>,
     convert: fn(T) -> napi::Result<J>,
 }
@@ -11836,9 +12230,8 @@ impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> TxnAsyncTakeOp<T, J
     ) -> Result<Self> {
         let ticket = txn.async_order.reserve_ticket()?;
         Ok(Self {
-            inner: txn.inner.clone(),
-            order: txn.async_order.clone(),
-            ticket,
+            inner: Some(txn.inner.clone()),
+            ticket: Some(ticket),
             op: Some(Box::new(op)),
             convert,
         })
@@ -11846,28 +12239,43 @@ impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> TxnAsyncTakeOp<T, J
 }
 
 impl<T: Send + 'static, J: ToNapiValue + TypeName + 'static> Task for TxnAsyncTakeOp<T, J> {
-    type Output = T;
+    type Output = std::result::Result<T, EngineError>;
     type JsValue = J;
 
-    fn compute(&mut self) -> napi::Result<T> {
-        let _turn = self.order.wait_turn(self.ticket)?;
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        let ticket = self
+            .ticket
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("native task computed twice"))?;
+        let inner = self
+            .inner
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("native task computed twice"))?;
         let op = self.op.take().ok_or_else(|| {
             napi::Error::from_reason("TxnAsyncTakeOp::compute called twice".to_string())
         })?;
+        ticket.wait()?;
         let mut txn = {
-            let mut guard = self
-                .inner
+            let mut guard = inner
                 .lock()
                 .map_err(|e| napi::Error::from_reason(e.to_string()))?;
             guard
                 .take()
                 .ok_or_else(|| napi::Error::from_reason(EngineError::TxnClosed.to_string()))?
         };
-        op(&mut txn).map_err(|e| napi::Error::from_reason(e.to_string()))
+        #[cfg(feature = "binding-test-hooks")]
+        let hooks = txn.binding_test_handle();
+        let result = op(&mut txn);
+        drop(txn);
+        drop(inner);
+        drop(ticket);
+        #[cfg(feature = "binding-test-hooks")]
+        hooks.hit("handoff");
+        Ok(result)
     }
 
-    fn resolve(&mut self, _env: Env, output: T) -> napi::Result<J> {
-        (self.convert)(output)
+    fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<J> {
+        (self.convert)(output.map_err(|e| engine_error(env, e))?)
     }
 }
 
@@ -11879,20 +12287,28 @@ fn napi_identity<T>(value: T) -> Result<T> {
     Ok(value)
 }
 
-fn with_engine<F, T>(db: &OverGraph, f: F) -> Result<T>
+fn with_engine<F, T>(env: Env, db: &OverGraph, f: F) -> Result<T>
 where
     F: FnOnce(&DatabaseEngine) -> std::result::Result<T, EngineError>,
 {
     let engine = clone_engine_handle(&db.inner)?;
-    f(&engine).map_err(|e| napi::Error::from_reason(e.to_string()))
+    {
+        let result = f(&engine);
+        drop(engine);
+        result.map_err(|e| engine_error(env, e))
+    }
 }
 
-fn with_engine_ref<F, T>(db: &OverGraph, f: F) -> Result<T>
+fn with_engine_ref<F, T>(env: Env, db: &OverGraph, f: F) -> Result<T>
 where
     F: FnOnce(&DatabaseEngine) -> std::result::Result<T, EngineError>,
 {
     let engine = clone_engine_handle(&db.inner)?;
-    f(&engine).map_err(|e| napi::Error::from_reason(e.to_string()))
+    {
+        let result = f(&engine);
+        drop(engine);
+        result.map_err(|e| engine_error(env, e))
+    }
 }
 
 fn clone_engine_handle(db: &Arc<Mutex<Option<InnerDb>>>) -> Result<DatabaseEngine> {
@@ -11905,7 +12321,7 @@ fn clone_engine_handle(db: &Arc<Mutex<Option<InnerDb>>>) -> Result<DatabaseEngin
     Ok(inner.engine.clone())
 }
 
-fn with_txn<F, T>(inner: &Arc<Mutex<Option<CoreWriteTxn>>>, f: F) -> Result<T>
+fn with_txn<F, T>(env: Env, inner: &Arc<Mutex<Option<CoreWriteTxn>>>, f: F) -> Result<T>
 where
     F: FnOnce(&mut CoreWriteTxn) -> std::result::Result<T, EngineError>,
 {
@@ -11915,10 +12331,14 @@ where
     let txn = guard
         .as_mut()
         .ok_or_else(|| napi::Error::from_reason(EngineError::TxnClosed.to_string()))?;
-    f(txn).map_err(|e| napi::Error::from_reason(e.to_string()))
+    {
+        let result = f(txn);
+        drop(guard);
+        result.map_err(|e| engine_error(env, e))
+    }
 }
 
-fn with_txn_ref<F, T>(inner: &Arc<Mutex<Option<CoreWriteTxn>>>, f: F) -> Result<T>
+fn with_txn_ref<F, T>(env: Env, inner: &Arc<Mutex<Option<CoreWriteTxn>>>, f: F) -> Result<T>
 where
     F: FnOnce(&CoreWriteTxn) -> std::result::Result<T, EngineError>,
 {
@@ -11928,10 +12348,14 @@ where
     let txn = guard
         .as_ref()
         .ok_or_else(|| napi::Error::from_reason(EngineError::TxnClosed.to_string()))?;
-    f(txn).map_err(|e| napi::Error::from_reason(e.to_string()))
+    {
+        let result = f(txn);
+        drop(guard);
+        result.map_err(|e| engine_error(env, e))
+    }
 }
 
-fn with_txn_take<F, T>(inner: &Arc<Mutex<Option<CoreWriteTxn>>>, f: F) -> Result<T>
+fn with_txn_take<F, T>(env: Env, inner: &Arc<Mutex<Option<CoreWriteTxn>>>, f: F) -> Result<T>
 where
     F: FnOnce(&mut CoreWriteTxn) -> std::result::Result<T, EngineError>,
 {
@@ -11943,7 +12367,11 @@ where
             .take()
             .ok_or_else(|| napi::Error::from_reason(EngineError::TxnClosed.to_string()))?
     };
-    f(&mut txn).map_err(|e| napi::Error::from_reason(e.to_string()))
+    {
+        let result = f(&mut txn);
+        drop(txn);
+        result.map_err(|e| engine_error(env, e))
+    }
 }
 
 fn js_upsert_node_options(options: Option<UpsertNodeOptions>) -> CoreUpsertNodeOptions {

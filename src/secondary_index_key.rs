@@ -5,7 +5,7 @@ use crate::property_value_semantics::{
 };
 use crate::types::{
     edge_metadata_index_field_name, fnv1a, node_metadata_index_field_name,
-    EdgeMetadataIndexFieldManifest, NodeMetadataIndexFieldManifest, PropValue, SecondaryIndexField,
+    EdgeMetadataIndexFieldManifest, NodeMetadataIndexFieldManifest, PropValue,
     SecondaryIndexFieldManifest, SecondaryIndexKind, SecondaryIndexManifestEntry,
     SecondaryIndexTarget,
 };
@@ -1350,34 +1350,14 @@ pub(crate) fn field_source(field: &SecondaryIndexFieldManifest) -> CompoundField
     }
 }
 
-pub(crate) fn public_field_source(field: &SecondaryIndexField) -> CompoundFieldSource {
+pub(crate) fn canonical_field_name(field: &SecondaryIndexFieldManifest) -> &str {
     match field {
-        SecondaryIndexField::Property { .. } => CompoundFieldSource::Property,
-        SecondaryIndexField::NodeMetadata(_) => CompoundFieldSource::NodeMetadata,
-        SecondaryIndexField::EdgeMetadata(_) => CompoundFieldSource::EdgeMetadata,
-    }
-}
-
-pub(crate) fn canonical_field_name(field: &SecondaryIndexFieldManifest) -> String {
-    match field {
-        SecondaryIndexFieldManifest::Property { key } => key.clone(),
+        SecondaryIndexFieldManifest::Property { key } => key,
         SecondaryIndexFieldManifest::NodeMetadata { field } => {
-            node_metadata_index_field_name((*field).into()).to_string()
+            node_metadata_index_field_name((*field).into())
         }
         SecondaryIndexFieldManifest::EdgeMetadata { field } => {
-            edge_metadata_index_field_name((*field).into()).to_string()
-        }
-    }
-}
-
-pub(crate) fn public_canonical_field_name(field: &SecondaryIndexField) -> String {
-    match field {
-        SecondaryIndexField::Property { key } => key.clone(),
-        SecondaryIndexField::NodeMetadata(field) => {
-            node_metadata_index_field_name(*field).to_string()
-        }
-        SecondaryIndexField::EdgeMetadata(field) => {
-            edge_metadata_index_field_name(*field).to_string()
+            edge_metadata_index_field_name((*field).into())
         }
     }
 }

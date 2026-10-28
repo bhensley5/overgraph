@@ -2403,7 +2403,14 @@ mod tests {
     fn create_declared_node_property_scrub_db() -> (TempDir, PathBuf, DatabaseEngine, u64, u64) {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let db = open_test_db(&db_path);
+        let db = crate::engine::open_index_protocol_fixture(
+            &db_path,
+            &DbOptions {
+                compact_after_n_flushes: 0,
+                ..DbOptions::default()
+            },
+        )
+        .unwrap();
         let eq = db
             .ensure_node_property_index(
                 "Researcher",
@@ -2426,6 +2433,21 @@ mod tests {
                 },
             )
             .unwrap();
+        // These sidecars must be maintained by real Ready indexes. Stopping the
+        // worker while a build is queued can cancel it; never forge readiness.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        for index_id in [eq.index_id, range.index_id] {
+            loop {
+                let info = db.list_node_property_indexes().unwrap().into_iter()
+                    .find(|info| info.index_id == index_id).unwrap();
+                assert_ne!(info.state, SecondaryIndexState::Failed, "{info:?}");
+                if info.state == SecondaryIndexState::Ready {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "index not ready: {info:?}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
         db.shutdown_secondary_index_worker();
 
         let nodes: Vec<NodeInput> = (0..4)
@@ -2448,16 +2470,17 @@ mod tests {
             .collect();
         db.batch_upsert_nodes(nodes).unwrap();
         db.flush().unwrap();
-        db.with_runtime_manifest_write(|manifest| {
-            for entry in &mut manifest.secondary_indexes {
-                if entry.index_id == eq.index_id || entry.index_id == range.index_id {
-                    entry.state = SecondaryIndexState::Ready;
-                    entry.last_error = None;
-                }
-            }
-            Ok(())
-        })
-        .unwrap();
+        let mut range_ids = db.find_nodes_range(
+            "Researcher", "score",
+            Some(&crate::types::PropertyRangeBound::Included(PropValue::Int(10))),
+            Some(&crate::types::PropertyRangeBound::Included(PropValue::Int(13))),
+        ).unwrap();
+        range_ids.sort_unstable();
+        let mut expected_ids = db.get_nodes_by_labels("Researcher").unwrap()
+            .into_iter().map(|node| node.id).collect::<Vec<_>>();
+        expected_ids.sort_unstable();
+        assert_eq!(expected_ids.len(), 4);
+        assert_eq!(range_ids, expected_ids);
         (dir, db_path, db, eq.index_id, range.index_id)
     }
 
@@ -3019,7 +3042,14 @@ mod tests {
     fn scrub_does_not_require_missing_building_declared_node_property_sidecar() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let db = open_test_db(&db_path);
+        let db = crate::engine::open_index_protocol_fixture(
+            &db_path,
+            &DbOptions {
+                compact_after_n_flushes: 0,
+                ..DbOptions::default()
+            },
+        )
+        .unwrap();
         let mut props = BTreeMap::new();
         props.insert(
             "status".to_string(),

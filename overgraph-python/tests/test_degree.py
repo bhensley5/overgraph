@@ -1,3 +1,4 @@
+from conftest import drain_after_close
 import time
 import os
 import pytest
@@ -180,14 +181,14 @@ class TestDegreeSidecars:
         assert abs(db.avg_edge_weight(a) - 3.0) < 1e-6
         assert db.degrees([a, b, c])[a] == 2
         db.close()
-
+        drain_after_close(db)
         reopened = OverGraph.open(db_path)
         assert reopened.degree(a) == 2
         assert abs(reopened.sum_edge_weights(a) - 6.0) < 1e-6
         assert abs(reopened.avg_edge_weight(a) - 3.0) < 1e-6
         assert reopened.degrees([a, b, c])[a] == 2
         reopened.close()
-
+        drain_after_close(reopened)
     def test_corrupt_degree_sidecar_falls_back(self, db_path):
         db = OverGraph.open(db_path)
         a = db.upsert_node("Person", "a")
@@ -195,7 +196,7 @@ class TestDegreeSidecars:
         db.upsert_edge(a, b, "RELATES_TO", weight=5.0)
         db.flush()
         db.close()
-
+        drain_after_close(db)
         segments_dir = os.path.join(db_path, "segments")
         sidecars = [
             os.path.join(segments_dir, name, "degree_delta.dat")
@@ -213,8 +214,7 @@ class TestDegreeSidecars:
         assert reopened.degrees([a, b])[a] == 1
         assert len(reopened.neighbors(a)) == 1
         reopened.close()
-
-
+        drain_after_close(reopened)
 class TestDegreeTemporal:
     def test_ignores_expired_edge(self, db):
         a = db.upsert_node("Person", "a")

@@ -1,3 +1,4 @@
+import { drainAfterClose } from './helpers/native-lifecycle.mjs';
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -14,6 +15,7 @@ function tempDb(name, options = undefined) {
     db,
     close() {
       db.close();
+      drainAfterClose(db);
       rmSync(tmpDir, { recursive: true, force: true });
     },
   };
@@ -36,6 +38,7 @@ describe('schema management APIs', () => {
   after(() => {
     for (const entry of cleanup.splice(0).reverse()) {
       entry.close();
+      drainAfterClose(entry);
     }
   });
 
@@ -248,11 +251,12 @@ describe('schema management APIs', () => {
       properties: { since: { required: true, nullable: false, types: ['int'] } },
     });
     db.close();
-
+    drainAfterClose(db);
     db = OverGraph.open(join(tmpDir, 'db'), { walSyncMode: 'immediate' });
     assert.equal(db.getNodeSchema('PersistedNode').schema.properties.name.required, true);
     assert.equal(db.getEdgeSchema('PersistedEdge').schema.properties.since.types[0], 'int');
     db.close();
+    drainAfterClose(db);
   });
 
   it('publishes, alters, checks, replaces, and drops graph schemas in bulk', () => {

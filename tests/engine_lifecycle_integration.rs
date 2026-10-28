@@ -1,3 +1,5 @@
+mod support;
+
 use overgraph::*;
 use std::collections::BTreeMap;
 
@@ -31,7 +33,7 @@ fn test_full_engine_lifecycle() {
     let db_path = dir.path().join("integration_db");
 
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = support::open(&db_path, &DbOptions::default()).unwrap();
 
         for i in 1..=100 {
             let label = match i % 3 {
@@ -71,7 +73,7 @@ fn test_full_engine_lifecycle() {
     }
 
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = support::open(&db_path, &DbOptions::default()).unwrap();
 
         let node1 = engine.get_node(1).unwrap().unwrap();
         assert_eq!(node1.key, "key:1");
@@ -111,7 +113,7 @@ fn test_full_engine_lifecycle() {
     }
 
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = support::open(&db_path, &DbOptions::default()).unwrap();
         assert!(engine.get_node(1).unwrap().is_some());
         assert!(engine.get_node(99).unwrap().is_some());
         assert!(engine.get_node(50).unwrap().is_none());
@@ -127,7 +129,7 @@ fn test_wal_replay_last_write_wins() {
     let db_path = dir.path().join("update_db");
 
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = support::open(&db_path, &DbOptions::default()).unwrap();
 
         let id1 = engine
             .upsert_node("Person", "stable-key", node_options("original", 0.51))
@@ -141,7 +143,7 @@ fn test_wal_replay_last_write_wins() {
     }
 
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = support::open(&db_path, &DbOptions::default()).unwrap();
         let node = engine.get_node(1).unwrap().unwrap();
         assert_eq!(
             node.props.get("name"),
@@ -159,7 +161,7 @@ fn test_crash_recovery_without_close() {
     let db_path = dir.path().join("crash_db");
 
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = support::open(&db_path, &DbOptions::default()).unwrap();
         for i in 1..=20 {
             let key = format!("crash:{}", i);
             let id = engine
@@ -171,7 +173,7 @@ fn test_crash_recovery_without_close() {
     }
 
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = support::open(&db_path, &DbOptions::default()).unwrap();
         assert_eq!(engine.node_count().unwrap(), 20);
         let node10 = engine.get_node(10).unwrap().unwrap();
         assert_eq!(node10.key, "crash:10");

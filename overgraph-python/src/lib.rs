@@ -91,7 +91,30 @@ use std::sync::{Arc, Mutex};
 pyo3::create_exception!(overgraph, OverGraphError, pyo3::exceptions::PyException);
 
 fn to_py_err(e: EngineError) -> PyErr {
-    OverGraphError::new_err(e.to_string())
+    let error = OverGraphError::new_err(e.to_string());
+    let enriched = Python::with_gil(|py| -> PyResult<()> {
+        let value = error.value(py);
+        if let Some(code) = e.code() {
+            value.setattr("code", code)?;
+        }
+        if let EngineError::ResourceLimit {
+            resource,
+            requested,
+            limit,
+            retryable,
+        } = e
+        {
+            value.setattr("resource", resource)?;
+            value.setattr("requested", requested)?;
+            value.setattr("limit", limit)?;
+            value.setattr("retryable", retryable)?;
+        }
+        Ok(())
+    });
+    if let Err(error) = enriched {
+        return error;
+    }
+    error
 }
 
 fn lock_err<T>(e: std::sync::PoisonError<T>) -> PyErr {
@@ -113,6 +136,10 @@ struct InnerDb {
 #[pyclass]
 pub struct OverGraph {
     inner: Arc<Mutex<Option<InnerDb>>>,
+    #[cfg(feature = "production-concurrency")]
+    stats_handle: eg::BindingStatsHandle,
+    #[cfg(feature = "production-concurrency")]
+    close_handle: eg::BindingCloseHandle,
 }
 
 /// Execute a closure with mutable engine access, releasing the GIL.
@@ -122,7 +149,16 @@ where
     T: Send,
 {
     let engine = clone_engine_handle(&db.inner)?;
-    py.allow_threads(move || f(&engine).map_err(to_py_err))
+    py.allow_threads(move || {
+        #[cfg(feature = "binding-test-hooks")]
+        let hooks = engine.binding_test_handle();
+        let result = f(&engine);
+        drop(engine);
+        #[cfg(feature = "binding-test-hooks")]
+        hooks.hit("handoff");
+        result
+    })
+    .map_err(to_py_err)
 }
 
 /// Execute a closure with shared engine access, releasing the GIL.
@@ -132,7 +168,16 @@ where
     T: Send,
 {
     let engine = clone_engine_handle(&db.inner)?;
-    py.allow_threads(move || f(&engine).map_err(to_py_err))
+    py.allow_threads(move || {
+        #[cfg(feature = "binding-test-hooks")]
+        let hooks = engine.binding_test_handle();
+        let result = f(&engine);
+        drop(engine);
+        #[cfg(feature = "binding-test-hooks")]
+        hooks.hit("handoff");
+        result
+    })
+    .map_err(to_py_err)
 }
 
 fn clone_engine_handle(inner: &Arc<Mutex<Option<InnerDb>>>) -> PyResult<DatabaseEngine> {
@@ -150,11 +195,9 @@ fn scrub_path(
 ) -> PyResult<DatabaseScrubReport> {
     let options = parse_scrub_path_options(kwargs)?;
     let path = path.to_string();
-    py.allow_threads(move || {
-        eg::scrub_path_with_options(Path::new(&path), &options)
-            .map(DatabaseScrubReport::from)
-            .map_err(to_py_err)
-    })
+    py.allow_threads(move || eg::scrub_path_with_options(Path::new(&path), &options))
+        .map(DatabaseScrubReport::from)
+        .map_err(to_py_err)
 }
 
 #[pymethods]
@@ -168,8 +211,33 @@ impl OverGraph {
             Some(d) => parse_db_options(d)?,
             None => DbOptions::default(),
         };
-        let engine = DatabaseEngine::open(Path::new(path), &opts).map_err(to_py_err)?;
+        #[cfg(not(feature = "production-concurrency"))]
+        if kwargs.is_some_and(|d| {
+            d.get_item("concurrency_options")
+                .ok()
+                .flatten()
+                .is_some_and(|v| !v.is_none())
+        }) {
+            return Err(PyValueError::new_err(
+                "concurrency_options require production-concurrency",
+            ));
+        }
+        #[cfg(feature = "production-concurrency")]
+        let concurrency_options = parse_concurrency_options(kwargs)?;
+        #[cfg(feature = "production-concurrency")]
+        let engine = DatabaseEngine::open_with_concurrency_options(
+            Path::new(path),
+            &opts,
+            &concurrency_options,
+        );
+        #[cfg(not(feature = "production-concurrency"))]
+        let engine = DatabaseEngine::open(Path::new(path), &opts);
+        let engine = engine.map_err(to_py_err)?;
         Ok(OverGraph {
+            #[cfg(feature = "production-concurrency")]
+            stats_handle: engine.binding_stats_handle(),
+            #[cfg(feature = "production-concurrency")]
+            close_handle: engine.binding_close_handle(),
             inner: Arc::new(Mutex::new(Some(InnerDb { engine }))),
         })
     }
@@ -177,22 +245,74 @@ impl OverGraph {
     #[pyo3(signature = (force=false))]
     fn close(&self, py: Python<'_>, force: bool) -> PyResult<()> {
         let inner = self.inner.clone();
-        py.allow_threads(move || {
-            let engine = {
-                let mut guard = inner.lock().map_err(lock_err)?;
-                guard.take().map(|db| db.engine)
-            };
-            if let Some(engine) = engine {
-                if force {
-                    engine.close_fast().map_err(to_py_err)?;
-                } else {
-                    engine.close().map_err(to_py_err)?;
-                }
+        #[cfg(feature = "production-concurrency")]
+        let completion = self.close_handle.clone();
+        py.allow_threads(move || -> Result<(), EngineError> {
+            #[cfg(feature = "production-concurrency")]
+            {
+                let engine = {
+                    let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(db) = guard.as_ref() {
+                        db.engine.binding_request_close(force)?;
+                    } else if completion.is_complete() {
+                        return Ok(());
+                    }
+                    guard.take()
+                };
+                drop(engine);
+                drop(inner);
+                completion.wait()
             }
-            Ok(())
+            #[cfg(not(feature = "production-concurrency"))]
+            {
+                let engine = inner.lock().unwrap_or_else(|e| e.into_inner()).take();
+                let result = match engine.as_ref() {
+                    Some(db) => {
+                        if force {
+                            db.engine.close_fast()
+                        } else {
+                            db.engine.close()
+                        }
+                    }
+                    None => Ok(()),
+                };
+                drop(engine);
+                drop(inner);
+                result
+            }
         })
+        .map_err(to_py_err)
     }
 
+    fn reclamation_stats(&self) -> PyResult<ReclamationStats> {
+        #[cfg(feature = "production-concurrency")]
+        {
+            self.stats_handle
+                .read()
+                .map(ReclamationStats::from)
+                .map_err(to_py_err)
+        }
+        #[cfg(not(feature = "production-concurrency"))]
+        {
+            Err(PyValueError::new_err(
+                "reclamation_stats requires production-concurrency",
+            ))
+        }
+    }
+
+    #[cfg(feature = "binding-test-hooks")]
+    fn binding_test_hold(&self, point: &str, path: &str) -> PyResult<()> {
+        clone_engine_handle(&self.inner)?
+            .binding_test_handle()
+            .arm(point, path)
+            .map_err(to_py_err)
+    }
+    #[cfg(feature = "binding-test-hooks")]
+    fn binding_test_fault(&self, kind: &str) -> PyResult<()> {
+        clone_engine_handle(&self.inner)?
+            .binding_test_fault(kind)
+            .map_err(to_py_err)
+    }
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -1542,27 +1662,32 @@ impl OverGraph {
         // for callback invocations. Use a closure that acquires the GIL
         // only when calling the Python callback.
         let engine_result = py.allow_threads(move || {
-            let result = engine
-                .compact_with_progress(|progress| {
-                    Python::with_gil(|py| {
-                        let py_progress = CompactionProgress::from(progress);
-                        match callback.call1(py, (py_progress,)) {
-                            Ok(result) => result.extract::<bool>(py).unwrap_or(true),
-                            Err(e) => {
-                                *err_clone.lock().unwrap() = Some(e);
-                                false // Cancel compaction
-                            }
+            #[cfg(feature = "binding-test-hooks")]
+            let hooks = engine.binding_test_handle();
+            let result = engine.compact_with_progress(|progress| {
+                Python::with_gil(|py| {
+                    let py_progress = CompactionProgress::from(progress);
+                    match callback.call1(py, (py_progress,)) {
+                        Ok(result) => result.extract::<bool>(py).unwrap_or(true),
+                        Err(e) => {
+                            *err_clone.lock().unwrap() = Some(e);
+                            false // Cancel compaction
                         }
-                    })
+                    }
                 })
-                .map_err(to_py_err)?;
-            Ok(result.map(CompactionStats::from))
+            });
+            drop(engine);
+            #[cfg(feature = "binding-test-hooks")]
+            hooks.hit("handoff");
+            result
         });
         // If cancellation was due to a Python error, re-raise that instead
         if let Some(py_err) = captured_err.lock().unwrap().take() {
             return Err(py_err);
         }
         engine_result
+            .map(|result| result.map(CompactionStats::from))
+            .map_err(to_py_err)
     }
 
     // --- Pagination ---
@@ -2136,7 +2261,17 @@ impl WriteTxn {
                 .take()
                 .ok_or_else(|| OverGraphError::new_err(EngineError::TxnClosed.to_string()))?
         };
-        let result = py.allow_threads(move || txn.commit()).map_err(to_py_err)?;
+        let result = py
+            .allow_threads(move || {
+                #[cfg(feature = "binding-test-hooks")]
+                let hooks = txn.binding_test_handle();
+                let result = txn.commit();
+                drop(txn);
+                #[cfg(feature = "binding-test-hooks")]
+                hooks.hit("handoff");
+                result
+            })
+            .map_err(to_py_err)?;
         Ok(TxnCommitResult::from(result))
     }
 
@@ -2145,6 +2280,92 @@ impl WriteTxn {
     }
 }
 
+#[pyclass(frozen)]
+#[derive(Clone)]
+pub struct ReclamationHistogram {
+    #[pyo3(get)]
+    pub buckets: Vec<u64>,
+    #[pyo3(get)]
+    pub samples: u64,
+    #[pyo3(get)]
+    pub max_us: Option<u64>,
+}
+impl From<eg::ReclamationHistogram> for ReclamationHistogram {
+    fn from(s: eg::ReclamationHistogram) -> Self {
+        Self {
+            buckets: s.buckets.to_vec(),
+            samples: s.samples,
+            max_us: s.max_us,
+        }
+    }
+}
+#[pyclass(frozen)]
+#[derive(Clone)]
+pub struct ReclamationStats {
+    #[pyo3(get)]
+    pub registered_objects: u64,
+    #[pyo3(get)]
+    pub retired_objects: u64,
+    #[pyo3(get)]
+    pub dropping_objects: u64,
+    #[pyo3(get)]
+    pub active_generations: u64,
+    #[pyo3(get)]
+    pub frozen_generations: u64,
+    #[pyo3(get)]
+    pub leased_participants: u64,
+    #[pyo3(get)]
+    pub participant_limit: u64,
+    #[pyo3(get)]
+    pub process_participants: u64,
+    #[pyo3(get)]
+    pub active_sessions: u64,
+    #[pyo3(get)]
+    pub draining_sessions: u64,
+    #[pyo3(get)]
+    pub close_state: String,
+    #[pyo3(get)]
+    pub oldest_retirement_age_us: Option<u64>,
+    #[pyo3(get)]
+    pub scan_lag_us: Option<u64>,
+    #[pyo3(get)]
+    pub release_to_eligibility_us: ReclamationHistogram,
+    #[pyo3(get)]
+    pub eligibility_to_drop_us: ReclamationHistogram,
+    #[pyo3(get)]
+    pub worker_wall_us: Option<u64>,
+    #[pyo3(get)]
+    pub worker_cpu_us: Option<u64>,
+}
+impl From<eg::ReclamationStats> for ReclamationStats {
+    fn from(s: eg::ReclamationStats) -> Self {
+        Self {
+            registered_objects: s.registered_objects,
+            retired_objects: s.retired_objects,
+            dropping_objects: s.dropping_objects,
+            active_generations: s.active_generations,
+            frozen_generations: s.frozen_generations,
+            leased_participants: s.leased_participants,
+            participant_limit: s.participant_limit,
+            process_participants: s.process_participants,
+            active_sessions: s.active_sessions,
+            draining_sessions: s.draining_sessions,
+            close_state: match s.close_state {
+                eg::ReclamationCloseState::Open => "open",
+                eg::ReclamationCloseState::Draining => "draining",
+                eg::ReclamationCloseState::Drained => "drained",
+                _ => unreachable!("unknown close state"),
+            }
+            .into(),
+            oldest_retirement_age_us: s.oldest_retirement_age_us,
+            scan_lag_us: s.scan_lag_us,
+            release_to_eligibility_us: s.release_to_eligibility_us.into(),
+            eligibility_to_drop_us: s.eligibility_to_drop_us.into(),
+            worker_wall_us: s.worker_wall_us,
+            worker_cpu_us: s.worker_cpu_us,
+        }
+    }
+}
 // ============================================================
 // Python-facing types
 // ============================================================
@@ -10230,6 +10451,7 @@ fn parse_txn_operations(py: Python<'_>, list: &Bound<'_, PyList>) -> PyResult<Ve
 // ============================================================
 
 const KNOWN_OPTIONS: &[&str] = &[
+    "concurrency_options",
     "create_if_missing",
     "edge_uniqueness",
     "memtable_flush_threshold",
@@ -10925,12 +11147,28 @@ fn validate_py_type_token_name(name: &str, context: &str) -> PyResult<()> {
 // Module registration
 // ============================================================
 
+#[cfg(feature = "binding-test-hooks")]
+#[pyfunction]
+fn binding_test_hold_gil(path: &str) -> PyResult<()> {
+    // Intentionally keep the GIL; this function owns only test metadata.
+    let handle = eg::BindingTestHandle::default();
+    handle.arm("gil", path).map_err(to_py_err)?;
+    handle.hit("gil");
+    Ok(())
+}
+
 #[pymodule]
 fn overgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    #[cfg(feature = "binding-test-hooks")]
+    m.add_function(wrap_pyfunction!(binding_test_hold_gil, m)?)?;
     m.add_function(wrap_pyfunction!(scrub_path, m)?)?;
     m.add_class::<OverGraph>()?;
     m.add_class::<WriteTxn>()?;
     m.add_class::<DbStats>()?;
+    {
+        m.add_class::<ReclamationStats>()?;
+        m.add_class::<ReclamationHistogram>()?;
+    }
     m.add_class::<NodeView>()?;
     m.add_class::<EdgeView>()?;
     m.add_class::<PatchResult>()?;
@@ -10982,4 +11220,55 @@ fn overgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<OrphanSegmentScrubResult>()?;
     m.add("OverGraphError", m.py().get_type::<OverGraphError>())?;
     Ok(())
+}
+
+#[cfg(feature = "production-concurrency")]
+fn parse_concurrency_options(
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<eg::ConcurrencyOptions> {
+    let mut options = eg::ConcurrencyOptions::default();
+    if let Some(value) = kwargs
+        .map(|d| d.get_item("concurrency_options"))
+        .transpose()?
+        .flatten()
+    {
+        if value.is_none() {
+            return Ok(options);
+        }
+        let mapping = value.py().import("collections.abc")?.getattr("Mapping")?;
+        if !value.is_instance(&mapping)? {
+            return Err(PyTypeError::new_err(
+                "concurrency_options must be a Mapping",
+            ));
+        }
+        for item in value.call_method0("items")?.try_iter()? {
+            let item = item?;
+            let (key, value): (String, Bound<'_, PyAny>) = item.extract()?;
+            if value.is_instance_of::<PyBool>() {
+                return Err(PyTypeError::new_err(format!(
+                    "concurrency_options.{key} must be an integer"
+                )));
+            }
+            let number: u64 = value.extract()?;
+            let size = || {
+                usize::try_from(number).map_err(|_| {
+                    PyValueError::new_err(format!("concurrency_options.{key} overflows usize"))
+                })
+            };
+            match key.as_str() {
+                "max_batch_operations" => options.max_batch_operations = size()?,
+                "max_batch_bytes" => options.max_batch_bytes = size()?,
+                "generation_operation_limit" => options.generation_operation_limit = size()?,
+                "generation_wal_bytes" => options.generation_wal_bytes = size()?,
+                "admission_timeout_ms" => options.admission_timeout_ms = number,
+                _ => {
+                    return Err(PyValueError::new_err(format!(
+                        "unknown concurrency option: {key}"
+                    )))
+                }
+            }
+        }
+    }
+    options.validate().map_err(to_py_err)?;
+    Ok(options)
 }

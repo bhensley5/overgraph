@@ -163,22 +163,35 @@ impl PreparedRetainedEdgeIds {
 
 #[allow(dead_code)]
 pub(crate) enum EdgeCandidateCursor {
-    MemtableFullScan {
-        memtable: Arc<Memtable>,
+    MemtableFullScan {        chunk: MemtableIdChunk,
+
+        memtable: SharedArc<Memtable>,
         snapshot_seq: u64,
         held: Option<u64>,
         last_seek_bound: Option<u64>,
         exhausted: bool,
     },
     SegmentFullScan {
-        reader: Arc<SegmentReader>,
+        reader: SharedArc<SegmentReader>,
         pos: usize,
         held: Option<u64>,
         last_seek_bound: Option<u64>,
         exhausted: bool,
     },
-    MemtableLabel {
-        memtable: Arc<Memtable>,
+    MemtableEquality {        chunk: MemtableIdChunk,
+
+        reservation:Option<PreparedEdgeIdReservation>,
+        memtable: SharedArc<Memtable>,
+        index_id: u64,
+        value_hash:u64,
+        snapshot_seq: u64,
+        held: Option<u64>,
+        last_seek_bound: Option<u64>,
+        exhausted: bool,
+    },
+    MemtableLabel {        chunk: MemtableIdChunk,
+
+        memtable: SharedArc<Memtable>,
         label_id: u32,
         snapshot_seq: u64,
         held: Option<u64>,
@@ -186,7 +199,7 @@ pub(crate) enum EdgeCandidateCursor {
         exhausted: bool,
     },
     SegmentLabelPosting {
-        reader: Arc<SegmentReader>,
+        reader: SharedArc<SegmentReader>,
         posting: SegmentLabelPosting,
         pos: usize,
         held: Option<u64>,
@@ -194,7 +207,7 @@ pub(crate) enum EdgeCandidateCursor {
         exhausted: bool,
     },
     SegmentEqualityGroup {
-        reader: Arc<SegmentReader>,
+        reader: SharedArc<SegmentReader>,
         index_id: u64,
         offset: usize,
         id_count: usize,
@@ -203,8 +216,9 @@ pub(crate) enum EdgeCandidateCursor {
         last_seek_bound: Option<u64>,
         exhausted: bool,
     },
-    MemtableAdjacency {
-        memtable: Arc<Memtable>,
+    MemtableAdjacency {chunk:MemtableIdChunk,
+
+        memtable: SharedArc<Memtable>,
         node_id: u64,
         outgoing: bool,
         label_filter_id: Option<u32>,
@@ -214,7 +228,7 @@ pub(crate) enum EdgeCandidateCursor {
         exhausted: bool,
     },
     SegmentAdjacency {
-        reader: Arc<SegmentReader>,
+        reader: SharedArc<SegmentReader>,
         cursor: crate::segment_reader::SegmentAdjPostingCursor,
         held: Option<u64>,
         last_seek_bound: Option<u64>,
@@ -232,8 +246,9 @@ pub(crate) enum EdgeCandidateCursor {
 
 #[allow(dead_code)]
 impl EdgeCandidateCursor {
-    pub(crate) fn memtable_full_scan(memtable: Arc<Memtable>, snapshot_seq: u64) -> Self {
-        Self::MemtableFullScan {
+    pub(crate) fn memtable_full_scan(memtable: SharedArc<Memtable>, snapshot_seq: u64) -> Self {
+        Self::MemtableFullScan {            chunk: MemtableIdChunk::default(),
+
             memtable,
             snapshot_seq,
             held: None,
@@ -242,7 +257,7 @@ impl EdgeCandidateCursor {
         }
     }
 
-    pub(crate) fn segment_full_scan(reader: Arc<SegmentReader>) -> Self {
+    pub(crate) fn segment_full_scan(reader: SharedArc<SegmentReader>) -> Self {
         Self::SegmentFullScan {
             reader,
             pos: 0,
@@ -252,12 +267,32 @@ impl EdgeCandidateCursor {
         }
     }
 
+    pub(crate) fn memtable_equality(
+        memtable: SharedArc<Memtable>,
+        index_id:u64,
+        value_hash:u64,
+        snapshot_seq: u64,
+    ) -> Self {
+        Self::MemtableEquality {            chunk: MemtableIdChunk::default(),
+
+            reservation:None,
+            memtable,
+            index_id,
+            value_hash,
+            snapshot_seq,
+            held: None,
+            last_seek_bound: None,
+            exhausted: false,
+        }
+    }
+
     pub(crate) fn memtable_label(
-        memtable: Arc<Memtable>,
+        memtable: SharedArc<Memtable>,
         label_id: u32,
         snapshot_seq: u64,
     ) -> Self {
-        Self::MemtableLabel {
+        Self::MemtableLabel {            chunk: MemtableIdChunk::default(),
+
             memtable,
             label_id,
             snapshot_seq,
@@ -268,7 +303,7 @@ impl EdgeCandidateCursor {
     }
 
     pub(crate) fn segment_label_posting(
-        reader: Arc<SegmentReader>,
+        reader: SharedArc<SegmentReader>,
         posting: SegmentLabelPosting,
     ) -> Self {
         Self::SegmentLabelPosting {
@@ -282,7 +317,7 @@ impl EdgeCandidateCursor {
     }
 
     pub(crate) fn segment_equality_group(
-        reader: Arc<SegmentReader>,
+        reader: SharedArc<SegmentReader>,
         index_id: u64,
         offset: usize,
         id_count: usize,
@@ -300,13 +335,14 @@ impl EdgeCandidateCursor {
     }
 
     pub(crate) fn memtable_adjacency(
-        memtable: Arc<Memtable>,
+        memtable: SharedArc<Memtable>,
         node_id: u64,
         outgoing: bool,
         label_filter_id: Option<u32>,
         snapshot_seq: u64,
     ) -> Self {
-        Self::MemtableAdjacency {
+        Self::MemtableAdjacency {chunk:MemtableIdChunk::default(),
+
             memtable,
             node_id,
             outgoing,
@@ -319,7 +355,7 @@ impl EdgeCandidateCursor {
     }
 
     pub(crate) fn segment_adjacency(
-        reader: Arc<SegmentReader>,
+        reader: SharedArc<SegmentReader>,
         cursor: crate::segment_reader::SegmentAdjPostingCursor,
     ) -> Self {
         Self::SegmentAdjacency {
@@ -361,7 +397,8 @@ impl EdgeCandidateCursor {
 
     pub(crate) fn next_ge(&mut self, bound: u64) -> Result<Option<u64>, EngineError> {
         match self {
-            Self::MemtableFullScan {
+            Self::MemtableFullScan {                chunk,
+
                 memtable,
                 snapshot_seq,
                 held,
@@ -378,7 +415,7 @@ impl EdgeCandidateCursor {
                 if *exhausted {
                     return Ok(None);
                 }
-                match memtable.next_visible_edge_id_after(*snapshot_seq, bound.checked_sub(1)) {
+                match chunk.next_ge(bound,|start|memtable.refill_edge_ids_at(*snapshot_seq,start))? {
                     Some(edge_id) => {
                         *held = Some(edge_id);
                         Ok(Some(edge_id))
@@ -442,7 +479,41 @@ impl EdgeCandidateCursor {
                 *held = Some(edge_id);
                 Ok(Some(edge_id))
             }
-            Self::MemtableLabel {
+            Self::MemtableEquality {                chunk,
+
+                reservation:_,
+                memtable,
+                index_id,
+                value_hash,
+                snapshot_seq,
+                held,
+                last_seek_bound,
+                exhausted,
+            } => {
+                if let Some(head) = *held {
+                    if bound <= head {
+                        return Ok(Some(head));
+                    }
+                }
+                assert_monotonic_bound(*last_seek_bound, *held, bound);
+                *last_seek_bound = Some(bound);
+                if *exhausted {
+                    return Ok(None);
+                }
+                match chunk.next_ge(bound,|start|memtable.refill_secondary_eq_ids_at(*index_id,*value_hash,*snapshot_seq,start,128))? {
+                    Some(edge_id) => {
+                        *held = Some(edge_id);
+                        Ok(Some(edge_id))
+                    }
+                    None => {
+                        *held = None;
+                        *exhausted = true;
+                        Ok(None)
+                    }
+                }
+            }
+            Self::MemtableLabel {                chunk,
+
                 memtable,
                 label_id,
                 snapshot_seq,
@@ -460,7 +531,7 @@ impl EdgeCandidateCursor {
                 if *exhausted {
                     return Ok(None);
                 }
-                match memtable.next_visible_edge_by_label_id_ge(*label_id, *snapshot_seq, bound) {
+                match chunk.next_ge(bound,|start|memtable.refill_label_ids_at(true,*label_id,*snapshot_seq,start))? {
                     Some(edge_id) => {
                         *held = Some(edge_id);
                         Ok(Some(edge_id))
@@ -562,7 +633,8 @@ impl EdgeCandidateCursor {
                     }
                 }
             }
-            Self::MemtableAdjacency {
+            Self::MemtableAdjacency {chunk,
+
                 memtable,
                 node_id,
                 outgoing,
@@ -582,13 +654,7 @@ impl EdgeCandidateCursor {
                 if *exhausted {
                     return Ok(None);
                 }
-                match memtable.next_visible_adj_edge_ge(
-                    *node_id,
-                    *outgoing,
-                    *label_filter_id,
-                    *snapshot_seq,
-                    bound,
-                ) {
+                match chunk.next_ge(bound,|start|memtable.refill_endpoint_ids_at(*node_id,*outgoing,label_filter_id.as_ref().map(std::slice::from_ref),*snapshot_seq,start))? {
                     Some(edge_id) => {
                         *held = Some(edge_id);
                         Ok(Some(edge_id))
@@ -705,7 +771,8 @@ impl EdgeCandidateCursor {
             return Ok(());
         }
         match self {
-            Self::MemtableFullScan {
+            Self::MemtableFullScan {                chunk,
+
                 memtable,
                 snapshot_seq,
                 held,
@@ -716,8 +783,7 @@ impl EdgeCandidateCursor {
                     let candidate = if held.is_some_and(|head| bound <= head) {
                         held.expect("checked held candidate")
                     } else {
-                        match memtable
-                            .next_visible_edge_id_after(*snapshot_seq, bound.checked_sub(1))
+                        match chunk.next_ge(bound,|start|memtable.refill_edge_ids_at(*snapshot_seq,start))?
                         {
                             Some(candidate) => candidate,
                             None => {
@@ -781,7 +847,37 @@ impl EdgeCandidateCursor {
                     accept!(candidate);
                 }
             }
-            Self::MemtableLabel {
+            Self::MemtableEquality {                chunk,
+
+                reservation:_,
+                memtable,
+                index_id,
+                value_hash,
+                snapshot_seq,
+                held,
+                last_seek_bound,
+                exhausted,
+            } => {
+                while !*exhausted && out.len().saturating_sub(start_len) < max {
+                    let candidate = if held.is_some_and(|head| bound <= head) {
+                        held.expect("checked held candidate")
+                    } else {
+                        match chunk.next_ge(bound,|start|memtable.refill_secondary_eq_ids_at(*index_id,*value_hash,*snapshot_seq,start,128))? {
+                            Some(candidate) => candidate,
+                            None => {
+                                *held = None;
+                                *exhausted = true;
+                                break;
+                            }
+                        }
+                    };
+                    *held = Some(candidate);
+                    *last_seek_bound = Some(bound);
+                    accept!(candidate);
+                }
+            }
+            Self::MemtableLabel {                chunk,
+
                 memtable,
                 label_id,
                 snapshot_seq,
@@ -793,11 +889,7 @@ impl EdgeCandidateCursor {
                     let candidate = if held.is_some_and(|head| bound <= head) {
                         held.expect("checked held candidate")
                     } else {
-                        match memtable.next_visible_edge_by_label_id_ge(
-                            *label_id,
-                            *snapshot_seq,
-                            bound,
-                        ) {
+                        match chunk.next_ge(bound,|start|memtable.refill_label_ids_at(true,*label_id,*snapshot_seq,start))? {
                             Some(candidate) => candidate,
                             None => {
                                 *held = None;
@@ -895,7 +987,8 @@ impl EdgeCandidateCursor {
                     accept!(candidate);
                 }
             }
-            Self::MemtableAdjacency {
+            Self::MemtableAdjacency {chunk,
+
                 memtable,
                 node_id,
                 outgoing,
@@ -909,13 +1002,7 @@ impl EdgeCandidateCursor {
                     let candidate = if held.is_some_and(|head| bound <= head) {
                         held.expect("checked held candidate")
                     } else {
-                        match memtable.next_visible_adj_edge_ge(
-                            *node_id,
-                            *outgoing,
-                            *label_filter_id,
-                            *snapshot_seq,
-                            bound,
-                        ) {
+                        match chunk.next_ge(bound,|start|memtable.refill_endpoint_ids_at(*node_id,*outgoing,label_filter_id.as_ref().map(std::slice::from_ref),*snapshot_seq,start))? {
                             Some(candidate) => candidate,
                             None => {
                                 *held = None;
@@ -1106,17 +1193,17 @@ impl ReadView {
     fn build_prepared_full_scan_edge_cursor(&self) -> EdgeStreamSet {
         let mut cursors = Vec::with_capacity(1 + self.immutable_epochs.len() + self.segments.len());
         cursors.push(EdgeCandidateCursor::memtable_full_scan(
-            Arc::clone(&self.memtable),
+            Clone::clone(&self.memtable),
             self.snapshot_seq,
         ));
         for epoch in &self.immutable_epochs {
             cursors.push(EdgeCandidateCursor::memtable_full_scan(
-                Arc::clone(&epoch.memtable),
+                Clone::clone(&epoch.memtable),
                 self.snapshot_seq,
             ));
         }
         for segment in &self.segments {
-            cursors.push(EdgeCandidateCursor::segment_full_scan(Arc::clone(segment)));
+            cursors.push(EdgeCandidateCursor::segment_full_scan(Clone::clone(segment)));
         }
         #[cfg(test)]
         for _ in 0..cursors.len() {
@@ -1128,13 +1215,13 @@ impl ReadView {
     fn build_label_edge_stream(&self, label_id: u32) -> Result<EdgeLeafStream, EngineError> {
         let mut cursors = Vec::new();
         cursors.push(EdgeCandidateCursor::memtable_label(
-            Arc::clone(&self.memtable),
+            Clone::clone(&self.memtable),
             label_id,
             self.snapshot_seq,
         ));
         for epoch in &self.immutable_epochs {
             cursors.push(EdgeCandidateCursor::memtable_label(
-                Arc::clone(&epoch.memtable),
+                Clone::clone(&epoch.memtable),
                 label_id,
                 self.snapshot_seq,
             ));
@@ -1142,7 +1229,7 @@ impl ReadView {
         for segment in &self.segments {
             if let Some(posting) = segment.edge_label_posting(label_id)? {
                 cursors.push(EdgeCandidateCursor::segment_label_posting(
-                    Arc::clone(segment),
+                    Clone::clone(segment),
                     posting,
                 ));
             }
@@ -1169,30 +1256,16 @@ impl ReadView {
                 #[cfg(test)]
                 self.note_streamed_edge_leaf_demotion();
                 followups.extend(materialization_followups(
-                    self.equality_sidecar_failure_followup(index_id, None),
+                    self.equality_sidecar_failure_followup(index_id, None)?,
                 ));
                 return Ok(EdgeStreamBuildResult::Demoted { followups });
             }
         }
 
         for &value_hash in value_hashes {
-            let ids = self.memtable.visible_secondary_eq_edge_ids_sorted(
-                index_id,
-                value_hash,
-                self.snapshot_seq,
-            );
-            if !ids.is_empty() {
-                cursors.push(EdgeCandidateCursor::sorted_buffer(ids));
-            }
-            for epoch in &self.immutable_epochs {
-                let ids = epoch.memtable.visible_secondary_eq_edge_ids_sorted(
-                    index_id,
-                    value_hash,
-                    self.snapshot_seq,
-                );
-                if !ids.is_empty() {
-                    cursors.push(EdgeCandidateCursor::sorted_buffer(ids));
-                }
+            for memtable in std::iter::once(&self.memtable).chain(self.immutable_epochs.iter().map(|e|&e.memtable)) {
+                if memtable.is_candidate() {cursors.push(EdgeCandidateCursor::memtable_equality(Clone::clone(memtable),index_id,value_hash,self.snapshot_seq));}
+                else {let ids=memtable.visible_secondary_eq_edge_ids_sorted(index_id,value_hash,self.snapshot_seq)?;if !ids.is_empty(){cursors.push(EdgeCandidateCursor::sorted_buffer(ids));}}
             }
             for segment in &self.segments {
                 match segment.secondary_eq_group_span_if_present_for_target(
@@ -1202,7 +1275,7 @@ impl ReadView {
                 ) {
                     Ok(crate::segment_reader::SecondaryEqGroupSpanLookup::Found(span)) => {
                         cursors.push(EdgeCandidateCursor::segment_equality_group(
-                            Arc::clone(segment),
+                            Clone::clone(segment),
                             index_id,
                             span.offset,
                             span.id_count,
@@ -1213,7 +1286,7 @@ impl ReadView {
                         #[cfg(test)]
                         self.note_streamed_edge_leaf_demotion();
                         followups.extend(materialization_followups(
-                            self.equality_sidecar_failure_followup(index_id, None),
+                            self.equality_sidecar_failure_followup(index_id, None)?,
                         ));
                         return Ok(EdgeStreamBuildResult::Demoted { followups });
                     }
@@ -1221,7 +1294,7 @@ impl ReadView {
                         #[cfg(test)]
                         self.note_streamed_edge_leaf_demotion();
                         followups.extend(materialization_followups(
-                            self.equality_sidecar_failure_followup(index_id, Some(error)),
+                            self.equality_sidecar_failure_followup(index_id, Some(error))?,
                         ));
                         return Ok(EdgeStreamBuildResult::Demoted { followups });
                     }
@@ -1241,7 +1314,7 @@ impl ReadView {
         let mut cursors = Vec::new();
         push_memtable_endpoint_cursors(
             &mut cursors,
-            Arc::clone(&self.memtable),
+            Clone::clone(&self.memtable),
             node_ids,
             direction,
             label_filter_id,
@@ -1250,7 +1323,7 @@ impl ReadView {
         for epoch in &self.immutable_epochs {
             push_memtable_endpoint_cursors(
                 &mut cursors,
-                Arc::clone(&epoch.memtable),
+                Clone::clone(&epoch.memtable),
                 node_ids,
                 direction,
                 label_filter_id,
@@ -1266,7 +1339,7 @@ impl ReadView {
                 None => segment.endpoint_adj_posting_cursors(node_ids, direction, None)?,
             };
             cursors.extend(segment_cursors.into_iter().map(|cursor| {
-                EdgeCandidateCursor::segment_adjacency(Arc::clone(segment), cursor)
+                EdgeCandidateCursor::segment_adjacency(Clone::clone(segment), cursor)
             }));
         }
         Ok(EdgeLeafStream::new(cursors))
@@ -1493,7 +1566,7 @@ impl ReadView {
             );
             if coverage != crate::planner_stats::DeclaredIndexRuntimeCoverageState::Available {
                 followups.extend(materialization_followups(
-                    self.equality_sidecar_failure_followup(index_id, None),
+                    self.equality_sidecar_failure_followup(index_id, None)?,
                 ));
                 return Ok(PreparedEdgeLeafBuildResult::Demoted { followups });
             }
@@ -1501,19 +1574,27 @@ impl ReadView {
 
         for &value_hash in value_hashes {
             let mut memtables = Vec::with_capacity(1 + self.immutable_epochs.len());
-            memtables.push(Arc::clone(&self.memtable));
+            memtables.push(Clone::clone(&self.memtable));
             memtables.extend(
                 self.immutable_epochs
                     .iter()
-                    .map(|epoch| Arc::clone(&epoch.memtable)),
+                    .map(|epoch| Clone::clone(&epoch.memtable)),
             );
             for memtable in memtables {
                 let count = memtable.secondary_eq_edge_hash_count_at(
                     index_id,
                     value_hash,
                     self.snapshot_seq,
-                );
+                )?;
                 if count == 0 {
+                    continue;
+                }
+                if memtable.is_candidate() {
+                    let Some(reservation)=budget.reserve(count.min(128)) else {return Ok(PreparedEdgeLeafBuildResult::Demoted {followups});};
+                    let mut cursor=EdgeCandidateCursor::memtable_equality(memtable,index_id,value_hash,self.snapshot_seq);
+                    if let EdgeCandidateCursor::MemtableEquality{reservation:slot,..}=&mut cursor{*slot=Some(reservation);}
+                    cursors.push(cursor);
+                    #[cfg(test)] note_prepared_edge_streamed_cursor_build();
                     continue;
                 }
                 let Some(mut reservation) = budget.reserve(count) else {
@@ -1523,7 +1604,7 @@ impl ReadView {
                     index_id,
                     value_hash,
                     self.snapshot_seq,
-                );
+                )?;
                 reservation.shrink_to(ids.len());
                 cursors.push(EdgeCandidateCursor::prepared_sorted_buffer(
                     PreparedRetainedEdgeIds { ids, reservation },
@@ -1539,7 +1620,7 @@ impl ReadView {
                 ) {
                     Ok(crate::segment_reader::SecondaryEqGroupSpanLookup::Found(span)) => {
                         cursors.push(EdgeCandidateCursor::segment_equality_group(
-                            Arc::clone(segment),
+                            Clone::clone(segment),
                             index_id,
                             span.offset,
                             span.id_count,
@@ -1550,13 +1631,13 @@ impl ReadView {
                     Ok(crate::segment_reader::SecondaryEqGroupSpanLookup::MissingValueGroup) => {}
                     Ok(crate::segment_reader::SecondaryEqGroupSpanLookup::MissingSidecar) => {
                         followups.extend(materialization_followups(
-                            self.equality_sidecar_failure_followup(index_id, None),
+                            self.equality_sidecar_failure_followup(index_id, None)?,
                         ));
                         return Ok(PreparedEdgeLeafBuildResult::Demoted { followups });
                     }
                     Err(error) => {
                         followups.extend(materialization_followups(
-                            self.equality_sidecar_failure_followup(index_id, Some(error)),
+                            self.equality_sidecar_failure_followup(index_id, Some(error))?,
                         ));
                         return Ok(PreparedEdgeLeafBuildResult::Demoted { followups });
                     }
@@ -2114,7 +2195,7 @@ fn endpoint_stream_label_filter(label_filter_ids: Option<&[u32]>) -> Option<Endp
 #[allow(dead_code)]
 fn push_memtable_endpoint_cursors(
     cursors: &mut Vec<EdgeCandidateCursor>,
-    memtable: Arc<Memtable>,
+    memtable: SharedArc<Memtable>,
     node_ids: &[u64],
     direction: Direction,
     label_filter_id: Option<u32>,
@@ -2123,14 +2204,14 @@ fn push_memtable_endpoint_cursors(
     for &node_id in node_ids {
         match direction {
             Direction::Outgoing => cursors.push(EdgeCandidateCursor::memtable_adjacency(
-                Arc::clone(&memtable),
+                Clone::clone(&memtable),
                 node_id,
                 true,
                 label_filter_id,
                 snapshot_seq,
             )),
             Direction::Incoming => cursors.push(EdgeCandidateCursor::memtable_adjacency(
-                Arc::clone(&memtable),
+                Clone::clone(&memtable),
                 node_id,
                 false,
                 label_filter_id,
@@ -2138,14 +2219,14 @@ fn push_memtable_endpoint_cursors(
             )),
             Direction::Both => {
                 cursors.push(EdgeCandidateCursor::memtable_adjacency(
-                    Arc::clone(&memtable),
+                    Clone::clone(&memtable),
                     node_id,
                     true,
                     label_filter_id,
                     snapshot_seq,
                 ));
                 cursors.push(EdgeCandidateCursor::memtable_adjacency(
-                    Arc::clone(&memtable),
+                    Clone::clone(&memtable),
                     node_id,
                     false,
                     label_filter_id,
@@ -2400,26 +2481,26 @@ mod edge_stream_tests {
         assert_cursor_sequence("sorted max", sorted_cursor(&max_ids), &max_ids, &max_bounds);
         assert_cursor_bulk_matches_seek("sorted max", || sorted_cursor(&max_ids));
 
-        let label_memtable = Arc::new(Memtable::new());
+        let label_memtable = SharedArc::new(Memtable::new());
         for (seq, id) in ids.into_iter().enumerate() {
             label_memtable.apply_op(&WalOp::UpsertEdge(make_edge(id, 1, 2, 33)), seq as u64 + 1);
         }
         assert_cursor_sequence(
             "memtable label terminal",
-            EdgeCandidateCursor::memtable_label(Arc::clone(&label_memtable), 33, ids.len() as u64),
+            EdgeCandidateCursor::memtable_label(Clone::clone(&label_memtable), 33, ids.len() as u64),
             &ids,
             &bounds,
         );
         assert_cursor_bulk_matches_seek("memtable label", || {
             EdgeCandidateCursor::memtable_label(
-                Arc::clone(&label_memtable),
+                Clone::clone(&label_memtable),
                 33,
                 ids.len() as u64,
             )
         });
         assert_cursor_bulk_matches_seek("memtable full scan", || {
             EdgeCandidateCursor::memtable_full_scan(
-                Arc::clone(&label_memtable),
+                Clone::clone(&label_memtable),
                 ids.len() as u64,
             )
         });
@@ -2430,7 +2511,7 @@ mod edge_stream_tests {
             &[0, u64::MAX],
         );
 
-        let max_label_memtable = Arc::new(Memtable::new());
+        let max_label_memtable = SharedArc::new(Memtable::new());
         for (seq, id) in max_ids.into_iter().enumerate() {
             max_label_memtable.apply_op(
                 &WalOp::UpsertEdge(make_edge(id, 1, 2, 34)),
@@ -2439,26 +2520,26 @@ mod edge_stream_tests {
         }
         assert_cursor_sequence(
             "memtable label max",
-            EdgeCandidateCursor::memtable_label(Arc::clone(&max_label_memtable), 34, 2),
+            EdgeCandidateCursor::memtable_label(Clone::clone(&max_label_memtable), 34, 2),
             &max_ids,
             &max_bounds,
         );
         assert_cursor_sequence(
             "memtable full scan max",
-            EdgeCandidateCursor::memtable_full_scan(Arc::clone(&max_label_memtable), 2),
+            EdgeCandidateCursor::memtable_full_scan(Clone::clone(&max_label_memtable), 2),
             &max_ids,
             &max_bounds,
         );
         assert_cursor_bulk_matches_seek("memtable label max", || {
             EdgeCandidateCursor::memtable_label(
-                Arc::clone(&max_label_memtable),
+                Clone::clone(&max_label_memtable),
                 34,
                 2,
             )
         });
         assert_cursor_bulk_matches_seek("memtable full scan max", || {
             EdgeCandidateCursor::memtable_full_scan(
-                Arc::clone(&max_label_memtable),
+                Clone::clone(&max_label_memtable),
                 2,
             )
         });
@@ -2469,22 +2550,22 @@ mod edge_stream_tests {
                 .apply_op(&WalOp::UpsertEdge(make_edge(id, 1, 2, 35)), seq as u64 + 1);
         }
         let (_label_dir, label_reader) = write_test_segment(&segment_label_memtable, &[]);
-        let label_reader = Arc::new(label_reader);
+        let label_reader = SharedArc::new(label_reader);
         let label_posting = label_reader.edge_label_posting(35).unwrap().unwrap();
         assert_cursor_sequence(
             "segment label terminal",
-            EdgeCandidateCursor::segment_label_posting(Arc::clone(&label_reader), label_posting),
+            EdgeCandidateCursor::segment_label_posting(Clone::clone(&label_reader), label_posting),
             &ids,
             &bounds,
         );
         assert_cursor_bulk_matches_seek("segment label", || {
             EdgeCandidateCursor::segment_label_posting(
-                Arc::clone(&label_reader),
+                Clone::clone(&label_reader),
                 label_posting,
             )
         });
         assert_cursor_bulk_matches_seek("segment full scan", || {
-            EdgeCandidateCursor::segment_full_scan(Arc::clone(&label_reader))
+            EdgeCandidateCursor::segment_full_scan(Clone::clone(&label_reader))
         });
 
         let max_segment_label_memtable = Memtable::new();
@@ -2494,12 +2575,12 @@ mod edge_stream_tests {
         }
         let (_max_label_dir, max_label_reader) =
             write_test_segment(&max_segment_label_memtable, &[]);
-        let max_label_reader = Arc::new(max_label_reader);
+        let max_label_reader = SharedArc::new(max_label_reader);
         let max_label_posting = max_label_reader.edge_label_posting(36).unwrap().unwrap();
         assert_cursor_sequence(
             "segment label max",
             EdgeCandidateCursor::segment_label_posting(
-                Arc::clone(&max_label_reader),
+                Clone::clone(&max_label_reader),
                 max_label_posting,
             ),
             &max_ids,
@@ -2507,23 +2588,23 @@ mod edge_stream_tests {
         );
         assert_cursor_sequence(
             "segment full scan max",
-            EdgeCandidateCursor::segment_full_scan(Arc::clone(&max_label_reader)),
+            EdgeCandidateCursor::segment_full_scan(Clone::clone(&max_label_reader)),
             &max_ids,
             &max_bounds,
         );
         assert_cursor_bulk_matches_seek("segment label max", || {
             EdgeCandidateCursor::segment_label_posting(
-                Arc::clone(&max_label_reader),
+                Clone::clone(&max_label_reader),
                 max_label_posting,
             )
         });
         assert_cursor_bulk_matches_seek("segment full scan max", || {
-            EdgeCandidateCursor::segment_full_scan(Arc::clone(&max_label_reader))
+            EdgeCandidateCursor::segment_full_scan(Clone::clone(&max_label_reader))
         });
 
         let entry = edge_equality_entry(93, 37, "status");
         let equality_memtable = Memtable::new();
-        equality_memtable.register_secondary_index(&entry);
+        equality_memtable.register_secondary_index(&entry).unwrap();
         for (seq, id) in ids.into_iter().enumerate() {
             equality_memtable.apply_op(
                 &WalOp::UpsertEdge(make_edge_with_props(id, 1, 2, 37, prop_status("hot"))),
@@ -2534,7 +2615,7 @@ mod edge_stream_tests {
             &equality_memtable,
             std::slice::from_ref(&entry),
         );
-        let eq_reader = Arc::new(eq_reader);
+        let eq_reader = SharedArc::new(eq_reader);
         let hot_hash = hash_prop_equality_key(&PropValue::String("hot".to_string()));
         let crate::segment_reader::SecondaryEqGroupSpanLookup::Found(eq_span) = eq_reader
             .secondary_eq_group_span_if_present_for_target(
@@ -2549,7 +2630,7 @@ mod edge_stream_tests {
         assert_cursor_sequence(
             "segment equality terminal",
             EdgeCandidateCursor::segment_equality_group(
-                Arc::clone(&eq_reader),
+                Clone::clone(&eq_reader),
                 entry.index_id,
                 eq_span.offset,
                 eq_span.id_count,
@@ -2559,7 +2640,7 @@ mod edge_stream_tests {
         );
         assert_cursor_bulk_matches_seek("segment equality", || {
             EdgeCandidateCursor::segment_equality_group(
-                Arc::clone(&eq_reader),
+                Clone::clone(&eq_reader),
                 entry.index_id,
                 eq_span.offset,
                 eq_span.id_count,
@@ -2568,7 +2649,7 @@ mod edge_stream_tests {
 
         let max_entry = edge_equality_entry(94, 38, "status");
         let max_equality_memtable = Memtable::new();
-        max_equality_memtable.register_secondary_index(&max_entry);
+        max_equality_memtable.register_secondary_index(&max_entry).unwrap();
         for (seq, id) in max_ids.into_iter().enumerate() {
             max_equality_memtable.apply_op(
                 &WalOp::UpsertEdge(make_edge_with_props(id, 1, 2, 38, prop_status("hot"))),
@@ -2579,7 +2660,7 @@ mod edge_stream_tests {
             &max_equality_memtable,
             std::slice::from_ref(&max_entry),
         );
-        let max_eq_reader = Arc::new(max_eq_reader);
+        let max_eq_reader = SharedArc::new(max_eq_reader);
         let crate::segment_reader::SecondaryEqGroupSpanLookup::Found(max_eq_span) = max_eq_reader
             .secondary_eq_group_span_if_present_for_target(
                 max_entry.index_id,
@@ -2593,7 +2674,7 @@ mod edge_stream_tests {
         assert_cursor_sequence(
             "segment equality max",
             EdgeCandidateCursor::segment_equality_group(
-                Arc::clone(&max_eq_reader),
+                Clone::clone(&max_eq_reader),
                 max_entry.index_id,
                 max_eq_span.offset,
                 max_eq_span.id_count,
@@ -2603,14 +2684,14 @@ mod edge_stream_tests {
         );
         assert_cursor_bulk_matches_seek("segment equality max", || {
             EdgeCandidateCursor::segment_equality_group(
-                Arc::clone(&max_eq_reader),
+                Clone::clone(&max_eq_reader),
                 max_entry.index_id,
                 max_eq_span.offset,
                 max_eq_span.id_count,
             )
         });
 
-        let adj_memtable = Arc::new(Memtable::new());
+        let adj_memtable = SharedArc::new(Memtable::new());
         adj_memtable.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 1);
         adj_memtable.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 2);
         for (seq, id) in ids.into_iter().enumerate() {
@@ -2619,7 +2700,7 @@ mod edge_stream_tests {
         assert_cursor_sequence(
             "memtable adjacency terminal",
             EdgeCandidateCursor::memtable_adjacency(
-                Arc::clone(&adj_memtable),
+                Clone::clone(&adj_memtable),
                 1,
                 true,
                 Some(39),
@@ -2630,7 +2711,7 @@ mod edge_stream_tests {
         );
         assert_cursor_bulk_matches_seek("memtable adjacency", || {
             EdgeCandidateCursor::memtable_adjacency(
-                Arc::clone(&adj_memtable),
+                Clone::clone(&adj_memtable),
                 1,
                 true,
                 Some(39),
@@ -2644,7 +2725,7 @@ mod edge_stream_tests {
             &[0, u64::MAX],
         );
 
-        let max_adj_memtable = Arc::new(Memtable::new());
+        let max_adj_memtable = SharedArc::new(Memtable::new());
         max_adj_memtable.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 1);
         max_adj_memtable.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 2);
         for (seq, id) in max_ids.into_iter().enumerate() {
@@ -2654,7 +2735,7 @@ mod edge_stream_tests {
         assert_cursor_sequence(
             "memtable adjacency max",
             EdgeCandidateCursor::memtable_adjacency(
-                Arc::clone(&max_adj_memtable),
+                Clone::clone(&max_adj_memtable),
                 1,
                 true,
                 Some(40),
@@ -2665,7 +2746,7 @@ mod edge_stream_tests {
         );
         assert_cursor_bulk_matches_seek("memtable adjacency max", || {
             EdgeCandidateCursor::memtable_adjacency(
-                Arc::clone(&max_adj_memtable),
+                Clone::clone(&max_adj_memtable),
                 1,
                 true,
                 Some(40),
@@ -2681,7 +2762,7 @@ mod edge_stream_tests {
                 .apply_op(&WalOp::UpsertEdge(make_edge(id, 1, 2, 41)), seq as u64 + 3);
         }
         let (_adj_dir, adj_reader) = write_test_segment(&segment_adj_memtable, &[]);
-        let adj_reader = Arc::new(adj_reader);
+        let adj_reader = SharedArc::new(adj_reader);
         let adj_labels = [41];
         let mut adj_cursors = adj_reader
             .endpoint_adj_posting_cursors(&[1], Direction::Outgoing, Some(&adj_labels))
@@ -2690,7 +2771,7 @@ mod edge_stream_tests {
         assert_cursor_sequence(
             "segment adjacency terminal",
             EdgeCandidateCursor::segment_adjacency(
-                Arc::clone(&adj_reader),
+                Clone::clone(&adj_reader),
                 adj_cursors.remove(0),
             ),
             &ids,
@@ -2701,7 +2782,7 @@ mod edge_stream_tests {
                 .endpoint_adj_posting_cursors(&[1], Direction::Outgoing, Some(&adj_labels))
                 .unwrap();
             EdgeCandidateCursor::segment_adjacency(
-                Arc::clone(&adj_reader),
+                Clone::clone(&adj_reader),
                 cursors.remove(0),
             )
         });
@@ -2714,7 +2795,7 @@ mod edge_stream_tests {
                 .apply_op(&WalOp::UpsertEdge(make_edge(id, 1, 2, 42)), seq as u64 + 3);
         }
         let (_max_adj_dir, max_adj_reader) = write_test_segment(&max_segment_adj_memtable, &[]);
-        let max_adj_reader = Arc::new(max_adj_reader);
+        let max_adj_reader = SharedArc::new(max_adj_reader);
         let max_adj_labels = [42];
         let mut max_adj_cursors = max_adj_reader
             .endpoint_adj_posting_cursors(&[1], Direction::Outgoing, Some(&max_adj_labels))
@@ -2723,7 +2804,7 @@ mod edge_stream_tests {
         assert_cursor_sequence(
             "segment adjacency max",
             EdgeCandidateCursor::segment_adjacency(
-                Arc::clone(&max_adj_reader),
+                Clone::clone(&max_adj_reader),
                 max_adj_cursors.remove(0),
             ),
             &max_ids,
@@ -2738,7 +2819,7 @@ mod edge_stream_tests {
                 )
                 .unwrap();
             EdgeCandidateCursor::segment_adjacency(
-                Arc::clone(&max_adj_reader),
+                Clone::clone(&max_adj_reader),
                 cursors.remove(0),
             )
         });
@@ -2746,7 +2827,7 @@ mod edge_stream_tests {
 
     #[test]
     fn edge_stream_memtable_label_cursor_includes_bound_and_skips_invisible_slots() {
-        let memtable = Arc::new(Memtable::new());
+        let memtable = SharedArc::new(Memtable::new());
         memtable.apply_op(&WalOp::UpsertEdge(make_edge(1, 1, 2, 7)), 1);
         memtable.apply_op(&WalOp::UpsertEdge(make_edge(3, 1, 2, 7)), 2);
         memtable.apply_op(&WalOp::UpsertEdge(make_edge(5, 1, 2, 7)), 3);
@@ -2768,7 +2849,7 @@ mod edge_stream_tests {
             memtable.apply_op(&WalOp::UpsertEdge(make_edge(id, 1, 2, 4)), seq as u64 + 1);
         }
         let (_dir, reader) = write_test_segment(&memtable, &[]);
-        let reader = Arc::new(reader);
+        let reader = SharedArc::new(reader);
         let posting = reader.edge_label_posting(4).unwrap().unwrap();
         let mut cursor = EdgeCandidateCursor::segment_label_posting(reader, posting);
 
@@ -2783,7 +2864,7 @@ mod edge_stream_tests {
     fn edge_stream_segment_equality_cursor_seeks_edge_property_group() {
         let entry = edge_equality_entry(91, 7, "status");
         let memtable = Memtable::new();
-        memtable.register_secondary_index(&entry);
+        memtable.register_secondary_index(&entry).unwrap();
         for (seq, (id, status)) in [
             (2, "hot"),
             (5, "hot"),
@@ -2800,7 +2881,7 @@ mod edge_stream_tests {
             );
         }
         let (_dir, reader) = write_test_segment(&memtable, std::slice::from_ref(&entry));
-        let reader = Arc::new(reader);
+        let reader = SharedArc::new(reader);
         let hot_hash = hash_prop_equality_key(&PropValue::String("hot".to_string()));
         let crate::segment_reader::SecondaryEqGroupSpanLookup::Found(span) = reader
             .secondary_eq_group_span_if_present_for_target(
@@ -2833,7 +2914,7 @@ mod edge_stream_tests {
 
     #[test]
     fn edge_stream_memtable_adjacency_cursor_filters_skips_and_holds() {
-        let memtable = Arc::new(Memtable::new());
+        let memtable = SharedArc::new(Memtable::new());
         memtable.apply_op(&WalOp::UpsertNode(make_node(1, 1, "a")), 1);
         memtable.apply_op(&WalOp::UpsertNode(make_node(2, 1, "b")), 2);
         memtable.apply_op(&WalOp::UpsertNode(make_node(3, 1, "c")), 3);
@@ -2887,7 +2968,7 @@ mod edge_stream_tests {
             7,
         );
         let (_dir, reader) = write_test_segment(&memtable, &[]);
-        let reader = Arc::new(reader);
+        let reader = SharedArc::new(reader);
         let labels = [7];
         let mut cursors = reader
             .endpoint_adj_posting_cursors(&[1], Direction::Outgoing, Some(&labels))
@@ -3017,7 +3098,7 @@ mod edge_stream_tests {
     fn edge_stream_read_view_leaf_streams_cover_visible_sources() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("db");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = crate::engine::tests::open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let a = engine
             .upsert_node("StreamNode", "a", UpsertNodeOptions::default())
             .unwrap();
@@ -3148,7 +3229,7 @@ mod edge_stream_tests {
     fn edge_stream_equality_leaf_treats_missing_value_groups_as_empty_sources() {
         let entry = edge_equality_entry(92, 7, "status");
         let segment_with_hot = Memtable::new();
-        segment_with_hot.register_secondary_index(&entry);
+        segment_with_hot.register_secondary_index(&entry).unwrap();
         segment_with_hot.apply_op(
             &WalOp::UpsertEdge(make_edge_with_props(10, 1, 2, 7, prop_status("hot"))),
             1,
@@ -3157,7 +3238,7 @@ mod edge_stream_tests {
             write_test_segment(&segment_with_hot, std::slice::from_ref(&entry));
 
         let segment_without_hot = Memtable::new();
-        segment_without_hot.register_secondary_index(&entry);
+        segment_without_hot.register_secondary_index(&entry).unwrap();
         segment_without_hot.apply_op(
             &WalOp::UpsertEdge(make_edge_with_props(20, 1, 2, 7, prop_status("cold"))),
             1,
@@ -3192,7 +3273,7 @@ mod edge_stream_tests {
             unreachable!();
         };
         let stream = EdgeLeafStream::new(vec![EdgeCandidateCursor::segment_equality_group(
-            Arc::new(hot_reader),
+            SharedArc::new(hot_reader),
             entry.index_id,
             span.offset,
             span.id_count,

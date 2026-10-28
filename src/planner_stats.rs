@@ -1,3 +1,4 @@
+use crate::engine::shared::SharedArc;
 use crate::error::EngineError;
 use crate::property_value_semantics::{
     hash_prop_equality_key, numeric_range_sort_key_for_value, NumericRangeSortKey,
@@ -15,9 +16,7 @@ use crate::segment_components::{
     decode_identity_header, COMPONENT_IDENTITY_HEADER_LEN, COMPONENT_IDENTITY_HEADER_MAGIC,
 };
 use crate::segment_reader::SegmentReader;
-use crate::segment_writer::{
-    publish_planner_stats_component_payload_from_latest, CompactEdgeMeta, CompactNodeMeta,
-};
+use crate::segment_writer::{CompactEdgeMeta, CompactNodeMeta};
 use crate::types::{
     EdgeRecord, NodeIdMap, NodeRecord, PropValue, SecondaryIndexFieldManifest, SecondaryIndexKind,
     SecondaryIndexManifestEntry, SecondaryIndexState, SecondaryIndexTarget,
@@ -188,7 +187,7 @@ pub(crate) struct DeclaredIndexRuntimeCoverage {
 
 impl DeclaredIndexRuntimeCoverage {
     pub(crate) fn from_readers(
-        segments: &[Arc<SegmentReader>],
+        segments: &[SharedArc<SegmentReader>],
         secondary_indexes: &[SecondaryIndexManifestEntry],
     ) -> Self {
         let mut coverage = Self::default();
@@ -789,7 +788,7 @@ pub(crate) struct AdjacencyRollupStats {
 impl PlannerStatsView {
     pub(crate) fn build_from_readers(
         generation: u64,
-        segments: &[Arc<SegmentReader>],
+        segments: &[SharedArc<SegmentReader>],
         secondary_indexes: &[SecondaryIndexManifestEntry],
         runtime_coverage: &DeclaredIndexRuntimeCoverage,
     ) -> Self {
@@ -1429,7 +1428,7 @@ const STALE_RISK_MEDIUM_RAW_TO_VISIBLE_BPS: u128 = 10_526;
 const STALE_RISK_MEDIUM_ESTIMATED_STALE_NODES: u64 = 1024;
 
 fn segment_stale_risks_from_readers(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
 ) -> BTreeMap<u64, StalePostingRisk> {
     let mut risks = BTreeMap::new();
     let mut newer_sample_ids = BTreeSet::new();
@@ -2807,6 +2806,32 @@ pub(crate) fn write_targeted_secondary_index_planner_stats_sidecar(
     target_index: &SecondaryIndexManifestEntry,
     ready_secondary_indexes: &[SecondaryIndexManifestEntry],
 ) -> Result<PlannerStatsWriteOutcome, EngineError> {
+    let (outcome, prepared) = prepare_targeted_secondary_index_planner_stats_sidecar(
+        seg_dir,
+        segment,
+        target_index,
+        ready_secondary_indexes,
+    )?;
+    if let Some(prepared) = prepared {
+        prepared.publish()?;
+    }
+    Ok(outcome)
+}
+
+pub(crate) fn prepare_targeted_secondary_index_planner_stats_sidecar(
+    seg_dir: &Path,
+    segment: &SegmentReader,
+    target_index: &SecondaryIndexManifestEntry,
+    ready_secondary_indexes: &[SecondaryIndexManifestEntry],
+) -> Result<
+    (
+        PlannerStatsWriteOutcome,
+        Option<crate::segment_writer::PreparedOptionalComponent>,
+    ),
+    EngineError,
+> {
+    #[cfg(test)]
+    crate::persistence_fault::check(crate::persistence_fault::Boundary::PlannerStatsPrepare)?;
     let policy = PlannerStatsBuildPolicy::targeted_secondary_index_refresh(target_index.index_id);
     if !matches!(
         policy.mode,
@@ -2820,14 +2845,14 @@ pub(crate) fn write_targeted_secondary_index_planner_stats_sidecar(
     }
 
     if target_index.state != SecondaryIndexState::Ready {
-        return Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable);
+        return Ok((PlannerStatsWriteOutcome::SkippedTargetUnavailable, None));
     }
     let ready_indexes = ready_planner_stats_indexes(ready_secondary_indexes);
     if !ready_indexes
         .iter()
         .any(|entry| planner_stats_declaration_matches(entry, target_index))
     {
-        return Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable);
+        return Ok((PlannerStatsWriteOutcome::SkippedTargetUnavailable, None));
     }
 
     let target_is_property = matches!(
@@ -2844,10 +2869,10 @@ pub(crate) fn write_targeted_secondary_index_planner_stats_sidecar(
         let mut stats =
             build_equality_index_stats_from_segment(segment, std::slice::from_ref(target_index))?;
         let Some(stats) = stats.pop() else {
-            return Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable);
+            return Ok((PlannerStatsWriteOutcome::SkippedTargetUnavailable, None));
         };
         if !stats.sidecar_present_at_build {
-            return Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable);
+            return Ok((PlannerStatsWriteOutcome::SkippedTargetUnavailable, None));
         }
         Some(stats)
     } else {
@@ -2858,10 +2883,10 @@ pub(crate) fn write_targeted_secondary_index_planner_stats_sidecar(
             let mut stats =
                 build_range_index_stats_from_segment(segment, std::slice::from_ref(target_index))?;
             let Some(stats) = stats.pop() else {
-                return Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable);
+                return Ok((PlannerStatsWriteOutcome::SkippedTargetUnavailable, None));
             };
             if !stats.sidecar_present_at_build {
-                return Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable);
+                return Ok((PlannerStatsWriteOutcome::SkippedTargetUnavailable, None));
             }
             Some(stats)
         } else {
@@ -2871,17 +2896,17 @@ pub(crate) fn write_targeted_secondary_index_planner_stats_sidecar(
         let mut stats =
             build_compound_index_stats_from_segment(segment, std::slice::from_ref(target_index))?;
         let Some(stats) = stats.pop() else {
-            return Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable);
+            return Ok((PlannerStatsWriteOutcome::SkippedTargetUnavailable, None));
         };
         if stats.coverage != DeclaredIndexRuntimeCoverageState::Available {
-            return Ok(PlannerStatsWriteOutcome::SkippedTargetUnavailable);
+            return Ok((PlannerStatsWriteOutcome::SkippedTargetUnavailable, None));
         }
         Some(stats)
     } else {
         None
     };
 
-    let written = publish_planner_stats_component_payload_from_latest(
+    let prepared = crate::segment_writer::prepare_planner_stats_component_payload_from_latest(
         seg_dir,
         &ready_indexes,
         |current_payload, segment_id, node_count, edge_count| {
@@ -2906,16 +2931,84 @@ pub(crate) fn write_targeted_secondary_index_planner_stats_sidecar(
             planner_stats_sidecar_payload(stats)
         },
     )?;
-    if !written {
-        return Ok(PlannerStatsWriteOutcome::SkippedOversize);
-    }
-    Ok(PlannerStatsWriteOutcome::Written)
+    let outcome = if prepared.is_some() {
+        PlannerStatsWriteOutcome::Written
+    } else {
+        PlannerStatsWriteOutcome::SkippedOversize
+    };
+    Ok((outcome, prepared))
 }
 
 pub(crate) fn planner_stats_declaration_fingerprint_for_entry(
     entry: &SecondaryIndexManifestEntry,
 ) -> u64 {
     declaration_fingerprint(&declared_index_fingerprints(std::slice::from_ref(entry)))
+}
+
+// The streaming flush keeps the exact sorted first-pass candidate selection and
+// second-pass value accumulation used below; only the record source differs.
+#[cfg(feature = "production-concurrency")]
+pub(crate) struct StreamingFlushStats {
+    labels: BTreeMap<u32, NodeLabelAccumulator>,
+    candidates: BTreeMap<u32, PropertyKeyCandidateTracker>,
+    reasons: BTreeMap<(u32, String), PropertyStatsTrackedReason>,
+    properties: BTreeMap<(u32, String), PropertyAccumulator>,
+    ids: Vec<u64>,
+}
+#[cfg(feature = "production-concurrency")]
+impl StreamingFlushStats {
+    pub(crate) fn new(indexes: &[SecondaryIndexManifestEntry]) -> Self {
+        Self {
+            labels: BTreeMap::new(),
+            candidates: BTreeMap::new(),
+            reasons: declared_property_reasons(indexes),
+            properties: BTreeMap::new(),
+            ids: Vec::new(),
+        }
+    }
+    pub(crate) fn observe_candidates(&mut self, node: &NodeRecord) {
+        self.ids.push(node.id);
+        for &label in node.label_ids.as_slice() {
+            observe_label(&mut self.labels, node.id, label, node.updated_at);
+            observe_general_property_candidates(
+                &mut self.candidates,
+                &self.reasons,
+                label,
+                &node.props,
+            );
+        }
+    }
+    pub(crate) fn select(&mut self) {
+        self.properties = seed_property_accumulators(
+            &self.reasons,
+            std::mem::take(&mut self.candidates),
+            &self.labels,
+        );
+    }
+    pub(crate) fn observe_values(&mut self, node: &NodeRecord) {
+        for &label in node.label_ids.as_slice() {
+            observe_selected_node_properties(&mut self.properties, label, &node.props);
+        }
+    }
+    pub(crate) fn finish(self, edges: &[CompactEdgeMeta]) -> StatsCorePartial {
+        let timestamps = finalize_timestamp_stats_from_label_accs(&self.labels);
+        StatsCorePartial {
+            node_count: self.ids.len() as u64,
+            edge_count: edges.len() as u64,
+            truncated: false,
+            general_property_stats_complete: true,
+            general_property_sampled_node_count: self.ids.len() as u64,
+            general_property_sampled_raw_bytes: 0,
+            general_property_budget_exhausted: false,
+            node_label_stats: finalize_node_label_stats(self.labels),
+            timestamp_stats: timestamps,
+            property_stats: finalize_property_stats(self.properties),
+            adjacency_stats: build_adjacency_stats_from_edge_meta(
+                edges.iter().map(EdgeMetaRef::from),
+            ),
+            node_id_sample: node_id_sample(self.ids.into_iter()),
+        }
+    }
 }
 
 pub(crate) fn build_flush_stats_core_partial(
@@ -3010,7 +3103,7 @@ pub(crate) fn build_flush_stats(
 }
 
 pub(crate) fn build_compaction_stats_core_partial(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     edge_metas: &[CompactEdgeMeta],
     secondary_indexes: &[SecondaryIndexManifestEntry],
@@ -3025,7 +3118,7 @@ pub(crate) fn build_compaction_stats_core_partial(
 }
 
 fn build_compaction_stats_core_partial_with_policy(
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     edge_metas: &[CompactEdgeMeta],
     secondary_indexes: &[SecondaryIndexManifestEntry],
@@ -3120,7 +3213,7 @@ pub(crate) fn assemble_compaction_stats_from_partials(
 pub(crate) fn build_compaction_stats(
     segment_id: u64,
     seg_dir: &Path,
-    segments: &[Arc<SegmentReader>],
+    segments: &[SharedArc<SegmentReader>],
     node_metas: &[CompactNodeMeta],
     edge_metas: &[CompactEdgeMeta],
     secondary_indexes: &[SecondaryIndexManifestEntry],
@@ -4231,12 +4324,148 @@ fn planner_stats_payload_slice(data: &[u8]) -> Result<&[u8], PlannerStatsReadFai
     Ok(data)
 }
 
-fn decode_planner_stats_envelope(
-    data: &[u8],
-    expected_segment_id: u64,
-    expected_node_count: u64,
-    expected_edge_count: u64,
-) -> Result<SegmentPlannerStatsV1, String> {
+/// Partial DTOs and validation indexes remain in the registered reader job on
+/// every decode/validation failure; only a complete valid DTO is adopted.
+#[derive(Default)]
+pub(crate) struct RetainedPlannerStatsOpen {
+    stats: Option<Box<SegmentPlannerStatsV1>>,
+    construction: crate::engine::payload::json::MessagePackConstruction,
+    scratch: StatsValidationScratch,
+    failure: Option<String>,
+}
+impl RetainedPlannerStatsOpen {
+    pub(crate) fn read(
+        &mut self,
+        data: &[u8],
+        segment_id: u64,
+        nodes: u64,
+        edges: u64,
+    ) -> Result<bool, EngineError> {
+        self.stats = Some(Box::new(
+            crate::engine::payload::json::MessagePackConstruction::empty_planner_stats(),
+        ));
+        if data.len() > PLANNER_STATS_HARD_SIDECAR_BYTES {
+            self.failure = Some("planner stats sidecar exceeds hard cap".into());
+            return Ok(false);
+        }
+        let payload = match planner_stats_envelope_payload(data) {
+            Ok(payload) => payload,
+            Err(reason) => {
+                self.failure = Some(reason);
+                return Ok(false);
+            }
+        };
+        if let Err(error) = self
+            .construction
+            .planner_stats(self.stats.as_mut().unwrap(), payload)
+        {
+            if matches!(error, EngineError::ResourceLimit { .. }) {
+                return Err(error);
+            }
+            self.failure = Some(bounded_stats_diagnostic(format_args!("{}", error)));
+            return Ok(false);
+        }
+        let stats = self.stats.as_ref().unwrap();
+
+        self.scratch
+            .properties
+            .try_reserve_exact(stats.property_stats.len())
+            .map_err(|_| {
+                self.construction.allocation_error(
+                    stats
+                        .property_stats
+                        .len()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                )
+            })?;
+        match validate_stats_payload_with_scratch(
+            stats,
+            segment_id,
+            nodes,
+            edges,
+            &mut self.scratch,
+        ) {
+            Ok(()) => Ok(true),
+            Err(reason) => {
+                self.failure = Some(reason);
+                Ok(false)
+            }
+        }
+    }
+    pub(crate) fn take_stats(&mut self) -> Box<SegmentPlannerStatsV1> {
+        self.stats.take().expect("validated stats")
+    }
+    pub(crate) fn reason(&self) -> &str {
+        self.failure
+            .as_deref()
+            .unwrap_or("planner stats unavailable")
+    }
+}
+
+#[derive(Default)]
+struct StatsValidationScratch {
+    labels: BTreeMap<u32, u64>,
+    timestamps: BTreeMap<u32, ()>,
+    properties: Vec<usize>,
+    declarations: BTreeMap<u64, usize>,
+    edge_labels: BTreeMap<u32, u64>,
+    equality: BTreeMap<u64, ()>,
+    ranges: BTreeMap<u64, ()>,
+    compounds: BTreeMap<u64, ()>,
+    adjacency: BTreeMap<(PlannerStatsDirection, Option<u32>), ()>,
+}
+impl StatsValidationScratch {}
+
+struct StatsPropertyKey<'a>(&'a str);
+impl std::fmt::Display for StatsPropertyKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut end = self.0.len().min(80);
+        while !self.0.is_char_boundary(end) {
+            end -= 1;
+        }
+        f.write_str(&self.0[..end])?;
+        if end < self.0.len() {
+            f.write_str("…")?;
+        }
+        Ok(())
+    }
+}
+
+// Formatting never constructs an unbounded temporary containing a property key.
+// The returned failure is retained by the registered job. Legacy diagnostics use
+// the same sink, preserving their useful prefix and complete short messages.
+pub(crate) fn bounded_stats_diagnostic(args: std::fmt::Arguments<'_>) -> String {
+    struct Sink {
+        bytes: [u8; 960],
+        len: usize,
+    }
+    impl std::fmt::Write for Sink {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            let mut take = text.len().min(self.bytes.len() - self.len);
+            while !text.is_char_boundary(take) {
+                take -= 1;
+            }
+            self.bytes[self.len..self.len + take].copy_from_slice(&text.as_bytes()[..take]);
+            self.len += take;
+            if take == text.len() {
+                Ok(())
+            } else {
+                Err(std::fmt::Error)
+            }
+        }
+    }
+    let mut sink = Sink {
+        bytes: [0; 960],
+        len: 0,
+    };
+    let _ = std::fmt::write(&mut sink, args);
+    std::str::from_utf8(&sink.bytes[..sink.len])
+        .unwrap()
+        .to_owned()
+}
+macro_rules! stats_diagnostic { ($($args:tt)*) => { bounded_stats_diagnostic(format_args!($($args)*)) }; }
+
+fn planner_stats_envelope_payload(data: &[u8]) -> Result<&[u8], String> {
     if data.len() < PLANNER_STATS_ENVELOPE_LEN {
         return Err("planner stats sidecar is shorter than envelope".to_string());
     }
@@ -4245,14 +4474,18 @@ fn decode_planner_stats_envelope(
     }
     let version = u32::from_le_bytes(data[8..12].try_into().unwrap());
     if version != PLANNER_STATS_FORMAT_VERSION {
-        return Err(format!("unsupported planner stats version {}", version));
+        return Err(stats_diagnostic!(
+            "unsupported planner stats version {}",
+            version
+        ));
     }
     let payload_len = u64::from_le_bytes(data[12..20].try_into().unwrap()) as usize;
     let expected_payload_len = data.len() - PLANNER_STATS_ENVELOPE_LEN;
     if payload_len != expected_payload_len {
-        return Err(format!(
+        return Err(stats_diagnostic!(
             "planner stats payload length mismatch: header={}, actual={}",
-            payload_len, expected_payload_len
+            payload_len,
+            expected_payload_len
         ));
     }
     let expected_crc = u32::from_le_bytes(data[20..24].try_into().unwrap());
@@ -4267,6 +4500,16 @@ fn decode_planner_stats_envelope(
     if expected_crc != actual_crc {
         return Err("planner stats payload crc mismatch".to_string());
     }
+    Ok(payload)
+}
+
+fn decode_planner_stats_envelope(
+    data: &[u8],
+    expected_segment_id: u64,
+    expected_node_count: u64,
+    expected_edge_count: u64,
+) -> Result<SegmentPlannerStatsV1, String> {
+    let payload = planner_stats_envelope_payload(data)?;
     let stats: SegmentPlannerStatsV1 =
         rmp_serde::from_slice(payload).map_err(|error| error.to_string())?;
     validate_stats_payload(
@@ -4284,28 +4527,46 @@ fn validate_stats_payload(
     expected_node_count: u64,
     expected_edge_count: u64,
 ) -> Result<(), String> {
+    validate_stats_payload_with_scratch(
+        stats,
+        expected_segment_id,
+        expected_node_count,
+        expected_edge_count,
+        &mut StatsValidationScratch::default(),
+    )
+}
+fn validate_stats_payload_with_scratch(
+    stats: &SegmentPlannerStatsV1,
+    expected_segment_id: u64,
+    expected_node_count: u64,
+    expected_edge_count: u64,
+    scratch: &mut StatsValidationScratch,
+) -> Result<(), String> {
     if stats.format_version != PLANNER_STATS_FORMAT_VERSION {
-        return Err(format!(
+        return Err(stats_diagnostic!(
             "planner stats payload version mismatch: {}",
             stats.format_version
         ));
     }
     if stats.segment_id != expected_segment_id {
-        return Err(format!(
+        return Err(stats_diagnostic!(
             "planner stats segment id mismatch: expected {}, got {}",
-            expected_segment_id, stats.segment_id
+            expected_segment_id,
+            stats.segment_id
         ));
     }
     if stats.node_count != expected_node_count {
-        return Err(format!(
+        return Err(stats_diagnostic!(
             "planner stats node count mismatch: expected {}, got {}",
-            expected_node_count, stats.node_count
+            expected_node_count,
+            stats.node_count
         ));
     }
     if stats.edge_count != expected_edge_count {
-        return Err(format!(
+        return Err(stats_diagnostic!(
             "planner stats edge count mismatch: expected {}, got {}",
-            expected_edge_count, stats.edge_count
+            expected_edge_count,
+            stats.edge_count
         ));
     }
     if stats.general_property_sampled_node_count > stats.node_count {
@@ -4328,35 +4589,47 @@ fn validate_stats_payload(
     {
         return Err("planner stats node id sample is not sorted".to_string());
     }
-    let label_counts = validate_node_label_stats(stats)?;
-    validate_timestamp_stats(stats, &label_counts)?;
-    validate_property_stats(stats, &label_counts)?;
-    validate_declared_index_stats(stats, &label_counts)?;
-    validate_adjacency_stats(stats)?;
+    validate_node_label_stats(stats, &mut scratch.labels)?;
+    validate_timestamp_stats(stats, &scratch.labels, &mut scratch.timestamps)?;
+    validate_property_stats(stats, &scratch.labels, &mut scratch.properties)?;
+    validate_declared_index_stats(
+        stats,
+        &scratch.labels,
+        &mut scratch.declarations,
+        &mut scratch.edge_labels,
+        &mut scratch.equality,
+        &mut scratch.ranges,
+        &mut scratch.compounds,
+    )?;
+    validate_adjacency_stats(stats, &mut scratch.adjacency)?;
     Ok(())
 }
 
-fn validate_node_label_stats(stats: &SegmentPlannerStatsV1) -> Result<BTreeMap<u32, u64>, String> {
-    let mut label_counts = BTreeMap::new();
+fn validate_node_label_stats(
+    stats: &SegmentPlannerStatsV1,
+    label_counts: &mut BTreeMap<u32, u64>,
+) -> Result<(), String> {
     let mut total = 0u64;
     for label_stat in &stats.node_label_stats {
         if label_stat.node_count == 0 {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats label {} has zero node count",
                 label_stat.label_id
             ));
         }
         if label_stat.node_count > stats.node_count {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats label {} node count {} exceeds segment node count {}",
-                label_stat.label_id, label_stat.node_count, stats.node_count
+                label_stat.label_id,
+                label_stat.node_count,
+                stats.node_count
             ));
         }
         if label_counts
             .insert(label_stat.label_id, label_stat.node_count)
             .is_some()
         {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats label {} appears more than once",
                 label_stat.label_id
             ));
@@ -4374,9 +4647,10 @@ fn validate_node_label_stats(stats: &SegmentPlannerStatsV1) -> Result<BTreeMap<u
         )?;
     }
     if stats.node_label_stats.len() <= 1 && total != stats.node_count {
-        return Err(format!(
+        return Err(stats_diagnostic!(
             "planner stats label counts sum to {}, expected {} for single-label stats",
-            total, stats.node_count
+            total,
+            stats.node_count
         ));
     }
     let max_memberships = stats
@@ -4384,36 +4658,40 @@ fn validate_node_label_stats(stats: &SegmentPlannerStatsV1) -> Result<BTreeMap<u
         .checked_mul(MAX_NODE_LABELS_PER_NODE as u64)
         .ok_or_else(|| "planner stats label count bound overflow".to_string())?;
     if total < stats.node_count || total > max_memberships {
-        return Err(format!(
+        return Err(stats_diagnostic!(
             "planner stats label counts sum to {}, expected between {} and {}",
-            total, stats.node_count, max_memberships
+            total,
+            stats.node_count,
+            max_memberships
         ));
     }
-    Ok(label_counts)
+    Ok(())
 }
 
 fn validate_timestamp_stats(
     stats: &SegmentPlannerStatsV1,
     label_counts: &BTreeMap<u32, u64>,
+    seen: &mut BTreeMap<u32, ()>,
 ) -> Result<(), String> {
-    let mut seen = BTreeMap::new();
     for timestamp in &stats.timestamp_stats {
         let Some(label_count) = label_counts.get(&timestamp.label_id) else {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats timestamp section references unknown label {}",
                 timestamp.label_id
             ));
         };
         if seen.insert(timestamp.label_id, ()).is_some() {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats timestamp section repeats label {}",
                 timestamp.label_id
             ));
         }
         if timestamp.count != *label_count {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats timestamp count for label {} is {}, expected {}",
-                timestamp.label_id, timestamp.count, label_count
+                timestamp.label_id,
+                timestamp.count,
+                label_count
             ));
         }
         if timestamp.min_ms > timestamp.max_ms {
@@ -4427,69 +4705,87 @@ fn validate_timestamp_stats(
 fn validate_property_stats(
     stats: &SegmentPlannerStatsV1,
     label_counts: &BTreeMap<u32, u64>,
+    seen: &mut Vec<usize>,
 ) -> Result<(), String> {
-    let mut seen = BTreeMap::new();
+    seen.try_reserve_exact(stats.property_stats.len())
+        .map_err(|_| "planner stats validation allocation".to_string())?;
+    seen.extend(0..stats.property_stats.len());
+    seen.sort_unstable_by(|left, right| {
+        let left = &stats.property_stats[*left];
+        let right = &stats.property_stats[*right];
+        (left.label_id, left.prop_key.as_str()).cmp(&(right.label_id, right.prop_key.as_str()))
+    });
+    if let Some(pair) = seen.windows(2).find(|pair| {
+        let a = &stats.property_stats[pair[0]];
+        let b = &stats.property_stats[pair[1]];
+        a.label_id == b.label_id && a.prop_key == b.prop_key
+    }) {
+        let prop = &stats.property_stats[pair[1]];
+        return Err(stats_diagnostic!(
+            "planner stats property {} for label {} appears more than once",
+            StatsPropertyKey(&prop.prop_key),
+            prop.label_id
+        ));
+    }
+
     for prop in &stats.property_stats {
+        let key = StatsPropertyKey(&prop.prop_key);
         let Some(label_count) = label_counts.get(&prop.label_id) else {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats property {} references unknown label {}",
-                prop.prop_key, prop.label_id
+                key,
+                prop.label_id
             ));
         };
-        let key = (prop.label_id, prop.prop_key.as_str());
-        if seen.insert(key, ()).is_some() {
-            return Err(format!(
-                "planner stats property {} for label {} appears more than once",
-                prop.prop_key, prop.label_id
-            ));
-        }
         if prop.present_count > *label_count {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats property {} present count exceeds label count",
-                prop.prop_key
+                key
             ));
         }
         if prop.null_count > prop.present_count {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats property {} null count exceeds present count",
-                prop.prop_key
+                key
             ));
         }
         if prop.value_kind_counts.null_count != prop.null_count {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats property {} null kind count mismatch",
-                prop.prop_key
+                key
             ));
         }
         let kind_total = value_kind_total(&prop.value_kind_counts)?;
         if kind_total != prop.present_count {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats property {} value-kind counts sum to {}, expected {}",
-                prop.prop_key, kind_total, prop.present_count
+                key,
+                kind_total,
+                prop.present_count
             ));
         }
         if let Some(exact) = prop.exact_distinct_count {
             if exact > prop.present_count {
-                return Err(format!(
+                return Err(stats_diagnostic!(
                     "planner stats property {} exact distinct count exceeds present count",
-                    prop.prop_key
+                    key
                 ));
             }
         }
         if let Some(lower_bound) = prop.distinct_lower_bound {
             if lower_bound > prop.present_count {
-                return Err(format!(
+                return Err(stats_diagnostic!(
                     "planner stats property {} distinct lower bound exceeds present count",
-                    prop.prop_key
+                    key
                 ));
             }
         }
         validate_value_frequencies(&prop.top_values, prop.present_count, "property top values")?;
         for summary in &prop.numeric_summaries {
             if summary.count > prop.present_count {
-                return Err(format!(
+                return Err(stats_diagnostic!(
                     "planner stats property {} numeric summary exceeds present count",
-                    prop.prop_key
+                    key
                 ));
             }
             validate_ordered_option_pair(
@@ -4506,48 +4802,53 @@ fn validate_property_stats(
 fn validate_declared_index_stats(
     stats: &SegmentPlannerStatsV1,
     label_counts: &BTreeMap<u32, u64>,
+    declared: &mut BTreeMap<u64, usize>,
+    edge_label_counts: &mut BTreeMap<u32, u64>,
+    equality_seen: &mut BTreeMap<u64, ()>,
+    range_seen: &mut BTreeMap<u64, ()>,
+    compound_seen: &mut BTreeMap<u64, ()>,
 ) -> Result<(), String> {
-    let declared = declared_index_map(stats)?;
-    let edge_label_counts = edge_label_counts_from_adjacency_stats(stats);
-    let mut equality_seen = BTreeMap::new();
+    declared_index_map(stats, declared)?;
+    edge_label_counts_from_adjacency_stats(stats, edge_label_counts);
     for equality in &stats.equality_index_stats {
         let Some(declared_index) = declared.get(&equality.index_id) else {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats equality index {} has no declaration",
                 equality.index_id
             ));
         };
+        let declared_index = &stats.declared_indexes[*declared_index];
         if declared_index.kind != PlannerStatsDeclaredIndexKind::Equality
             || declared_index.target_label_id != equality.target_label_id
             || declared_index.prop_key != equality.prop_key
         {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats equality index {} declaration mismatch",
                 equality.index_id
             ));
         }
         if equality_seen.insert(equality.index_id, ()).is_some() {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats equality index {} appears more than once",
                 equality.index_id
             ));
         }
         let target_count =
-            declared_index_target_count(declared_index, label_counts, &edge_label_counts);
+            declared_index_target_count(declared_index, label_counts, edge_label_counts);
         if equality.total_postings > target_count {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats equality index {} postings exceed target count",
                 equality.index_id
             ));
         }
         if equality.value_group_count > equality.total_postings {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats equality index {} group count exceeds postings",
                 equality.index_id
             ));
         }
         if equality.max_group_postings > equality.total_postings {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats equality index {} max group exceeds postings",
                 equality.index_id
             ));
@@ -4559,33 +4860,33 @@ fn validate_declared_index_stats(
         )?;
     }
 
-    let mut range_seen = BTreeMap::new();
     for range in &stats.range_index_stats {
         let Some(declared_index) = declared.get(&range.index_id) else {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats range index {} has no declaration",
                 range.index_id
             ));
         };
+        let declared_index = &stats.declared_indexes[*declared_index];
         if declared_index.kind != PlannerStatsDeclaredIndexKind::Range
             || declared_index.target_label_id != range.target_label_id
             || declared_index.prop_key != range.prop_key
         {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats range index {} declaration mismatch",
                 range.index_id
             ));
         }
         if range_seen.insert(range.index_id, ()).is_some() {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats range index {} appears more than once",
                 range.index_id
             ));
         }
         let target_count =
-            declared_index_target_count(declared_index, label_counts, &edge_label_counts);
+            declared_index_target_count(declared_index, label_counts, edge_label_counts);
         if range.total_entries > target_count {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats range index {} entries exceed target count",
                 range.index_id
             ));
@@ -4594,60 +4895,60 @@ fn validate_declared_index_stats(
         validate_range_buckets(range.total_entries, &range.buckets)?;
     }
 
-    let mut compound_seen = BTreeMap::new();
     for compound in &stats.compound_index_stats {
         let Some(declared_index) = declared.get(&compound.index_id) else {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats compound index {} has no declaration",
                 compound.index_id
             ));
         };
+        let declared_index = &stats.declared_indexes[*declared_index];
         if declared_index.kind != compound.kind
             || declared_index.target != compound.target
             || declared_index.target_label_id != compound.target_label_id
             || declared_index.field_fingerprint != compound.field_fingerprint
             || declared_index.field_count != compound.field_count
         {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats compound index {} declaration mismatch",
                 compound.index_id
             ));
         }
         if compound_seen.insert(compound.index_id, ()).is_some() {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats compound index {} appears more than once",
                 compound.index_id
             ));
         }
         let target_count =
-            declared_index_target_count(declared_index, label_counts, &edge_label_counts);
+            declared_index_target_count(declared_index, label_counts, edge_label_counts);
         if compound.total_postings > target_count {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats compound index {} postings exceed target count",
                 compound.index_id
             ));
         }
         if compound.distinct_full_keys > compound.total_postings {
-            return Err(format!(
+            return Err(stats_diagnostic!(
                 "planner stats compound index {} distinct keys exceed postings",
                 compound.index_id
             ));
         }
         for prefix in &compound.prefix_stats {
             if prefix.distinct_prefixes > compound.distinct_full_keys {
-                return Err(format!(
+                return Err(stats_diagnostic!(
                     "planner stats compound index {} prefix distinct count exceeds full keys",
                     compound.index_id
                 ));
             }
             if prefix.max_postings_per_prefix > compound.total_postings {
-                return Err(format!(
+                return Err(stats_diagnostic!(
                     "planner stats compound index {} prefix max exceeds postings",
                     compound.index_id
                 ));
             }
             if prefix.exact_prefix_postings.len() > COMPOUND_STATS_EXACT_PREFIX_LIMIT {
-                return Err(format!(
+                return Err(stats_diagnostic!(
                     "planner stats compound index {} exact prefix map exceeds cap",
                     compound.index_id
                 ));
@@ -4655,7 +4956,7 @@ fn validate_declared_index_stats(
         }
         for range in &compound.range_stats {
             if range.total_numeric_entries > compound.total_postings {
-                return Err(format!(
+                return Err(stats_diagnostic!(
                     "planner stats compound index {} range entries exceed postings",
                     compound.index_id
                 ));
@@ -4667,8 +4968,10 @@ fn validate_declared_index_stats(
     Ok(())
 }
 
-fn edge_label_counts_from_adjacency_stats(stats: &SegmentPlannerStatsV1) -> BTreeMap<u32, u64> {
-    let mut counts: BTreeMap<u32, u64> = BTreeMap::new();
+fn edge_label_counts_from_adjacency_stats(
+    stats: &SegmentPlannerStatsV1,
+    counts: &mut BTreeMap<u32, u64>,
+) {
     for adjacency in &stats.adjacency_stats {
         let Some(edge_label_id) = adjacency.edge_label_id else {
             continue;
@@ -4678,7 +4981,6 @@ fn edge_label_counts_from_adjacency_stats(stats: &SegmentPlannerStatsV1) -> BTre
             .and_modify(|count| *count = (*count).max(adjacency.total_edges))
             .or_insert(adjacency.total_edges);
     }
-    counts
 }
 
 fn declared_index_target_count(
@@ -4700,21 +5002,23 @@ fn declared_index_target_count(
 
 fn declared_index_map(
     stats: &SegmentPlannerStatsV1,
-) -> Result<BTreeMap<u64, &DeclaredIndexStatsFingerprint>, String> {
-    let mut declared = BTreeMap::new();
-    for entry in &stats.declared_indexes {
-        if declared.insert(entry.index_id, entry).is_some() {
-            return Err(format!(
+    declared: &mut BTreeMap<u64, usize>,
+) -> Result<(), String> {
+    for (index, entry) in stats.declared_indexes.iter().enumerate() {
+        if declared.insert(entry.index_id, index).is_some() {
+            return Err(stats_diagnostic!(
                 "planner stats declaration {} appears more than once",
                 entry.index_id
             ));
         }
     }
-    Ok(declared)
+    Ok(())
 }
 
-fn validate_adjacency_stats(stats: &SegmentPlannerStatsV1) -> Result<(), String> {
-    let mut seen = BTreeMap::new();
+fn validate_adjacency_stats(
+    stats: &SegmentPlannerStatsV1,
+    seen: &mut BTreeMap<(PlannerStatsDirection, Option<u32>), ()>,
+) -> Result<(), String> {
     for adjacency in &stats.adjacency_stats {
         let key = (adjacency.direction, adjacency.edge_label_id);
         if seen.insert(key, ()).is_some() {
@@ -4790,9 +5094,10 @@ fn validate_timestamp_buckets(
         "timestamp bucket counts",
     )?;
     if sum != expected_count {
-        return Err(format!(
+        return Err(stats_diagnostic!(
             "planner stats timestamp buckets sum to {}, expected {}",
-            sum, expected_count
+            sum,
+            expected_count
         ));
     }
     Ok(())
@@ -4813,9 +5118,10 @@ fn validate_range_buckets(expected_count: u64, buckets: &[RangeBucket]) -> Resul
         "range bucket counts",
     )?;
     if sum != expected_count {
-        return Err(format!(
+        return Err(stats_diagnostic!(
             "planner stats range buckets sum to {}, expected {}",
-            sum, expected_count
+            sum,
+            expected_count
         ));
     }
     Ok(())
@@ -4827,26 +5133,31 @@ fn validate_value_frequencies(
     label: &str,
 ) -> Result<(), String> {
     if values.len() > PLANNER_STATS_MAX_HEAVY_HITTERS_PER_KEY {
-        return Err(format!("planner stats {} exceed cap", label));
+        return Err(stats_diagnostic!("planner stats {} exceed cap", label));
     }
     if !values.windows(2).all(|pair| {
         pair[0].count > pair[1].count
             || (pair[0].count == pair[1].count && pair[0].value_hash <= pair[1].value_hash)
     }) {
-        return Err(format!(
+        return Err(stats_diagnostic!(
             "planner stats {} are not deterministically sorted",
             label
         ));
     }
     let sum = checked_count_sum(values.iter().map(|value| value.count), label)?;
     if sum > max_total {
-        return Err(format!(
+        return Err(stats_diagnostic!(
             "planner stats {} sum to {}, exceeds {}",
-            label, sum, max_total
+            label,
+            sum,
+            max_total
         ));
     }
     if values.iter().any(|value| value.count > max_total) {
-        return Err(format!("planner stats {} entry exceeds total", label));
+        return Err(stats_diagnostic!(
+            "planner stats {} entry exceeds total",
+            label
+        ));
     }
     Ok(())
 }
@@ -4879,7 +5190,7 @@ fn checked_count_sum(counts: impl Iterator<Item = u64>, label: &str) -> Result<u
 
 fn checked_add_count(left: u64, right: u64, label: &str) -> Result<u64, String> {
     left.checked_add(right)
-        .ok_or_else(|| format!("planner stats {} overflow", label))
+        .ok_or_else(|| stats_diagnostic!("planner stats {} overflow", label))
 }
 
 fn validate_ordered_option_pair<T: Ord>(
@@ -4890,7 +5201,10 @@ fn validate_ordered_option_pair<T: Ord>(
     match (min, max) {
         (Some(min), Some(max)) if min <= max => Ok(()),
         (None, None) => Ok(()),
-        _ => Err(format!("planner stats {} are inconsistent", label)),
+        _ => Err(stats_diagnostic!(
+            "planner stats {} are inconsistent",
+            label
+        )),
     }
 }
 
@@ -5482,35 +5796,45 @@ fn decode_node_props_at(
 ) -> Result<BTreeMap<String, PropValue>, EngineError> {
     let start = data_offset as usize;
     let label_count = *data.get(start).ok_or_else(|| {
-        EngineError::CorruptRecord(format!("node {} record too short for label count", node_id))
+        EngineError::CorruptRecord(stats_diagnostic!(
+            "node {} record too short for label count",
+            node_id
+        ))
     })? as usize;
     if label_count == 0 || label_count > crate::types::MAX_NODE_LABELS_PER_NODE {
-        return Err(EngineError::CorruptRecord(format!(
+        return Err(EngineError::CorruptRecord(stats_diagnostic!(
             "node {} record has invalid label count {}",
-            node_id, label_count
+            node_id,
+            label_count
         )));
     }
     let key_len_start = start.checked_add(1 + label_count * 4).ok_or_else(|| {
-        EngineError::CorruptRecord(format!("node {} props offset overflow", node_id))
+        EngineError::CorruptRecord(stats_diagnostic!("node {} props offset overflow", node_id))
     })?;
     let key_len_end = key_len_start.checked_add(2).ok_or_else(|| {
-        EngineError::CorruptRecord(format!("node {} props key len overflow", node_id))
+        EngineError::CorruptRecord(stats_diagnostic!("node {} props key len overflow", node_id))
     })?;
     let key_len_bytes = data.get(key_len_start..key_len_end).ok_or_else(|| {
-        EngineError::CorruptRecord(format!("node {} record too short for key length", node_id))
+        EngineError::CorruptRecord(stats_diagnostic!(
+            "node {} record too short for key length",
+            node_id
+        ))
     })?;
     let key_len = u16::from_le_bytes(key_len_bytes.try_into().unwrap()) as usize;
     let props_len_start = key_len_end
         .checked_add(key_len)
         .and_then(|offset| offset.checked_add(8 + 8 + 4))
         .ok_or_else(|| {
-            EngineError::CorruptRecord(format!("node {} props offset overflow", node_id))
+            EngineError::CorruptRecord(stats_diagnostic!("node {} props offset overflow", node_id))
         })?;
     let props_len_end = props_len_start.checked_add(4).ok_or_else(|| {
-        EngineError::CorruptRecord(format!("node {} props length offset overflow", node_id))
+        EngineError::CorruptRecord(stats_diagnostic!(
+            "node {} props length offset overflow",
+            node_id
+        ))
     })?;
     let props_len_bytes = data.get(props_len_start..props_len_end).ok_or_else(|| {
-        EngineError::CorruptRecord(format!(
+        EngineError::CorruptRecord(stats_diagnostic!(
             "node {} record too short for props length",
             node_id
         ))
@@ -5518,13 +5842,20 @@ fn decode_node_props_at(
     let props_len = u32::from_le_bytes(props_len_bytes.try_into().unwrap()) as usize;
     let props_start = props_len_end;
     let props_end = props_start.checked_add(props_len).ok_or_else(|| {
-        EngineError::CorruptRecord(format!("node {} props length overflow", node_id))
+        EngineError::CorruptRecord(stats_diagnostic!("node {} props length overflow", node_id))
     })?;
     let props_bytes = data.get(props_start..props_end).ok_or_else(|| {
-        EngineError::CorruptRecord(format!("node {} props range exceeds record data", node_id))
+        EngineError::CorruptRecord(stats_diagnostic!(
+            "node {} props range exceeds record data",
+            node_id
+        ))
     })?;
     rmp_serde::from_slice(props_bytes).map_err(|error| {
-        EngineError::SerializationError(format!("decode node {} props: {}", node_id, error))
+        EngineError::SerializationError(stats_diagnostic!(
+            "decode node {} props: {}",
+            node_id,
+            error
+        ))
     })
 }
 
@@ -5754,6 +6085,57 @@ mod tests {
             adjacency_stats: Vec::new(),
             node_id_sample: vec![42],
         }
+    }
+
+    #[test]
+    fn p45a2_sidecar_stats_guarded_tuple_map_and_legacy_grammar() {
+        let mut stats = minimal_stats(9);
+        add_eq_stats(
+            &mut stats,
+            11,
+            7,
+            "color",
+            1,
+            1,
+            vec![ValueFrequency {
+                value_hash: 7,
+                count: 1,
+            }],
+        );
+        for named in [false, true] {
+            let payload = if named {
+                rmp_serde::to_vec_named(&stats).unwrap()
+            } else {
+                rmp_serde::to_vec(&stats).unwrap()
+            };
+            let data = stats_test_envelope(&payload);
+            let mut open = RetainedPlannerStatsOpen::default();
+            assert!(open.read(&data, 9, 1, 0).unwrap(), "{}", open.reason());
+            assert_eq!(*open.take_stats(), stats);
+        }
+        // Existing sequence grammar permits the serde(default) trailing
+        // compound field to be absent, and preserves accepted trailing bytes.
+        let mut payload = rmp_serde::to_vec(&minimal_stats(9)).unwrap();
+        assert_eq!(&payload[..3], &[0xdc, 0, 21]);
+        payload[2] = 20;
+        assert_eq!(payload.pop(), Some(0x90));
+        payload.extend_from_slice(b"trailing");
+        let data = stats_test_envelope(&payload);
+        let mut open = RetainedPlannerStatsOpen::default();
+        assert!(open.read(&data, 9, 1, 0).unwrap(), "{}", open.reason());
+        assert_eq!(*open.take_stats(), minimal_stats(9));
+    }
+    fn stats_test_envelope(payload: &[u8]) -> Vec<u8> {
+        let mut crc = Crc32Hasher::new();
+        crc.update(payload);
+        let mut data = Vec::new();
+        data.extend_from_slice(&PLANNER_STATS_MAGIC);
+        data.extend_from_slice(&PLANNER_STATS_FORMAT_VERSION.to_le_bytes());
+        data.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        data.extend_from_slice(&crc.finalize().to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(payload);
+        data
     }
 
     fn equality_entry(index_id: u64) -> SecondaryIndexManifestEntry {
@@ -6227,7 +6609,16 @@ mod tests {
         let mut node_label_counts = BTreeMap::new();
         node_label_counts.insert(7, 1);
 
-        assert!(validate_declared_index_stats(&stats, &node_label_counts).is_ok());
+        assert!(validate_declared_index_stats(
+            &stats,
+            &node_label_counts,
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new()
+        )
+        .is_ok());
     }
 
     #[test]
@@ -6248,13 +6639,13 @@ mod tests {
         let mut equality = minimal_stats(1);
         equality.edge_count = 12;
         equality.adjacency_stats = vec![row(3, 12, 4)];
-        assert!(validate_adjacency_stats(&equality).is_ok());
+        assert!(validate_adjacency_stats(&equality, &mut BTreeMap::new()).is_ok());
 
         let mut impossible = minimal_stats(2);
         impossible.edge_count = 5;
         impossible.adjacency_stats = vec![row(2, 5, 2)];
         assert_eq!(
-            validate_adjacency_stats(&impossible).unwrap_err(),
+            validate_adjacency_stats(&impossible, &mut BTreeMap::new()).unwrap_err(),
             "planner stats adjacency total exceeds source count times max fanout"
         );
 
@@ -6262,7 +6653,7 @@ mod tests {
         widened.edge_count = u64::MAX;
         widened.adjacency_stats = vec![row((u64::MAX / 2) + 1, u64::MAX, 2)];
         assert!(
-            validate_adjacency_stats(&widened).is_ok(),
+            validate_adjacency_stats(&widened, &mut BTreeMap::new()).is_ok(),
             "the source-count/max-fanout product must be evaluated in u128"
         );
     }

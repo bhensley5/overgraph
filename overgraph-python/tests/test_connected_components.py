@@ -1,3 +1,4 @@
+from conftest import drain_after_close
 import pytest
 from overgraph import OverGraph
 
@@ -129,13 +130,13 @@ class TestConnectedComponents:
         db.upsert_edge(a, b, "RELATES_TO")
         db.flush()
         db.close()
-
+        drain_after_close(db)
         db2 = OverGraph.open(path)
         comps = db2.connected_components()
         assert len(comps) == 2
         assert len(set(comps.values())) == 1
         db2.close()
-
+        drain_after_close(db2)
     def test_empty_graph(self, db):
         comps = db.connected_components()
         assert comps == {}

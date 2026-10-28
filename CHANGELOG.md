@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-26
+
+### Changed
+
+- Let reads continue against consistent committed snapshots while writes commit.
+  Older captured snapshots remain valid through updates and background maintenance.
+  Writers retain configured admission, resource and durability limits.
+- Select the concurrent engine by default in Rust, Node.js and Python, with one
+  ordered radix primary directory and searchable per-ID version histories. Existing
+  snapshot, tombstone, pagination and recovery semantics remain. WAL/segment formats
+  are retained; no on-disk migration is introduced. Rust builds can retain the legacy engine
+  with `--no-default-features`.
+
 ## [0.17.1] - 2026-10-11
 
 ### Fixed
@@ -569,6 +582,7 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[0.18.0]: https://github.com/bhensley5/overgraph/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/bhensley5/overgraph/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/bhensley5/overgraph/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/bhensley5/overgraph/compare/v0.15.0...v0.16.0

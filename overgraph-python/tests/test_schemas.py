@@ -1,3 +1,4 @@
+from conftest import drain_after_close
 import inspect
 import os
 
@@ -296,7 +297,7 @@ def test_schema_persists_after_close_reopen(db_path):
         db.set_node_schema("PersistentNode", required_string_schema())
     finally:
         db.close()
-
+        drain_after_close(db)
     reopened = OverGraph.open(db_path)
     try:
         info = reopened.get_node_schema("PersistentNode")
@@ -304,8 +305,7 @@ def test_schema_persists_after_close_reopen(db_path):
         assert info.schema["properties"]["name"]["types"] == ["string"]
     finally:
         reopened.close()
-
-
+        drain_after_close(reopened)
 def test_bulk_graph_schema_apis_publish_check_replace_drop_and_remain_atomic(db):
     db.upsert_node("PyBulkPerson", "ada", props={"name": "Ada"})
     db.upsert_node("PyBulkCompany", "acme")

@@ -227,7 +227,7 @@ impl DatabaseEngine {
             instr.secondary_index_followups = secondary_index_followups as u64;
         }
         for followup in graph_rows.followups {
-            self.runtime.enqueue_secondary_index_read_followup(followup);
+            self.runtime.enqueue_secondary_index_read_followup(followup, &published.view.sources);
         }
         let graph_result = graph_rows.value;
         if instr.enabled {
@@ -475,7 +475,7 @@ impl DatabaseEngine {
             .fetch_add(1, Ordering::Relaxed);
         let outcome = published.view.query_node_ids_outcome(query)?;
         for followup in outcome.followups {
-            self.runtime.enqueue_secondary_index_read_followup(followup);
+            self.runtime.enqueue_secondary_index_read_followup(followup, &published.view.sources);
         }
         Ok(outcome.value)
     }
@@ -490,7 +490,7 @@ impl DatabaseEngine {
             .fetch_add(1, Ordering::Relaxed);
         let outcome = published.view.query_nodes_outcome(query)?;
         for followup in outcome.followups {
-            self.runtime.enqueue_secondary_index_read_followup(followup);
+            self.runtime.enqueue_secondary_index_read_followup(followup, &published.view.sources);
         }
         Ok(outcome.value)
     }
@@ -513,7 +513,7 @@ impl DatabaseEngine {
             .fetch_add(1, Ordering::Relaxed);
         let outcome = published.view.query_edge_ids_outcome(query)?;
         for followup in outcome.followups {
-            self.runtime.enqueue_secondary_index_read_followup(followup);
+            self.runtime.enqueue_secondary_index_read_followup(followup, &published.view.sources);
         }
         Ok(outcome.value)
     }
@@ -528,7 +528,7 @@ impl DatabaseEngine {
             .fetch_add(1, Ordering::Relaxed);
         let outcome = published.view.query_edges_outcome(query)?;
         for followup in outcome.followups {
-            self.runtime.enqueue_secondary_index_read_followup(followup);
+            self.runtime.enqueue_secondary_index_read_followup(followup, &published.view.sources);
         }
         Ok(outcome.value)
     }
@@ -551,7 +551,7 @@ impl DatabaseEngine {
             .view
             .query_graph_rows_outcome(&normalized, cursor_state)?;
         for followup in outcome.followups {
-            self.runtime.enqueue_secondary_index_read_followup(followup);
+            self.runtime.enqueue_secondary_index_read_followup(followup, &published.view.sources);
         }
         Ok(outcome.value)
     }
@@ -597,7 +597,7 @@ impl DatabaseEngine {
             .view
             .query_graph_pipeline_normalized(&normalized, cursor_state)?;
         for followup in outcome.followups {
-            self.runtime.enqueue_secondary_index_read_followup(followup);
+            self.runtime.enqueue_secondary_index_read_followup(followup, &published.view.sources);
         }
         Ok(outcome.value)
     }
@@ -631,7 +631,7 @@ impl DatabaseEngine {
             query.options.max_cursor_bytes,
         )?;
         for followup in outcome.followups {
-            self.runtime.enqueue_secondary_index_read_followup(followup);
+            self.runtime.enqueue_secondary_index_read_followup(followup, &published.view.sources);
         }
         Ok(graph_pipeline_result_from_graph_row_result(
             query,
@@ -3047,7 +3047,7 @@ impl DatabaseEngine {
                 options,
             )?;
             for followup in read_result.followups {
-                self.runtime.enqueue_secondary_index_read_followup(followup);
+                self.runtime.enqueue_secondary_index_read_followup(followup, &snapshot.sources);
             }
             if read_result.rows.len() > options.max_mutation_rows {
                 return Err(gql_mutation_cap_error(

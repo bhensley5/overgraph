@@ -1,3 +1,4 @@
+use crate::engine::shared::SharedArc;
 use crate::engine::DegreeEntry;
 use crate::error::EngineError;
 use crate::segment_components::{
@@ -203,7 +204,7 @@ pub(crate) struct DegreeOverlayEdit {
 }
 
 impl DegreeOverlaySnapshot {
-    pub(crate) fn empty() -> Arc<Self> {
+    pub(crate) fn empty() -> SharedArc<Self> {
         let mut groups = Vec::with_capacity(DEGREE_OVERLAY_GROUP_COUNT);
         for _ in 0..DEGREE_OVERLAY_GROUP_COUNT {
             let mut shards = Vec::with_capacity(DEGREE_OVERLAY_GROUP_SIZE);
@@ -214,12 +215,12 @@ impl DegreeOverlaySnapshot {
                 shards: shards.into_boxed_slice(),
             }));
         }
-        Arc::new(Self {
+        SharedArc::new(Self {
             groups: groups.into_boxed_slice(),
         })
     }
 
-    pub(crate) fn from_flat(entries: NodeIdMap<DegreeDelta>) -> Arc<Self> {
+    pub(crate) fn from_flat(entries: NodeIdMap<DegreeDelta>) -> SharedArc<Self> {
         let snapshot = Self::empty();
         if entries.is_empty() {
             return snapshot;
@@ -262,19 +263,19 @@ impl DegreeOverlaySnapshot {
 
     #[cfg(test)]
     pub(crate) fn group_arc_for_test(&self, index: usize) -> Arc<DegreeOverlayShardGroup> {
-        Arc::clone(&self.groups[index])
+        Clone::clone(&self.groups[index])
     }
 
     #[cfg(test)]
     pub(crate) fn shard_arc_for_test(&self, shard_index: usize) -> Arc<DegreeOverlayShard> {
         let group_index = shard_index / DEGREE_OVERLAY_GROUP_SIZE;
         let local_index = shard_index % DEGREE_OVERLAY_GROUP_SIZE;
-        Arc::clone(&self.groups[group_index].shards[local_index])
+        Clone::clone(&self.groups[group_index].shards[local_index])
     }
 }
 
 impl DegreeOverlayEdit {
-    pub(crate) fn new(base: Arc<DegreeOverlaySnapshot>) -> Self {
+    pub(crate) fn new(base: SharedArc<DegreeOverlaySnapshot>) -> Self {
         Self {
             groups: base.groups.to_vec(),
         }
@@ -292,7 +293,7 @@ impl DegreeOverlayEdit {
         }
     }
 
-    pub(crate) fn finish(mut self) -> Arc<DegreeOverlaySnapshot> {
+    pub(crate) fn finish(mut self) -> SharedArc<DegreeOverlaySnapshot> {
         for group in &mut self.groups {
             if let Some(group_mut) = Arc::get_mut(group) {
                 for shard in group_mut.shards.iter_mut() {
@@ -302,7 +303,7 @@ impl DegreeOverlayEdit {
                 }
             }
         }
-        Arc::new(DegreeOverlaySnapshot {
+        SharedArc::new(DegreeOverlaySnapshot {
             groups: self.groups.into_boxed_slice(),
         })
     }
@@ -322,7 +323,7 @@ fn degree_overlay_shard_index(node_id: u64) -> usize {
 }
 
 pub(crate) struct DegreeSidecar {
-    data: Mmap,
+    data: Arc<Mmap>,
     payload_offset: usize,
     payload_len: usize,
     entry_count: usize,
@@ -338,9 +339,21 @@ impl DegreeSidecar {
                 path.display()
             )));
         }
-        let data = unsafe { Mmap::map(&file)? };
+        let data = Arc::new(unsafe { Mmap::map(&file)? });
         let (payload_offset, payload_len) = degree_payload_range(path, &data)?;
-        let payload = &data[payload_offset..payload_offset + payload_len];
+        Self::from_mapping(data, payload_offset, payload_len)
+    }
+    pub(crate) fn from_mapping(
+        data: Arc<Mmap>,
+        payload_offset: usize,
+        payload_len: usize,
+    ) -> Result<Self, EngineError> {
+        let end = payload_offset
+            .checked_add(payload_len)
+            .ok_or_else(|| EngineError::CorruptRecord("degree payload span overflow".into()))?;
+        let payload = data.get(payload_offset..end).ok_or_else(|| {
+            EngineError::CorruptRecord("degree payload span exceeds mapping".into())
+        })?;
         let shape = validate_degree_sidecar_shape(payload)?;
         Ok(Self {
             data,
@@ -1022,7 +1035,7 @@ mod tests {
         let untouched_shard = base.shard_arc_for_test(2);
         let touched_shard = base.shard_arc_for_test(1);
 
-        let mut edit = DegreeOverlayEdit::new(Arc::clone(&base));
+        let mut edit = DegreeOverlayEdit::new(Clone::clone(&base));
         edit.add_delta(1, DegreeDelta::add_valid_edge(1, 2, 1.0));
         let edited = edit.finish();
 

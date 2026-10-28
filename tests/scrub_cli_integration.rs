@@ -1,3 +1,7 @@
+#[path = "support/native_close.rs"]
+mod native_close;
+mod support;
+
 use overgraph::{DatabaseEngine, DbOptions, NodeInput, UpsertEdgeOptions};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -15,7 +19,7 @@ fn open_test_db(path: &Path) -> DatabaseEngine {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    DatabaseEngine::open(path, &opts).unwrap()
+    support::open(path, &opts).unwrap()
 }
 
 fn populate_and_flush(db: &DatabaseEngine) {
@@ -49,7 +53,7 @@ fn closed_populated_db() -> (TempDir, std::path::PathBuf) {
     let db_path = dir.path().join("testdb");
     let db = open_test_db(&db_path);
     populate_and_flush(&db);
-    db.close().unwrap();
+    native_close::close_and_wait(db);
     (dir, db_path)
 }
 

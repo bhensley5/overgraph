@@ -942,7 +942,11 @@ fn build_graph_row_chunked_scale_engine_variant(
     let mut high_score_rows = 0usize;
     let mut prefix_source_fanout = BTreeMap::<u64, usize>::new();
     let mut hub_outgoing_fanout = BTreeMap::<u64, usize>::new();
-    for ordinal in 0..EDGE_STREAMING_SCALE_TOTAL_EDGES {
+    for (ordinal, &edge_id) in edge_ids
+        .iter()
+        .enumerate()
+        .take(EDGE_STREAMING_SCALE_TOTAL_EDGES)
+    {
         let (source_ordinal, target_ordinal) = {
             let (source_id, target_id) = graph_row_chunked_scale_layout_endpoints(
                 layout,
@@ -968,7 +972,7 @@ fn build_graph_row_chunked_scale_engine_variant(
         }
         let row = GraphRowChunkedOracleRow {
             source_id: node_ids[source_ordinal],
-            edge_id: edge_ids[ordinal],
+            edge_id,
             target_id: node_ids[target_ordinal],
             score: edge_streaming_scale_score(ordinal),
         };
@@ -1156,13 +1160,17 @@ fn build_graph_row_edgepull_scale_engine() -> GraphRowEdgePullScaleEngine {
     let mut residual_rows = Vec::with_capacity(GRAPH_ROW_EDGEPULL_EDGE_COUNT / 8);
     let mut outgoing_fanout = vec![0usize; GRAPH_ROW_EDGEPULL_NODE_COUNT];
     let mut unique_edges = std::collections::BTreeSet::new();
-    for ordinal in 0..GRAPH_ROW_EDGEPULL_EDGE_COUNT {
+    for (ordinal, &edge_id) in edge_ids
+        .iter()
+        .enumerate()
+        .take(GRAPH_ROW_EDGEPULL_EDGE_COUNT)
+    {
         let source_ordinal = ordinal % GRAPH_ROW_EDGEPULL_NODE_COUNT;
         let target_ordinal = (source_ordinal + 1 + ordinal / GRAPH_ROW_EDGEPULL_NODE_COUNT)
             % GRAPH_ROW_EDGEPULL_NODE_COUNT;
         let row = GraphRowChunkedOracleRow {
             source_id: node_ids[source_ordinal],
-            edge_id: edge_ids[ordinal],
+            edge_id,
             target_id: node_ids[target_ordinal],
             score: graph_row_edgepull_score(ordinal),
         };
@@ -1348,6 +1356,17 @@ fn fully_flush_and_reopen_graph_row_edgepull_hub_evidence_engine(
 ) -> GraphRowEdgePullHubEvidenceEngine {
     fixture.engine.flush().unwrap();
     fixture.engine.close().unwrap();
+    #[cfg(feature = "production-concurrency")]
+    {
+        let until = Instant::now() + std::time::Duration::from_secs(15);
+        while !matches!(
+            fixture.engine.reclamation_stats().unwrap().close_state,
+            overgraph::ReclamationCloseState::Drained
+        ) {
+            assert!(Instant::now() < until, "QPX-036 native close did not drain");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
     fixture.engine = DatabaseEngine::open(
         fixture._dir.path(),
         &DbOptions {
@@ -4396,17 +4415,17 @@ fn graph_row_chunked_query(
             graph_row_return_binding("edge"),
             graph_row_return_binding("target"),
         ]),
-        order_by: order_by_score
-            .then(|| {
-                vec![GraphOrderItem {
-                    expr: GraphExpr::Property {
-                        alias: "edge".to_string(),
-                        key: "score".to_string(),
-                    },
-                    direction: GraphOrderDirection::Desc,
-                }]
-            })
-            .unwrap_or_default(),
+        order_by: if order_by_score {
+            vec![GraphOrderItem {
+                expr: GraphExpr::Property {
+                    alias: "edge".to_string(),
+                    key: "score".to_string(),
+                },
+                direction: GraphOrderDirection::Desc,
+            }]
+        } else {
+            Vec::new()
+        },
         page: GraphPageRequest {
             skip: 0,
             limit,
@@ -4470,17 +4489,17 @@ fn graph_row_edgepull_query(
             graph_row_return_binding("edge"),
             graph_row_return_binding("target"),
         ]),
-        order_by: order_by_score
-            .then(|| {
-                vec![GraphOrderItem {
-                    expr: GraphExpr::Property {
-                        alias: "edge".to_string(),
-                        key: "score".to_string(),
-                    },
-                    direction: GraphOrderDirection::Desc,
-                }]
-            })
-            .unwrap_or_default(),
+        order_by: if order_by_score {
+            vec![GraphOrderItem {
+                expr: GraphExpr::Property {
+                    alias: "edge".to_string(),
+                    key: "score".to_string(),
+                },
+                direction: GraphOrderDirection::Desc,
+            }]
+        } else {
+            Vec::new()
+        },
         page: GraphPageRequest {
             skip: 0,
             limit,
@@ -4963,9 +4982,7 @@ fn assert_graph_row_edgepull_source_plan(
             "rejected; kind=RejectedNodeAnchor; segment=0; alias={alias}; reason=no legal initial candidate source; decision=not_costed; cost=unavailable"
         );
         assert!(
-            alternatives
-                .iter()
-                .any(|detail| *detail == expected.as_str()),
+            alternatives.contains(&expected.as_str()),
             "{alias} must be rejected because it has no legal initial source: {alternatives:?}"
         );
     }
@@ -5050,6 +5067,16 @@ fn assert_graph_row_edgepull_runtime(
 struct GraphRowEdgePullQpx036Evidence {
     two_hop_lines: Vec<String>,
     stage_lines: Vec<String>,
+    pages: GraphRowQpx036Pages,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GraphRowQpx036Pages {
+    epoch: i64,
+    first_rows: Vec<[u64; 5]>,
+    first_cursor: String,
+    continuation_rows: Vec<[u64; 5]>,
+    continuation_cursor: String,
 }
 
 fn assert_graph_row_edgepull_qpx036_cost_fields(line: &str) {
@@ -5084,62 +5111,139 @@ fn assert_graph_row_edgepull_qpx036_cost_line(line: &str, edge: &str, chosen: bo
     assert_graph_row_edgepull_qpx036_cost_fields(line);
 }
 
+fn assert_graph_row_qpx036_adjacency_rejection(line: &str, edge: &str, reason: &str) {
+    assert_eq!(
+        line,
+        format!("rejected; kind=AdjacencyPull; segment=0; edge=alias:{edge}; coverage=uncomputable; decision=rejected; reason={reason}; decision=rejected_by={reason}; cost=unavailable"),
+        "QPX-036 explicit AdjacencyPull legality alternative changed"
+    );
+}
+
+fn graph_row_qpx036_expected_edge(edge: &str, chosen: bool, seeded_stage: bool) -> String {
+    let (label, candidates, warnings, work, frontier, index) = match (edge, seeded_stage) {
+        ("fanout", false) => (258, 200_000, "[CandidateCapExceeded]", 612_548, 2_500, 1),
+        ("fanout", true) => (258, 200_000, "[CandidateCapExceeded]", 600_024, 65_537, 0),
+        ("seed", false) => (257, 2_500, "[]", 1_007_548, 65_537, 0),
+        _ => panic!("unexpected QPX-036 edge/stage"),
+    };
+    let disposition = if chosen { "chosen" } else { "rejected" };
+    let decision = if chosen {
+        "chosen_lowest_cost_or_deterministic_tie_breaker"
+    } else {
+        "rejected_by=estimated_work"
+    };
+    format!("{disposition}; kind=EdgeAnchor; segment=0; edge=alias:{edge}; source=EdgeCandidateSource; label_id=Some({label}); from_bound=false; to_bound=false; source=EdgeLabelIndex; estimated_candidates=Some({candidates}); warnings={warnings}; decision={decision}; cost_work={work}; simulated_frontier={frontier}; fanout_complete=true; confidence_rank=0; stale_risk_rank=0; hub_risk_rank=0; frontier_capped=true; source_rank=5; canonical_key=edge:alias:{edge}:{index}")
+}
+
 fn graph_row_edgepull_qpx036_alternative_lines(
     explain: &overgraph::GraphRowExplain,
-    chosen_edge: &str,
-    rejected_edge: &str,
+    active_seed_tail: bool,
 ) -> Vec<String> {
     let mut alternatives = Vec::new();
     graph_row_explain_details(&explain.plan, "GraphRowPlanAlternative", &mut alternatives);
-    let rejected_nodes = alternatives
-        .iter()
-        .filter(|line| line.starts_with("rejected; kind=RejectedNodeAnchor;"))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        rejected_nodes.len(),
-        3,
-        "QPX-036 must retain all three rejected node alternatives: {alternatives:?}"
-    );
-    for (line, alias) in rejected_nodes.iter().zip(["source", "mid", "target"]) {
-        assert!(
-            line.contains(&format!("alias={alias};")),
-            "QPX-036 two-hop node-alternative order changed: {alternatives:?}"
-        );
-    }
-    assert!(
-        rejected_nodes.iter().all(|line| {
-            line.contains("reason=no legal initial candidate source")
-                && line.contains("decision=not_costed")
-                && line.contains("cost=unavailable")
-        }),
-        "QPX-036 node alternatives must be uncosted legality rejections: {alternatives:?}"
-    );
-    let chosen = alternatives
-        .iter()
-        .find(|line| {
-            line.starts_with("chosen; kind=EdgeAnchor;")
-                && line.contains(&format!("edge=alias:{chosen_edge}"))
-        })
-        .expect("QPX-036 chosen edge alternative missing");
-    let rejected = alternatives
-        .iter()
-        .find(|line| {
-            line.starts_with("rejected; kind=EdgeAnchor;")
-                && line.contains(&format!("edge=alias:{rejected_edge}"))
-        })
-        .expect("QPX-036 rejected edge alternative missing");
-    assert_graph_row_edgepull_qpx036_cost_line(chosen, chosen_edge, true);
-    assert_graph_row_edgepull_qpx036_cost_line(rejected, rejected_edge, false);
     assert_eq!(
         alternatives.len(),
-        5,
-        "QPX-036 two-hop must emit exactly three node and two edge alternatives: {alternatives:?}"
+        7,
+        "QPX-036 must retain exactly seven alternatives: {alternatives:?}"
     );
-    assert!(
-        alternatives[3] == *chosen && alternatives[4] == *rejected,
-        "QPX-036 two-hop edge-alternative order changed: {alternatives:?}"
+    for (line, alias) in alternatives[..3].iter().zip(["source", "mid", "target"]) {
+        assert_eq!(*line, format!("rejected; kind=RejectedNodeAnchor; segment=0; alias={alias}; reason=no legal initial candidate source; decision=not_costed; cost=unavailable"));
+    }
+    if active_seed_tail {
+        assert_graph_row_qpx036_adjacency_rejection(
+            alternatives[3],
+            "seed",
+            "mutable_active_memtable",
+        );
+        assert_graph_row_qpx036_adjacency_rejection(
+            alternatives[4],
+            "fanout",
+            "logical_from_not_slot_zero",
+        );
+        assert_graph_row_edgepull_qpx036_cost_line(alternatives[5], "fanout", true);
+    } else {
+        assert_graph_row_qpx036_adjacency_rejection(
+            alternatives[3],
+            "fanout",
+            "logical_from_not_slot_zero",
+        );
+        // Immutable/segment forms may cost-select AdjacencyPull (Phase44b mixed-layer contract).
+        // This exact ordered-admission line retains H=1 <= F=4096 and the advisory four-times gate.
+        assert_eq!(alternatives[4], "chosen; kind=AdjacencyPull; P=42494; M=2500; O=2500; A=2500; C=2500; R=Some(65537); H=1; K=11; F=4096; L=4; S=0; owners_needed=1; index_entries=42494; raw_postings_needed=1; candidate_edges=1; owner_merge_work=4; dense=false; prefix_heuristic=true; fanout_complete=true; partial_or_stale=false; coverage=advisory; edge_pull_work=1007548; ordered_work=42900; four_x_pass=true; decision=admitted; reason=four_x_margin_passed; decision=chosen_lowest_cost_or_deterministic_tie_breaker; cost_work=42900; simulated_frontier=65537; fanout_complete=false; confidence_rank=2; stale_risk_rank=0; hub_risk_rank=0; frontier_capped=true; source_rank=6; canonical_key=edge:alias:seed:0:production=adjacency_pull");
+        assert_graph_row_edgepull_qpx036_cost_line(alternatives[5], "fanout", false);
+    }
+    assert_eq!(
+        alternatives[5],
+        graph_row_qpx036_expected_edge("fanout", active_seed_tail, false)
+    );
+    assert_graph_row_edgepull_qpx036_cost_line(alternatives[6], "seed", false);
+    assert_eq!(
+        alternatives[6],
+        graph_row_qpx036_expected_edge("seed", false, false)
     );
     alternatives.into_iter().map(str::to_string).collect()
+}
+
+// Bound execution to two source IDs (10,000 complete matches) while preserving the
+// unconstrained planner/cost assertions above. Compare the first two ten-row pages,
+// exact IDs/order and cursor bytes at one pinned epoch across flush/reopen.
+fn graph_row_qpx036_pages(
+    fixture: &GraphRowEdgePullHubEvidenceEngine,
+    epoch: i64,
+) -> GraphRowQpx036Pages {
+    let mut query = graph_row_edgepull_qpx036_two_hop_query();
+    query.nodes[0].ids = fixture.node_ids[2..4].to_vec();
+    query.at_epoch = Some(epoch);
+    let rows = |result: &overgraph::GraphRowResult| {
+        result.rows.iter().map(|row| {
+        match row.values.as_slice() {
+            [overgraph::GraphValue::NodeId(source), overgraph::GraphValue::EdgeId(seed), overgraph::GraphValue::NodeId(mid), overgraph::GraphValue::EdgeId(fanout), overgraph::GraphValue::NodeId(target)] => [*source, *seed, *mid, *fanout, *target],
+            values => panic!("QPX-036 expected five ID bindings: {values:?}"),
+        }
+    }).collect::<Vec<_>>()
+    };
+    let first = fixture.engine.query_graph_rows(&query).unwrap();
+    let first_cursor = first
+        .next_cursor
+        .clone()
+        .expect("QPX-036 first continuation");
+    query.page.cursor = Some(first_cursor.clone());
+    let continuation = fixture.engine.query_graph_rows(&query).unwrap();
+    let continuation_cursor = continuation
+        .next_cursor
+        .clone()
+        .expect("QPX-036 second continuation");
+    let expected = (0..20)
+        .map(|ordinal| {
+            [
+                fixture.node_ids[2],
+                fixture.seed_edge_ids[0],
+                fixture.node_ids[0],
+                fixture.hub_edge_ids[ordinal],
+                fixture.node_ids[2 + ordinal],
+            ]
+        })
+        .collect::<Vec<_>>();
+    let first_rows = rows(&first);
+    let continuation_rows = rows(&continuation);
+    assert_eq!(first_rows, expected[..10]);
+    assert_eq!(continuation_rows, expected[10..]);
+    for result in [&first, &continuation] {
+        assert_eq!(
+            result.columns,
+            ["source", "seed", "mid", "fanout", "target"]
+        );
+        assert_eq!(result.stats.effective_at_epoch, epoch);
+        assert!(result.stats.frontier_peak <= query.options.max_frontier);
+        assert!(result.stats.intermediate_bindings_peak <= query.options.max_intermediate_bindings);
+    }
+    GraphRowQpx036Pages {
+        epoch,
+        first_rows,
+        first_cursor,
+        continuation_rows,
+        continuation_cursor,
+    }
 }
 
 fn graph_row_edgepull_qpx036_stage_alternative_lines(
@@ -5156,6 +5260,7 @@ fn graph_row_edgepull_qpx036_stage_alternative_lines(
     assert_graph_row_edgepull_qpx036_cost_fields(chosen);
     let rejected_nodes = alternatives
         .iter()
+        .copied()
         .filter(|line| line.starts_with("rejected; kind=RejectedNodeAnchor;"))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -5179,11 +5284,17 @@ fn graph_row_edgepull_qpx036_stage_alternative_lines(
     }
     assert_eq!(
         alternatives.len(),
-        3,
-        "QPX-036 stage must emit exactly two node alternatives then Fanout: {alternatives:?}"
+        4,
+        "QPX-036 stage must emit two node alternatives, AdjacencyPull rejection then Fanout: {alternatives:?}"
     );
+    assert_eq!(&alternatives[..2], rejected_nodes.as_slice());
+    assert_eq!(
+        alternatives[3],
+        graph_row_qpx036_expected_edge("fanout", true, true)
+    );
+    assert_graph_row_qpx036_adjacency_rejection(alternatives[2], "fanout", "initial_bound_slots");
     assert!(
-        alternatives[2] == *chosen,
+        alternatives[3] == *chosen,
         "QPX-036 stage edge-alternative order changed: {alternatives:?}"
     );
     alternatives.into_iter().map(str::to_string).collect()
@@ -5191,6 +5302,7 @@ fn graph_row_edgepull_qpx036_stage_alternative_lines(
 
 fn collect_graph_row_edgepull_qpx036_evidence(
     fixture: &GraphRowEdgePullHubEvidenceEngine,
+    pinned_epoch: Option<i64>,
 ) -> GraphRowEdgePullQpx036Evidence {
     assert_eq!(fixture.node_ids.len(), GRAPH_ROW_EDGEPULL_NODE_COUNT);
     assert_eq!(
@@ -5202,27 +5314,23 @@ fn collect_graph_row_edgepull_qpx036_evidence(
         GRAPH_ROW_EDGEPULL_QPX036_SEED_EDGE_COUNT
     );
 
-    let two_hop_query = graph_row_edgepull_qpx036_two_hop_query();
+    let active_seed_tail = fixture.active_seed_tail_count > 0;
+    let mut two_hop_query = graph_row_edgepull_qpx036_two_hop_query();
+    two_hop_query.at_epoch = pinned_epoch;
     let two_hop = fixture.engine.explain_graph_rows(&two_hop_query).unwrap();
     assert!(
         graph_row_explain_has_node(
             &two_hop.plan,
             "GraphRowPhysicalPlan",
-            &["initial_driver=EdgeAnchor(edge=alias:fanout"]
+            &[if active_seed_tail {
+                "initial_driver=EdgeAnchor(edge=alias:fanout"
+            } else {
+                "initial_driver=EdgeAnchor(edge=alias:seed"
+            }]
         ),
-        "QPX-036 two-hop fixture changed its amended Fanout choice: {two_hop:?}"
+        "QPX-036 storage-phase anchor changed: {two_hop:?}"
     );
-    let two_hop_lines = graph_row_edgepull_qpx036_alternative_lines(&two_hop, "fanout", "seed");
-    let chosen_fanout = two_hop_lines
-        .iter()
-        .find(|line| {
-            line.starts_with("chosen; kind=EdgeAnchor;") && line.contains("edge=alias:fanout")
-        })
-        .expect("QPX-036 chosen Fanout line missing after collection");
-    assert!(
-        chosen_fanout.contains("cost_work=612548"),
-        "QPX-036 chosen Fanout cost changed: {chosen_fanout}"
-    );
+    let two_hop_lines = graph_row_edgepull_qpx036_alternative_lines(&two_hop, active_seed_tail);
     let rejected_seed = two_hop_lines
         .iter()
         .find(|line| {
@@ -5266,9 +5374,11 @@ fn collect_graph_row_edgepull_qpx036_evidence(
         .detail
         .contains("seeded_node_aliases=mid"));
 
+    let pages = graph_row_qpx036_pages(fixture, two_hop.effective_at_epoch.unwrap());
     GraphRowEdgePullQpx036Evidence {
         two_hop_lines,
         stage_lines,
+        pages,
     }
 }
 
@@ -6144,7 +6254,7 @@ fn bench_graph_row_edgepull(c: &mut Criterion) {
         assert_eq!(warm_fixture.flushed_hub_batches, 3);
         assert_eq!(warm_fixture.active_hub_tail_count, 20_000);
         assert_eq!(warm_fixture.active_seed_tail_count, 2_500);
-        let warm = collect_graph_row_edgepull_qpx036_evidence(&warm_fixture);
+        let warm = collect_graph_row_edgepull_qpx036_evidence(&warm_fixture, None);
         for line in &warm.two_hop_lines {
             eprintln!("QPX-036 warm two-hop: {line}");
         }
@@ -6156,7 +6266,13 @@ fn bench_graph_row_edgepull(c: &mut Criterion) {
         assert_eq!(reopened_fixture.flushed_hub_batches, 4);
         assert_eq!(reopened_fixture.active_hub_tail_count, 0);
         assert_eq!(reopened_fixture.active_seed_tail_count, 0);
-        let reopened = collect_graph_row_edgepull_qpx036_evidence(&reopened_fixture);
+        let reopened =
+            collect_graph_row_edgepull_qpx036_evidence(&reopened_fixture, Some(warm.pages.epoch));
+        assert_eq!(
+            warm.pages, reopened.pages,
+            "QPX-036 first/continuation rows/order/cursor bytes across storage phase"
+        );
+        eprintln!("QPX-036 bounded page parity: first=10 continuation=10 source_ids=2 complete_matches=10000 pinned_epoch={} exact_cursor_bytes=true caps_preserved=true", warm.pages.epoch);
         for line in &reopened.two_hop_lines {
             eprintln!("QPX-036 reopened two-hop: {line}");
         }

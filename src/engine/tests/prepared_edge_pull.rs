@@ -499,7 +499,7 @@ fn prepared_edge_pull_policy_cutoff_parity_across_many_pulls() {
     drop(view);
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     let reopened_view = reopened.published_state().view.clone();
     let reopened_planning = reopened_view.normalize_edge_query(&planning_query).unwrap();
     let reopened_execution = reopened_view.normalize_edge_query(&execution_query).unwrap();
@@ -552,7 +552,7 @@ fn prepared_edge_pull_consumes_u64_max_and_stops_above_end_bound_before_verifica
             let mut write_seq = core.engine_seq;
             for edge_id in candidate_ids {
                 write_seq += 1;
-                core.active_memtable().apply_op(
+                core.active_memtable().apply_op_for_test(
                     &WalOp::UpsertEdge(EdgeRecord {
                         id: edge_id,
                         from,
@@ -567,7 +567,7 @@ fn prepared_edge_pull_consumes_u64_max_and_stops_above_end_bound_before_verifica
                         last_write_seq: 0,
                     }),
                     write_seq,
-                );
+                ).unwrap();
             }
             core.engine_seq = write_seq;
             Ok(())
@@ -656,7 +656,7 @@ fn prepared_edge_pull_consumes_u64_max_and_stops_above_end_bound_before_verifica
 
 #[test]
 fn prepared_edge_pull_source_modes_match_stateless_and_construct_once_across_pull_counts() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let label = "CP44_PREPARED_CONSTRUCTION";
     ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
     ensure_ready_edge_property_index(&engine, label, "region", SecondaryIndexKind::Equality);
@@ -788,7 +788,7 @@ fn prepared_edge_pull_source_modes_match_stateless_and_construct_once_across_pul
 
 #[test]
 fn prepared_edge_pull_moves_planning_and_preparation_followups_once_before_fallback() {
-    let (dir, engine) = query_test_engine();
+    let (dir, engine) = query_index_protocol_fixture();
     let db_path = dir.path().join("db");
     let label = "CP44_PREPARED_FOLLOWUPS";
     let index_id =

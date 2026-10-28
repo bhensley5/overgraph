@@ -188,7 +188,7 @@ Complete reference for OverGraph's public API across **Rust**, **Node.js**, and 
 **Rust** - add to `Cargo.toml`:
 ```toml
 [dependencies]
-overgraph = "0.17"
+overgraph = "0.18"
 ```
 
 **Node.js**:
@@ -210,6 +210,12 @@ Prebuilt binaries are published for Linux (x86_64, aarch64), macOS (x86_64, Appl
 ### open
 
 Opens an existing database or creates a new one. A database is a self-contained directory on disk.
+
+The default `production-concurrency` build retains the existing storage formats;
+`--no-default-features` selects the separate legacy engine. Opening
+an older directory does not repair a previously misordered compaction manifest. Valid
+file interchange does not establish general rollback safety: an older engine can still
+reproduce its own compaction-ordering defect.
 
 **Rust**
 ```rust

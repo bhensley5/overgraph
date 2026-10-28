@@ -1,8 +1,17 @@
+#[path = "support/native_close.rs"]
+mod native_close;
+mod support;
+
 use overgraph::{
     DatabaseEngine, DbOptions, PrunePolicy, UpsertEdgeOptions, UpsertNodeOptions, WalSyncMode,
 };
+use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
+
+fn open_fixture(path: &Path, options: &DbOptions) -> DatabaseEngine {
+    support::open(path, options).unwrap()
+}
 
 fn inspect_binary() -> &'static str {
     env!("CARGO_BIN_EXE_overgraph-inspect")
@@ -17,8 +26,8 @@ fn test_inspect_empty_db() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
-    db.close().unwrap();
+    let db = open_fixture(dir.path(), &opts);
+    native_close::close_and_wait(db);
 
     let output = Command::new(inspect_binary())
         .arg(dir.path().to_str().unwrap())
@@ -47,7 +56,7 @@ fn test_inspect_with_data() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = open_fixture(dir.path(), &opts);
 
     for i in 0..10 {
         db.upsert_node(
@@ -67,7 +76,7 @@ fn test_inspect_with_data() {
         .unwrap();
 
     db.flush().unwrap();
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let output = Command::new(inspect_binary())
         .arg(dir.path().to_str().unwrap())
@@ -99,7 +108,7 @@ fn test_inspect_multiple_segments() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = open_fixture(dir.path(), &opts);
 
     for i in 0..5 {
         db.upsert_node(
@@ -121,7 +130,7 @@ fn test_inspect_multiple_segments() {
     }
     db.flush().unwrap();
 
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let output = Command::new(inspect_binary())
         .arg(dir.path().to_str().unwrap())
@@ -146,7 +155,7 @@ fn test_inspect_with_prune_policies() {
         wal_sync_mode: WalSyncMode::Immediate,
         ..DbOptions::default()
     };
-    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = open_fixture(dir.path(), &opts);
 
     db.set_prune_policy(
         "old_memories",
@@ -158,7 +167,7 @@ fn test_inspect_with_prune_policies() {
     )
     .unwrap();
 
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let output = Command::new(inspect_binary())
         .arg(dir.path().to_str().unwrap())
@@ -184,7 +193,7 @@ fn test_inspect_json_with_data() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = open_fixture(dir.path(), &opts);
 
     for i in 0..5 {
         db.upsert_node(
@@ -195,7 +204,7 @@ fn test_inspect_json_with_data() {
         .unwrap();
     }
     db.flush().unwrap();
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let output = Command::new(inspect_binary())
         .args(["--json", dir.path().to_str().unwrap()])
@@ -233,7 +242,7 @@ fn test_inspect_json_with_multi_label_data() {
         compact_after_n_flushes: 0,
         ..DbOptions::default()
     };
-    let db = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let db = open_fixture(dir.path(), &opts);
 
     db.upsert_node("Person", "person-only", UpsertNodeOptions::default())
         .unwrap();
@@ -244,7 +253,7 @@ fn test_inspect_json_with_multi_label_data() {
     )
     .unwrap();
     db.flush().unwrap();
-    db.close().unwrap();
+    native_close::close_and_wait(db);
 
     let output = Command::new(inspect_binary())
         .args(["--json", dir.path().to_str().unwrap()])

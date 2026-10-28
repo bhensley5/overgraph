@@ -1,6 +1,8 @@
 import type {
   DatabaseScrubFinding,
+  DatabaseScrubFindingType,
   DatabaseScrubReport,
+  DatabaseScrubSeverity,
   EdgeInput,
   EdgeLabelInfo,
   EdgeSchema,
@@ -22,6 +24,7 @@ import type {
   NodeSchema,
   NodeSchemaInfo,
   ManifestScrubSummary,
+  ManifestScrubSource,
   OrphanSegmentScrubResult,
   OverGraph,
   SchemaCheckOptions,
@@ -33,6 +36,7 @@ import type {
   SchemaSetOptions,
   SchemaValidationReport,
   WalScrubResult,
+  WalScrubRole,
 } from '../../index.js'
 import { scrubPath, scrubPathAsync } from '../../index.js'
 import type {
@@ -62,11 +66,6 @@ import type * as QueryTypes from '../../query-types.js'
 
 declare const db: OverGraph
 declare const dbPath: string
-
-type DatabaseScrubFindingType = NonNullable<DatabaseScrubFinding['findingType']>
-type DatabaseScrubSeverity = NonNullable<DatabaseScrubFinding['severity']>
-type ManifestScrubSource = NonNullable<ManifestScrubSummary['source']>
-type WalScrubRole = NonNullable<WalScrubResult['role']>
 
 const scrubPathOptions: ScrubPathOptions = {
   validateWal: true,
@@ -638,3 +637,22 @@ void gqlExplainIndexTargetFields
 void gqlExplainIndexTargetCompound
 void mutationOperation
 void mutationReturnColumns
+
+// Candidate diagnostic amounts preserve the complete unsigned 64-bit range.
+import type { ConcurrencyOptions, ReclamationStats, OverGraphConcurrencyError } from '../../index.js'
+const concurrencyOptions: ConcurrencyOptions = {
+  maxBatchOperations: 65536, maxBatchBytes: 16 * 1024 * 1024,
+  generationOperationLimit: 1048576, generationWalBytes: 512 * 1024 * 1024,
+  admissionTimeoutMs: 1000,
+}
+void concurrencyOptions
+function checkConcurrencyStats(stats: ReclamationStats, error: OverGraphConcurrencyError) {
+  const count: number | bigint = stats.registeredObjects
+  const maximum: number | bigint | null = stats.releaseToEligibilityUs.maxUs
+  const amount: number | bigint | undefined = error.requested
+  void count; void maximum; void amount
+  // @ts-expect-error diagnostic amounts must not silently narrow to Number
+  const narrowed: number = stats.retiredObjects
+  void narrowed
+}
+void checkConcurrencyStats

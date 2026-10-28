@@ -7,10 +7,13 @@
 //! checks that consult all live sources in the correct order. Engine read paths
 //! delegate to `SourceList` instead of open-coding memtable + segment logic.
 
+mod graph;
+
 use crate::edge_metadata::{EdgeMetadataCandidate, EdgeMetadataVisibilityState, RangeBoundFlags};
+use crate::engine::shared::SharedArc;
 use crate::engine::ReadViewImmutableEpoch;
 use crate::error::EngineError;
-use crate::memtable::Memtable;
+use crate::memtable::{IdentityOpinion, Memtable, PrimaryOpinion};
 use crate::property_value_semantics::NumericRangeSortKey;
 use crate::row_projection::{EdgeSelectedFieldNeeds, NodeSelectedFieldNeeds, PropertySelection};
 use crate::secondary_index_key::{CompoundPrefixBounds, CompoundRangeBounds};
@@ -18,15 +21,14 @@ use crate::segment_reader::{SegmentAdjPostingCursor, SegmentReader};
 use crate::types::*;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
-use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::ops::{Bound, ControlFlow};
 
 /// Concrete borrowing struct over the three source layers. This is not a trait,
 /// because Memtable and SegmentReader have fundamentally different APIs.
 pub struct SourceList<'a> {
     pub(crate) active: &'a Memtable,
     pub(crate) immutable: &'a [ReadViewImmutableEpoch],
-    pub(crate) segments: &'a [Arc<SegmentReader>],
+    pub(crate) segments: &'a [SharedArc<SegmentReader>],
     pub(crate) snapshot_seq: u64,
     #[cfg(test)]
     pub(crate) selected_field_read_counters: Option<&'a SelectedFieldReadCounters>,
@@ -60,21 +62,6 @@ pub(crate) enum LimitedCompoundIndexRead {
     MissingSidecar,
 }
 
-#[derive(Clone, Copy)]
-struct MemtableEndpointLimit<'a> {
-    direction: Direction,
-    label_filter_ids: Option<&'a [u32]>,
-    snapshot_seq: u64,
-    limit: usize,
-}
-
-#[derive(Clone, Copy)]
-enum EndpointEdgeScanLayer {
-    Active,
-    Immutable(usize),
-    Segment(usize),
-}
-
 enum EndpointEdgeScanSource<'a> {
     Memtable(MemtableEndpointEdgeScanSource<'a>),
     Segment(SegmentEndpointEdgeScanSource<'a>),
@@ -92,6 +79,8 @@ struct MemtableEndpointScanCursor<'a> {
     label_filter_ids: Option<&'a [u32]>,
     snapshot_seq: u64,
     next_after: Option<u64>,
+    pending: std::collections::VecDeque<u64>,
+    exhausted: bool,
 }
 
 struct MemtableEndpointEdgeScanSource<'a> {
@@ -115,15 +104,15 @@ impl<'a> EndpointEdgeScanSource<'a> {
         label_filter_ids: Option<&'a [u32]>,
         snapshot_seq: u64,
         after: Option<u64>,
-    ) -> Self {
-        Self::Memtable(MemtableEndpointEdgeScanSource::new(
+    ) -> Result<Self, EngineError> {
+        Ok(Self::Memtable(MemtableEndpointEdgeScanSource::new(
             memtable,
             node_ids,
             direction,
             label_filter_ids,
             snapshot_seq,
             after,
-        ))
+        )?))
     }
 
     fn segment(
@@ -144,7 +133,7 @@ impl<'a> EndpointEdgeScanSource<'a> {
 
     fn next_id(&mut self) -> Result<Option<u64>, EngineError> {
         match self {
-            Self::Memtable(source) => Ok(source.next_id()),
+            Self::Memtable(source) => source.next_id(),
             Self::Segment(source) => source.next_id(),
         }
     }
@@ -158,7 +147,7 @@ impl<'a> MemtableEndpointEdgeScanSource<'a> {
         label_filter_ids: Option<&'a [u32]>,
         snapshot_seq: u64,
         after: Option<u64>,
-    ) -> Self {
+    ) -> Result<Self, EngineError> {
         let mut cursors = Vec::new();
         for &node_id in node_ids {
             match direction {
@@ -169,6 +158,8 @@ impl<'a> MemtableEndpointEdgeScanSource<'a> {
                     label_filter_ids,
                     snapshot_seq,
                     next_after: after,
+                    pending: Default::default(),
+                    exhausted: false,
                 }),
                 Direction::Incoming => cursors.push(MemtableEndpointScanCursor {
                     memtable,
@@ -177,6 +168,8 @@ impl<'a> MemtableEndpointEdgeScanSource<'a> {
                     label_filter_ids,
                     snapshot_seq,
                     next_after: after,
+                    pending: Default::default(),
+                    exhausted: false,
                 }),
                 Direction::Both => {
                     cursors.push(MemtableEndpointScanCursor {
@@ -186,6 +179,8 @@ impl<'a> MemtableEndpointEdgeScanSource<'a> {
                         label_filter_ids,
                         snapshot_seq,
                         next_after: after,
+                        pending: Default::default(),
+                        exhausted: false,
                     });
                     cursors.push(MemtableEndpointScanCursor {
                         memtable,
@@ -194,6 +189,8 @@ impl<'a> MemtableEndpointEdgeScanSource<'a> {
                         label_filter_ids,
                         snapshot_seq,
                         next_after: after,
+                        pending: Default::default(),
+                        exhausted: false,
                     });
                 }
             }
@@ -205,51 +202,51 @@ impl<'a> MemtableEndpointEdgeScanSource<'a> {
             last_seen: None,
         };
         for cursor_index in 0..source.cursors.len() {
-            if let Some(edge_id) = source.next_cursor_id(cursor_index) {
+            if let Some(edge_id) = source.next_cursor_id(cursor_index)? {
                 source.heap.push(Reverse((edge_id, cursor_index)));
             }
         }
-        source
+        Ok(source)
     }
 
-    fn next_cursor_id(&mut self, cursor_index: usize) -> Option<u64> {
+    fn next_cursor_id(&mut self, cursor_index: usize) -> Result<Option<u64>, EngineError> {
         let cursor = &mut self.cursors[cursor_index];
-        let edge_id = match cursor.direction {
-            MemtableEndpointScanDirection::Outgoing => {
-                cursor.memtable.next_visible_edge_from_endpoint_after(
-                    cursor.node_id,
-                    cursor.label_filter_ids,
-                    cursor.snapshot_seq,
-                    cursor.next_after,
-                )
+        loop {
+            if let Some(id) = cursor.pending.pop_front() {
+                return Ok(Some(id));
             }
-            MemtableEndpointScanDirection::Incoming => {
-                cursor.memtable.next_visible_edge_to_endpoint_after(
-                    cursor.node_id,
-                    cursor.label_filter_ids,
-                    cursor.snapshot_seq,
-                    cursor.next_after,
-                )
+            if cursor.exhausted {
+                return Ok(None);
             }
-        };
-        if let Some(edge_id) = edge_id {
-            cursor.next_after = Some(edge_id);
+            let direction = match cursor.direction {
+                MemtableEndpointScanDirection::Outgoing => Direction::Outgoing,
+                MemtableEndpointScanDirection::Incoming => Direction::Incoming,
+            };
+            let (ids, last, done) = cursor.memtable.refill_endpoint_ids_at(
+                cursor.node_id,
+                direction == Direction::Outgoing,
+                cursor.label_filter_ids,
+                cursor.snapshot_seq,
+                cursor.next_after.map_or(Bound::Unbounded, Bound::Excluded),
+            )?;
+            cursor.next_after = last.or(cursor.next_after);
+            cursor.exhausted = done;
+            cursor.pending.extend(ids);
         }
-        edge_id
     }
 
-    fn next_id(&mut self) -> Option<u64> {
+    fn next_id(&mut self) -> Result<Option<u64>, EngineError> {
         while let Some(Reverse((edge_id, cursor_index))) = self.heap.pop() {
-            if let Some(next_id) = self.next_cursor_id(cursor_index) {
+            if let Some(next_id) = self.next_cursor_id(cursor_index)? {
                 self.heap.push(Reverse((next_id, cursor_index)));
             }
             if self.last_seen == Some(edge_id) {
                 continue;
             }
             self.last_seen = Some(edge_id);
-            return Some(edge_id);
+            return Ok(Some(edge_id));
         }
-        None
+        Ok(None)
     }
 }
 
@@ -298,6 +295,19 @@ impl<'a> SegmentEndpointEdgeScanSource<'a> {
     }
 }
 
+fn try_visible_ids(
+    ids: Vec<u64>,
+    mut hidden: impl FnMut(u64) -> Result<bool, EngineError>,
+) -> Result<Vec<u64>, EngineError> {
+    let mut visible = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !hidden(id)? {
+            visible.push(id);
+        }
+    }
+    Ok(visible)
+}
+
 impl<'a> SourceList<'a> {
     /// Find multiple nodes by ID across all sources.
     ///
@@ -316,7 +326,7 @@ impl<'a> SourceList<'a> {
             .collect();
         remaining = self
             .active
-            .batch_get_nodes_at(&remaining, self.snapshot_seq, &mut results);
+            .batch_get_nodes_at(&remaining, self.snapshot_seq, &mut results)?;
 
         for epoch in self.immutable {
             if remaining.is_empty() {
@@ -325,7 +335,7 @@ impl<'a> SourceList<'a> {
             remaining =
                 epoch
                     .memtable
-                    .batch_get_nodes_at(&remaining, self.snapshot_seq, &mut results);
+                    .batch_get_nodes_at(&remaining, self.snapshot_seq, &mut results)?;
         }
 
         if !remaining.is_empty() {
@@ -360,7 +370,7 @@ impl<'a> SourceList<'a> {
             .collect();
         remaining = self
             .active
-            .batch_get_edges_at(&remaining, self.snapshot_seq, &mut results);
+            .batch_get_edges_at(&remaining, self.snapshot_seq, &mut results)?;
 
         for epoch in self.immutable {
             if remaining.is_empty() {
@@ -369,7 +379,7 @@ impl<'a> SourceList<'a> {
             remaining =
                 epoch
                     .memtable
-                    .batch_get_edges_at(&remaining, self.snapshot_seq, &mut results);
+                    .batch_get_edges_at(&remaining, self.snapshot_seq, &mut results)?;
         }
 
         if !remaining.is_empty() {
@@ -414,7 +424,7 @@ impl<'a> SourceList<'a> {
             }
             let prior = std::mem::take(&mut remaining);
             remaining =
-                memtable.batch_get_edge_metadata_at(&prior, self.snapshot_seq, &mut visibility);
+                memtable.batch_get_edge_metadata_at(&prior, self.snapshot_seq, &mut visibility)?;
             for (index, _) in prior {
                 if let EdgeMetadataVisibilityState::Live(meta) = visibility[index] {
                     results[index] = Some(meta);
@@ -454,41 +464,40 @@ impl<'a> SourceList<'a> {
         let mut visibility = vec![EdgeMetadataVisibilityState::Missing; ids.len()];
 
         {
-            let mut resolve_memtable =
-                |memtable: &Memtable,
-                 layer: EdgeMetadataSourceLayer,
-                 remaining: &mut Vec<(usize, u64)>| {
-                    if remaining.is_empty() {
-                        return;
-                    }
-                    let prior = std::mem::take(remaining);
-                    *remaining = memtable.batch_get_edge_metadata_at(
-                        &prior,
-                        self.snapshot_seq,
-                        &mut visibility,
-                    );
-                    for (index, _) in prior {
-                        match visibility[index] {
-                            EdgeMetadataVisibilityState::Live(meta) => {
-                                results[index] =
-                                    Some(EdgeMetadataSourceOpinion::Live { layer, meta });
-                            }
-                            EdgeMetadataVisibilityState::Deleted => {
-                                results[index] =
-                                    Some(EdgeMetadataSourceOpinion::MissingOrTombstoned);
-                            }
-                            EdgeMetadataVisibilityState::Missing => {}
+            let mut resolve_memtable = |memtable: &Memtable,
+                                        layer: EdgeMetadataSourceLayer,
+                                        remaining: &mut Vec<(usize, u64)>|
+             -> Result<(), EngineError> {
+                if remaining.is_empty() {
+                    return Ok(());
+                }
+                let prior = std::mem::take(remaining);
+                *remaining = memtable.batch_get_edge_metadata_at(
+                    &prior,
+                    self.snapshot_seq,
+                    &mut visibility,
+                )?;
+                for (index, _) in prior {
+                    match visibility[index] {
+                        EdgeMetadataVisibilityState::Live(meta) => {
+                            results[index] = Some(EdgeMetadataSourceOpinion::Live { layer, meta });
                         }
+                        EdgeMetadataVisibilityState::Deleted => {
+                            results[index] = Some(EdgeMetadataSourceOpinion::MissingOrTombstoned);
+                        }
+                        EdgeMetadataVisibilityState::Missing => {}
                     }
-                };
+                }
+                Ok(())
+            };
 
-            resolve_memtable(self.active, EdgeMetadataSourceLayer::Active, &mut remaining);
+            resolve_memtable(self.active, EdgeMetadataSourceLayer::Active, &mut remaining)?;
             for (index, epoch) in self.immutable.iter().enumerate() {
                 resolve_memtable(
                     &epoch.memtable,
                     EdgeMetadataSourceLayer::Immutable(index),
                     &mut remaining,
-                );
+                )?;
             }
         }
         if !remaining.is_empty() {
@@ -548,7 +557,7 @@ impl<'a> SourceList<'a> {
             &remaining,
             self.snapshot_seq,
             &mut results,
-        );
+        )?;
 
         for epoch in self.immutable {
             if remaining.is_empty() {
@@ -558,7 +567,7 @@ impl<'a> SourceList<'a> {
                 &remaining,
                 self.snapshot_seq,
                 &mut results,
-            );
+            )?;
         }
 
         if !remaining.is_empty() {
@@ -639,7 +648,7 @@ impl<'a> SourceList<'a> {
             &mut results,
             #[cfg(test)]
             self.selected_field_read_counters,
-        );
+        )?;
 
         for epoch in self.immutable {
             if remaining.is_empty() {
@@ -652,7 +661,7 @@ impl<'a> SourceList<'a> {
                 &mut results,
                 #[cfg(test)]
                 self.selected_field_read_counters,
-            );
+            )?;
         }
 
         if !remaining.is_empty() {
@@ -728,7 +737,7 @@ impl<'a> SourceList<'a> {
             &mut results,
             #[cfg(test)]
             self.selected_field_read_counters,
-        );
+        )?;
 
         for epoch in self.immutable {
             if remaining.is_empty() {
@@ -741,7 +750,7 @@ impl<'a> SourceList<'a> {
                 &mut results,
                 #[cfg(test)]
                 self.selected_field_read_counters,
-            );
+            )?;
         }
 
         if !remaining.is_empty() {
@@ -787,283 +796,121 @@ impl<'a> SourceList<'a> {
     /// Find a node by ID across all sources. Short-circuits on the first
     /// source that has an opinion (live record or tombstone).
     pub fn find_node(&self, id: u64) -> Result<Option<NodeRecord>, EngineError> {
-        if let Some(node) = self.active.get_node_at(id, self.snapshot_seq) {
-            return Ok(Some(node));
-        }
-        if self.active.is_node_deleted_at(id, self.snapshot_seq) {
-            return Ok(None);
-        }
-
-        for epoch in self.immutable {
-            if let Some(node) = epoch.memtable.get_node_at(id, self.snapshot_seq) {
-                return Ok(Some(node));
+        for m in
+            std::iter::once(self.active).chain(self.immutable.iter().map(|e| e.memtable.as_ref()))
+        {
+            match m.node_opinion_at(id, self.snapshot_seq)? {
+                PrimaryOpinion::Missing => {}
+                PrimaryOpinion::Removed(_) => return Ok(None),
+                PrimaryOpinion::Live(v) => return Ok(Some(v)),
             }
-            if epoch.memtable.is_node_deleted_at(id, self.snapshot_seq) {
+        }
+        for segment in self.segments {
+            if segment.is_node_deleted(id) {
                 return Ok(None);
             }
-        }
-
-        for seg in self.segments {
-            if seg.is_node_deleted(id) {
-                return Ok(None);
-            }
-            if let Some(node) = seg.get_node(id)? {
-                return Ok(Some(node));
+            if let Some(value) = segment.get_node(id)? {
+                return Ok(Some(value));
             }
         }
-
         Ok(None)
     }
 
     /// Find an edge by ID across all sources. Short-circuits on the first
     /// source that has an opinion (live record or tombstone).
     pub fn find_edge(&self, id: u64) -> Result<Option<EdgeRecord>, EngineError> {
-        if let Some(edge) = self.active.get_edge_at(id, self.snapshot_seq) {
-            return Ok(Some(edge));
-        }
-        if self.active.is_edge_deleted_at(id, self.snapshot_seq) {
-            return Ok(None);
-        }
-
-        for epoch in self.immutable {
-            if let Some(edge) = epoch.memtable.get_edge_at(id, self.snapshot_seq) {
-                return Ok(Some(edge));
+        for m in
+            std::iter::once(self.active).chain(self.immutable.iter().map(|e| e.memtable.as_ref()))
+        {
+            match m.edge_opinion_at(id, self.snapshot_seq)? {
+                PrimaryOpinion::Missing => {}
+                PrimaryOpinion::Removed(_) => return Ok(None),
+                PrimaryOpinion::Live(v) => return Ok(Some(v)),
             }
-            if epoch.memtable.is_edge_deleted_at(id, self.snapshot_seq) {
+        }
+        for segment in self.segments {
+            if segment.is_edge_deleted(id) {
                 return Ok(None);
             }
-        }
-
-        for seg in self.segments {
-            if seg.is_edge_deleted(id) {
-                return Ok(None);
-            }
-            if let Some(edge) = seg.get_edge(id)? {
-                return Ok(Some(edge));
+            if let Some(value) = segment.get_edge(id)? {
+                return Ok(Some(value));
             }
         }
-
         Ok(None)
     }
 
-    pub fn find_nodes_by_label_keys<'b>(
+    pub fn find_nodes_by_label_keys(
         &self,
-        keys: &[(u32, &'b str)],
+        keys: &[(u32, &str)],
     ) -> Result<Vec<Option<NodeRecord>>, EngineError> {
-        let n = keys.len();
-        let mut results = vec![None; n];
-        if n == 0 {
-            return Ok(results);
-        }
-
-        let mut remaining: Vec<(usize, u32, &'b str)> = Vec::with_capacity(n);
-        for (i, &(label_id, key)) in keys.iter().enumerate() {
-            if let Some(node) = self.active.node_by_key_at(label_id, key, self.snapshot_seq) {
-                results[i] = Some(node);
-            } else {
-                remaining.push((i, label_id, key));
-            }
-        }
-
-        let mut candidates: Vec<(usize, u32, &'b str, u64)> = Vec::new();
-        for (epoch_idx, epoch) in self.immutable.iter().enumerate() {
-            if remaining.is_empty() {
-                break;
-            }
-            remaining.retain(|&(i, label_id, key)| {
-                if let Some(node) = epoch
-                    .memtable
-                    .node_by_key_at(label_id, key, self.snapshot_seq)
-                {
-                    if self.is_node_tombstoned_above_immutable(node.id, epoch_idx) {
-                        return false;
-                    }
-                    candidates.push((i, label_id, key, node.id));
-                    return false;
-                }
-                true
-            });
-        }
-
-        if !remaining.is_empty() {
-            remaining.sort_unstable_by(|left, right| (left.1, left.2).cmp(&(right.1, right.2)));
-        }
-
-        for seg in self.segments {
-            if remaining.is_empty() {
-                break;
-            }
-
-            let resolved = seg.resolve_keys_to_ids(&remaining)?;
-            if !resolved.is_empty() {
-                let mut found = Vec::with_capacity(resolved.len());
-                for (orig_idx, node_id) in resolved {
-                    let (label_id, key) = keys[orig_idx];
-                    candidates.push((orig_idx, label_id, key, node_id));
-                    found.push(orig_idx);
-                }
-                found.sort_unstable();
-                found.dedup();
-                remaining.retain(|&(i, _, _)| found.binary_search(&i).is_err());
-            }
-        }
-
-        if !candidates.is_empty() {
-            let mut candidate_ids: Vec<u64> = candidates
-                .iter()
-                .map(|&(_, _, _, node_id)| node_id)
-                .collect();
-            candidate_ids.sort_unstable();
-            candidate_ids.dedup();
-
-            let visibility = self.find_node_visibility_meta(&candidate_ids)?;
-            let mut candidate_labels_by_id: NodeIdMap<Vec<u32>> = NodeIdMap::default();
-            for &(_, label_id, _, node_id) in &candidates {
-                let labels = candidate_labels_by_id.entry(node_id).or_default();
-                if !labels.contains(&label_id) {
-                    labels.push(label_id);
-                }
-            }
-            let mut visible_ids = Vec::new();
-            let mut visible_positions = NodeIdMap::default();
-            for (index, state) in visibility.into_iter().enumerate() {
-                let NodeVisibilityState::Live(meta) = state else {
-                    continue;
-                };
-                let node_id = candidate_ids[index];
-                if candidate_labels_by_id.get(&node_id).is_some_and(|labels| {
-                    labels
-                        .iter()
-                        .any(|&label_id| meta.label_ids.contains(label_id))
-                }) {
-                    visible_positions.insert(node_id, visible_ids.len());
-                    visible_ids.push(node_id);
-                }
-            }
-
-            if !visible_ids.is_empty() {
-                let hydrated = self.find_nodes(&visible_ids)?;
-                for (orig_idx, label_id, key, node_id) in candidates {
-                    let Some(&position) = visible_positions.get(&node_id) else {
-                        continue;
-                    };
-                    let Some(node) = hydrated[position].as_ref() else {
-                        continue;
-                    };
-                    if node.label_ids.contains(label_id) && node.key == key {
-                        results[orig_idx] = Some(node.clone());
-                    }
-                }
-            }
-        }
-
-        Ok(results)
+        let ids = self.find_node_ids_by_label_keys(keys)?;
+        let wanted: Vec<u64> = ids.iter().flatten().copied().collect();
+        let mut hydrated = self.find_nodes(&wanted)?.into_iter();
+        Ok(ids
+            .into_iter()
+            .map(|id| id.and_then(|_| hydrated.next().flatten()))
+            .collect())
     }
 
-    pub(crate) fn find_node_ids_by_label_keys<'b>(
+    pub(crate) fn find_node_ids_by_label_keys(
         &self,
-        keys: &[(u32, &'b str)],
+        keys: &[(u32, &str)],
     ) -> Result<Vec<Option<u64>>, EngineError> {
-        let n = keys.len();
-        let mut results = vec![None; n];
-        if n == 0 {
-            return Ok(results);
-        }
-
-        let mut remaining: Vec<(usize, u32, &'b str)> = Vec::with_capacity(n);
-        let mut candidates: Vec<(usize, u32, &'b str, u64)> = Vec::new();
-        for (i, &(label_id, key)) in keys.iter().enumerate() {
-            if let Some(node_id) = self
-                .active
-                .node_id_by_key_at(label_id, key, self.snapshot_seq)
-            {
-                candidates.push((i, label_id, key, node_id));
-            } else {
-                remaining.push((i, label_id, key));
-            }
-        }
-
-        for (epoch_idx, epoch) in self.immutable.iter().enumerate() {
+        let mut candidates = vec![None; keys.len()];
+        let mut remaining: Vec<usize> = (0..keys.len()).collect();
+        for memtable in
+            std::iter::once(self.active).chain(self.immutable.iter().map(|e| e.memtable.as_ref()))
+        {
             if remaining.is_empty() {
                 break;
             }
-            remaining.retain(|&(i, label_id, key)| {
-                if let Some(node_id) =
-                    epoch
-                        .memtable
-                        .node_id_by_key_at(label_id, key, self.snapshot_seq)
-                {
-                    if self.is_node_tombstoned_above_immutable(node_id, epoch_idx) {
-                        return false;
-                    }
-                    candidates.push((i, label_id, key, node_id));
-                    return false;
+            let lookups = remaining.iter().map(|&i| keys[i]).collect::<Vec<_>>();
+            let opinions = memtable.key_opinions_at(&lookups, self.snapshot_seq)?;
+            let mut next = Vec::new();
+            for (i, opinion) in remaining.into_iter().zip(opinions) {
+                match opinion {
+                    IdentityOpinion::Missing => next.push(i),
+                    IdentityOpinion::Removed => {}
+                    IdentityOpinion::Live(id) => candidates[i] = Some(id),
                 }
-                true
-            });
+            }
+            remaining = next;
         }
-
-        if !remaining.is_empty() {
-            remaining.sort_unstable_by(|left, right| (left.1, left.2).cmp(&(right.1, right.2)));
-        }
-
-        for seg in self.segments {
-            if remaining.is_empty() {
+        let mut unresolved = remaining
+            .iter()
+            .map(|&i| (i, keys[i].0, keys[i].1))
+            .collect::<Vec<_>>();
+        unresolved.sort_unstable_by(|a, b| (a.1, a.2).cmp(&(b.1, b.2)));
+        for segment in self.segments {
+            if unresolved.is_empty() {
                 break;
             }
-
-            let resolved = seg.resolve_keys_to_ids(&remaining)?;
-            if !resolved.is_empty() {
-                let mut found = Vec::with_capacity(resolved.len());
-                for (orig_idx, node_id) in resolved {
-                    let (label_id, key) = keys[orig_idx];
-                    candidates.push((orig_idx, label_id, key, node_id));
-                    found.push(orig_idx);
-                }
-                found.sort_unstable();
-                found.dedup();
-                remaining.retain(|&(i, _, _)| found.binary_search(&i).is_err());
+            for (i, id) in segment.resolve_keys_to_ids(&unresolved)? {
+                candidates[i] = Some(id);
             }
+            unresolved.retain(|(i, _, _)| candidates[*i].is_none());
         }
-
-        if !candidates.is_empty() {
-            let mut candidate_ids: Vec<u64> = candidates
-                .iter()
-                .map(|&(_, _, _, node_id)| node_id)
-                .collect();
-            candidate_ids.sort_unstable();
-            candidate_ids.dedup();
-
-            let selected = self.find_node_projected_fields(
-                &candidate_ids,
-                &NodeSelectedFieldNeeds {
-                    key: true,
-                    ..NodeSelectedFieldNeeds::default()
-                },
-            )?;
-            let mut selected_positions = NodeIdMap::default();
-            for (position, (&node_id, fields)) in
-                candidate_ids.iter().zip(selected.iter()).enumerate()
-            {
-                if fields.is_some() {
-                    selected_positions.insert(node_id, position);
-                }
-            }
-
-            for (orig_idx, label_id, key, node_id) in candidates {
-                let Some(&position) = selected_positions.get(&node_id) else {
-                    continue;
-                };
-                let Some(fields) = selected[position].as_ref() else {
-                    continue;
-                };
-                if fields.meta.label_ids.contains(label_id) && fields.key.as_deref() == Some(key) {
-                    results[orig_idx] = Some(node_id);
+        let mut ids = candidates.iter().flatten().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        let fields = self.find_node_projected_fields(
+            &ids,
+            &NodeSelectedFieldNeeds {
+                key: true,
+                ..Default::default()
+            },
+        )?;
+        for (i, candidate) in candidates.iter_mut().enumerate() {
+            if let Some(id) = *candidate {
+                let position = ids.binary_search(&id).expect("resolved candidate");
+                if !fields[position].as_ref().is_some_and(|n| {
+                    n.meta.label_ids.contains(keys[i].0) && n.key.as_deref() == Some(keys[i].1)
+                }) {
+                    *candidate = None;
                 }
             }
         }
-
-        Ok(results)
+        Ok(candidates)
     }
 
     pub fn find_node_by_label_key(
@@ -1071,6 +918,14 @@ impl<'a> SourceList<'a> {
         label_id: u32,
         key: &str,
     ) -> Result<Option<NodeRecord>, EngineError> {
+        match self
+            .active
+            .node_key_record_opinion_at(label_id, key, self.snapshot_seq)?
+        {
+            IdentityOpinion::Missing => {}
+            IdentityOpinion::Removed => return Ok(None),
+            IdentityOpinion::Live(value) => return Ok(Some(value)),
+        }
         Ok(self
             .find_nodes_by_label_keys(&[(label_id, key)])?
             .pop()
@@ -1083,135 +938,165 @@ impl<'a> SourceList<'a> {
         to: u64,
         label_id: u32,
     ) -> Result<Option<EdgeRecord>, EngineError> {
-        if let Some(edge) = self
-            .active
-            .edge_by_triple_at(from, to, label_id, self.snapshot_seq)
+        Ok(self
+            .find_edges_by_triples(&[(from, to, label_id)])?
+            .pop()
+            .flatten())
+    }
+
+    pub(crate) fn find_edge_ids_by_triples(
+        &self,
+        triples: &[(u64, u64, u32)],
+    ) -> Result<Vec<Option<u64>>, EngineError> {
+        let mut candidates = vec![None; triples.len()];
+        let mut remaining: Vec<usize> = (0..triples.len()).collect();
+        for memtable in
+            std::iter::once(self.active).chain(self.immutable.iter().map(|e| e.memtable.as_ref()))
         {
-            return Ok(Some(edge));
-        }
-
-        for (i, epoch) in self.immutable.iter().enumerate() {
-            if let Some(edge) =
-                epoch
-                    .memtable
-                    .edge_by_triple_at(from, to, label_id, self.snapshot_seq)
-            {
-                if self.is_edge_tombstoned_above_immutable(edge.id, i) {
-                    return Ok(None);
+            if remaining.is_empty() {
+                break;
+            }
+            let lookups = remaining.iter().map(|&i| triples[i]).collect::<Vec<_>>();
+            let opinions = memtable.triple_opinions_at(&lookups, self.snapshot_seq)?;
+            let mut next = Vec::new();
+            for (i, opinion) in remaining.into_iter().zip(opinions) {
+                match opinion {
+                    IdentityOpinion::Missing => next.push(i),
+                    IdentityOpinion::Removed => {}
+                    IdentityOpinion::Live(id) => candidates[i] = Some(id),
                 }
-                return Ok(Some(edge));
+            }
+            remaining = next;
+        }
+        let mut unresolved = remaining
+            .iter()
+            .map(|&i| {
+                let t = triples[i];
+                (i, t.0, t.1, t.2)
+            })
+            .collect::<Vec<_>>();
+        unresolved.sort_unstable_by_key(|x| (x.1, x.2, x.3));
+        for segment in self.segments {
+            if unresolved.is_empty() {
+                break;
+            }
+            for (i, id) in segment.resolve_triples_to_ids(&unresolved)? {
+                candidates[i] = Some(id);
+            }
+            unresolved.retain(|(i, _, _, _)| candidates[*i].is_none());
+        }
+        let mut ids = candidates.iter().flatten().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        let rows = self.find_edge_metadata(&ids)?;
+        let mut results = vec![None; triples.len()];
+        for (i, candidate) in candidates.into_iter().enumerate() {
+            if let Some(id) = candidate {
+                let row = &rows[ids.binary_search(&id).expect("resolved candidate")];
+                if let Some(edge) = row {
+                    if (edge.from, edge.to, edge.label_id) == triples[i] {
+                        results[i] = Some(id);
+                    }
+                }
             }
         }
-
-        for (s, seg) in self.segments.iter().enumerate() {
-            if let Some(edge) = seg.edge_by_triple(from, to, label_id)? {
-                if self.is_edge_tombstoned_above_segment(edge.id, s) {
-                    return Ok(None);
-                }
-                return Ok(Some(edge));
-            }
-        }
-
-        Ok(None)
+        Ok(results)
     }
 
     pub fn find_edges_by_triples(
         &self,
         triples: &[(u64, u64, u32)],
     ) -> Result<Vec<Option<EdgeRecord>>, EngineError> {
-        let n = triples.len();
-        let mut results = vec![None; n];
-        if n == 0 {
-            return Ok(results);
-        }
-
-        let mut remaining: Vec<(usize, u64, u64, u32)> = triples
-            .iter()
-            .enumerate()
-            .map(|(index, &(from, to, label_id))| (index, from, to, label_id))
-            .collect();
-
-        remaining =
-            self.active
-                .batch_edges_by_triples_at(&remaining, self.snapshot_seq, &mut results);
-
-        for (epoch_idx, epoch) in self.immutable.iter().enumerate() {
-            if remaining.is_empty() {
-                break;
-            }
-            let previous = remaining;
-            remaining = epoch.memtable.batch_edges_by_triples_at(
-                &previous,
-                self.snapshot_seq,
-                &mut results,
-            );
-            for &(orig_idx, _, _, _) in &previous {
-                if let Some(edge) = results[orig_idx].as_ref() {
-                    if self.is_edge_tombstoned_above_immutable(edge.id, epoch_idx) {
-                        results[orig_idx] = None;
-                    }
-                }
-            }
-        }
-
-        if remaining.is_empty() {
-            return Ok(results);
-        }
-
-        remaining.sort_unstable_by(|left, right| {
-            (left.1, left.2, left.3).cmp(&(right.1, right.2, right.3))
-        });
-
-        for (seg_idx, seg) in self.segments.iter().enumerate() {
-            if remaining.is_empty() {
-                break;
-            }
-
-            let found = seg.resolve_triples_batch(&remaining, &mut results)?;
-            for &orig_idx in &found {
-                if let Some(edge) = results[orig_idx].as_ref() {
-                    if self.is_edge_tombstoned_above_segment(edge.id, seg_idx) {
-                        results[orig_idx] = None;
-                    }
-                }
-            }
-
-            if !found.is_empty() {
-                let mut found_mask = vec![false; n];
-                for &idx in &found {
-                    found_mask[idx] = true;
-                }
-                remaining.retain(|&(idx, _, _, _)| !found_mask[idx]);
-            }
-        }
-
-        Ok(results)
+        let ids = self.find_edge_ids_by_triples(triples)?;
+        let wanted = ids.iter().flatten().copied().collect::<Vec<_>>();
+        let mut rows = self.find_edges(&wanted)?.into_iter();
+        Ok(ids
+            .into_iter()
+            .map(|id| id.and_then(|_| rows.next().flatten()))
+            .collect())
     }
 
-    pub fn collect_deleted_nodes(&self) -> NodeIdSet {
-        let mut deleted = self.active.collect_deleted_nodes_at(self.snapshot_seq);
-        for epoch in self.immutable {
-            deleted.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq));
-        }
-        for seg in self.segments {
-            for &id in seg.deleted_node_tombstones().keys() {
-                deleted.insert(id);
+    pub(crate) fn is_node_deleted(&self, id: u64) -> Result<bool, EngineError> {
+        for m in
+            std::iter::once(self.active).chain(self.immutable.iter().map(|e| e.memtable.as_ref()))
+        {
+            let mut rows = [NodeVisibilityState::Missing];
+            m.batch_get_node_visibility_meta_at(&[(0, id)], self.snapshot_seq, &mut rows)?;
+            match rows[0] {
+                NodeVisibilityState::Deleted => return Ok(true),
+                NodeVisibilityState::Live(_) => return Ok(false),
+                NodeVisibilityState::Missing => {}
             }
         }
-        deleted
+        for s in self.segments {
+            if s.is_node_deleted(id) {
+                return Ok(true);
+            }
+            let mut row = [None];
+            s.get_node_meta_batch(&[(0, id)], &mut row)?;
+            if row[0].is_some() {
+                return Ok(false);
+            }
+        }
+        Ok(false)
+    }
+    pub(crate) fn is_edge_deleted(&self, id: u64) -> Result<bool, EngineError> {
+        for m in
+            std::iter::once(self.active).chain(self.immutable.iter().map(|e| e.memtable.as_ref()))
+        {
+            match m.edge_visibility_state_at(id, self.snapshot_seq)? {
+                EdgeVisibilityState::Deleted => return Ok(true),
+                EdgeVisibilityState::Live => return Ok(false),
+                EdgeVisibilityState::Missing => {}
+            }
+        }
+        for s in self.segments {
+            if s.is_edge_deleted(id) {
+                return Ok(true);
+            }
+            let mut metadata = [None];
+            s.get_edge_metadata_batch(&[(0, id)], &mut metadata)?;
+            if metadata[0].is_some() {
+                return Ok(false);
+            }
+        }
+        Ok(false)
     }
 
-    pub fn collect_deleted_edges(&self) -> NodeIdSet {
-        let mut deleted = self.active.collect_deleted_edges_at(self.snapshot_seq);
+    pub fn collect_deleted_nodes(&self) -> Result<NodeIdSet, EngineError> {
+        let mut deleted = self.active.collect_deleted_nodes_at(self.snapshot_seq)?;
         for epoch in self.immutable {
-            deleted.extend(epoch.memtable.collect_deleted_edges_at(self.snapshot_seq));
+            deleted.extend(epoch.memtable.collect_deleted_nodes_at(self.snapshot_seq)?);
         }
-        for seg in self.segments {
-            for &id in seg.deleted_edge_tombstones().keys() {
-                deleted.insert(id);
+        for segment in self.segments {
+            deleted.extend(segment.deleted_node_tombstones().keys().copied());
+        }
+        let ids = deleted.iter().copied().collect::<Vec<_>>();
+        let visible = self.find_node_visibility_meta(&ids)?;
+        for (id, state) in ids.into_iter().zip(visible) {
+            if matches!(state, NodeVisibilityState::Live(_)) {
+                deleted.remove(&id);
             }
         }
-        deleted
+        Ok(deleted)
+    }
+
+    pub fn collect_deleted_edges(&self) -> Result<NodeIdSet, EngineError> {
+        let mut deleted = self.active.collect_deleted_edges_at(self.snapshot_seq)?;
+        for epoch in self.immutable {
+            deleted.extend(epoch.memtable.collect_deleted_edges_at(self.snapshot_seq)?);
+        }
+        for segment in self.segments {
+            deleted.extend(segment.deleted_edge_tombstones().keys().copied());
+        }
+        let ids = deleted.iter().copied().collect::<Vec<_>>();
+        let visible = self.find_edge_metadata_with_source(&ids)?;
+        for (id, state) in ids.into_iter().zip(visible) {
+            if matches!(state, EdgeMetadataSourceOpinion::Live { .. }) {
+                deleted.remove(&id);
+            }
+        }
+        Ok(deleted)
     }
 
     fn append_edge_matches(result: &mut Vec<u64>, mut matching_ids: Vec<u64>) {
@@ -1223,10 +1108,11 @@ impl<'a> SourceList<'a> {
     fn append_edge_matches_filtered(
         result: &mut Vec<u64>,
         mut matching_ids: Vec<u64>,
-        mut is_shadowed: impl FnMut(u64) -> bool,
-    ) {
-        matching_ids.retain(|&id| !is_shadowed(id));
+        mut is_shadowed: impl FnMut(u64) -> Result<bool, EngineError>,
+    ) -> Result<(), EngineError> {
+        matching_ids = try_visible_ids(matching_ids, &mut is_shadowed)?;
         Self::append_edge_matches(result, matching_ids);
+        Ok(())
     }
 
     fn push_edge_match_limited(
@@ -1251,135 +1137,13 @@ impl<'a> SourceList<'a> {
         result
     }
 
-    fn append_memtable_endpoint_matches_limited(
-        result: &mut Vec<u64>,
-        memtable: &Memtable,
-        node_ids: &[u64],
-        params: MemtableEndpointLimit<'_>,
-        mut is_shadowed: impl FnMut(u64) -> bool,
-    ) {
-        let mut cursors = Vec::new();
-        for &node_id in node_ids {
-            match params.direction {
-                Direction::Outgoing => cursors.push((node_id, true, None)),
-                Direction::Incoming => cursors.push((node_id, false, None)),
-                Direction::Both => {
-                    cursors.push((node_id, true, None));
-                    cursors.push((node_id, false, None));
-                }
-            }
-        }
-
-        let mut heap = BinaryHeap::new();
-        for (index, cursor) in cursors.iter_mut().enumerate() {
-            let next = if cursor.1 {
-                memtable.next_visible_edge_from_endpoint_after(
-                    cursor.0,
-                    params.label_filter_ids,
-                    params.snapshot_seq,
-                    cursor.2,
-                )
-            } else {
-                memtable.next_visible_edge_to_endpoint_after(
-                    cursor.0,
-                    params.label_filter_ids,
-                    params.snapshot_seq,
-                    cursor.2,
-                )
-            };
-            if let Some(edge_id) = next {
-                cursor.2 = Some(edge_id);
-                heap.push(Reverse((edge_id, index)));
-            }
-        }
-
-        let mut last_seen = None;
-        while let Some(Reverse((edge_id, cursor_index))) = heap.pop() {
-            let cursor = &mut cursors[cursor_index];
-            let next = if cursor.1 {
-                memtable.next_visible_edge_from_endpoint_after(
-                    cursor.0,
-                    params.label_filter_ids,
-                    params.snapshot_seq,
-                    cursor.2,
-                )
-            } else {
-                memtable.next_visible_edge_to_endpoint_after(
-                    cursor.0,
-                    params.label_filter_ids,
-                    params.snapshot_seq,
-                    cursor.2,
-                )
-            };
-            if let Some(next_id) = next {
-                cursor.2 = Some(next_id);
-                heap.push(Reverse((next_id, cursor_index)));
-            }
-
-            if last_seen == Some(edge_id) {
-                continue;
-            }
-            last_seen = Some(edge_id);
-            if is_shadowed(edge_id) {
-                continue;
-            }
-            if Self::push_edge_match_limited(result, edge_id, params.limit).is_break() {
-                break;
-            }
-        }
-    }
-
-    fn append_segment_endpoint_matches_limited(
-        result: &mut Vec<u64>,
-        segment: &SegmentReader,
-        node_ids: &[u64],
-        direction: Direction,
-        label_filter_ids: Option<&[u32]>,
-        limit: usize,
-        mut is_shadowed: impl FnMut(u64) -> bool,
-    ) -> Result<(), EngineError> {
-        if result.len() >= limit {
-            return Ok(());
-        }
-
-        let mut cursors =
-            segment.endpoint_adj_posting_cursors(node_ids, direction, label_filter_ids)?;
-        let mut heap = BinaryHeap::new();
-        for (index, cursor) in cursors.iter_mut().enumerate() {
-            if let Some(edge_id) = segment.next_adj_posting_edge_id(cursor)? {
-                heap.push(Reverse((edge_id, index)));
-            }
-        }
-
-        let mut last_seen = None;
-        while let Some(Reverse((edge_id, cursor_index))) = heap.pop() {
-            let cursor = &mut cursors[cursor_index];
-            if let Some(next_id) = segment.next_adj_posting_edge_id(cursor)? {
-                heap.push(Reverse((next_id, cursor_index)));
-            }
-
-            if last_seen == Some(edge_id) {
-                continue;
-            }
-            last_seen = Some(edge_id);
-            if is_shadowed(edge_id) {
-                continue;
-            }
-            if Self::push_edge_match_limited(result, edge_id, limit).is_break() {
-                break;
-            }
-        }
-
-        Ok(())
-    }
-
     fn endpoint_edge_scan_sources<'b>(
         &'b self,
         node_ids: &[u64],
         direction: Direction,
         label_filter_ids: Option<&'b [u32]>,
         start_after: Option<u64>,
-    ) -> Result<Vec<(EndpointEdgeScanLayer, EndpointEdgeScanSource<'b>)>, EngineError> {
+    ) -> Result<Vec<EndpointEdgeScanSource<'b>>, EngineError> {
         if node_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -1389,55 +1153,34 @@ impl<'a> SourceList<'a> {
         sorted_node_ids.dedup();
 
         let mut sources = Vec::with_capacity(1 + self.immutable.len() + self.segments.len());
-        sources.push((
-            EndpointEdgeScanLayer::Active,
-            EndpointEdgeScanSource::memtable(
-                self.active,
+        sources.push(EndpointEdgeScanSource::memtable(
+            self.active,
+            &sorted_node_ids,
+            direction,
+            label_filter_ids,
+            self.snapshot_seq,
+            start_after,
+        )?);
+        for epoch in self.immutable {
+            sources.push(EndpointEdgeScanSource::memtable(
+                &epoch.memtable,
                 &sorted_node_ids,
                 direction,
                 label_filter_ids,
                 self.snapshot_seq,
                 start_after,
-            ),
-        ));
-        for (index, epoch) in self.immutable.iter().enumerate() {
-            sources.push((
-                EndpointEdgeScanLayer::Immutable(index),
-                EndpointEdgeScanSource::memtable(
-                    &epoch.memtable,
-                    &sorted_node_ids,
-                    direction,
-                    label_filter_ids,
-                    self.snapshot_seq,
-                    start_after,
-                ),
-            ));
+            )?);
         }
-        for (index, segment) in self.segments.iter().enumerate() {
-            sources.push((
-                EndpointEdgeScanLayer::Segment(index),
-                EndpointEdgeScanSource::segment(
-                    segment.as_ref(),
-                    &sorted_node_ids,
-                    direction,
-                    label_filter_ids,
-                    start_after,
-                )?,
-            ));
+        for segment in self.segments {
+            sources.push(EndpointEdgeScanSource::segment(
+                segment.as_ref(),
+                &sorted_node_ids,
+                direction,
+                label_filter_ids,
+                start_after,
+            )?);
         }
         Ok(sources)
-    }
-
-    fn endpoint_scan_source_shadowed(&self, layer: EndpointEdgeScanLayer, edge_id: u64) -> bool {
-        match layer {
-            EndpointEdgeScanLayer::Active => false,
-            EndpointEdgeScanLayer::Immutable(index) => {
-                self.is_edge_shadowed_above_immutable(edge_id, index)
-            }
-            EndpointEdgeScanLayer::Segment(index) => {
-                self.is_edge_shadowed_above_segment(edge_id, index)
-            }
-        }
     }
 
     pub(crate) fn scan_edge_ids_by_endpoints_after<F>(
@@ -1455,40 +1198,58 @@ impl<'a> SourceList<'a> {
         let mut sources =
             self.endpoint_edge_scan_sources(node_ids, direction, label_filter_ids, start_after)?;
         let mut heap = BinaryHeap::new();
-        for (source_index, (_, source)) in sources.iter_mut().enumerate() {
+        for (source_index, source) in sources.iter_mut().enumerate() {
             if let Some(edge_id) = source.next_id()? {
                 heap.push(Reverse((edge_id, source_index)));
             }
         }
 
-        let chunk_limit = chunk_limit.max(1);
-        let mut chunk = Vec::with_capacity(chunk_limit);
+        let chunk_limit = chunk_limit.clamp(1, 4096);
+        let mut owners = node_ids.to_vec();
+        owners.sort_unstable();
+        owners.dedup();
+        let mut raw = Vec::with_capacity(chunk_limit);
+        let mut verified = Vec::with_capacity(chunk_limit);
+        let mut flush = |raw: &mut Vec<u64>| -> Result<ControlFlow<()>, EngineError> {
+            let ids = self.verify_edge_candidate_ids(std::mem::take(raw), |m| {
+                label_filter_ids.is_none_or(|ls| ls.contains(&m.label_id))
+                    && match direction {
+                        Direction::Outgoing => owners.binary_search(&m.from).is_ok(),
+                        Direction::Incoming => owners.binary_search(&m.to).is_ok(),
+                        Direction::Both => {
+                            owners.binary_search(&m.from).is_ok()
+                                || owners.binary_search(&m.to).is_ok()
+                        }
+                    }
+            })?;
+            verified.extend(ids);
+            while verified.len() >= chunk_limit {
+                if visitor(&verified[..chunk_limit])?.is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
+                verified.drain(..chunk_limit);
+            }
+            Ok(ControlFlow::Continue(()))
+        };
         let mut last_seen = None;
         while let Some(Reverse((edge_id, source_index))) = heap.pop() {
-            if let Some(next_id) = sources[source_index].1.next_id()? {
+            if let Some(next_id) = sources[source_index].next_id()? {
                 heap.push(Reverse((next_id, source_index)));
             }
-
             if last_seen == Some(edge_id) {
                 continue;
             }
             last_seen = Some(edge_id);
-            let layer = sources[source_index].0;
-            if self.endpoint_scan_source_shadowed(layer, edge_id) {
-                continue;
-            }
-
-            chunk.push(edge_id);
-            if chunk.len() >= chunk_limit {
-                if visitor(&chunk)?.is_break() {
-                    return Ok(());
-                }
-                chunk.clear();
+            raw.push(edge_id);
+            if raw.len() == chunk_limit && flush(&mut raw)?.is_break() {
+                return Ok(());
             }
         }
-
-        if !chunk.is_empty() {
-            let _ = visitor(&chunk)?;
+        if !raw.is_empty() && flush(&mut raw)?.is_break() {
+            return Ok(());
+        }
+        if !verified.is_empty() {
+            let _ = visitor(&verified)?;
         }
         Ok(())
     }
@@ -1526,33 +1287,20 @@ impl<'a> SourceList<'a> {
     }
 
     pub(crate) fn edge_ids_by_label_id(&self, label_id: u32) -> Result<Vec<u64>, EngineError> {
-        let mut result = Vec::new();
-
-        Self::append_edge_matches(
-            &mut result,
-            self.active
-                .visible_edges_by_label_id(label_id, self.snapshot_seq),
-        );
-        for (index, epoch) in self.immutable.iter().enumerate() {
-            Self::append_edge_matches_filtered(
-                &mut result,
+        let mut ids = self
+            .active
+            .visible_edges_by_label_id(label_id, self.snapshot_seq)?;
+        for epoch in self.immutable {
+            ids.extend(
                 epoch
                     .memtable
-                    .visible_edges_by_label_id(label_id, self.snapshot_seq),
-                |id| self.is_edge_shadowed_above_immutable(id, index),
+                    .visible_edges_by_label_id(label_id, self.snapshot_seq)?,
             );
         }
-        for (index, seg) in self.segments.iter().enumerate() {
-            Self::append_edge_matches_filtered(
-                &mut result,
-                seg.edges_by_label_id(label_id)?,
-                |id| self.is_edge_shadowed_above_segment(id, index),
-            );
+        for segment in self.segments {
+            ids.extend(segment.edges_by_label_id(label_id)?);
         }
-
-        result.sort_unstable();
-        result.dedup();
-        Ok(result)
+        self.verify_edge_candidate_ids(ids, |m| m.label_id == label_id)
     }
 
     pub(crate) fn edge_ids_by_triple(
@@ -1561,33 +1309,23 @@ impl<'a> SourceList<'a> {
         to: u64,
         label_id: u32,
     ) -> Result<Vec<u64>, EngineError> {
-        let mut result = Vec::new();
-
-        Self::append_edge_matches(
-            &mut result,
-            self.active
-                .edge_ids_by_triple_at(from, to, label_id, self.snapshot_seq),
-        );
-        for (index, epoch) in self.immutable.iter().enumerate() {
-            Self::append_edge_matches_filtered(
-                &mut result,
-                epoch
-                    .memtable
-                    .edge_ids_by_triple_at(from, to, label_id, self.snapshot_seq),
-                |id| self.is_edge_shadowed_above_immutable(id, index),
-            );
+        let mut ids = self
+            .active
+            .edge_ids_by_triple_at(from, to, label_id, self.snapshot_seq)?;
+        for epoch in self.immutable {
+            ids.extend(epoch.memtable.edge_ids_by_triple_at(
+                from,
+                to,
+                label_id,
+                self.snapshot_seq,
+            )?);
         }
-        for (index, seg) in self.segments.iter().enumerate() {
-            Self::append_edge_matches_filtered(
-                &mut result,
-                seg.edge_ids_by_triple(from, to, label_id)?,
-                |id| self.is_edge_shadowed_above_segment(id, index),
-            );
+        for segment in self.segments {
+            ids.extend(segment.edge_ids_by_triple(from, to, label_id)?);
         }
-
-        result.sort_unstable();
-        result.dedup();
-        Ok(result)
+        self.verify_edge_candidate_ids(ids, |m| {
+            m.from == from && m.to == to && m.label_id == label_id
+        })
     }
 
     pub(crate) fn edge_ids_by_endpoints_limited(
@@ -1597,67 +1335,25 @@ impl<'a> SourceList<'a> {
         label_filter_ids: Option<&[u32]>,
         limit: usize,
     ) -> Result<Vec<u64>, EngineError> {
-        if node_ids.is_empty() {
+        if limit == 0 {
             return Ok(Vec::new());
         }
-
-        let mut sorted_node_ids = node_ids.to_vec();
-        sorted_node_ids.sort_unstable();
-        sorted_node_ids.dedup();
-
         let mut result = Vec::new();
-
-        Self::append_memtable_endpoint_matches_limited(
-            &mut result,
-            self.active,
-            &sorted_node_ids,
-            MemtableEndpointLimit {
-                direction,
-                label_filter_ids,
-                snapshot_seq: self.snapshot_seq,
-                limit,
+        self.scan_edge_ids_by_endpoints(
+            node_ids,
+            direction,
+            label_filter_ids,
+            limit.min(4096),
+            |chunk| {
+                let remaining = limit.saturating_sub(result.len());
+                result.extend(chunk.iter().take(remaining).copied());
+                Ok(if result.len() == limit {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                })
             },
-            |_| false,
-        );
-        if result.len() >= limit {
-            return Ok(Self::finalize_edge_matches(result));
-        }
-
-        for (index, epoch) in self.immutable.iter().enumerate() {
-            Self::append_memtable_endpoint_matches_limited(
-                &mut result,
-                &epoch.memtable,
-                &sorted_node_ids,
-                MemtableEndpointLimit {
-                    direction,
-                    label_filter_ids,
-                    snapshot_seq: self.snapshot_seq,
-                    limit,
-                },
-                |id| self.is_edge_shadowed_above_immutable(id, index),
-            );
-            if result.len() >= limit {
-                return Ok(Self::finalize_edge_matches(result));
-            }
-        }
-
-        for (index, seg) in self.segments.iter().enumerate() {
-            Self::append_segment_endpoint_matches_limited(
-                &mut result,
-                seg,
-                &sorted_node_ids,
-                direction,
-                label_filter_ids,
-                limit,
-                |id| self.is_edge_shadowed_above_segment(id, index),
-            )?;
-            if result.len() >= limit {
-                return Ok(Self::finalize_edge_matches(result));
-            }
-        }
-
-        result.sort_unstable();
-        result.dedup();
+        )?;
         Ok(result)
     }
 
@@ -1676,6 +1372,7 @@ impl<'a> SourceList<'a> {
         bounds: RangeBoundFlags<f32>,
         limit: usize,
     ) -> Result<Vec<u64>, EngineError> {
+        let mut callback_error = None;
         let mut result = Vec::new();
         if self
             .active
@@ -1687,9 +1384,12 @@ impl<'a> SourceList<'a> {
                 } else {
                     ControlFlow::Continue(())
                 }
-            })
+            })?
             .is_break()
         {
+            if let Some(error) = callback_error.take() {
+                return Err(error);
+            }
             return Ok(Self::finalize_edge_matches(result));
         }
         for (index, epoch) in self.immutable.iter().enumerate() {
@@ -1698,21 +1398,36 @@ impl<'a> SourceList<'a> {
                 .for_each_edge_metadata_at(self.snapshot_seq, |meta| {
                     if label_id.is_none_or(|target| meta.label_id == target)
                         && crate::edge_metadata::weight_matches_bounds(meta.weight, bounds)
-                        && !self.is_edge_shadowed_above_immutable(meta.edge_id, index)
+                        && !match self.is_edge_shadowed_above_immutable(meta.edge_id, index) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                callback_error = Some(error);
+                                return ControlFlow::Break(());
+                            }
+                        }
                     {
                         Self::push_edge_match_limited(&mut result, meta.edge_id, limit)
                     } else {
                         ControlFlow::Continue(())
                     }
-                })
+                })?
                 .is_break()
             {
+                if let Some(error) = callback_error.take() {
+                    return Err(error);
+                }
                 return Ok(Self::finalize_edge_matches(result));
             }
         }
         for (index, seg) in self.segments.iter().enumerate() {
             let mut push = |edge_id| {
-                if self.is_edge_shadowed_above_segment(edge_id, index) {
+                if match self.is_edge_shadowed_above_segment(edge_id, index) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        callback_error = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                } {
                     ControlFlow::Continue(())
                 } else {
                     Self::push_edge_match_limited(&mut result, edge_id, limit)
@@ -1733,9 +1448,16 @@ impl<'a> SourceList<'a> {
                 },
             )?;
             if flow.is_break() {
+                if let Some(error) = callback_error.take() {
+                    return Err(error);
+                }
                 return Ok(Self::finalize_edge_matches(result));
             }
         }
+        if let Some(error) = callback_error.take() {
+            return Err(error);
+        }
+
         Ok(Self::finalize_edge_matches(result))
     }
 
@@ -1754,6 +1476,7 @@ impl<'a> SourceList<'a> {
         bounds: RangeBoundFlags<i64>,
         limit: usize,
     ) -> Result<Vec<u64>, EngineError> {
+        let mut callback_error = None;
         let mut result = Vec::new();
         if self
             .active
@@ -1765,9 +1488,12 @@ impl<'a> SourceList<'a> {
                 } else {
                     ControlFlow::Continue(())
                 }
-            })
+            })?
             .is_break()
         {
+            if let Some(error) = callback_error.take() {
+                return Err(error);
+            }
             return Ok(Self::finalize_edge_matches(result));
         }
         for (index, epoch) in self.immutable.iter().enumerate() {
@@ -1776,21 +1502,36 @@ impl<'a> SourceList<'a> {
                 .for_each_edge_metadata_at(self.snapshot_seq, |meta| {
                     if label_id.is_none_or(|target| meta.label_id == target)
                         && crate::edge_metadata::i64_matches_bounds(meta.updated_at, bounds)
-                        && !self.is_edge_shadowed_above_immutable(meta.edge_id, index)
+                        && !match self.is_edge_shadowed_above_immutable(meta.edge_id, index) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                callback_error = Some(error);
+                                return ControlFlow::Break(());
+                            }
+                        }
                     {
                         Self::push_edge_match_limited(&mut result, meta.edge_id, limit)
                     } else {
                         ControlFlow::Continue(())
                     }
-                })
+                })?
                 .is_break()
             {
+                if let Some(error) = callback_error.take() {
+                    return Err(error);
+                }
                 return Ok(Self::finalize_edge_matches(result));
             }
         }
         for (index, seg) in self.segments.iter().enumerate() {
             let mut push = |edge_id| {
-                if self.is_edge_shadowed_above_segment(edge_id, index) {
+                if match self.is_edge_shadowed_above_segment(edge_id, index) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        callback_error = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                } {
                     ControlFlow::Continue(())
                 } else {
                     Self::push_edge_match_limited(&mut result, edge_id, limit)
@@ -1811,9 +1552,16 @@ impl<'a> SourceList<'a> {
                 },
             )?;
             if flow.is_break() {
+                if let Some(error) = callback_error.take() {
+                    return Err(error);
+                }
                 return Ok(Self::finalize_edge_matches(result));
             }
         }
+        if let Some(error) = callback_error.take() {
+            return Err(error);
+        }
+
         Ok(Self::finalize_edge_matches(result))
     }
 
@@ -1823,6 +1571,7 @@ impl<'a> SourceList<'a> {
         bounds: RangeBoundFlags<i64>,
         limit: usize,
     ) -> Result<Vec<u64>, EngineError> {
+        let mut callback_error = None;
         let mut result = Vec::new();
         if self
             .active
@@ -1834,9 +1583,12 @@ impl<'a> SourceList<'a> {
                 } else {
                     ControlFlow::Continue(())
                 }
-            })
+            })?
             .is_break()
         {
+            if let Some(error) = callback_error.take() {
+                return Err(error);
+            }
             return Ok(Self::finalize_edge_matches(result));
         }
         for (index, epoch) in self.immutable.iter().enumerate() {
@@ -1845,21 +1597,36 @@ impl<'a> SourceList<'a> {
                 .for_each_edge_metadata_at(self.snapshot_seq, |meta| {
                     if label_id.is_none_or(|target| meta.label_id == target)
                         && crate::edge_metadata::i64_matches_bounds(meta.valid_from, bounds)
-                        && !self.is_edge_shadowed_above_immutable(meta.edge_id, index)
+                        && !match self.is_edge_shadowed_above_immutable(meta.edge_id, index) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                callback_error = Some(error);
+                                return ControlFlow::Break(());
+                            }
+                        }
                     {
                         Self::push_edge_match_limited(&mut result, meta.edge_id, limit)
                     } else {
                         ControlFlow::Continue(())
                     }
-                })
+                })?
                 .is_break()
             {
+                if let Some(error) = callback_error.take() {
+                    return Err(error);
+                }
                 return Ok(Self::finalize_edge_matches(result));
             }
         }
         for (index, seg) in self.segments.iter().enumerate() {
             let mut push = |edge_id| {
-                if self.is_edge_shadowed_above_segment(edge_id, index) {
+                if match self.is_edge_shadowed_above_segment(edge_id, index) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        callback_error = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                } {
                     ControlFlow::Continue(())
                 } else {
                     Self::push_edge_match_limited(&mut result, edge_id, limit)
@@ -1880,9 +1647,16 @@ impl<'a> SourceList<'a> {
                 },
             )?;
             if flow.is_break() {
+                if let Some(error) = callback_error.take() {
+                    return Err(error);
+                }
                 return Ok(Self::finalize_edge_matches(result));
             }
         }
+        if let Some(error) = callback_error.take() {
+            return Err(error);
+        }
+
         Ok(Self::finalize_edge_matches(result))
     }
 
@@ -1892,6 +1666,7 @@ impl<'a> SourceList<'a> {
         bounds: RangeBoundFlags<i64>,
         limit: usize,
     ) -> Result<Vec<u64>, EngineError> {
+        let mut callback_error = None;
         let mut result = Vec::new();
         if self
             .active
@@ -1903,9 +1678,12 @@ impl<'a> SourceList<'a> {
                 } else {
                     ControlFlow::Continue(())
                 }
-            })
+            })?
             .is_break()
         {
+            if let Some(error) = callback_error.take() {
+                return Err(error);
+            }
             return Ok(Self::finalize_edge_matches(result));
         }
         for (index, epoch) in self.immutable.iter().enumerate() {
@@ -1914,21 +1692,36 @@ impl<'a> SourceList<'a> {
                 .for_each_edge_metadata_at(self.snapshot_seq, |meta| {
                     if label_id.is_none_or(|target| meta.label_id == target)
                         && crate::edge_metadata::i64_matches_bounds(meta.valid_to, bounds)
-                        && !self.is_edge_shadowed_above_immutable(meta.edge_id, index)
+                        && !match self.is_edge_shadowed_above_immutable(meta.edge_id, index) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                callback_error = Some(error);
+                                return ControlFlow::Break(());
+                            }
+                        }
                     {
                         Self::push_edge_match_limited(&mut result, meta.edge_id, limit)
                     } else {
                         ControlFlow::Continue(())
                     }
-                })
+                })?
                 .is_break()
             {
+                if let Some(error) = callback_error.take() {
+                    return Err(error);
+                }
                 return Ok(Self::finalize_edge_matches(result));
             }
         }
         for (index, seg) in self.segments.iter().enumerate() {
             let mut push = |edge_id| {
-                if self.is_edge_shadowed_above_segment(edge_id, index) {
+                if match self.is_edge_shadowed_above_segment(edge_id, index) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        callback_error = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                } {
                     ControlFlow::Continue(())
                 } else {
                     Self::push_edge_match_limited(&mut result, edge_id, limit)
@@ -1949,9 +1742,16 @@ impl<'a> SourceList<'a> {
                 },
             )?;
             if flow.is_break() {
+                if let Some(error) = callback_error.take() {
+                    return Err(error);
+                }
                 return Ok(Self::finalize_edge_matches(result));
             }
         }
+        if let Some(error) = callback_error.take() {
+            return Err(error);
+        }
+
         Ok(Self::finalize_edge_matches(result))
     }
 
@@ -1973,7 +1773,7 @@ impl<'a> SourceList<'a> {
                 value_hash,
                 self.snapshot_seq,
                 Some(raw_remaining),
-            );
+            )?;
             raw_remaining = raw_remaining.saturating_sub(ids.len());
             Self::append_edge_matches(&mut result, ids);
             if result.len() >= limit {
@@ -1996,11 +1796,11 @@ impl<'a> SourceList<'a> {
                     value_hash,
                     self.snapshot_seq,
                     Some(raw_remaining),
-                );
+                )?;
                 raw_remaining = raw_remaining.saturating_sub(ids.len());
                 Self::append_edge_matches_filtered(&mut result, ids, |id| {
                     self.is_edge_shadowed_above_immutable(id, index)
-                });
+                })?;
                 if result.len() >= limit {
                     return Ok(LimitedEdgeIndexRead::Ready(Self::finalize_edge_matches(
                         result,
@@ -2034,7 +1834,7 @@ impl<'a> SourceList<'a> {
                     posting_offset = chunk.next_offset;
                     Self::append_edge_matches_filtered(&mut result, chunk.ids, |id| {
                         self.is_edge_shadowed_above_segment(id, index)
-                    });
+                    })?;
                     if result.len() >= limit {
                         return Ok(LimitedEdgeIndexRead::Ready(Self::finalize_edge_matches(
                             result,
@@ -2059,6 +1859,7 @@ impl<'a> SourceList<'a> {
         upper: Option<(NumericRangeSortKey, bool)>,
         limit: usize,
     ) -> Result<Option<Vec<u64>>, EngineError> {
+        let mut callback_error = None;
         let mut result = Vec::new();
         let flow = self.active.for_each_visible_secondary_range_entry_at(
             index_id,
@@ -2067,8 +1868,11 @@ impl<'a> SourceList<'a> {
             None,
             self.snapshot_seq,
             &mut |(_, edge_id)| Self::push_edge_match_limited(&mut result, edge_id, limit),
-        );
+        )?;
         if flow.is_break() {
+            if let Some(error) = callback_error.take() {
+                return Err(error);
+            }
             return Ok(Some(Self::finalize_edge_matches(result)));
         }
 
@@ -2080,7 +1884,13 @@ impl<'a> SourceList<'a> {
                 None,
                 self.snapshot_seq,
                 &mut |(_, edge_id)| {
-                    if self.is_edge_shadowed_above_immutable(edge_id, index) {
+                    if match self.is_edge_shadowed_above_immutable(edge_id, index) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            callback_error = Some(error);
+                            return ControlFlow::Break(());
+                        }
+                    } {
                         return ControlFlow::Continue(());
                     }
                     if Self::push_edge_match_limited(&mut result, edge_id, limit).is_break() {
@@ -2088,8 +1898,11 @@ impl<'a> SourceList<'a> {
                     }
                     ControlFlow::Continue(())
                 },
-            );
+            )?;
             if flow.is_break() {
+                if let Some(error) = callback_error.take() {
+                    return Err(error);
+                }
                 return Ok(Some(Self::finalize_edge_matches(result)));
             }
         }
@@ -2098,6 +1911,9 @@ impl<'a> SourceList<'a> {
             let mut after = None;
             loop {
                 if result.len() >= limit {
+                    if let Some(error) = callback_error.take() {
+                        return Err(error);
+                    }
                     return Ok(Some(Self::finalize_edge_matches(result)));
                 }
                 let remaining = limit.saturating_sub(result.len()).min(256);
@@ -2109,6 +1925,9 @@ impl<'a> SourceList<'a> {
                     Some(remaining),
                 )?
                 else {
+                    if let Some(error) = callback_error.take() {
+                        return Err(error);
+                    }
                     return Ok(None);
                 };
                 if entries.is_empty() {
@@ -2116,14 +1935,21 @@ impl<'a> SourceList<'a> {
                 }
                 after = entries.last().copied();
                 for (_, edge_id) in entries {
-                    if self.is_edge_shadowed_above_segment(edge_id, index) {
+                    if self.is_edge_shadowed_above_segment(edge_id, index)? {
                         continue;
                     }
                     if Self::push_edge_match_limited(&mut result, edge_id, limit).is_break() {
+                        if let Some(error) = callback_error.take() {
+                            return Err(error);
+                        }
                         return Ok(Some(Self::finalize_edge_matches(result)));
                     }
                 }
             }
+        }
+
+        if let Some(error) = callback_error.take() {
+            return Err(error);
         }
 
         Ok(Some(Self::finalize_edge_matches(result)))
@@ -2138,8 +1964,19 @@ impl<'a> SourceList<'a> {
         self.compound_ids_limited(
             entry,
             limit,
-            |memtable| {
-                memtable.find_node_compound_prefix_at(entry.index_id, bounds, self.snapshot_seq)
+            |memtable, after, max| {
+                let start = after.map_or_else(
+                    || std::ops::Bound::Included((bounds.lower.clone(), 0)),
+                    std::ops::Bound::Excluded,
+                );
+                memtable.refill_compound_at(
+                    entry.index_id,
+                    start,
+                    &bounds.upper_exclusive,
+                    None,
+                    self.snapshot_seq,
+                    max,
+                )
             },
             |segment, remaining| {
                 segment.compound_prefix_candidates_if_present_limited(entry, bounds, remaining)
@@ -2157,8 +1994,23 @@ impl<'a> SourceList<'a> {
         self.compound_ids_limited(
             entry,
             limit,
-            |memtable| {
-                memtable.find_node_compound_range_at(entry.index_id, bounds, self.snapshot_seq)
+            |memtable, after, max| {
+                let start = after.map_or_else(
+                    || crate::memtable::compound_start_bound(bounds.lower.as_ref()),
+                    std::ops::Bound::Excluded,
+                );
+                memtable.refill_compound_at(
+                    entry.index_id,
+                    start,
+                    &bounds.upper_exclusive,
+                    bounds
+                        .lower
+                        .as_ref()
+                        .filter(|b| b.exclusive_component_prefix)
+                        .map(|b| b.key.as_slice()),
+                    self.snapshot_seq,
+                    max,
+                )
             },
             |segment, remaining| {
                 segment.compound_range_candidates_if_present_limited(entry, bounds, remaining)
@@ -2176,8 +2028,19 @@ impl<'a> SourceList<'a> {
         self.compound_ids_limited(
             entry,
             limit,
-            |memtable| {
-                memtable.find_edge_compound_prefix_at(entry.index_id, bounds, self.snapshot_seq)
+            |memtable, after, max| {
+                let start = after.map_or_else(
+                    || std::ops::Bound::Included((bounds.lower.clone(), 0)),
+                    std::ops::Bound::Excluded,
+                );
+                memtable.refill_compound_at(
+                    entry.index_id,
+                    start,
+                    &bounds.upper_exclusive,
+                    None,
+                    self.snapshot_seq,
+                    max,
+                )
             },
             |segment, remaining| {
                 segment.compound_prefix_candidates_if_present_limited(entry, bounds, remaining)
@@ -2195,8 +2058,23 @@ impl<'a> SourceList<'a> {
         self.compound_ids_limited(
             entry,
             limit,
-            |memtable| {
-                memtable.find_edge_compound_range_at(entry.index_id, bounds, self.snapshot_seq)
+            |memtable, after, max| {
+                let start = after.map_or_else(
+                    || crate::memtable::compound_start_bound(bounds.lower.as_ref()),
+                    std::ops::Bound::Excluded,
+                );
+                memtable.refill_compound_at(
+                    entry.index_id,
+                    start,
+                    &bounds.upper_exclusive,
+                    bounds
+                        .lower
+                        .as_ref()
+                        .filter(|b| b.exclusive_component_prefix)
+                        .map(|b| b.key.as_slice()),
+                    self.snapshot_seq,
+                    max,
+                )
             },
             |segment, remaining| {
                 segment.compound_range_candidates_if_present_limited(entry, bounds, remaining)
@@ -2214,7 +2092,12 @@ impl<'a> SourceList<'a> {
         edge: bool,
     ) -> Result<LimitedCompoundIndexRead, EngineError>
     where
-        M: FnMut(&Memtable) -> Vec<u64>,
+        M: FnMut(
+            &Memtable,
+            Option<(Vec<u8>, u64)>,
+            usize,
+        )
+            -> Result<(Vec<(Vec<u8>, u64)>, Option<(Vec<u8>, u64)>, bool), EngineError>,
         S: FnMut(&SegmentReader, usize) -> Result<Option<Vec<u64>>, EngineError>,
     {
         // Tombstones are suppressed with per-candidate newer-source probes so
@@ -2223,30 +2106,20 @@ impl<'a> SourceList<'a> {
         // sources are intentionally kept: final verification hydrates the
         // latest visible record and re-checks the full filter, matching the
         // single-property candidate paths.
-        let is_deleted_above_immutable = |id: u64, imm_idx: usize| {
+        let is_deleted_above_immutable = |id: u64, index: usize| -> Result<bool, EngineError> {
             if edge {
-                self.active.is_edge_deleted_at(id, self.snapshot_seq)
-                    || self.immutable[..imm_idx]
-                        .iter()
-                        .any(|epoch| epoch.memtable.is_edge_deleted_at(id, self.snapshot_seq))
+                self.is_edge_tombstoned_above_immutable(id, index)
             } else {
-                self.active.is_node_deleted_at(id, self.snapshot_seq)
-                    || self.immutable[..imm_idx]
-                        .iter()
-                        .any(|epoch| epoch.memtable.is_node_deleted_at(id, self.snapshot_seq))
+                self.is_node_tombstoned_above_immutable(id, index)
             }
         };
-        let is_deleted_above_segment = |id: u64, seg_idx: usize| {
-            is_deleted_above_immutable(id, self.immutable.len())
-                || self.segments[..seg_idx].iter().any(|segment| {
-                    if edge {
-                        segment.is_edge_deleted(id)
-                    } else {
-                        segment.is_node_deleted(id)
-                    }
-                })
+        let is_deleted_above_segment = |id: u64, index: usize| -> Result<bool, EngineError> {
+            if edge {
+                return self.is_edge_tombstoned_above_segment(id, index);
+            }
+            Ok(is_deleted_above_immutable(id, self.immutable.len())?
+                || self.segments[..index].iter().any(|s| s.is_node_deleted(id)))
         };
-
         let mut seen = NodeIdSet::default();
         let mut result = Vec::new();
 
@@ -2259,6 +2132,9 @@ impl<'a> SourceList<'a> {
             for id in ids {
                 if seen.insert(id) {
                     result.push(id);
+                    if result.len() >= limit {
+                        return true;
+                    }
                 }
             }
             result.len() >= limit
@@ -2269,19 +2145,32 @@ impl<'a> SourceList<'a> {
             ids
         }
 
-        if push_unseen(&mut result, &mut seen, memtable_lookup(self.active), limit) {
-            return Ok(LimitedCompoundIndexRead::Ready(finalize(result)));
+        if limit == 0 {
+            return Ok(LimitedCompoundIndexRead::Ready(result));
         }
-        for (imm_idx, epoch) in self.immutable.iter().enumerate() {
-            let ids = memtable_lookup(&epoch.memtable);
-            if push_unseen(
-                &mut result,
-                &mut seen,
-                ids.into_iter()
-                    .filter(|&id| !is_deleted_above_immutable(id, imm_idx)),
-                limit,
-            ) {
-                return Ok(LimitedCompoundIndexRead::Ready(finalize(result)));
+        for (source_index, memtable) in std::iter::once(self.active)
+            .chain(self.immutable.iter().map(|e| e.memtable.as_ref()))
+            .enumerate()
+        {
+            let mut after = None;
+            loop {
+                let (rows, last, done) =
+                    memtable_lookup(memtable, after, limit.saturating_sub(result.len()).min(128))?;
+                for (_, id) in rows {
+                    if source_index > 0 && is_deleted_above_immutable(id, source_index - 1)? {
+                        continue;
+                    }
+                    if seen.insert(id) {
+                        result.push(id);
+                        if result.len() >= limit {
+                            return Ok(LimitedCompoundIndexRead::Ready(finalize(result)));
+                        }
+                    }
+                }
+                if done {
+                    break;
+                }
+                after = Some(last.expect("compound source progress"));
             }
         }
         for (seg_idx, segment) in self.segments.iter().enumerate() {
@@ -2295,8 +2184,7 @@ impl<'a> SourceList<'a> {
             if push_unseen(
                 &mut result,
                 &mut seen,
-                ids.into_iter()
-                    .filter(|&id| !is_deleted_above_segment(id, seg_idx)),
+                try_visible_ids(ids, |id| is_deleted_above_segment(id, seg_idx))?,
                 limit,
             ) {
                 return Ok(LimitedCompoundIndexRead::Ready(finalize(result)));
@@ -2331,84 +2219,95 @@ impl<'a> SourceList<'a> {
             .collect())
     }
 
-    fn is_node_tombstoned_above_immutable(&self, node_id: u64, imm_idx: usize) -> bool {
-        if self.active.is_node_deleted_at(node_id, self.snapshot_seq) {
-            return true;
+    fn is_node_tombstoned_above_immutable(
+        &self,
+        node_id: u64,
+        imm_idx: usize,
+    ) -> Result<bool, EngineError> {
+        for m in std::iter::once(self.active).chain(
+            self.immutable[..imm_idx]
+                .iter()
+                .map(|e| e.memtable.as_ref()),
+        ) {
+            if m.is_node_deleted_at(node_id, self.snapshot_seq)? {
+                return Ok(true);
+            }
         }
-        self.immutable[..imm_idx].iter().any(|epoch| {
-            epoch
-                .memtable
-                .is_node_deleted_at(node_id, self.snapshot_seq)
-        })
+        Ok(false)
     }
 
-    fn is_edge_shadowed_above_immutable(&self, edge_id: u64, imm_idx: usize) -> bool {
-        if !matches!(
-            self.active
-                .edge_visibility_state_at(edge_id, self.snapshot_seq),
-            EdgeVisibilityState::Missing
+    fn is_edge_shadowed_above_immutable(
+        &self,
+        edge_id: u64,
+        imm_idx: usize,
+    ) -> Result<bool, EngineError> {
+        for m in std::iter::once(self.active).chain(
+            self.immutable[..imm_idx]
+                .iter()
+                .map(|e| e.memtable.as_ref()),
         ) {
-            return true;
-        }
-        self.immutable[..imm_idx].iter().any(|epoch| {
-            !matches!(
-                epoch
-                    .memtable
-                    .edge_visibility_state_at(edge_id, self.snapshot_seq),
-                EdgeVisibilityState::Missing
-            )
-        })
-    }
-
-    fn is_edge_shadowed_above_segment(&self, edge_id: u64, seg_idx: usize) -> bool {
-        if !matches!(
-            self.active
-                .edge_visibility_state_at(edge_id, self.snapshot_seq),
-            EdgeVisibilityState::Missing
-        ) {
-            return true;
-        }
-        for epoch in self.immutable {
             if !matches!(
-                epoch
-                    .memtable
-                    .edge_visibility_state_at(edge_id, self.snapshot_seq),
+                m.edge_visibility_state_at(edge_id, self.snapshot_seq)?,
                 EdgeVisibilityState::Missing
             ) {
-                return true;
+                return Ok(true);
             }
         }
-        self.segments[..seg_idx]
-            .iter()
-            .any(|seg| seg.has_edge(edge_id) || seg.is_edge_deleted(edge_id))
+        Ok(false)
     }
 
-    fn is_edge_tombstoned_above_immutable(&self, edge_id: u64, imm_idx: usize) -> bool {
-        if self.active.is_edge_deleted_at(edge_id, self.snapshot_seq) {
-            return true;
-        }
-        self.immutable[..imm_idx].iter().any(|epoch| {
-            epoch
-                .memtable
-                .is_edge_deleted_at(edge_id, self.snapshot_seq)
-        })
-    }
-
-    fn is_edge_tombstoned_above_segment(&self, edge_id: u64, seg_idx: usize) -> bool {
-        if self.active.is_edge_deleted_at(edge_id, self.snapshot_seq) {
-            return true;
-        }
-        for epoch in self.immutable {
-            if epoch
-                .memtable
-                .is_edge_deleted_at(edge_id, self.snapshot_seq)
-            {
-                return true;
+    fn is_edge_shadowed_above_segment(
+        &self,
+        edge_id: u64,
+        seg_idx: usize,
+    ) -> Result<bool, EngineError> {
+        for m in
+            std::iter::once(self.active).chain(self.immutable.iter().map(|e| e.memtable.as_ref()))
+        {
+            if !matches!(
+                m.edge_visibility_state_at(edge_id, self.snapshot_seq)?,
+                EdgeVisibilityState::Missing
+            ) {
+                return Ok(true);
             }
         }
-        self.segments[..seg_idx]
+        Ok(self.segments[..seg_idx]
             .iter()
-            .any(|seg| seg.is_edge_deleted(edge_id))
+            .any(|s| s.has_edge(edge_id) || s.is_edge_deleted(edge_id)))
+    }
+
+    fn is_edge_tombstoned_above_immutable(
+        &self,
+        edge_id: u64,
+        imm_idx: usize,
+    ) -> Result<bool, EngineError> {
+        for m in std::iter::once(self.active).chain(
+            self.immutable[..imm_idx]
+                .iter()
+                .map(|e| e.memtable.as_ref()),
+        ) {
+            if m.is_edge_deleted_at(edge_id, self.snapshot_seq)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn is_edge_tombstoned_above_segment(
+        &self,
+        edge_id: u64,
+        seg_idx: usize,
+    ) -> Result<bool, EngineError> {
+        for m in
+            std::iter::once(self.active).chain(self.immutable.iter().map(|e| e.memtable.as_ref()))
+        {
+            if m.is_edge_deleted_at(edge_id, self.snapshot_seq)? {
+                return Ok(true);
+            }
+        }
+        Ok(self.segments[..seg_idx]
+            .iter()
+            .any(|s| s.is_edge_deleted(edge_id)))
     }
 }
 
@@ -2429,7 +2328,7 @@ mod tests {
         ReadViewImmutableEpoch {
             epoch_id: 0,
             wal_generation_id: 0,
-            memtable: Arc::new(mt),
+            memtable: SharedArc::new(mt),
             degree_overlay: DegreeOverlaySnapshot::empty(),
             in_flight: false,
         }
@@ -2705,7 +2604,7 @@ mod tests {
         segment_mt.apply_op(&WalOp::UpsertEdge(make_edge(12, 1, 4, 5)), 1);
         segment_mt.apply_op(&WalOp::UpsertEdge(make_edge(14, 1, 5, 6)), 1);
         write_segment_without_degree_sidecar_for_test(&seg_dir, 1, &segment_mt, None).unwrap();
-        let segments = vec![Arc::new(
+        let segments = vec![SharedArc::new(
             SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap(),
         )];
 
@@ -2773,7 +2672,7 @@ mod tests {
             .insert("ignored".to_string(), PropValue::Bool(true));
         segment_mt.apply_op(&WalOp::UpsertEdge(segment_only), 1);
         write_segment_without_degree_sidecar_for_test(&seg_dir, 1, &segment_mt, None).unwrap();
-        let segments = vec![Arc::new(
+        let segments = vec![SharedArc::new(
             SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap(),
         )];
 
@@ -2902,7 +2801,7 @@ mod tests {
             .insert("ignored".to_string(), PropValue::Bool(true));
         segment_mt.apply_op(&WalOp::UpsertNode(segment_only), 1);
         write_segment_without_degree_sidecar_for_test(&seg_dir, 1, &segment_mt, None).unwrap();
-        let segments = vec![Arc::new(
+        let segments = vec![SharedArc::new(
             SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap(),
         )];
 
@@ -3025,7 +2924,7 @@ mod tests {
         segment_mt.apply_op(&WalOp::UpsertEdge(make_edge(20, 2, 1, 5)), 1);
         segment_mt.apply_op(&WalOp::UpsertEdge(make_edge(30, 3, 1, 5)), 1);
         write_segment_without_degree_sidecar_for_test(&seg_dir, 1, &segment_mt, None).unwrap();
-        let segments = vec![Arc::new(
+        let segments = vec![SharedArc::new(
             SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap(),
         )];
 
@@ -3090,7 +2989,7 @@ mod tests {
         old.weight = 1.0;
         segment_mt.apply_op(&WalOp::UpsertEdge(old), 1);
         write_segment_without_degree_sidecar_for_test(&seg_dir, 1, &segment_mt, None).unwrap();
-        let segments = vec![Arc::new(
+        let segments = vec![SharedArc::new(
             SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap(),
         )];
 
@@ -3136,7 +3035,7 @@ mod tests {
         write_segment_without_degree_sidecar_for_test(&seg_dir, 1, &segment_mt, None).unwrap();
         assert!(!seg_dir.join(EDGE_WEIGHT_INDEX_LOGICAL_NAME).exists());
         remove_manifest_component_for_test(&seg_dir, SegmentComponentKind::EdgeWeightIndex);
-        let segments = vec![Arc::new(
+        let segments = vec![SharedArc::new(
             SegmentReader::open_unpinned_for_test(&seg_dir, 1, None).unwrap(),
         )];
 
@@ -3221,7 +3120,7 @@ mod tests {
         };
         let immutable = vec![wrap_imm(imm)];
         let sources = sources_for(&active, &immutable, u64::MAX);
-        let deleted = sources.collect_deleted_nodes();
+        let deleted = sources.collect_deleted_nodes().unwrap();
         assert!(deleted.contains(&1));
         assert!(deleted.contains(&2));
     }

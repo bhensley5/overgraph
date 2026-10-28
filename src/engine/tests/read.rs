@@ -310,7 +310,7 @@ fn test_label_index_survives_flush_and_reopen() {
     }
 
     // Reopen. Label index should be available from segment
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     assert_eq!(engine.nodes_by_labels("Person").unwrap(), vec![a]);
     assert_eq!(engine.nodes_by_labels("Company").unwrap(), vec![b]);
     assert_eq!(engine.edges_by_label("KNOWS").unwrap().len(), 1);
@@ -787,7 +787,7 @@ fn test_count_nodes_by_labels_suppresses_stale_memberships() {
     }
 
     {
-        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &opts).unwrap();
         assert_eq!(
             engine
                 .count_nodes_by_labels(vec!["Person".to_string(), "Employee".to_string()])
@@ -844,7 +844,7 @@ fn test_nodes_by_labels_all_superset_verifies_after_replacement() {
     }
 
     {
-        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &opts).unwrap();
         assert!(engine
             .nodes_by_labels(&["Person", "Employee"])
             .unwrap()
@@ -2149,7 +2149,7 @@ fn test_find_nodes_survives_flush_and_reopen() {
     }
 
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let results = engine
             .find_nodes("Person", "lang", &PropValue::String("rust".to_string()))
@@ -2353,7 +2353,7 @@ fn test_find_nodes_fallback_routes_and_filters_latest_visible_records() {
 fn test_find_nodes_building_declaration_still_uses_fallback() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     seed_internal_node_labels(&engine, &[1]).unwrap();
 
     let red = PropValue::String("red".to_string());
@@ -2405,6 +2405,7 @@ fn test_find_nodes_building_declaration_still_uses_fallback() {
         })
         .unwrap();
     engine.rebuild_secondary_index_catalog().unwrap();
+    #[cfg(not(feature = "production-concurrency"))]
     engine.seed_secondary_index_entry(&entry).unwrap();
 
     let info = engine
@@ -2430,7 +2431,7 @@ fn test_find_nodes_building_declaration_still_uses_fallback() {
 fn test_find_nodes_ready_declaration_uses_index_lookup_across_sources() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let red = PropValue::String("red".to_string());
 
@@ -2531,7 +2532,7 @@ fn test_find_nodes_ready_declaration_uses_index_lookup_across_sources() {
 fn test_find_nodes_ready_equality_index_matches_signed_zero_verifier_semantics() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut neg_zero_props = BTreeMap::new();
     neg_zero_props.insert("temp".to_string(), PropValue::Float(-0.0));
@@ -2608,7 +2609,7 @@ fn test_find_nodes_ready_equality_index_matches_signed_zero_verifier_semantics()
 fn test_find_nodes_active_equality_index_uses_semantic_hashes() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let info = engine
         .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -2757,7 +2758,7 @@ fn test_find_nodes_active_equality_index_uses_semantic_hashes() {
 fn test_find_nodes_semantic_equality_index_updates_tombstones_and_shadows() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let info = engine
         .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -2943,7 +2944,7 @@ fn test_find_nodes_scan_fallback_uses_semantic_numeric_equality() {
 fn test_find_nodes_ready_declaration_suppresses_stale_and_collision_candidates() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let red = PropValue::String("red".to_string());
     let blue = PropValue::String("blue".to_string());
@@ -3003,7 +3004,7 @@ fn test_find_nodes_ready_declaration_suppresses_stale_and_collision_candidates()
         &tampered_groups,
     )
     .unwrap();
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut updated_props = BTreeMap::new();
     updated_props.insert("color".to_string(), blue.clone());
@@ -3029,6 +3030,25 @@ fn test_find_nodes_ready_declaration_suppresses_stale_and_collision_candidates()
     assert_eq!(routes.equality_scan_fallback, 0);
     assert_eq!(routes.equality_index_lookup, 2);
 
+    // Planner-backed verification must also reject the deliberately colliding
+    // segment candidate and the stale red opinion hidden by the active source.
+    let collision_query = NodeQuery {
+        label_filter: Some(NodeLabelFilter {
+            labels: vec!["Person".into()],
+            mode: LabelMatchMode::All,
+        }),
+        filter: Some(NodeFilterExpr::PropertyEquals {
+            key: "color".into(),
+            value: red.clone(),
+        }),
+        ..Default::default()
+    };
+    assert!(engine
+        .query_node_ids(&collision_query)
+        .unwrap()
+        .items
+        .is_empty());
+
     engine.close().unwrap();
 }
 
@@ -3036,7 +3056,7 @@ fn test_find_nodes_ready_declaration_suppresses_stale_and_collision_candidates()
 fn test_find_nodes_ready_declaration_respects_prune_policies() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let red = PropValue::String("red".to_string());
     let mut red_props = BTreeMap::new();
@@ -3132,7 +3152,7 @@ fn test_find_nodes_ready_declaration_respects_prune_policies() {
 fn test_find_nodes_ready_eq_cursor_no_false_next_after_stale_candidates() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let red = PropValue::String("red".to_string());
     let mut red_props = BTreeMap::new();
@@ -3201,7 +3221,7 @@ fn test_find_nodes_ready_eq_cursor_no_false_next_after_stale_candidates() {
 fn test_find_nodes_ready_declaration_keeps_revived_same_id_after_tombstone() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let red = PropValue::String("red".to_string());
     let mut red_props = BTreeMap::new();
@@ -3266,7 +3286,7 @@ fn test_find_nodes_ready_declaration_keeps_revived_same_id_after_tombstone() {
 fn test_find_nodes_ready_declaration_filters_same_id_label_change() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let red = PropValue::String("red".to_string());
     let mut red_props = BTreeMap::new();
@@ -3593,7 +3613,7 @@ fn test_find_nodes_paged_with_policies() {
 fn test_find_nodes_range_fallback_orders_and_paginates() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut expected = Vec::new();
     for (key, score) in [
@@ -4026,7 +4046,7 @@ fn brute_force_range_oracle(
 fn test_find_nodes_range_open_and_closed_intervals_match_in_fallback_and_ready_paths() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut seg_low_props = BTreeMap::new();
     seg_low_props.insert("score".to_string(), PropValue::Int(10));
@@ -4152,7 +4172,7 @@ fn test_find_nodes_range_open_and_closed_intervals_match_in_fallback_and_ready_p
 fn test_find_nodes_range_ready_parity_matches_bruteforce_oracle_across_domains() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut all_ids = Vec::new();
 
@@ -4424,7 +4444,7 @@ fn test_find_nodes_range_ready_parity_matches_bruteforce_oracle_across_domains()
 fn test_find_nodes_range_ready_refills_segment_chunks_with_pruned_overrides() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     for score in 1..=80i64 {
         let mut props = BTreeMap::new();
@@ -4526,7 +4546,7 @@ fn test_find_nodes_range_ready_refills_segment_chunks_with_pruned_overrides() {
 fn test_find_nodes_range_ready_declaration_routes_and_orders_across_sources() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut seg_props = BTreeMap::new();
     seg_props.insert("score".to_string(), PropValue::Int(30));
@@ -4672,7 +4692,7 @@ fn test_find_nodes_range_ready_declaration_routes_and_orders_across_sources() {
 fn test_find_nodes_range_ready_declaration_hides_stale_and_incompatible_older_matches() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut props = BTreeMap::new();
     props.insert("score".to_string(), PropValue::Int(20));
@@ -4743,7 +4763,7 @@ fn test_find_nodes_range_ready_declaration_hides_stale_and_incompatible_older_ma
 fn test_find_nodes_range_ready_paged_verifies_latest_numeric_key_before_cursor() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut mutable_props = BTreeMap::new();
     mutable_props.insert("score".to_string(), PropValue::Int(20));
@@ -4839,7 +4859,7 @@ fn test_find_nodes_range_ready_paged_verifies_latest_numeric_key_before_cursor()
 fn test_find_nodes_range_ready_domainless_uint_int_and_float() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut count_props_a = BTreeMap::new();
     count_props_a.insert("count".to_string(), PropValue::UInt(5));
@@ -5369,7 +5389,7 @@ fn test_temporal_fields_survive_wal_replay() {
 
     // Reopen, WAL replay
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
         let edge = engine.get_edge(eid).unwrap().unwrap();
         assert_eq!(edge.valid_from, 3000);
         assert_eq!(edge.valid_to, 9000);
@@ -5717,7 +5737,7 @@ fn test_invalidated_edge_survives_wal_replay() {
 
     // Reopen. WAL replay should preserve invalidation
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
         let edge = engine.get_edge(eid).unwrap().unwrap();
         assert_eq!(edge.valid_to, 1);
 
@@ -7009,7 +7029,7 @@ fn open_imm(path: &std::path::Path) -> DatabaseEngine {
         compact_after_n_flushes: 0,
         ..Default::default()
     };
-    DatabaseEngine::open(path, &opts).unwrap()
+    open_after_native_shutdown(path, &opts).unwrap()
 }
 
 #[test]
@@ -8222,7 +8242,7 @@ fn test_graph_patch_vectors_survive_wal_replay() {
         engine.close().unwrap();
     }
 
-    let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let engine = open_after_native_shutdown(&db_path, &opts).unwrap();
     let node = engine.get_node(node_id).unwrap().unwrap();
     assert_eq!(node.dense_vector, Some(vec![0.1, 0.2, 0.3]));
     assert_eq!(node.sparse_vector, Some(vec![(2, 1.5), (5, 2.0)]));
@@ -9473,7 +9493,7 @@ fn test_prune_policy_survives_close_reopen() {
     }
 
     // Reopen
-    let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+    let engine = open_after_native_shutdown(&db_path, &opts).unwrap();
     let list = engine.list_prune_policies().unwrap();
     assert_eq!(list.len(), 2);
     // BTreeMap ordering: "age-rule" < "weight-rule"
@@ -11502,7 +11522,7 @@ fn test_multi_label_prune_stale_membership_suppressed_across_sources() {
     }
 
     {
-        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &opts).unwrap();
         let policy = PrunePolicy {
             max_age_ms: None,
             max_weight: Some(0.5),
@@ -11678,7 +11698,7 @@ fn test_close_fast_basic() {
     engine.close_fast().unwrap();
 
     // Reopen. Data should be intact
-    let engine2 = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine2 = open_after_native_shutdown(dir.path(), &opts).unwrap();
     assert!(engine2.get_node(id).unwrap().is_some());
     engine2.close().unwrap();
 }
@@ -11714,7 +11734,7 @@ fn test_close_fast_cancels_bg_compact() {
     engine.close_fast().unwrap();
 
     // Reopen. Data should be intact (original segments preserved)
-    let engine2 = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine2 = open_after_native_shutdown(dir.path(), &opts).unwrap();
     let stats = engine2.stats().unwrap();
     // All nodes should still be accessible
     assert!(engine2.get_node_by_key("Person", "node_0_0").unwrap().is_some());
@@ -11744,7 +11764,7 @@ fn test_close_fast_group_commit() {
     engine.close_fast().unwrap();
 
     // Reopen. Data should be durable
-    let engine2 = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine2 = open_after_native_shutdown(dir.path(), &opts).unwrap();
     assert!(engine2.get_node(id).unwrap().is_some());
     engine2.close().unwrap();
 }
@@ -12027,11 +12047,10 @@ fn test_stats_immutable_memtable_fields() {
     assert_eq!(stats.immutable_memtable_bytes, 0);
     assert_eq!(stats.pending_flush_count, 0);
     assert!(stats.segment_count >= 1);
-    // After flush, oldest retained should equal active (no pending epochs)
-    assert_eq!(
-        stats.oldest_retained_wal_generation_id,
-        stats.active_wal_generation_id
-    );
+    // Include the WAL still needed by manifest.prev, even though no runtime
+    // immutable remains. Statistics describe physical retained generations.
+    let disk_oldest=std::fs::read_dir(dir.path()).unwrap().filter_map(|e|{let name=e.ok()?.file_name();name.to_str()?.strip_prefix("wal_")?.strip_suffix(".wal")?.parse::<u64>().ok()}).min().unwrap();
+    assert_eq!(stats.oldest_retained_wal_generation_id,disk_oldest);
 
     engine.close().unwrap();
 }
@@ -12561,7 +12580,7 @@ fn test_v3_compact_reopen_durability() {
     engine.close().unwrap();
 
     // Reopen and verify
-    let engine2 = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine2 = open_after_native_shutdown(dir.path(), &opts).unwrap();
     assert_eq!(engine2.segments_for_test().len(), 1);
     for i in 0..100 {
         let n = engine2.get_node_by_key("Person", &format!("n{}", i)).unwrap();
@@ -12612,7 +12631,7 @@ fn test_vector_segment_flush_reopen_mixed_nodes() {
     engine.flush().unwrap();
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let reopened = open_after_native_shutdown(dir.path(), &opts).unwrap();
     let vector_node = reopened.get_node(vector_node).unwrap().unwrap();
     assert_eq!(vector_node.dense_vector, Some(vec![0.1, 0.2, 0.3]));
     assert_eq!(vector_node.sparse_vector, Some(vec![(3, 1.25), (8, 0.5)]));
@@ -12642,7 +12661,7 @@ fn test_plain_segment_flush_reopen_v6_fast_path() {
     engine.flush().unwrap();
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(dir.path(), &DbOptions::default()).unwrap();
     let node = reopened.get_node(node_id).unwrap().unwrap();
     assert!(node.dense_vector.is_none());
     assert!(node.sparse_vector.is_none());
@@ -12723,7 +12742,7 @@ fn test_vector_segments_survive_standard_compaction_reopen() {
     engine.compact().unwrap().unwrap();
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let reopened = open_after_native_shutdown(dir.path(), &opts).unwrap();
     assert_eq!(reopened.segments_for_test().len(), 1);
 
     let node = reopened.get_node(node_id).unwrap().unwrap();
@@ -12781,7 +12800,7 @@ fn test_standard_compaction_clears_stale_vector_payloads() {
     engine.compact().unwrap().unwrap();
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let reopened = open_after_native_shutdown(dir.path(), &opts).unwrap();
     let node = reopened.get_node(node_id).unwrap().unwrap();
     assert!(node.dense_vector.is_none());
     assert!(node.sparse_vector.is_none());
@@ -12849,7 +12868,7 @@ fn test_vector_segments_survive_fast_merge_reopen() {
     engine.compact().unwrap().unwrap();
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let reopened = open_after_native_shutdown(dir.path(), &opts).unwrap();
     assert_eq!(reopened.segments_for_test().len(), 1);
 
     let dense = reopened.get_node(dense_node).unwrap().unwrap();
@@ -13415,7 +13434,7 @@ fn test_vector_search_dense_errors_when_unconfigured_empty_when_no_vectors() {
         }),
         ..DbOptions::default()
     };
-    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let engine = open_after_native_shutdown(dir.path(), &opts).unwrap();
     engine
         .upsert_node(
             "Person",
@@ -13514,7 +13533,7 @@ fn test_vector_search_sparse_empty_when_no_sparse_vectors() {
     engine.close().unwrap();
 
     let dir = TempDir::new().unwrap();
-    let engine = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let engine = open_after_native_shutdown(dir.path(), &DbOptions::default()).unwrap();
     engine
         .upsert_node(
             "Person",
@@ -13938,7 +13957,7 @@ fn test_vector_search_sparse_flush_and_reopen_parity() {
     );
 
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(dir.path(), &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(dir.path(), &DbOptions::default()).unwrap();
     let after = reopened.vector_search(&request).unwrap();
     assert_vector_hits_match(&after, &before);
     reopened.close().unwrap();
@@ -14128,7 +14147,7 @@ fn test_vector_search_hybrid_flush_and_reopen_parity() {
 
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(
+    let reopened = open_after_native_shutdown(
         dir.path(),
         &DbOptions {
             dense_vector: Some(DenseVectorConfig {
@@ -14329,7 +14348,7 @@ fn test_vector_search_sparse_standard_compaction_parity() {
     assert_vector_hits_match(&after_compact, &before);
 
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let reopened = open_after_native_shutdown(dir.path(), &opts).unwrap();
     let after_reopen = reopened.vector_search(&request).unwrap();
     assert_vector_hits_match(&after_reopen, &before);
     reopened.close().unwrap();
@@ -14403,7 +14422,7 @@ fn test_vector_search_sparse_fast_merge_compaction_parity() {
     assert_vector_hits_match(&after_compact, &before);
 
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let reopened = open_after_native_shutdown(dir.path(), &opts).unwrap();
     let after_reopen = reopened.vector_search(&request).unwrap();
     assert_vector_hits_match(&after_reopen, &before);
     reopened.close().unwrap();
@@ -14453,7 +14472,7 @@ fn test_vector_search_sparse_background_compaction_parity_with_mixed_vectors() {
     assert_vector_hits_match(&after_bg, &before);
 
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let reopened = open_after_native_shutdown(dir.path(), &opts).unwrap();
     let after_reopen = reopened.vector_search(&request).unwrap();
     assert_vector_hits_match(&after_reopen, &before);
     reopened.close().unwrap();
@@ -15461,7 +15480,7 @@ fn test_vector_search_dense_supports_euclidean_and_dot_product_metrics() {
         }),
         ..DbOptions::default()
     };
-    let dot = DatabaseEngine::open(dot_dir.path(), &dot_opts).unwrap();
+    let dot = open_after_native_shutdown(dot_dir.path(), &dot_opts).unwrap();
     let lower = dot
         .upsert_node(
             "Person",
@@ -15839,7 +15858,7 @@ fn test_vector_search_dense_standard_compaction_parity() {
     assert_vector_hits_match(&after_compact, &before);
 
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let reopened = open_after_native_shutdown(dir.path(), &opts).unwrap();
     let after_reopen = reopened.vector_search(&request).unwrap();
     assert_vector_hits_match(&after_reopen, &before);
     reopened.close().unwrap();
@@ -15918,7 +15937,7 @@ fn test_vector_search_dense_fast_merge_compaction_parity() {
     assert_vector_hits_match(&after_compact, &before);
 
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let reopened = open_after_native_shutdown(dir.path(), &opts).unwrap();
     let after_reopen = reopened.vector_search(&request).unwrap();
     assert_vector_hits_match(&after_reopen, &before);
     reopened.close().unwrap();
@@ -15966,7 +15985,7 @@ fn test_vector_search_dense_background_compaction_parity() {
     assert_vector_hits_match(&after_bg, &before);
 
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let reopened = open_after_native_shutdown(dir.path(), &opts).unwrap();
     let after_reopen = reopened.vector_search(&request).unwrap();
     assert_vector_hits_match(&after_reopen, &before);
     reopened.close().unwrap();
@@ -16355,7 +16374,7 @@ fn test_vector_search_dense_scope_compaction_and_reopen_parity() {
     assert_vector_hits_match(&after_compact, &before);
 
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let reopened = open_after_native_shutdown(dir.path(), &opts).unwrap();
     let after_reopen = reopened.vector_search(&request).unwrap();
     assert_vector_hits_match(&after_reopen, &before);
     reopened.close().unwrap();
@@ -17071,7 +17090,7 @@ fn test_vector_search_sparse_scope_compaction_and_reopen_parity() {
     assert_vector_hits_match(&after_compact, &before);
 
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(dir.path(), &opts).unwrap();
+    let reopened = open_after_native_shutdown(dir.path(), &opts).unwrap();
     let after_reopen = reopened.vector_search(&request).unwrap();
     assert_vector_hits_match(&after_reopen, &before);
     reopened.close().unwrap();
@@ -17472,7 +17491,7 @@ fn write_compaction_test_segment(
     seg_dir: &std::path::Path,
     segment_id: u64,
     ops: Vec<WalOp>,
-) -> std::sync::Arc<SegmentReader> {
+) -> crate::engine::shared::SharedArc<SegmentReader> {
     write_compaction_test_segment_with_secondary_indexes(seg_dir, segment_id, ops, &[])
 }
 
@@ -17481,10 +17500,10 @@ fn write_compaction_test_segment_with_secondary_indexes(
     segment_id: u64,
     ops: Vec<WalOp>,
     secondary_indexes: &[SecondaryIndexManifestEntry],
-) -> std::sync::Arc<SegmentReader> {
+) -> crate::engine::shared::SharedArc<SegmentReader> {
     let mt = Memtable::new();
     for entry in secondary_indexes {
-        mt.register_secondary_index(entry);
+        mt.register_secondary_index(entry).unwrap();
     }
     for (idx, op) in ops.iter().enumerate() {
         mt.apply_op(op, (idx + 1) as u64);
@@ -17499,7 +17518,7 @@ fn write_compaction_test_segment_with_secondary_indexes(
         secondary_indexes,
     )
     .unwrap();
-    std::sync::Arc::new(
+    crate::engine::shared::SharedArc::new(
         SegmentReader::open_with_info(seg_dir, &info, None, secondary_indexes).unwrap(),
     )
 }
@@ -17507,7 +17526,7 @@ fn write_compaction_test_segment_with_secondary_indexes(
 fn compact_test_segments(
     out_dir: &std::path::Path,
     out_segment_id: u64,
-    segments: Vec<std::sync::Arc<SegmentReader>>,
+    segments: Vec<crate::engine::shared::SharedArc<SegmentReader>>,
     prune_policies: &[ResolvedPrunePolicy],
 ) -> (SegmentInfo, u64, u64, SegmentReader) {
     compact_test_segments_with_secondary_indexes(
@@ -17522,7 +17541,7 @@ fn compact_test_segments(
 fn compact_test_segments_with_secondary_indexes(
     out_dir: &std::path::Path,
     out_segment_id: u64,
-    segments: Vec<std::sync::Arc<SegmentReader>>,
+    segments: Vec<crate::engine::shared::SharedArc<SegmentReader>>,
     prune_policies: &[ResolvedPrunePolicy],
     secondary_indexes: &[SecondaryIndexManifestEntry],
 ) -> (SegmentInfo, u64, u64, SegmentReader) {
@@ -18174,8 +18193,8 @@ fn test_v3_deterministic_output() {
         db.close().unwrap();
     }
 
-    let db1 = DatabaseEngine::open(&p1, &DbOptions::default()).unwrap();
-    let db2 = DatabaseEngine::open(&p2, &DbOptions::default()).unwrap();
+    let db1 = open_after_native_shutdown(&p1, &DbOptions::default()).unwrap();
+    let db2 = open_after_native_shutdown(&p2, &DbOptions::default()).unwrap();
 
     for i in 0..50u64 {
         let n1 = db1.get_node(i + 1).unwrap();
@@ -18556,7 +18575,7 @@ fn test_v3_reopen_durability() {
         db.close().unwrap();
     }
 
-    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let db = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
     for i in 0..50u64 {
         let id = i + 1;
@@ -18931,7 +18950,7 @@ fn test_time_range_survives_reopen() {
     }
 
     {
-        let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let db = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
         let r = db.find_nodes_by_time_range("Person", 1500, 2500).unwrap();
         assert_eq!(r, vec![2]);
         let r = db.find_nodes_by_time_range("Person", 0, i64::MAX).unwrap();
@@ -22234,4 +22253,197 @@ fn test_get_nodes_by_keys_delete_recreate_delete_cross_segment() {
     );
 
     engine.close().unwrap();
+}
+mod exact_filtered_vector_fixture {
+    use super::*;
+    fn normalize_vector(values: &mut [f32]) {
+        let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for value in values.iter_mut() {
+                *value /= norm;
+            }
+        }
+    }
+    fn splitmix64(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+    fn clustered_dense_vector(
+        dimension: usize,
+        cluster: usize,
+        member: usize,
+        cluster_count: usize,
+    ) -> Vec<f32> {
+        let mut values = vec![0.0f32; dimension];
+        let primary = (cluster * 11) % dimension;
+        let secondary = (cluster * 11 + 7) % dimension;
+        let tertiary = (cluster * 11 + 19) % dimension;
+        let quaternary = (cluster * 11 + 31) % dimension;
+        values[primary] = 1.0;
+        values[secondary] = 0.45;
+        values[tertiary] = 0.2;
+        values[quaternary] = 0.1;
+
+        let seed = ((cluster as u64) << 32) ^ member as u64 ^ (cluster_count as u64).rotate_left(7);
+        let mut noise = splitmix64(seed);
+        for value in &mut values {
+            noise = splitmix64(noise);
+            let jitter = ((noise >> 40) as i32 - 8_192) as f32 / 65_536.0;
+            *value += jitter * 0.14;
+        }
+        normalize_vector(&mut values);
+        values
+    }
+    fn clustered_query_vector(
+        dimension: usize,
+        cluster: usize,
+        query_idx: usize,
+        cluster_count: usize,
+    ) -> Vec<f32> {
+        let mut values =
+            clustered_dense_vector(dimension, cluster, query_idx + 100_000, cluster_count);
+        let boundary_cluster = (cluster + 1) % cluster_count;
+        if query_idx % 2 == 1 {
+            let boundary = clustered_dense_vector(
+                dimension,
+                boundary_cluster,
+                query_idx + 200_000,
+                cluster_count,
+            );
+            for (value, boundary_value) in values.iter_mut().zip(boundary.iter()) {
+                *value = (*value * 0.72) + (*boundary_value * 0.28);
+            }
+            normalize_vector(&mut values);
+        }
+        values
+    }
+
+    fn close_fixture(db: DatabaseEngine) {
+        db.close().unwrap();
+        #[cfg(feature = "production-concurrency")]
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !matches!(
+                db.reclamation_stats().unwrap().close_state,
+                ReclamationCloseState::Drained
+            ) {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        }
+    }
+    #[test]
+    fn test_vector_exact_9216_filtered_fixture_and_reopen_payload_parity() {
+        #[cfg(feature = "production-concurrency")]
+        crate::engine::post45_read_tests::ready_participants_for_fixture();
+        let dir = TempDir::new().unwrap();
+        let options = DbOptions {
+            edge_uniqueness: true,
+            compact_after_n_flushes: 0,
+            dense_vector: Some(DenseVectorConfig {
+                dimension: 64,
+                metric: DenseMetric::Cosine,
+                hnsw: HnswConfig::default(),
+            }),
+            ..Default::default()
+        };
+        let db = DatabaseEngine::open(dir.path(), &options).unwrap();
+        for id in 1..=32 {
+            assert_eq!(db.ensure_node_label(&format!("BenchNode{id}")).unwrap(), id);
+            assert_eq!(db.ensure_edge_label(&format!("BenchEdge{id}")).unwrap(), id);
+        }
+        for batch in 0..3usize {
+            let inputs = (0..24usize)
+                .flat_map(|cluster| {
+                    (0..128usize).map(move |member| NodeInput {
+                        labels: vec![format!("BenchNode{}", if batch == 0 { 1 } else { 2 })],
+                        key: format!("mt{batch}_c{cluster}_n{member}"),
+                        props: BTreeMap::new(),
+                        weight: 1.,
+                        dense_vector: Some(clustered_dense_vector(
+                            64,
+                            (cluster + batch * 3) % 24,
+                            member + batch * 10000,
+                            24,
+                        )),
+                        sparse_vector: None,
+                    })
+                })
+                .collect();
+            assert_eq!(
+                db.batch_upsert_nodes(inputs).unwrap(),
+                (batch as u64 * 3072 + 1..=(batch as u64 + 1) * 3072).collect::<Vec<_>>()
+            );
+        }
+        let query = clustered_query_vector(64, 3, 9, 24);
+        let request = VectorSearchRequest {
+            mode: VectorSearchMode::Dense,
+            dense_query: Some(query.clone()),
+            sparse_query: None,
+            k: 10,
+            label_filter: Some(NodeLabelFilter {
+                labels: vec!["BenchNode1".into()],
+                mode: LabelMatchMode::Any,
+            }),
+            ef_search: None,
+            scope: None,
+            dense_weight: None,
+            sparse_weight: None,
+            fusion_mode: None,
+        };
+        let norm = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let mut oracle = (0..24usize)
+            .flat_map(|cluster| (0..128usize).map(move |member| (cluster, member)))
+            .map(|(cluster, member)| {
+                let v = clustered_dense_vector(64, cluster, member, 24);
+                let vn = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                VectorHit {
+                    node_id: (cluster * 128 + member + 1) as u64,
+                    score: v.iter().zip(&query).map(|(x, q)| x * q).sum::<f32>() / (norm * vn),
+                }
+            })
+            .collect::<Vec<_>>();
+        oracle.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node_id.cmp(&b.node_id)));
+        oracle.truncate(10);
+        let actual = db.vector_search(&request).unwrap();
+        assert_eq!(
+            actual.iter().map(|h| h.node_id).collect::<Vec<_>>(),
+            oracle.iter().map(|h| h.node_id).collect::<Vec<_>>()
+        );
+        for (a, b) in actual.iter().zip(&oracle) {
+            assert!((a.score - b.score).abs() < 1e-5);
+        }
+        let stats = db.stats().unwrap();
+        assert_eq!(
+            (
+                stats.segment_count,
+                stats.immutable_memtable_count,
+                stats.pending_flush_count
+            ),
+            (0, 0, 0)
+        );
+        close_fixture(db);
+        let db = DatabaseEngine::open(dir.path(), &options).unwrap();
+        for id in [1usize, 3072, 3073, 9216] {
+            let index = id - 1;
+            let batch = index / 3072;
+            let cluster = (index % 3072) / 128;
+            let member = index % 128;
+            let row = db.get_node(id as u64).unwrap().unwrap();
+            assert_eq!(
+                row.dense_vector,
+                Some(clustered_dense_vector(
+                    64,
+                    (cluster + batch * 3) % 24,
+                    member + batch * 10000,
+                    24
+                ))
+            );
+            assert_eq!(row.key, format!("mt{batch}_c{cluster}_n{member}"));
+        }
+        close_fixture(db);
+    }
 }

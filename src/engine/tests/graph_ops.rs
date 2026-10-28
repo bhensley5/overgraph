@@ -216,7 +216,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             edge_uniqueness: true,
             ..Default::default()
         };
-        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+        let db = open_after_native_shutdown(&dir.path().join("db"), &opts).unwrap();
 
         let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -619,7 +619,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             edge_uniqueness: true,
             ..Default::default()
         };
-        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+        let db = open_after_native_shutdown(&dir.path().join("db"), &opts).unwrap();
 
         let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -1668,7 +1668,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     #[test]
     fn test_ingest_mode_suppresses_auto_compact() {
         let dir = TempDir::new().unwrap();
-        let db = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+        let db = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
 
         db.ingest_mode().unwrap();
         for i in 0..10 {
@@ -1703,7 +1703,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             compact_after_n_flushes: 5,
             ..DbOptions::default()
         };
-        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+        let db = open_after_native_shutdown(&dir.path().join("db"), &opts).unwrap();
 
         assert_eq!(db.compact_after_n_flushes_for_test(), 5);
         db.ingest_mode().unwrap();
@@ -1724,7 +1724,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             compact_after_n_flushes: 5,
             ..DbOptions::default()
         };
-        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+        let db = open_after_native_shutdown(&dir.path().join("db"), &opts).unwrap();
 
         db.ingest_mode().unwrap();
         db.ingest_mode().unwrap();
@@ -3031,7 +3031,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_neighbors_paged_basic() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node("Person", "center", UpsertNodeOptions::default())
@@ -3087,7 +3087,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_neighbors_paged_cross_source() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node("Person", "center", UpsertNodeOptions::default())
@@ -3140,7 +3140,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_neighbors_paged_respects_tombstones() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node("Person", "center", UpsertNodeOptions::default())
@@ -3175,7 +3175,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_neighbors_paged_with_temporal_filter() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node("Person", "center", UpsertNodeOptions::default())
@@ -3217,7 +3217,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // Paginated results should match unpaginated neighbors()
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node("Person", "center", UpsertNodeOptions::default())
@@ -3264,7 +3264,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // Edges with future valid_from or past valid_to must be excluded.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node("Person", "center", UpsertNodeOptions::default())
@@ -3329,7 +3329,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // Create a mix of valid and invalid edges, paginate with small limit.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node("Person", "center", UpsertNodeOptions::default())
@@ -3391,7 +3391,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_neighbors_paged_policy_refills_past_sparse_filtered_window() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let center = engine
             .upsert_node("Person", "center", UpsertNodeOptions::default())
@@ -3453,7 +3453,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // Page 2 should not re-return page 1 items.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         // Create 10 Person-labeled nodes.
         let mut all_ids = Vec::new();
@@ -3510,7 +3510,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // Create many matching nodes, paginate, verify no duplicates and parity.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let mut matching_ids = Vec::new();
         for i in 0..12 {
@@ -3566,7 +3566,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // Verify cursor works correctly across memtable + segments.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         // Create some matching nodes, flush, create more
         let mut all_matching = Vec::new();
@@ -3621,7 +3621,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // a newer source (memtable or newer segment) has changed the property.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
@@ -3683,7 +3683,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // Same bug across segments: older segment has color=red, newer has color=blue.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let mut props = BTreeMap::new();
         props.insert("color".to_string(), PropValue::String("red".to_string()));
@@ -4487,7 +4487,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_traverse_depth_two_paged_basic() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -4542,7 +4542,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_traverse_depth_two_paged_roundtrip() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         for i in 0..5 {
@@ -4597,7 +4597,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_traverse_depth_two_cursor_past_end_returns_empty() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -4627,7 +4627,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_traverse_depth_two_filtered_emission_matches_old_constrained_shape() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -4658,7 +4658,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_traverse_depth_two_cross_segment() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -4695,7 +4695,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             edge_uniqueness: true,
             ..DbOptions::default()
         };
-        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &opts).unwrap();
 
         // Create edge and flush to segment
         let e1 = engine
@@ -4727,7 +4727,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
 
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let n1 = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let n2 = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4760,7 +4760,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             edge_uniqueness: true,
             ..DbOptions::default()
         };
-        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &opts).unwrap();
 
         // Create edge and flush (segment 1 has the edge)
         let e1 = engine
@@ -4793,7 +4793,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_top_k_by_weight() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4831,7 +4831,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_top_k_by_recency() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4864,7 +4864,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_top_k_by_decay() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4904,7 +4904,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_top_k_zero_returns_empty() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4924,7 +4924,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_top_k_k_greater_than_neighbors() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4951,7 +4951,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_top_k_with_label_filter() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -4982,7 +4982,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_top_k_excludes_deleted_neighbors() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -5010,7 +5010,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_top_k_across_segments() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
@@ -5038,7 +5038,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_top_k_negative_lambda_returns_error() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions { weight: 0.5, ..Default::default() }).unwrap();
 
@@ -5057,7 +5057,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // A→B→C→D, extract from A at depth 1 → only A and B
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -5090,7 +5090,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // A→B→C→D, extract from A at depth 3 → all nodes and edges
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -5122,7 +5122,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // Diamond: A→B, A→C, B→D, C→D. Node D should appear once.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -5160,7 +5160,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // Cycle: A→B→C→A. BFS should terminate, not loop.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -5194,7 +5194,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // A→A (self-loop), A→B. Should not infinite-loop.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -5223,7 +5223,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // Depth 0 returns just the start node, no edges
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -5247,7 +5247,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // Non-existent start node → empty subgraph
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let sg = engine
             .extract_subgraph(999, 5, &SubgraphOptions::default())
@@ -5264,7 +5264,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // A→B, C (isolated). Subgraph from A should not include C.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -5288,7 +5288,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // A→B→C. Extract from C with Incoming direction → C, B, A
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -5316,7 +5316,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // A→B←C. Extract from B with Both direction → A, B, C
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -5345,7 +5345,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // Filter by label 1 → A, B, D (not C).
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -5377,7 +5377,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     #[test]
     fn test_subgraph_node_label_filter_uses_single_any_all_eligibility() {
         let dir = TempDir::new().unwrap();
-        let engine = DatabaseEngine::open(&dir.path().join("testdb"), &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&dir.path().join("testdb"), &DbOptions::default()).unwrap();
 
         let root = engine
             .upsert_node(
@@ -5510,7 +5510,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             compact_after_n_flushes: 0,
             ..DbOptions::default()
         };
-        let engine = DatabaseEngine::open(&db_path, &opts).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &opts).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -5540,7 +5540,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // A→B→C, delete B → subgraph from A should only contain A (B is deleted)
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -5570,7 +5570,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // A→B (edge1), A→C (edge2). Delete edge1. Subgraph from A → A, C.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -5600,7 +5600,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // At epoch 150 → only B reachable. At epoch 350 → only C reachable.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -5632,7 +5632,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // Hub node A with 50 outgoing edges to B1..B50
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "hub", UpsertNodeOptions::default()).unwrap();
         let mut expected = NodeIdSet::from_iter([a]);
@@ -5662,7 +5662,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // Chain: A→B→C→D→E. Depth 2 → A, B, C only.
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let a = engine.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = engine.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -5698,7 +5698,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // Verify extracted nodes carry their full properties
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("testdb");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
         let mut props_a = BTreeMap::new();
         props_a.insert("name".to_string(), PropValue::String("Alice".to_string()));
@@ -6406,7 +6406,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
     fn test_degree_cache_mutation_update_same_endpoints_weight_change() {
         let dir = TempDir::new().unwrap();
         let opts = DbOptions { edge_uniqueness: true, ..Default::default() };
-        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+        let db = open_after_native_shutdown(&dir.path().join("db"), &opts).unwrap();
 
         let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -6762,7 +6762,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         // upsert replaces the first (same from/to/label_id).
         let dir = TempDir::new().unwrap();
         let opts = DbOptions { edge_uniqueness: true, ..Default::default() };
-        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+        let db = open_after_native_shutdown(&dir.path().join("db"), &opts).unwrap();
 
         let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -6924,7 +6924,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             db.close().unwrap();
         }
         {
-            let db = DatabaseEngine::open(&path, &DbOptions::default()).unwrap();
+            let db = open_after_native_shutdown(&path, &DbOptions::default()).unwrap();
             let entry_a = db.degree_cache_entry(a);
             let entry_b = db.degree_cache_entry(b);
             assert_eq!(entry_a.temporal_edge_count, 1);
@@ -6955,7 +6955,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         )
         .unwrap();
 
-        assert!(std::sync::Arc::ptr_eq(
+        assert!(crate::engine::shared::SharedArc::ptr_eq(
             &before,
             &db.active_degree_overlay_for_test()
         ));
@@ -6963,7 +6963,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
 
         txn.commit().unwrap();
         let after = db.active_degree_overlay_for_test();
-        assert!(!std::sync::Arc::ptr_eq(&before, &after));
+        assert!(!crate::engine::shared::SharedArc::ptr_eq(&before, &after));
         let entry_a = db.degree_cache_entry(a);
         assert_eq!(entry_a.out_degree, 1);
         assert!((entry_a.out_weight_sum - 2.5).abs() < 1e-10);
@@ -6978,7 +6978,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             edge_uniqueness: true,
             ..Default::default()
         };
-        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+        let db = open_after_native_shutdown(&dir.path().join("db"), &opts).unwrap();
 
         let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -6994,7 +6994,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             )
             .unwrap();
         rollback_txn.rollback().unwrap();
-        assert!(std::sync::Arc::ptr_eq(
+        assert!(crate::engine::shared::SharedArc::ptr_eq(
             &before_rollback,
             &db.active_degree_overlay_for_test()
         ));
@@ -7028,7 +7028,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             Err(err) => err,
         };
         assert!(matches!(err, EngineError::TxnConflict(_)));
-        assert!(std::sync::Arc::ptr_eq(
+        assert!(crate::engine::shared::SharedArc::ptr_eq(
             &before_conflict,
             &db.active_degree_overlay_for_test()
         ));
@@ -7048,7 +7048,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
         let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
         let overlay_before_node_only = db.active_degree_overlay_for_test();
         db.upsert_node("Person", "c", UpsertNodeOptions::default()).unwrap();
-        assert!(std::sync::Arc::ptr_eq(
+        assert!(crate::engine::shared::SharedArc::ptr_eq(
             &overlay_before_node_only,
             &db.active_degree_overlay_for_test()
         ));
@@ -7222,7 +7222,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             edge_uniqueness: true,
             ..Default::default()
         };
-        let db = DatabaseEngine::open(&dir.path().join("db"), &opts).unwrap();
+        let db = open_after_native_shutdown(&dir.path().join("db"), &opts).unwrap();
 
         let a = db.upsert_node("Person", "a", UpsertNodeOptions::default()).unwrap();
         let b = db.upsert_node("Person", "b", UpsertNodeOptions::default()).unwrap();
@@ -7297,7 +7297,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             db.flush().unwrap();
             db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default()).unwrap();
             db.flush().unwrap();
-            db.close().unwrap();
+            close_and_wait_for_native_shutdown(db);
         }
 
         std::fs::remove_file(segment_dir(&path, 1).join(crate::degree_cache::DEGREE_DELTA_FILENAME))
@@ -7678,7 +7678,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             )
             .unwrap();
             db.flush().unwrap();
-            db.close().unwrap();
+            close_and_wait_for_native_shutdown(db);
         }
         std::fs::remove_file(segment_dir(&path, 1).join(crate::degree_cache::DEGREE_DELTA_FILENAME))
             .unwrap();
@@ -8123,7 +8123,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             )
             .unwrap();
             db.flush().unwrap();
-            db.close().unwrap();
+            close_and_wait_for_native_shutdown(db);
         }
 
         let sidecar_path =
@@ -8196,7 +8196,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             )
             .unwrap();
             db.flush().unwrap();
-            db.close().unwrap();
+            close_and_wait_for_native_shutdown(db);
         }
 
         let sidecar_path =
@@ -8266,7 +8266,7 @@ fn graph_node_label_filter(names: &[&str], mode: LabelMatchMode) -> NodeLabelFil
             db.upsert_edge(a, c, "KNOWS", UpsertEdgeOptions::default())
                 .unwrap();
             db.flush().unwrap();
-            db.close().unwrap();
+            close_and_wait_for_native_shutdown(db);
         }
 
         std::fs::write(

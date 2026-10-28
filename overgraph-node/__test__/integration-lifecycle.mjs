@@ -1,3 +1,4 @@
+import { drainAfterClose } from './helpers/native-lifecycle.mjs';
 /**
  * P6-009: Full lifecycle integration test.
  *
@@ -33,6 +34,7 @@ describe('Full lifecycle integration', () => {
       memtableFlushThreshold: 64 * 1024, // low threshold to trigger auto-flush
     });
     db.close();
+    drainAfterClose(db);
   });
 
   it('Step 2: batch insert 500 nodes across 5 types', async () => {
@@ -59,6 +61,7 @@ describe('Full lifecycle integration', () => {
     assert.equal(sample.props.idx, 42);
 
     db.close();
+    drainAfterClose(db);
   });
 
   it('Step 3: batch insert 1000 edges (each node gets ~2 outgoing)', async () => {
@@ -87,6 +90,7 @@ describe('Full lifecycle integration', () => {
     assert.equal(sampleEdge.props.order, 0);
 
     db.close();
+    drainAfterClose(db);
   });
 
   it('Step 4: neighbor queries work on the graph', async () => {
@@ -112,6 +116,7 @@ describe('Full lifecycle integration', () => {
     assert.ok(incoming.length > 0, 'node 13 should have incoming neighbors');
 
     db.close();
+    drainAfterClose(db);
   });
 
   it('Step 5: traverse reaches exact 2nd-hop nodes', async () => {
@@ -127,6 +132,7 @@ describe('Full lifecycle integration', () => {
     }
 
     db.close();
+    drainAfterClose(db);
   });
 
   it('Step 6: find_nodes by property', async () => {
@@ -150,6 +156,7 @@ describe('Full lifecycle integration', () => {
     assert.equal(specific.length, 1);
 
     db.close();
+    drainAfterClose(db);
   });
 
   it('Step 7: delete a node and an edge', async () => {
@@ -168,6 +175,7 @@ describe('Full lifecycle integration', () => {
     assert.equal(await db.getEdgeAsync(deletedEdgeId), null);
 
     db.close();
+    drainAfterClose(db);
   });
 
   it('Step 8: flush and compact', async () => {
@@ -189,6 +197,7 @@ describe('Full lifecycle integration', () => {
     assert.ok(stats.nodesKept > 0);
 
     db.close();
+    drainAfterClose(db);
   });
 
   it('Step 9: close and reopen, all data survives', async () => {
@@ -225,5 +234,6 @@ describe('Full lifecycle integration', () => {
     }
 
     db.close();
+    drainAfterClose(db);
   });
 });

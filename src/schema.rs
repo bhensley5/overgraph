@@ -631,7 +631,23 @@ pub(crate) fn normalize_schema_manifest(manifest: &mut ManifestState) -> Result<
     Ok(dirty)
 }
 
+#[derive(Default)]
+pub(crate) struct SchemaManifestScratch {
+    node_label_ids: HashSet<u32>,
+    edge_label_ids: HashSet<u32>,
+    schema_ids: HashSet<u64>,
+    node_targets: HashSet<u32>,
+    edge_targets: HashSet<u32>,
+}
+
 pub(crate) fn validate_schema_manifest(manifest: &ManifestState) -> Result<(), EngineError> {
+    validate_schema_manifest_with_scratch(manifest, &mut SchemaManifestScratch::default())
+}
+
+pub(crate) fn validate_schema_manifest_with_scratch(
+    manifest: &ManifestState,
+    scratch: &mut SchemaManifestScratch,
+) -> Result<(), EngineError> {
     let has_schema_entries = !manifest.node_schemas.is_empty() || !manifest.edge_schemas.is_empty();
     match manifest.schema_catalog_version {
         0 if !has_schema_entries => return Ok(()),
@@ -649,11 +665,20 @@ pub(crate) fn validate_schema_manifest(manifest: &ManifestState) -> Result<(), E
         }
     }
 
-    let node_label_ids: HashSet<u32> = manifest.node_label_tokens.values().copied().collect();
-    let edge_label_ids: HashSet<u32> = manifest.edge_label_tokens.values().copied().collect();
-    let mut schema_ids = HashSet::new();
-    let mut node_targets = HashSet::new();
-    let mut edge_targets = HashSet::new();
+    let SchemaManifestScratch {
+        node_label_ids,
+        edge_label_ids,
+        schema_ids,
+        node_targets,
+        edge_targets,
+    } = scratch;
+    node_label_ids.clear();
+    edge_label_ids.clear();
+    schema_ids.clear();
+    node_targets.clear();
+    edge_targets.clear();
+    node_label_ids.extend(manifest.node_label_tokens.values().copied());
+    edge_label_ids.extend(manifest.edge_label_tokens.values().copied());
 
     for entry in &manifest.node_schemas {
         validate_manifest_entry_size("node schema", entry)?;
@@ -666,7 +691,7 @@ pub(crate) fn validate_schema_manifest(manifest: &ManifestState) -> Result<(), E
         validate_target_label_id(
             "node schema target",
             entry.label_id,
-            &node_label_ids,
+            node_label_ids,
             "node_label_tokens",
         )?;
         if !node_targets.insert(entry.label_id) {
@@ -683,7 +708,7 @@ pub(crate) fn validate_schema_manifest(manifest: &ManifestState) -> Result<(), E
             validate_node_label_constraint_manifest(
                 "node schema label_constraints",
                 constraints,
-                &node_label_ids,
+                node_label_ids,
             )?;
         }
         if let Some(weight) = &entry.weight {
@@ -727,7 +752,7 @@ pub(crate) fn validate_schema_manifest(manifest: &ManifestState) -> Result<(), E
         validate_target_label_id(
             "edge schema target",
             entry.label_id,
-            &edge_label_ids,
+            edge_label_ids,
             "edge_label_tokens",
         )?;
         if !edge_targets.insert(entry.label_id) {
@@ -738,10 +763,10 @@ pub(crate) fn validate_schema_manifest(manifest: &ManifestState) -> Result<(), E
         }
         validate_manifest_properties("edge schema", &entry.properties)?;
         if let Some(from) = &entry.from {
-            validate_endpoint_label_manifest("edge schema from endpoint", from, &node_label_ids)?;
+            validate_endpoint_label_manifest("edge schema from endpoint", from, node_label_ids)?;
         }
         if let Some(to) = &entry.to {
-            validate_endpoint_label_manifest("edge schema to endpoint", to, &node_label_ids)?;
+            validate_endpoint_label_manifest("edge schema to endpoint", to, node_label_ids)?;
         }
         if let Some(weight) = &entry.weight {
             validate_manifest_numeric_bounds(
@@ -2820,19 +2845,41 @@ fn normalize_endpoint_label_constraint_option(
 }
 
 fn sort_dedup(values: &mut Vec<u32>) -> bool {
-    let before = values.clone();
+    // Strictly increasing values are the normalized representation. Inspect
+    // before sorting rather than cloning a potentially large raw manifest list.
+    let changed = !values.windows(2).all(|pair| pair[0] < pair[1]);
     values.sort_unstable();
     values.dedup();
-    *values != before
+    changed
+}
+
+fn manifest_encoded_size<T: Serialize>(entry: &T) -> Result<usize, serde_json::Error> {
+    // Count the identical JSON encoding without a temporary owning byte vector.
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("schema size overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut encoded = Count(0);
+    serde_json::to_writer(&mut encoded, entry)?;
+    Ok(encoded.0)
 }
 
 fn validate_manifest_entry_size<T: Serialize>(context: &str, entry: &T) -> Result<(), EngineError> {
-    let encoded = serde_json::to_vec(entry).map_err(|error| {
+    let encoded = manifest_encoded_size(entry).map_err(|error| {
         EngineError::ManifestError(format!(
             "invalid schema manifest: {context} entry cannot serialize: {error}"
         ))
     })?;
-    if encoded.len() > MAX_SCHEMA_MANIFEST_BYTES_PER_ENTRY {
+    if encoded > MAX_SCHEMA_MANIFEST_BYTES_PER_ENTRY {
         return Err(EngineError::ManifestError(format!(
             "invalid schema manifest: {context} entry exceeds {} bytes",
             MAX_SCHEMA_MANIFEST_BYTES_PER_ENTRY
@@ -2979,12 +3026,12 @@ fn validate_enum_literals(context: &str, values: &[PropValue]) -> Result<(), Eng
                 "invalid schema manifest: {context} enum contains a non-finite float"
             )));
         }
-        let encoded = serde_json::to_vec(value).map_err(|error| {
+        let encoded = manifest_encoded_size(value).map_err(|error| {
             EngineError::ManifestError(format!(
                 "invalid schema manifest: {context} enum value cannot serialize: {error}"
             ))
         })?;
-        total_bytes = total_bytes.saturating_add(encoded.len());
+        total_bytes = total_bytes.saturating_add(encoded);
     }
     if total_bytes > MAX_SCHEMA_ENUM_LITERAL_BYTES_PER_PROPERTY {
         return Err(EngineError::ManifestError(format!(
@@ -3006,12 +3053,12 @@ fn validate_manifest_string_enum_literals(
     }
     let mut total_bytes = 0usize;
     for value in values {
-        let encoded = serde_json::to_vec(value).map_err(|error| {
+        let encoded = manifest_encoded_size(value).map_err(|error| {
             EngineError::ManifestError(format!(
                 "invalid schema manifest: {context} enum value cannot serialize: {error}"
             ))
         })?;
-        total_bytes = total_bytes.saturating_add(encoded.len());
+        total_bytes = total_bytes.saturating_add(encoded);
     }
     if total_bytes > MAX_SCHEMA_ENUM_LITERAL_BYTES_PER_PROPERTY {
         return Err(EngineError::ManifestError(format!(
@@ -3247,6 +3294,21 @@ mod tests {
         EndpointLabelManifestRule, HnswConfig, NodeLabelConstraintManifestRule,
         NodeSchemaManifestEntry, SchemaAdditionalPropertiesManifest, StringFieldSchemaManifestRule,
     };
+
+    #[test]
+    fn p45a2_schema_large_duplicate_normalization_is_in_place_and_idempotent() {
+        let mut values: Vec<_> = (0..100_000).map(|index| 64 - index % 64).collect();
+        let pointer = values.as_ptr();
+        let capacity = values.capacity();
+        assert!(sort_dedup(&mut values));
+        assert_eq!(values, (1..=64).collect::<Vec<_>>());
+        assert_eq!(values.as_ptr(), pointer);
+        assert_eq!(values.capacity(), capacity);
+        assert!(!sort_dedup(&mut values));
+        assert!(!sort_dedup(&mut Vec::new()));
+        assert!(!sort_dedup(&mut vec![1]));
+        assert!(sort_dedup(&mut vec![3, 1, 2]));
+    }
 
     fn manifest_with_labels() -> ManifestState {
         let mut manifest = default_manifest();

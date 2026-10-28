@@ -907,7 +907,7 @@ fn adjacency_stream_inclusive_seek_is_lazy_and_reopen_equivalent() {
     drop(source);
     drop(view);
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     let reopened_view = reopened.published_read_view_for_test();
     let mut reopened_source =
         prepared_adjacency_ready(&reopened_view, Direction::Outgoing, Some(&[label]));
@@ -923,7 +923,8 @@ fn adjacency_stream_inclusive_seek_is_lazy_and_reopen_equivalent() {
 
 #[test]
 fn adjacency_stream_enforces_4096_output_and_physical_caps_on_parallel_edges() {
-    let (_dir, engine) = query_test_engine();
+    // Assert output/scan work caps with a functional resource allowance.
+    let (_dir, engine) = query_functional_index_protocol_fixture();
     let a = insert_query_node(&engine, "AdjCap", "adj-cap-a", &[], 1.0);
     let b = insert_query_node(&engine, "AdjCap", "adj-cap-b", &[], 1.0);
     let label = engine.ensure_edge_label("ADJ_CAP").unwrap();
@@ -1020,7 +1021,8 @@ fn adjacency_stream_giant_immutable_owner_uses_one_bounded_scratch_and_truthful_
 
 #[test]
 fn adjacency_stream_odd_schedule_bounds_every_reusable_batch_vector() {
-    let (_dir, engine) = query_test_engine();
+    // This 600-edge fixture asserts pull/scratch bounds, not setup latency.
+    let (_dir, engine) = query_functional_index_protocol_fixture();
     let a = insert_query_node(&engine, "AdjOdd", "adj-odd-a", &[], 1.0);
     let b = insert_query_node(&engine, "AdjOdd", "adj-odd-b", &[], 1.0);
     engine.flush().unwrap();
@@ -1357,7 +1359,7 @@ fn adjacency_stream_is_equivalent_before_after_compaction_and_reopen() {
     assert_eq!(after, before);
 
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(&dir.path().join("db"), &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&dir.path().join("db"), &DbOptions::default()).unwrap();
     let reopened_edges = collect(&reopened.published_read_view_for_test());
     assert_eq!(reopened_edges, before);
 }

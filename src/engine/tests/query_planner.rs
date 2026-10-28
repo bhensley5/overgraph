@@ -955,17 +955,17 @@ fn edge_label_estimate_aggregates_active_and_immutable_posting_bounds() {
             published
                 .view
                 .memtable
-                .edge_label_posting_count_upper_bound(label_id),
+                .edge_label_posting_count_upper_bound(label_id).unwrap(),
             0
         );
         assert_eq!(published.view.immutable_epochs.len(), 1);
         assert_eq!(
             published.view.immutable_epochs[0]
                 .memtable
-                .edge_label_posting_count_upper_bound(label_id),
+                .edge_label_posting_count_upper_bound(label_id).unwrap(),
             1
         );
-        let estimate = published.view.edge_label_estimate(label_id);
+        let estimate = published.view.edge_label_estimate(label_id).unwrap();
         assert_eq!(estimate.kind, PlannerEstimateKind::UpperBound);
         assert_eq!(estimate.known_upper_bound(), Some(1));
     }
@@ -978,13 +978,13 @@ fn edge_label_estimate_aggregates_active_and_immutable_posting_bounds() {
         published
             .view
             .memtable
-            .edge_label_posting_count_upper_bound(label_id),
+            .edge_label_posting_count_upper_bound(label_id).unwrap(),
         1
     );
     assert_eq!(
         published
             .view
-            .edge_label_estimate(label_id)
+            .edge_label_estimate(label_id).unwrap()
             .known_upper_bound(),
         Some(2)
     );
@@ -1007,14 +1007,9 @@ fn segment_edge_delete_keeps_raw_label_bound_but_verifier_excludes_result() {
 
     {
         let (_guard, published) = engine.runtime.published_snapshot().unwrap();
-        assert_eq!(
-            published
-                .view
-                .memtable
-                .edge_label_posting_count_upper_bound(label_id),
-            0,
-            "a segment-only delete carries no label into the active memtable"
-        );
+        let active_retained=usize::from(published.view.memtable.is_candidate());
+        assert_eq!(published.view.memtable.edge_label_posting_count_upper_bound(label_id).unwrap(),active_retained,"candidate retains the negative label opinion; control has no local label slot");
+        assert!(published.view.memtable.visible_edges_by_label_id(label_id,published.view.snapshot_seq).unwrap().is_empty());
         assert_eq!(published.view.segments.len(), 1);
         assert_eq!(
             published.view.segments[0]
@@ -1025,9 +1020,9 @@ fn segment_edge_delete_keeps_raw_label_bound_but_verifier_excludes_result() {
         assert_eq!(
             published
                 .view
-                .edge_label_estimate(label_id)
+                .edge_label_estimate(label_id).unwrap()
                 .known_upper_bound(),
-            Some(1)
+            Some(1+active_retained as u64)
         );
     }
 
@@ -1078,10 +1073,10 @@ fn stale_active_edge_label_postings_only_loosen_estimate_and_preserve_results() 
             published
                 .view
                 .memtable
-                .edge_label_posting_count_upper_bound(label_id),
+                .edge_label_posting_count_upper_bound(label_id).unwrap(),
             80
         );
-        let estimate = published.view.edge_label_estimate(label_id);
+        let estimate = published.view.edge_label_estimate(label_id).unwrap();
         assert_eq!(estimate.kind, PlannerEstimateKind::UpperBound);
         assert_eq!(estimate.known_upper_bound(), Some(80));
         assert!(!estimate.proves_empty);
@@ -1314,7 +1309,7 @@ fn edge_query_metadata_sidecar_unavailable_falls_back_at_engine_level() {
         let seg_dir = crate::segment_writer::segment_dir(&db_path, 1);
         rewrite_sidecar(&seg_dir, logical_name, rewrite);
 
-        let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
         assert_eq!(reopened.query_edge_ids(&query).unwrap().edge_ids, baseline);
         let plan = reopened.explain_edge_query(&query).unwrap();
         assert!(plan_contains_node(&plan.root, &QueryPlanNode::EdgeMetadataScan));
@@ -1434,7 +1429,7 @@ fn edge_query_property_filter_uses_legal_universe_and_hydrates() {
 
 #[test]
 fn edge_query_uses_ready_edge_property_equality_index() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let a = insert_query_node(&engine, "Person",  "eq-edge-a", &[], 1.0);
     let b = insert_query_node(&engine, "Person",  "eq-edge-b", &[], 1.0);
     let c = insert_query_node(&engine, "Person",  "eq-edge-c", &[], 1.0);
@@ -1496,7 +1491,7 @@ fn edge_query_uses_ready_edge_property_equality_index() {
 
 #[test]
 fn edge_active_equality_index_uses_semantic_hashes() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let info = engine
         .ensure_edge_property_index("EDGE_SEMANTIC_ACTIVE", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
@@ -1652,7 +1647,7 @@ fn semantic_equality_sidecars_survive_flush_reopen_and_compaction_for_nodes_and_
     let a;
     let b;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         node_index = engine
             .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap()
@@ -1712,7 +1707,7 @@ fn semantic_equality_sidecars_survive_flush_reopen_and_compaction_for_nodes_and_
         engine.close().unwrap();
     }
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     wait_for_property_index_state(&reopened, node_index, SecondaryIndexState::Ready);
     wait_for_edge_property_index_state(&reopened, edge_index, SecondaryIndexState::Ready);
 
@@ -1777,7 +1772,7 @@ fn semantic_equality_sidecars_survive_flush_reopen_and_compaction_for_nodes_and_
     );
 
     reopened.close().unwrap();
-    let compacted_reopen = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let compacted_reopen = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     wait_for_property_index_state(&compacted_reopen, node_index, SecondaryIndexState::Ready);
     wait_for_edge_property_index_state(&compacted_reopen, edge_index, SecondaryIndexState::Ready);
     let mut final_nodes = compacted_reopen
@@ -1796,7 +1791,7 @@ fn semantic_equality_sidecars_survive_flush_reopen_and_compaction_for_nodes_and_
 
 #[test]
 fn edge_query_uses_ready_edge_property_range_index() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let a = insert_query_node(&engine, "Person",  "range-edge-a", &[], 1.0);
     let b = insert_query_node(&engine, "Person",  "range-edge-b", &[], 1.0);
     let c = insert_query_node(&engine, "Person",  "range-edge-c", &[], 1.0);
@@ -1865,7 +1860,7 @@ fn edge_query_uses_ready_edge_property_range_index() {
 
 #[test]
 fn streamed_edge_and_executes_broad_native_inputs_with_pagination_staleness_and_counters() {
-    let (dir, engine) = query_test_engine();
+    let (dir, engine) = query_index_protocol_fixture();
     let db_path = dir.path().join("db");
     let status_info = engine
         .ensure_edge_property_index(
@@ -2051,7 +2046,7 @@ fn streamed_edge_and_executes_broad_native_inputs_with_pagination_staleness_and_
     assert_eq!(hydrated.next_cursor, Some(expected[4]));
 
     engine.close().unwrap();
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let reopened_plan = reopened.explain_edge_query(&query).unwrap();
     let QueryPlanNode::Intersect { mode, .. } = explain_edge_input_node(&reopened_plan) else {
         panic!("expected reopened streamed edge intersect, got {reopened_plan:?}");
@@ -2065,7 +2060,7 @@ fn streamed_edge_and_executes_broad_native_inputs_with_pagination_staleness_and_
 
 #[test]
 fn streamed_edge_endpoint_and_executes_with_pagination_staleness_and_counters() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let label = "STREAMED_EDGE_ENDPOINT_EXEC";
     let other_label = "STREAMED_EDGE_ENDPOINT_OTHER";
     ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
@@ -2265,7 +2260,7 @@ fn streamed_edge_endpoint_and_executes_with_pagination_staleness_and_counters() 
 
 #[test]
 fn streamed_edge_all_small_and_stays_eager() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_edge_property_index(
             "STREAMED_EDGE_SMALL",
@@ -2361,7 +2356,7 @@ fn streamed_edge_all_small_and_stays_eager() {
 
 #[test]
 fn streamed_edge_single_source_and_or_in_mode_boundaries() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_edge_property_index(
             "STREAMED_EDGE_SINGLE",
@@ -2499,7 +2494,7 @@ fn streamed_edge_single_source_and_or_in_mode_boundaries() {
 
 #[test]
 fn streamed_edge_and_uses_buffered_range_and_weight_inputs() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_edge_property_index(
             "STREAMED_EDGE_BUFFERED",
@@ -2984,7 +2979,7 @@ fn streamed_edge_selector_admits_endpoint_only_when_strictly_most_selective() {
 
 #[test]
 fn streamed_edge_buffered_metadata_adapters_execute_updated_at_and_valid_at() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_edge_property_index(
             "STREAMED_EDGE_METADATA",
@@ -3184,7 +3179,7 @@ fn streamed_edge_buffered_metadata_adapters_execute_updated_at_and_valid_at() {
 
 #[test]
 fn streamed_edge_d1_buffer_overflow_demotes_to_verifier() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_edge_property_index(
             "STREAMED_EDGE_D1",
@@ -3312,7 +3307,7 @@ fn streamed_edge_d1_buffer_overflow_demotes_to_verifier() {
 
 #[test]
 fn streamed_edge_d1_terminal_buffer_overflow_falls_back_to_legal_universe() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let score_info = engine
         .ensure_edge_property_index(
             "STREAMED_EDGE_D1_TERMINAL",
@@ -3441,7 +3436,7 @@ fn streamed_edge_d1_terminal_buffer_overflow_falls_back_to_legal_universe() {
 fn streamed_edge_d3_equality_sidecar_failure_demotes_leaf_with_followup() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     seed_query_test_catalog(&engine);
     let status_index;
     let segment_id;
@@ -3579,7 +3574,7 @@ fn streamed_edge_d3_equality_sidecar_failure_demotes_leaf_with_followup() {
 
 #[test]
 fn streamed_edge_or_union_executes_with_dedup_pagination_and_staleness() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let label = "STREAMED_EDGE_OR";
     ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
     ensure_ready_edge_property_index(&engine, label, "region", SecondaryIndexKind::Equality);
@@ -3683,7 +3678,7 @@ fn streamed_edge_or_union_executes_with_dedup_pagination_and_staleness() {
 
 #[test]
 fn streamed_edge_union_composes_inside_and_as_leapfrog_input() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let label = "STREAMED_EDGE_OR_AND";
     ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
     ensure_ready_edge_property_index(&engine, label, "region", SecondaryIndexKind::Equality);
@@ -3752,7 +3747,7 @@ fn streamed_edge_union_composes_inside_and_as_leapfrog_input() {
 
 #[test]
 fn streamed_edge_union_uses_buffered_branch_under_cap() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let label = "STREAMED_EDGE_UNION_BUFFERED";
     ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
     ensure_ready_edge_property_index(&engine, label, "score", SecondaryIndexKind::Range);
@@ -3848,7 +3843,7 @@ fn streamed_edge_union_uses_buffered_branch_under_cap() {
 
 #[test]
 fn streamed_edge_union_d2_buffer_overflow_falls_back_complete() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let label = "STREAMED_EDGE_UNION_D2";
     let status_index =
         ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
@@ -3937,7 +3932,7 @@ fn streamed_edge_union_d2_buffer_overflow_falls_back_complete() {
 
 #[test]
 fn streamed_edge_union_cursor_overflow_and_non_streamable_branches_fallback() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let label = "STREAMED_EDGE_UNION_CURSOR";
     let status_index =
         ensure_ready_edge_property_index(&engine, label, "status", SecondaryIndexKind::Equality);
@@ -4091,7 +4086,7 @@ fn streamed_edge_union_cursor_overflow_and_non_streamable_branches_fallback() {
 
 #[test]
 fn edge_property_range_index_query_paginates_by_edge_id_cursor() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let a = insert_query_node(&engine, "Person",  "range-page-edge-a", &[], 1.0);
     let targets = (0..5)
         .map(|idx| insert_query_node(&engine, "Person",  &format!("range-page-edge-{idx}"), &[], 1.0))
@@ -4191,7 +4186,7 @@ fn edge_property_range_index_query_paginates_by_edge_id_cursor() {
 
 #[test]
 fn edge_property_index_does_not_make_filter_only_edge_query_legal() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let info = engine
         .ensure_edge_property_index("EDGE_LABEL_84", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
@@ -4251,7 +4246,7 @@ fn edge_query_missing_edge_property_index_remains_verifier_only() {
 
 #[test]
 fn edge_property_in_uses_index_union_and_preserves_signed_zero() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let a = insert_query_node(&engine, "Person",  "edge-in-a", &[], 1.0);
     let b = insert_query_node(&engine, "Person",  "edge-in-b", &[], 1.0);
     let c = insert_query_node(&engine, "Person",  "edge-in-c", &[], 1.0);
@@ -4336,7 +4331,7 @@ fn edge_property_in_uses_index_union_and_preserves_signed_zero() {
 
 #[test]
 fn edge_property_range_uses_ready_v2_numeric_range_sidecar() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let a = insert_query_node(&engine, "Person",  "edge-domain-a", &[], 1.0);
     let b = insert_query_node(&engine, "Person",  "edge-domain-b", &[], 1.0);
     let edge_id = engine
@@ -4380,7 +4375,7 @@ fn edge_property_range_uses_ready_v2_numeric_range_sidecar() {
 
 #[test]
 fn edge_property_or_with_verifier_branch_falls_back_whole_or() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let a = insert_query_node(&engine, "Person",  "edge-or-index-a", &[], 1.0);
     let b = insert_query_node(&engine, "Person",  "edge-or-index-b", &[], 1.0);
     let c = insert_query_node(&engine, "Person",  "edge-or-index-c", &[], 1.0);
@@ -4443,7 +4438,7 @@ fn edge_property_or_with_verifier_branch_falls_back_whole_or() {
 
 #[test]
 fn edge_property_indexed_not_filters_use_bounded_positive_universe_only() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let source = insert_query_node(&engine, "Person",  "edge-not-source", &[], 1.0);
     let active_keep_node = insert_query_node(&engine, "Person",  "edge-not-active-keep", &[], 1.0);
     let active_drop_node = insert_query_node(&engine, "Person",  "edge-not-active-drop", &[], 1.0);
@@ -4590,7 +4585,7 @@ fn edge_property_indexed_not_filters_use_bounded_positive_universe_only() {
 
 #[test]
 fn edge_property_index_visibility_merges_active_frozen_and_segments() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let nodes = (0..8)
         .map(|idx| insert_query_node(&engine, "Person",  &format!("edge-vis-{idx}"), &[], 1.0))
         .collect::<Vec<_>>();
@@ -4688,7 +4683,7 @@ fn edge_property_equality_verifier_filters_stale_or_colliding_postings() {
     let red_two;
     let blue;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let nodes = (0..4)
             .map(|idx| insert_query_node(&engine, "Person",  &format!("edge-collision-{idx}"), &[], 1.0))
             .collect::<Vec<_>>();
@@ -4747,7 +4742,7 @@ fn edge_property_equality_verifier_filters_stale_or_colliding_postings() {
         blue,
     );
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let query = EdgeQuery {
         label: Some("EDGE_LABEL_90".to_string()),
         filter: Some(EdgeFilterExpr::PropertyEquals {
@@ -4772,7 +4767,7 @@ fn edge_property_query_falls_back_and_marks_corrupt_equality_sidecar_failed() {
     let segment_id;
     let keep;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let a = insert_query_node(&engine, "Person",  "edge-corrupt-a", &[], 1.0);
         let b = insert_query_node(&engine, "Person",  "edge-corrupt-b", &[], 1.0);
         keep = engine
@@ -4803,7 +4798,7 @@ fn edge_property_query_falls_back_and_marks_corrupt_equality_sidecar_failed() {
     );
     corrupt_sidecar_header_in_place(&sidecar_path);
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let query = EdgeQuery {
         label: Some("EDGE_LABEL_91".to_string()),
         filter: Some(EdgeFilterExpr::PropertyEquals {
@@ -4824,7 +4819,7 @@ fn edge_property_query_enqueues_planning_followup_for_corrupt_equality_sidecar()
     let segment_id;
     let keep;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let a = insert_query_node(&engine, "Person",  "edge-plan-eq-a", &[], 1.0);
         let b = insert_query_node(&engine, "Person",  "edge-plan-eq-b", &[], 1.0);
         let c = insert_query_node(&engine, "Person",  "edge-plan-eq-c", &[], 1.0);
@@ -4867,7 +4862,7 @@ fn edge_property_query_enqueues_planning_followup_for_corrupt_equality_sidecar()
     );
     corrupt_planner_stats_for_segment(&db_path, segment_id);
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     wait_for_edge_property_index_state(&reopened, index_id, SecondaryIndexState::Ready);
     corrupt_sidecar_header_in_place(&sidecar_path);
     let query = EdgeQuery {
@@ -4906,7 +4901,7 @@ fn edge_property_query_enqueues_planning_followup_for_corrupt_range_sidecar() {
     let segment_id;
     let keep;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let a = insert_query_node(&engine, "Person",  "edge-corrupt-range-a", &[], 1.0);
         let b = insert_query_node(&engine, "Person",  "edge-corrupt-range-b", &[], 1.0);
         let c = insert_query_node(&engine, "Person",  "edge-corrupt-range-c", &[], 1.0);
@@ -4949,7 +4944,7 @@ fn edge_property_query_enqueues_planning_followup_for_corrupt_range_sidecar() {
     );
     corrupt_planner_stats_for_segment(&db_path, segment_id);
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     wait_for_edge_property_index_state(&reopened, index_id, SecondaryIndexState::Ready);
     corrupt_sidecar_header_in_place(&sidecar_path);
     let query = EdgeQuery {
@@ -4989,7 +4984,7 @@ fn edge_property_query_falls_back_and_marks_corrupt_range_sidecar_failed() {
     let segment_id;
     let keep;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let a = insert_query_node(&engine, "Person",  "edge-corrupt-range-failed-a", &[], 1.0);
         let b = insert_query_node(&engine, "Person",  "edge-corrupt-range-failed-b", &[], 1.0);
         let c = insert_query_node(&engine, "Person",  "edge-corrupt-range-failed-c", &[], 1.0);
@@ -5032,7 +5027,7 @@ fn edge_property_query_falls_back_and_marks_corrupt_range_sidecar_failed() {
     );
     corrupt_sidecar_header_in_place(&sidecar_path);
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let query = EdgeQuery {
         label: Some("EDGE_LABEL_96".to_string()),
         filter: Some(EdgeFilterExpr::PropertyRange {
@@ -5058,7 +5053,7 @@ fn edge_property_query_uses_sidecar_counts_when_planner_stats_are_missing() {
     let db_path = dir.path().join("testdb");
     let keep;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let a = insert_query_node(&engine, "Person",  "edge-no-stats-a", &[], 1.0);
         let b = insert_query_node(&engine, "Person",  "edge-no-stats-b", &[], 1.0);
         let c = insert_query_node(&engine, "Person",  "edge-no-stats-c", &[], 1.0);
@@ -5096,7 +5091,7 @@ fn edge_property_query_uses_sidecar_counts_when_planner_stats_are_missing() {
         .join(crate::planner_stats::PLANNER_STATS_FILENAME);
     std::fs::write(&stats_path, b"corrupt planner stats").unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let query = EdgeQuery {
         label: Some("EDGE_LABEL_92".to_string()),
         filter: Some(EdgeFilterExpr::PropertyEquals {
@@ -5115,7 +5110,7 @@ fn edge_property_query_uses_sidecar_counts_when_planner_stats_are_missing() {
 
 #[test]
 fn edge_property_in_union_materializes_when_union_cap_allows_it() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let matching_count = crate::planner_stats::PLANNER_STATS_DEFAULT_SELECTED_SOURCE_CAP + 904;
     let nonmatching_count = 2_000usize;
     let total_edges = matching_count + nonmatching_count;
@@ -6478,7 +6473,7 @@ fn compound_range_details(plan: &QueryPlan) -> &CompoundIndexPlanDetails {
 fn test_compound_node_equality_plans_executes_and_explains() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let keep = insert_query_node(
         &engine,
@@ -6561,7 +6556,7 @@ fn test_compound_node_equality_plans_executes_and_explains() {
 fn test_compound_node_range_and_in_cap_planning() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut expected = Vec::new();
     for score in 0..80 {
@@ -6687,7 +6682,7 @@ fn test_single_predicate_query_uses_compound_prefix() {
     // scan instead of a fallback label scan.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let acme_a = insert_query_node(
         &engine,
@@ -6774,7 +6769,7 @@ fn test_edge_single_predicate_with_anchor_uses_compound_prefix() {
     // compound prefix scan instead of adjacency expansion plus verify.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let from = insert_query_node(&engine, "Person", "anchor-from", &[], 1.0);
     let mut hot = None;
@@ -6836,7 +6831,7 @@ fn test_edge_single_predicate_with_anchor_uses_compound_prefix() {
 fn test_compound_one_field_metadata_key_index_plans_and_executes() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let keep = insert_query_node(
         &engine,
@@ -6910,7 +6905,7 @@ fn test_compound_one_field_metadata_key_index_plans_and_executes() {
 fn test_compound_edge_in_cap_skips_as_broad() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let from = insert_query_node(&engine, "Person", "edge-in-cap-from", &[], 1.0);
     let to = insert_query_node(&engine, "Person", "edge-in-cap-to", &[], 1.0);
@@ -6971,7 +6966,7 @@ fn test_compound_edge_in_cap_skips_as_broad() {
 fn test_compound_non_prefix_predicates_warn_prefix_not_satisfied() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     insert_query_node(
         &engine,
@@ -7067,7 +7062,7 @@ fn tenant_status_filter() -> Vec<NodeFilterExpr> {
 fn test_compound_three_field_prefix_only_planning() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut expected_prefix = Vec::new();
     for index in 0..12 {
@@ -7161,7 +7156,7 @@ fn test_compound_three_field_prefix_only_planning() {
 fn test_compound_multi_label_any_union_plans_and_executes() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let a_match =
         insert_query_node(&engine, "AnyA", "a-match", &tenant_status_props("acme", "active"), 1.0);
@@ -7233,7 +7228,7 @@ fn test_compound_multi_label_any_union_plans_and_executes() {
 fn test_compound_multi_label_any_falls_back_when_label_uncovered() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let a_match = insert_query_node(
         &engine,
@@ -7292,7 +7287,7 @@ fn test_compound_multi_label_any_falls_back_when_label_uncovered() {
 fn test_compound_multi_label_all_uses_one_declaration_and_verifies_rest() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let both = insert_query_node_with_labels(
         &engine,
@@ -7343,7 +7338,7 @@ fn test_compound_multi_label_all_uses_one_declaration_and_verifies_rest() {
 fn test_compound_index_suppresses_stale_segment_postings() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let keep = insert_query_node(
         &engine,
@@ -7455,7 +7450,7 @@ fn test_compound_index_suppresses_stale_segment_postings() {
 fn test_compound_truncated_segment_scan_reports_too_broad_not_partial_ready() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut ids = Vec::new();
     for ordinal in 0..5 {
@@ -7545,7 +7540,7 @@ fn test_equality_query_returns_all_memtable_matches_above_verify_chunk() {
     // Planner review N1: the raw-limited equality path clamped each memtable
     // read to one verify chunk (256) without a truncation signal, silently
     // dropping every memtable match past the clamp.
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let info = engine
         .ensure_node_property_index(
             "Person",
@@ -7616,7 +7611,7 @@ fn test_equality_query_merges_segment_and_memtable_matches_above_verify_chunk() 
     // Planner review N1 (mixed tiers): the segment tier drains fully while an
     // unflushed memtable holding more than one verify chunk of matches lost
     // everything past 256.
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let info = engine
         .ensure_node_property_index(
             "Person",
@@ -7706,7 +7701,7 @@ fn test_selective_index_above_default_cap_drives_under_write_load() {
     // discarded selective index probes as CandidateCapExceeded in favor of a
     // full label scan. Trusted posting upper bounds must uncap regardless of
     // confidence class.
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let info = engine
         .ensure_node_property_index(
             "Person",
@@ -7782,7 +7777,7 @@ fn test_compound_intersection_uses_semantic_equality_across_numeric_forms() {
     // compound scan whose lost rows verification cannot recover.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let x1 = insert_query_node(
         &engine,
@@ -7846,7 +7841,7 @@ fn test_edge_triple_index_estimate_ranks_first_in_intersect() {
     // Planner review P6: the triple source carried an unknown estimate, so it
     // ranked dead last and broad index inputs materialized ahead of the
     // cheapest probe in the engine.
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let a = insert_query_node(&engine, "Person", "a", &[], 1.0);
     let b = insert_query_node(&engine, "Person", "b", &[], 1.0);
     let keep_edge = engine
@@ -7921,7 +7916,7 @@ fn test_edge_query_explicit_anchor_skips_filter_planning_and_index_scan() {
     // wasted work — and must not touch index sidecars at all.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let from = insert_query_node(&engine, "Person", "from", &[], 1.0);
     let to = insert_query_node(&engine, "Person", "to", &[], 1.0);
@@ -7996,7 +7991,7 @@ fn test_compound_estimate_counts_sidecar_postings_when_stats_uncovered() {
     // the compound sidecar key table instead.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut acme_ids = Vec::new();
     for ordinal in 0..40 {
@@ -8045,7 +8040,7 @@ fn test_compound_estimate_counts_sidecar_postings_when_stats_uncovered() {
     );
     engine.close().unwrap();
     std::fs::remove_file(&stats_path).unwrap();
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     assert!(engine.segments_for_test()[0].planner_stats().is_none());
 
     let query = query_ids(
@@ -8079,7 +8074,7 @@ fn test_edge_equality_truncated_epoch_read_reports_too_broad_not_partial_ready()
     // Planner review N3: an immutable-memtable read that consumed the whole
     // raw budget could fall through to Ready when no segments followed,
     // silently dropping the postings the truncated read never returned.
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let info = engine
         .ensure_edge_property_index(
             "RELATES_TO",
@@ -8189,7 +8184,7 @@ fn test_edge_equality_truncated_epoch_read_reports_too_broad_not_partial_ready()
 fn test_compound_edge_endpoint_property_source_wins_when_selective() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let from = insert_query_node(&engine, "Person", "from", &[], 1.0);
     let mut edge_ids = Vec::new();
@@ -8258,7 +8253,7 @@ fn test_compound_edge_endpoint_property_source_wins_when_selective() {
 fn test_compound_planned_query_pages_with_cursor_across_sources() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     // 15 matches flushed into a segment, then 10 more matches plus noise left
     // in the memtable, so cursor pages cross posting lists and sources.
@@ -8383,7 +8378,7 @@ fn test_compound_value_dedup_handles_large_endpoint_lists() {
 fn test_compound_source_not_cheapest_skips_to_verifier_instead_of_intersect() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     // 8 rare acme nodes, 12 common acme nodes (compound prefix `tenant=acme`
     // matches 20 — within the 4x broad-source factor of the 8-candidate
@@ -8483,7 +8478,7 @@ fn test_compound_source_not_cheapest_skips_to_verifier_instead_of_intersect() {
 fn test_compound_weight_range_demotes_to_prefix_and_matches_infinite_weight() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let a = insert_query_node(&engine, "Person", "weight-a", &[], 1.0);
     let b = insert_query_node(&engine, "Person", "weight-b", &[], 1.0);
@@ -8576,7 +8571,7 @@ fn test_compound_weight_range_demotes_to_prefix_and_matches_infinite_weight() {
 fn test_compound_edge_corrupt_sidecar_falls_back_and_enqueues_followup() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let a = insert_query_node(&engine, "Person", "compound-corrupt-a", &[], 1.0);
     let b = insert_query_node(&engine, "Person", "compound-corrupt-b", &[], 1.0);
@@ -8629,7 +8624,7 @@ fn test_compound_edge_corrupt_sidecar_falls_back_and_enqueues_followup() {
     engine.close().unwrap();
     corrupt_compound_sidecar_payload_only_in_place(&sidecar_path);
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     wait_for_edge_property_index_state(&reopened, info.index_id, SecondaryIndexState::Ready);
     let plan = reopened.explain_edge_query(&query).unwrap();
     assert_eq!(compound_range_details(&plan).index_id, info.index_id);
@@ -8643,7 +8638,7 @@ fn test_compound_edge_corrupt_sidecar_falls_back_and_enqueues_followup() {
 fn test_compound_node_missing_sidecar_falls_back_and_enqueues_followup() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let keep = insert_query_node(
         &engine,
@@ -8700,6 +8695,8 @@ fn test_compound_node_missing_sidecar_falls_back_and_enqueues_followup() {
         info.index_id,
     );
     std::fs::remove_file(&sidecar_path).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    engine.reopen_segment_reader_and_rebuild_sources_for_test(engine.segments_for_test()[0].segment_id).unwrap();
 
     assert_single_read_followup_enqueued(&engine, || {
         assert_eq!(engine.query_node_ids(&query).unwrap().items, vec![keep]);
@@ -8711,7 +8708,7 @@ fn test_compound_node_missing_sidecar_falls_back_and_enqueues_followup() {
 fn test_compound_range_declaration_prefix_scan_missing_sidecar_self_repairs() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let keep = insert_query_node(
         &engine,
@@ -8775,6 +8772,8 @@ fn test_compound_range_declaration_prefix_scan_missing_sidecar_self_repairs() {
         info.index_id,
     );
     std::fs::remove_file(&sidecar_path).unwrap();
+    #[cfg(feature = "production-concurrency")]
+    engine.reopen_segment_reader_and_rebuild_sources_for_test(engine.segments_for_test()[0].segment_id).unwrap();
 
     // A missing sidecar on a prefix-only scan must still enqueue the
     // Range-kind repair followup: fallback keeps results correct and the
@@ -8810,12 +8809,12 @@ fn test_planner_stats_view_rebuilds_only_with_read_sources() {
         1.0,
     );
     let after_write = engine.planner_stats_view_for_test();
-    assert!(std::sync::Arc::ptr_eq(&initial, &after_write));
+    assert!(crate::engine::shared::SharedArc::ptr_eq(&initial, &after_write));
     assert_eq!(after_write.generation, initial.generation);
 
     engine.flush().unwrap();
     let after_flush = engine.planner_stats_view_for_test();
-    assert!(!std::sync::Arc::ptr_eq(&after_write, &after_flush));
+    assert!(!crate::engine::shared::SharedArc::ptr_eq(&after_write, &after_flush));
     assert!(after_flush.generation > after_write.generation);
     assert_eq!(after_flush.segment_count, 1);
     assert_eq!(after_flush.available_segment_stats, 1);
@@ -8935,7 +8934,7 @@ fn test_write_adjacent_helper_reads_do_not_rebuild_planner_stats_view() {
         engine.published_read_source_build_count_for_test(),
         source_builds_before
     );
-    assert!(std::sync::Arc::ptr_eq(&stats_before, &stats_after));
+    assert!(crate::engine::shared::SharedArc::ptr_eq(&stats_before, &stats_after));
     assert_eq!(stats_after.generation, generation_before);
 
     engine.close().unwrap();
@@ -8946,7 +8945,7 @@ fn test_planner_stats_corruption_degrades_without_index_repair_followup() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let info = engine
             .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
@@ -8969,7 +8968,7 @@ fn test_planner_stats_corruption_degrades_without_index_repair_followup() {
         .join(crate::planner_stats::PLANNER_STATS_FILENAME);
     std::fs::write(&stats_path, b"corrupt planner stats").unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let stats_view = reopened.planner_stats_view_for_test();
     assert_eq!(stats_view.segment_count, 1);
     assert_eq!(stats_view.available_segment_stats, 0);
@@ -8998,7 +8997,7 @@ fn node_property_query_enqueues_planning_followup_for_corrupt_equality_sidecar()
     let segment_id;
     let keep;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         keep = insert_query_node(&engine, "Person",
             "node-plan-eq-active",
             &[("status", PropValue::String("active".to_string()))],
@@ -9024,7 +9023,7 @@ fn node_property_query_enqueues_planning_followup_for_corrupt_equality_sidecar()
         index_id,
     );
     corrupt_planner_stats_for_segment(&db_path, segment_id);
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     wait_for_property_index_state(&reopened, index_id, SecondaryIndexState::Ready);
     corrupt_sidecar_header_in_place(&sidecar_path);
 
@@ -9057,7 +9056,7 @@ fn node_property_query_enqueues_planning_followup_for_corrupt_range_sidecar() {
     let segment_id;
     let keep;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         keep = insert_query_node(&engine, "Person",
             "node-plan-range-keep",
             &[("score", PropValue::Int(7))],
@@ -9083,7 +9082,7 @@ fn node_property_query_enqueues_planning_followup_for_corrupt_range_sidecar() {
         index_id,
     );
     corrupt_planner_stats_for_segment(&db_path, segment_id);
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     wait_for_property_index_state(&reopened, index_id, SecondaryIndexState::Ready);
     corrupt_sidecar_header_in_place(&sidecar_path);
 
@@ -9115,7 +9114,7 @@ fn node_property_query_enqueues_planning_followup_for_corrupt_range_sidecar() {
 fn node_property_query_enqueues_planning_followup_for_missing_equality_sidecar() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let keep = insert_query_node(&engine, "Person",
         "node-plan-missing-active",
@@ -9183,7 +9182,7 @@ fn test_planner_stats_zero_is_advisory_not_empty_result() {
     let db_path = dir.path().join("testdb");
     let index_id;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let info = engine
             .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
@@ -9215,7 +9214,7 @@ fn test_planner_stats_zero_is_advisory_not_empty_result() {
     let ready_indexes = [ready_node_property_equality_entry(index_id, 1, "status")];
     publish_planner_stats_for_test(&seg_dir, stats, &ready_indexes);
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let red = PropValue::String("red".to_string());
     let red_hash = hash_prop_equality_key(&red);
     assert_eq!(
@@ -9249,7 +9248,7 @@ fn test_planner_stats_low_equality_estimate_uses_capped_materialization() {
     let db_path = dir.path().join("testdb");
     let index_id;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let info = engine
             .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
             .unwrap();
@@ -9285,7 +9284,7 @@ fn test_planner_stats_low_equality_estimate_uses_capped_materialization() {
     let ready_indexes = [ready_node_property_equality_entry(index_id, 1, "status")];
     publish_planner_stats_for_test(&seg_dir, stats, &ready_indexes);
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let query = query_ids(Some("Person"),
         vec![NodeFilterExpr::PropertyEquals {
             key: "status".to_string(),
@@ -9329,7 +9328,7 @@ fn test_planner_stats_back_label_and_full_scan_explain_estimates() {
         let label_estimate = published.view.node_label_estimate(1).unwrap();
         assert_eq!(label_estimate.kind, PlannerEstimateKind::StatsExact);
         assert_eq!(label_estimate.known_upper_bound(), Some(3));
-        let full_estimate = published.view.full_scan_estimate();
+        let full_estimate = published.view.full_scan_estimate().unwrap();
         assert_eq!(full_estimate.kind, PlannerEstimateKind::StatsExact);
         assert_eq!(full_estimate.known_upper_bound(), Some(5));
     }
@@ -9386,7 +9385,7 @@ fn test_multi_label_any_and_all_membership_estimates_are_conservative() {
     assert_eq!(any.estimate.kind, PlannerEstimateKind::UpperBound);
     assert_eq!(any.estimate.known_upper_bound(), Some(5));
     assert_eq!(any.driver_label_id, None);
-    assert_eq!(published.view.full_scan_estimate().known_upper_bound(), Some(4));
+    assert_eq!(published.view.full_scan_estimate().unwrap().known_upper_bound(), Some(4));
 
     let all = published
         .view
@@ -9435,7 +9434,7 @@ fn test_multi_label_filter_estimates_fall_back_when_stats_are_corrupt() {
     }
     corrupt_planner_stats_for_segment(&db_path, 2);
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     let person_id = reopened.get_node_label_id("Person").unwrap().unwrap();
     let company_id = reopened.get_node_label_id("Company").unwrap().unwrap();
     let labels = NodeLabelSet::from_canonical_ids(&[person_id, company_id]).unwrap();
@@ -9848,7 +9847,7 @@ fn test_node_query_multi_label_property_keys_and_stale_membership() {
 
 #[test]
 fn test_node_query_multi_label_all_uses_requested_label_property_index() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let both = insert_query_node_with_labels(
         &engine,
         &["Person", "Employee"],
@@ -9925,7 +9924,7 @@ fn test_node_query_multi_label_all_uses_requested_label_property_index() {
 
 #[test]
 fn test_node_query_multi_label_all_uses_requested_label_range_and_timestamp_indexes() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let both = insert_query_node_with_labels(
         &engine,
         &["Person", "Employee"],
@@ -10003,7 +10002,7 @@ fn test_node_query_multi_label_all_uses_requested_label_range_and_timestamp_inde
 
 #[test]
 fn test_node_query_multi_label_all_large_explicit_ids_can_use_property_index() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let mut all_ids = Vec::new();
     let mut expected = Vec::new();
     for index in 0..50 {
@@ -10115,7 +10114,7 @@ fn test_explain_stale_membership_note_follows_label_posting_source() {
 fn test_active_memtable_only_estimates_are_exact_cheap() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let status = engine
         .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
@@ -10146,7 +10145,7 @@ fn test_active_memtable_only_estimates_are_exact_cheap() {
     let label_estimate = published.view.node_label_estimate(1).unwrap();
     assert_eq!(label_estimate.kind, PlannerEstimateKind::ExactCheap);
     assert_eq!(label_estimate.known_upper_bound(), Some(2));
-    let full_estimate = published.view.full_scan_estimate();
+    let full_estimate = published.view.full_scan_estimate().unwrap();
     assert_eq!(full_estimate.kind, PlannerEstimateKind::ExactCheap);
     assert_eq!(full_estimate.known_upper_bound(), Some(2));
     let (equality_estimate, followup) = published
@@ -10212,7 +10211,7 @@ fn test_active_memtable_only_estimates_are_exact_cheap() {
 fn test_planner_stats_equality_heavy_hitter_and_residual_explain_estimates() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let info = engine
         .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
@@ -10286,7 +10285,7 @@ fn test_planner_stats_equality_heavy_hitter_and_residual_explain_estimates() {
 fn test_planner_stats_rare_residual_equality_beats_broad_label_source() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let info = engine
         .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
@@ -10343,7 +10342,7 @@ fn test_planner_stats_rare_residual_equality_beats_broad_label_source() {
 fn test_planner_stats_broad_heavy_hitter_equality_streams_equality_source() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let info = engine
         .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
@@ -10397,7 +10396,7 @@ fn test_planner_stats_broad_heavy_hitter_equality_streams_equality_source() {
 fn test_planner_stats_range_and_timestamp_explain_use_no_planning_probe() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let score = engine
         .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
@@ -10459,7 +10458,7 @@ fn test_planner_stats_range_and_timestamp_mixed_coverage_probe_uncovered_segment
     let db_path = dir.path().join("testdb");
     let all_ids;
     {
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let score = engine
             .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
             .unwrap();
@@ -10506,7 +10505,7 @@ fn test_planner_stats_range_and_timestamp_mixed_coverage_probe_uncovered_segment
         .join(crate::planner_stats::PLANNER_STATS_FILENAME);
     std::fs::write(&stats_path, b"corrupt planner stats").unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let stats_view = reopened.planner_stats_view_for_test();
     assert_eq!(stats_view.available_segment_stats, 1);
     assert_eq!(stats_view.unavailable_segment_stats, 1);
@@ -10570,7 +10569,7 @@ fn test_planner_stats_range_and_timestamp_mixed_coverage_probe_uncovered_segment
 fn test_planner_stats_adaptive_cap_allows_high_confidence_range_above_default() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let score = engine
         .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("score").to_string() }], kind: SecondaryIndexKind::Range })
@@ -10630,7 +10629,7 @@ fn test_planner_stats_adaptive_cap_allows_high_confidence_range_above_default() 
 fn test_direct_read_apis_are_unchanged_with_planner_stats_sidecars() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let status = engine
         .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
@@ -10730,7 +10729,7 @@ fn test_planner_stats_mixed_segment_fallback_estimates_once() {
         .join(crate::planner_stats::PLANNER_STATS_FILENAME);
     std::fs::write(&stats_path, b"corrupt planner stats").unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     let stats_view = reopened.planner_stats_view_for_test();
     assert_eq!(stats_view.segment_count, 2);
     assert_eq!(stats_view.available_segment_stats, 1);
@@ -11052,7 +11051,7 @@ fn test_query_filter_exists_missing_not_and_or_verifier_semantics() {
 fn test_query_filter_in_dedupes_by_canonical_value_and_uses_union() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut map_value = BTreeMap::new();
     map_value.insert("x".to_string(), PropValue::Int(1));
@@ -11273,7 +11272,7 @@ fn test_query_filter_equality_contradictions_match_verifier_semantics() {
 fn test_query_indexed_float_signed_zero_equality_matches_verifier_semantics() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let neg_zero = insert_query_node(&engine, "Person",
         "indexed-neg-zero",
@@ -11338,7 +11337,7 @@ fn test_query_indexed_float_signed_zero_equality_matches_verifier_semantics() {
 fn test_query_filter_or_and_in_extract_complete_index_candidates() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let active = insert_query_node(&engine, "Person",
         "active",
@@ -11461,7 +11460,7 @@ fn test_query_filter_or_and_in_extract_complete_index_candidates() {
 fn test_query_filter_or_in_union_final_verification_and_pagination() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let stale_active = insert_query_node(&engine, "Person",
         "stale-active",
@@ -11574,7 +11573,7 @@ fn test_query_filter_or_in_union_final_verification_and_pagination() {
 fn test_query_filter_and_of_or_intersects_range() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let active_high = insert_query_node(&engine, "Person",
         "active-high",
@@ -11664,7 +11663,7 @@ fn test_query_filter_and_of_or_intersects_range() {
 fn test_query_filter_fallback_budget_and_empty_plan_edges() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let active = insert_query_node(&engine, "Person",
         "active",
@@ -11796,7 +11795,7 @@ fn test_query_filter_fallback_budget_and_empty_plan_edges() {
 fn test_query_or_unknown_branch_falls_back_without_partial_union() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let indexed = insert_query_node(&engine, "Person",
         "indexed",
@@ -11851,7 +11850,7 @@ fn test_query_or_unknown_branch_falls_back_without_partial_union() {
 
 #[test]
 fn test_query_or_preserves_broad_warning_from_streamable_and_reject() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_node_property_index(
             "Person",
@@ -11930,7 +11929,7 @@ fn test_query_or_preserves_broad_warning_from_streamable_and_reject() {
 fn test_query_filter_verify_only_uses_expected_legal_universe() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let label1_inputs: Vec<NodeInput> = (0..QUERY_RANGE_CANDIDATE_CAP + 8)
         .map(|index| NodeInput {
@@ -12103,7 +12102,7 @@ fn test_query_filter_verify_only_uses_expected_legal_universe() {
 fn test_query_filter_range_and_timestamp_probe_budget_overflow_is_cumulative() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let inputs: Vec<NodeInput> = (0..QUERY_RANGE_CANDIDATE_CAP + 8)
         .map(|index| NodeInput {
@@ -12129,7 +12128,7 @@ fn test_query_filter_range_and_timestamp_probe_budget_overflow_is_cumulative() {
     );
     engine.close().unwrap();
     std::fs::remove_file(&stats_path).unwrap();
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     assert!(engine.segments_for_test()[0].planner_stats().is_none());
 
     // Every leaf must cover the whole label so each one individually exceeds
@@ -12266,7 +12265,7 @@ fn test_query_label_only_pagination_excludes_deleted_and_survives_reopen() {
     engine.flush().unwrap();
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     let query = query_ids(Some("Person"), Vec::new(), false);
     assert_eq!(reopened.query_node_ids(&query).unwrap().items, expected);
     reopened.close().unwrap();
@@ -12403,7 +12402,7 @@ fn test_query_small_explicit_ids_beat_large_label_universe() {
 fn test_query_explain_omits_label_scan_when_property_index_drives_execution() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let active = insert_query_node(&engine, "Person",
         "active",
@@ -12882,7 +12881,7 @@ fn node_query_selected_field_verification_uses_segments_after_reopen_and_compact
         engine.close().unwrap();
     }
 
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     let query = query_ids(
         Some("Person"),
         vec![NodeFilterExpr::PropertyEquals {
@@ -12949,7 +12948,7 @@ fn node_query_selected_field_verification_uses_segments_after_reopen_and_compact
 
 #[test]
 fn node_query_property_index_candidates_verify_key_from_selected_fields() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     insert_query_node(
         &engine,
         "Person",
@@ -13181,12 +13180,15 @@ fn build_streaming_scale_test_fixture(
 ) -> StreamingScaleTestFixture {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(
+    let engine = open_large_write_control_fixture_with_admission_timeout(
         &db_path,
         &DbOptions {
             compact_after_n_flushes: 0,
             ..Default::default()
         },
+        // Stale replacement is semantic dataset setup, not a latency proof.
+        // Keep the existing 10s profile for the other scale-fixture shapes.
+        if stale_heavy { FUNCTIONAL_MAINTENANCE_ADMISSION_TIMEOUT_MS } else { 10_000 },
     )
     .unwrap();
     seed_query_test_catalog(&engine);
@@ -13394,13 +13396,16 @@ fn edge_streaming_scale_input(
 fn build_edge_streaming_scale_test_fixture(stale_heavy: bool) -> EdgeStreamingScaleTestFixture {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(
+    let engine = open_large_write_control_fixture_with_admission_timeout(
         &db_path,
         &DbOptions {
             compact_after_n_flushes: 0,
             edge_uniqueness: true,
             ..Default::default()
         },
+        // Stale replacement is semantic dataset setup, not a latency proof.
+        // Keep the existing 10s profile for the other scale-fixture shapes.
+        if stale_heavy { FUNCTIONAL_MAINTENANCE_ADMISSION_TIMEOUT_MS } else { 10_000 },
     )
     .unwrap();
     seed_query_test_catalog(&engine);
@@ -14320,7 +14325,7 @@ fn streaming_scale_edge_stale_heavy_equality_reports_verifier_waste() {
 
 #[test]
 fn streamed_and_executes_broad_native_inputs_with_pagination_and_staleness() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_node_property_index(
             "Person",
@@ -14446,7 +14451,7 @@ fn streamed_and_executes_broad_native_inputs_with_pagination_and_staleness() {
 
 #[test]
 fn streamed_single_source_driver_explains_and_counts() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_node_property_index(
             "Person",
@@ -14503,7 +14508,7 @@ fn streamed_single_source_driver_explains_and_counts() {
 
 #[test]
 fn streamed_and_declines_far_broad_native_reject_for_small_range_anchor() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_node_property_index(
             "Person",
@@ -14579,7 +14584,7 @@ fn streamed_and_declines_far_broad_native_reject_for_small_range_anchor() {
 
 #[test]
 fn streamed_node_selectivity_demotion_does_not_claim_buffer_overflow() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_node_property_index(
             "Person",
@@ -14659,7 +14664,7 @@ fn streamed_node_selectivity_demotion_does_not_claim_buffer_overflow() {
 
 #[test]
 fn streamed_edge_selectivity_demotion_does_not_claim_buffer_overflow() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let label = "EDGE_BUFFERED_DEMOTION_WARNING";
     ensure_ready_edge_property_index(
         &engine,
@@ -14766,7 +14771,7 @@ fn streamed_edge_selectivity_demotion_does_not_claim_buffer_overflow() {
 
 #[test]
 fn streamed_node_and_edge_input_count_and_legal_universe_demotions_are_truthful() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_functional_index_protocol_fixture();
     // One more than query_plan.rs's locked STREAMED_INTERSECT_MAX_INPUTS (16).
     const INPUTS: usize = 17;
     const TOTAL: usize = 10_000;
@@ -14980,7 +14985,7 @@ fn streamed_node_and_edge_input_count_and_legal_universe_demotions_are_truthful(
 
 #[test]
 fn streamed_and_public_planner_uses_buffered_range_with_native_equality() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_node_property_index(
             "Person",
@@ -15067,7 +15072,7 @@ fn streamed_and_public_planner_uses_buffered_range_with_native_equality() {
 fn streamed_explain_snapshots_are_deterministic_across_repeated_runs_and_reopen() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     seed_query_test_catalog(&engine);
 
     let status_info = engine
@@ -15306,7 +15311,7 @@ fn streamed_explain_snapshots_are_deterministic_across_repeated_runs_and_reopen(
 
     engine.close().unwrap();
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     for index_id in [
         status_info.index_id,
         region_info.index_id,
@@ -15328,7 +15333,7 @@ fn streamed_explain_snapshots_are_deterministic_across_repeated_runs_and_reopen(
 
 #[test]
 fn streamed_and_d1_buffer_overflow_demotes_to_verifier() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_node_property_index(
             "Person",
@@ -15433,7 +15438,7 @@ fn streamed_and_d1_buffer_overflow_demotes_to_verifier() {
 
 #[test]
 fn streamed_and_d3_equality_sidecar_failure_demotes_leaf() {
-    let (dir, engine) = query_test_engine();
+    let (dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_node_property_index(
             "Person",
@@ -15549,7 +15554,8 @@ fn streamed_and_d3_equality_sidecar_failure_demotes_leaf() {
 
 #[test]
 fn streamed_or_and_in_plan_streamed_union_paginate_and_count() {
-    let (_dir, engine) = query_test_engine();
+    let _dir = TempDir::new().unwrap();
+    let engine = open_large_write_control_fixture(_dir.path(), &DbOptions::default()).unwrap();
     let status_info = engine
         .ensure_node_property_index(
             "Person",
@@ -15663,7 +15669,7 @@ fn streamed_or_and_in_plan_streamed_union_paginate_and_count() {
 
 #[test]
 fn streamed_union_composes_inside_and_and_dedups_branch_candidates() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_functional_index_protocol_fixture();
     let status_info = engine
         .ensure_node_property_index(
             "Person",
@@ -15834,7 +15840,7 @@ fn streamed_union_composes_inside_and_and_dedups_branch_candidates() {
 
 #[test]
 fn streamed_union_d2_buffer_overflow_falls_back_without_partial_results() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_node_property_index(
             "Person",
@@ -15942,7 +15948,7 @@ fn streamed_union_d2_buffer_overflow_falls_back_without_partial_results() {
 
 #[test]
 fn streamed_union_leaf_overflow_demotes_inside_and() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_node_property_index(
             "Person",
@@ -16077,7 +16083,7 @@ fn streamed_union_leaf_overflow_demotes_inside_and() {
 
 #[test]
 fn streamed_union_allows_flattened_or_of_ins_over_expansion_cap_when_cursors_fit() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_node_property_index(
             "Person",
@@ -16154,7 +16160,7 @@ fn streamed_union_allows_flattened_or_of_ins_over_expansion_cap_when_cursors_fit
 
 #[test]
 fn streamed_or_declines_when_any_branch_is_not_streamable() {
-    let (_dir, engine) = query_test_engine();
+    let (_dir, engine) = query_index_protocol_fixture();
     let status_info = engine
         .ensure_node_property_index(
             "Person",
@@ -16218,7 +16224,7 @@ fn streamed_or_declines_when_any_branch_is_not_streamable() {
 fn streamed_union_cursor_count_overflow_is_not_streamable() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let engine = DatabaseEngine::open(
+    let engine = open_index_protocol_fixture(
         &db_path,
         &DbOptions {
             compact_after_n_flushes: 0,
@@ -16483,7 +16489,7 @@ fn test_query_key_lookup_anchor_normalization_and_source_choice() {
 fn test_query_intersects_ready_equality_indexes_against_oracle() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let a = insert_query_node(&engine, "Person",
         "a",
@@ -16562,7 +16568,7 @@ fn test_query_intersects_ready_equality_indexes_against_oracle() {
 fn test_query_intersects_equality_and_range_indexes_against_oracle() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let a = insert_query_node(&engine, "Person",
         "a",
@@ -16642,7 +16648,7 @@ fn test_query_intersects_equality_and_range_indexes_against_oracle() {
 fn test_query_intersects_equality_equality_and_range_indexes() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let a = insert_query_node(&engine, "Person",
         "a",
@@ -16735,7 +16741,7 @@ fn test_query_intersects_equality_equality_and_range_indexes() {
 fn test_query_intersects_timestamp_and_property_sources() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let a = insert_query_node(&engine, "Person",
         "a",
@@ -16909,7 +16915,7 @@ fn test_query_ready_index_sources_match_oracle_across_storage_states() {
 
     {
         let db_path = dir.path().join("memtable-only");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let mut all_ids = insert_lifecycle_segment_nodes(&engine);
         all_ids.extend(insert_lifecycle_active_nodes(&engine));
         ensure_lifecycle_indexes(&engine);
@@ -16919,7 +16925,7 @@ fn test_query_ready_index_sources_match_oracle_across_storage_states() {
 
     {
         let db_path = dir.path().join("mixed");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let mut all_ids = insert_lifecycle_segment_nodes(&engine);
         engine.flush().unwrap();
         all_ids.extend(insert_lifecycle_active_nodes(&engine));
@@ -16930,7 +16936,7 @@ fn test_query_ready_index_sources_match_oracle_across_storage_states() {
 
     {
         let db_path = dir.path().join("compacted-reopened");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         let mut all_ids = insert_lifecycle_segment_nodes(&engine);
         engine.flush().unwrap();
         all_ids.extend(insert_lifecycle_active_nodes(&engine));
@@ -16941,7 +16947,7 @@ fn test_query_ready_index_sources_match_oracle_across_storage_states() {
         assert_tiny_lifecycle_query_matches_oracle(&engine, &all_ids, &query);
         engine.close().unwrap();
 
-        let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         assert_tiny_lifecycle_query_matches_oracle(&reopened, &all_ids, &query);
         reopened.close().unwrap();
     }
@@ -17037,7 +17043,7 @@ fn test_query_selective_ready_indexes_match_oracle_across_storage_states() {
 
     {
         let db_path = dir.path().join("memtable-only-selective");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         ensure_selective_indexes(&engine);
         let all_ids = insert_selective_nodes(&engine, 0, 512);
         assert_selective_indexes_match_oracle(&engine, &all_ids, &query);
@@ -17046,7 +17052,7 @@ fn test_query_selective_ready_indexes_match_oracle_across_storage_states() {
 
     {
         let db_path = dir.path().join("mixed-selective");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         ensure_selective_indexes(&engine);
         let mut all_ids = insert_selective_nodes(&engine, 0, 256);
         engine.flush().unwrap();
@@ -17057,7 +17063,7 @@ fn test_query_selective_ready_indexes_match_oracle_across_storage_states() {
 
     {
         let db_path = dir.path().join("compacted-reopened-selective");
-        let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         ensure_selective_indexes(&engine);
         let mut all_ids = insert_selective_nodes(&engine, 0, 256);
         engine.flush().unwrap();
@@ -17068,7 +17074,7 @@ fn test_query_selective_ready_indexes_match_oracle_across_storage_states() {
         assert_selective_indexes_match_oracle(&engine, &all_ids, &query);
         engine.close().unwrap();
 
-        let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+        let reopened = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
         assert_selective_indexes_match_oracle(&reopened, &all_ids, &query);
         reopened.close().unwrap();
     }
@@ -17078,7 +17084,7 @@ fn test_query_selective_ready_indexes_match_oracle_across_storage_states() {
 fn test_query_bounded_range_uses_index_and_broad_sources_fallback() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut inputs = Vec::with_capacity(QUERY_RANGE_CANDIDATE_CAP + 1);
     for i in 0..=QUERY_RANGE_CANDIDATE_CAP {
@@ -17241,7 +17247,7 @@ fn test_query_bounded_range_uses_index_and_broad_sources_fallback() {
 fn test_query_missing_building_and_failed_indexes_fallback() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let a = insert_query_node(&engine, "Person",
         "a",
@@ -17332,7 +17338,7 @@ fn test_query_missing_building_and_failed_indexes_fallback() {
 fn test_query_ready_sidecar_removed_after_open_remains_usable_until_reopen() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let active = insert_query_node(&engine, "Person",
         "active",
@@ -17421,7 +17427,7 @@ fn test_query_ready_sidecar_removed_after_open_remains_usable_until_reopen() {
 fn test_query_explicit_anchor_does_not_scan_ready_property_index() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let active = insert_query_node(&engine, "Person",
         "active",
@@ -17647,7 +17653,7 @@ fn test_query_scan_parity_after_flush_reopen_overwrite_delete_and_prune() {
         engine.close().unwrap();
     }
 
-    let reopened = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let reopened = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
     let query = query_ids(Some("Person"),
         vec![NodeFilterExpr::PropertyEquals {
             key: "status".to_string(),
@@ -17714,7 +17720,7 @@ fn test_query_scan_parity_after_flush_reopen_overwrite_delete_and_prune() {
 fn test_query_broad_index_declines_streaming_for_small_source_choice() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut inputs = Vec::with_capacity(QUERY_RANGE_CANDIDATE_CAP + 1);
     for index in 0..=QUERY_RANGE_CANDIDATE_CAP {
@@ -17820,7 +17826,7 @@ fn test_query_broad_index_declines_streaming_for_small_source_choice() {
 fn test_query_large_explicit_ids_become_membership_check_for_cheaper_index() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut inputs = Vec::with_capacity(5_000);
     for index in 0..5_000 {
@@ -17880,7 +17886,7 @@ fn test_query_large_explicit_ids_become_membership_check_for_cheaper_index() {
 fn test_query_large_keys_become_membership_check_for_cheaper_index() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut inputs = Vec::with_capacity(50);
     for index in 0..50 {
@@ -17981,7 +17987,7 @@ fn test_query_full_scan_pagination_proves_extra_match_and_skips_tombstone() {
 fn test_query_node_page_planned_preserves_planning_followups_for_core_outcomes() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let keep = insert_query_node(&engine, "Person",
         "planned-followup-keep",
@@ -18256,7 +18262,7 @@ fn graph_row_borrowed_plan_chains_pages_without_consuming_or_replanning() {
 fn test_query_unknown_selected_index_source_falls_back_when_execution_cap_exceeded() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut inputs = Vec::with_capacity(QUERY_RANGE_CANDIDATE_CAP + 1);
     for index in 0..=QUERY_RANGE_CANDIDATE_CAP {
@@ -18387,7 +18393,7 @@ fn test_query_unknown_selected_index_source_falls_back_when_execution_cap_exceed
 fn test_query_limited_equality_read_skips_shadowed_ids_before_cap() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut inputs = Vec::with_capacity(3);
     for index in 0..3 {
@@ -18449,7 +18455,7 @@ fn test_query_limited_equality_read_skips_shadowed_ids_before_cap() {
 fn test_query_limited_equality_read_skips_newer_segment_shadowed_ids_before_cap() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
 
     let mut inputs = Vec::with_capacity(3);
     for index in 0..3 {
@@ -18512,7 +18518,7 @@ fn test_query_limited_equality_read_skips_newer_segment_shadowed_ids_before_cap(
 fn test_query_limited_equality_read_enforces_raw_posting_cap_for_stale_segments() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let info = engine
         .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
@@ -18585,7 +18591,7 @@ fn test_query_limited_equality_read_enforces_raw_posting_cap_for_stale_segments(
 fn test_query_stats_backed_equality_materialization_uses_raw_ids_only() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("testdb");
-    let engine = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
     let info = engine
         .ensure_node_property_index("Person", SecondaryIndexSpec { fields: vec![SecondaryIndexField::Property { key: ("status").to_string() }], kind: SecondaryIndexKind::Equality })
         .unwrap();
@@ -18698,4 +18704,24 @@ fn test_query_unknown_estimates_use_stable_rank_then_key() {
     }
 
     engine.close().unwrap();
+}
+
+// Explicit mutable index protocol setup; public candidate setup stays above.
+fn query_index_protocol_fixture() -> (TempDir, DatabaseEngine) {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let engine = open_index_protocol_fixture(&db_path, &DbOptions::default()).unwrap();
+    seed_query_test_catalog(&engine);
+    (dir, engine)
+}
+
+// These semantic planner/adjacency fixtures check routing/counters. Use
+// the existing functional resource allowance; dedicated refusal tests retain
+// their own short deadlines and no production default is changed.
+fn query_functional_index_protocol_fixture() -> (TempDir, DatabaseEngine) {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let engine = reopen_functional_maintenance_fixture(&db_path, &DbOptions::default()).unwrap();
+    seed_query_test_catalog(&engine);
+    (dir, engine)
 }

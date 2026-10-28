@@ -1,3 +1,4 @@
+import { drainAfterClose } from './helpers/native-lifecycle.mjs';
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -24,24 +25,27 @@ describe('close({ force: true })', () => {
     const db = OverGraph.open(join(tmpDir, 'normal'));
     db.upsertNode('Person', 'n1');
     db.close();
+    drainAfterClose(db);
   });
 
   it('should close with force: false (same as default)', () => {
     const db = OverGraph.open(join(tmpDir, 'force-false'));
     db.upsertNode('Person', 'n1');
     db.close({ force: false });
+    drainAfterClose(db);
   });
 
   it('should close with force: true', () => {
     const db = OverGraph.open(join(tmpDir, 'force-true'));
     db.upsertNode('Person', 'n1');
     db.close({ force: true });
-
+    drainAfterClose(db);
     // Reopen to verify data is intact
     const db2 = OverGraph.open(join(tmpDir, 'force-true'));
     const node = db2.getNodeByKey('Person', 'n1');
     assert.ok(node, 'node should survive close_fast');
     db2.close();
+    drainAfterClose(db2);
   });
 
   it('should close_fast after flush', () => {
@@ -51,28 +55,31 @@ describe('close({ force: true })', () => {
     }
     db.flush();
     db.close({ force: true });
-
+    drainAfterClose(db);
     const db2 = OverGraph.open(join(tmpDir, 'force-flushed'));
     const node = db2.getNodeByKey('Person', 'n5');
     assert.ok(node, 'flushed nodes should survive close_fast');
     db2.close();
+    drainAfterClose(db2);
   });
 
   it('should work with closeAsync({ force: true })', async () => {
     const db = OverGraph.open(join(tmpDir, 'async-force'));
     db.upsertNode('Person', 'async_node');
     await db.closeAsync({ force: true });
-
+    drainAfterClose(db);
     const db2 = OverGraph.open(join(tmpDir, 'async-force'));
     const node = db2.getNodeByKey('Person', 'async_node');
     assert.ok(node, 'node should survive async close_fast');
     db2.close();
+    drainAfterClose(db2);
   });
 
   it('should work with closeAsync() no options', async () => {
     const db = OverGraph.open(join(tmpDir, 'async-normal'));
     db.upsertNode('Person', 'n1');
     await db.closeAsync();
+    drainAfterClose(db);
   });
 });
 
@@ -108,6 +115,8 @@ describe('stats()', () => {
     assert.equal(s.edgeTombstoneCount, 0);
 
     db.close();
+
+    drainAfterClose(db);
   });
 
   it('should report sync mode', () => {
@@ -115,10 +124,11 @@ describe('stats()', () => {
     const db1 = OverGraph.open(join(tmpDir, 'mode-gc'));
     assert.equal(db1.stats().walSyncMode, 'group-commit');
     db1.close();
-
+    drainAfterClose(db1);
     const db2 = OverGraph.open(join(tmpDir, 'mode-imm'), { walSyncMode: 'immediate' });
     assert.equal(db2.stats().walSyncMode, 'immediate');
     db2.close();
+    drainAfterClose(db2);
   });
 
   it('should count segments after flush', () => {
@@ -135,6 +145,8 @@ describe('stats()', () => {
     assert.equal(db.stats().segmentCount, 2);
 
     db.close();
+
+    drainAfterClose(db);
   });
 
   it('should count tombstones after deletes', () => {
@@ -152,6 +164,8 @@ describe('stats()', () => {
     assert.equal(db.stats().edgeTombstoneCount, 1); // cascade
 
     db.close();
+
+    drainAfterClose(db);
   });
 
   it('should report lastCompactionMs after compact', () => {
@@ -179,6 +193,8 @@ describe('stats()', () => {
     assert.equal(db.stats().segmentCount, 1);
 
     db.close();
+
+    drainAfterClose(db);
   });
 
   it('should work with statsAsync()', async () => {
@@ -190,5 +206,7 @@ describe('stats()', () => {
     assert.equal(typeof s.walSyncMode, 'string');
 
     db.close();
+
+    drainAfterClose(db);
   });
 });
