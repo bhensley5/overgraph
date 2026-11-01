@@ -2662,13 +2662,21 @@ impl SegmentReader {
         let node_meta = &self.node_meta_mmap[..];
         let vector_meta = &self.node_vector_meta_mmap[..];
         let Some(node_meta_layout) = parse_node_meta_layout(node_meta)? else {
-            remaining_out.extend_from_slice(ids);
+            remaining_out.extend(
+                ids.iter()
+                    .copied()
+                    .filter(|id| !self.deleted_nodes.contains_key(id)),
+            );
             return Ok(());
         };
         let data = node_meta;
         let count = node_meta_layout.node_count;
         if count == 0 {
-            remaining_out.extend_from_slice(ids);
+            remaining_out.extend(
+                ids.iter()
+                    .copied()
+                    .filter(|id| !self.deleted_nodes.contains_key(id)),
+            );
             return Ok(());
         }
 
