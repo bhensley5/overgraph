@@ -14851,6 +14851,66 @@ fn test_vector_search_dense_label_filter_and_deleted_node_exclusion() {
 }
 
 #[test]
+fn test_vector_search_dense_excludes_deleted_node_after_tombstone_only_flush() {
+    let dir = TempDir::new().unwrap();
+    let opts = DbOptions {
+        dense_vector: Some(DenseVectorConfig {
+            dimension: 2,
+            metric: DenseMetric::Cosine,
+            hnsw: HnswConfig::default(),
+        }),
+        ..DbOptions::default()
+    };
+    let engine = DatabaseEngine::open(dir.path(), &opts).unwrap();
+
+    let deleted = engine
+        .upsert_node(
+            "Person",
+            "deleted",
+            UpsertNodeOptions {
+                dense_vector: Some(vec![1.0, 0.0]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let kept = engine
+        .upsert_node(
+            "Person",
+            "kept",
+            UpsertNodeOptions {
+                dense_vector: Some(vec![0.0, 1.0]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    engine.flush().unwrap();
+
+    // The second flush produces a segment holding only the tombstone.
+    engine.delete_node(deleted).unwrap();
+    engine.flush().unwrap();
+
+    let request = dense_search_request(vec![1.0, 0.0], 10, None, None);
+    let ids: Vec<u64> = engine
+        .vector_search(&request)
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.node_id)
+        .collect();
+    assert_eq!(ids, vec![kept]);
+
+    engine.close().unwrap();
+    let reopened = open_after_native_shutdown(dir.path(), &opts).unwrap();
+    let ids: Vec<u64> = reopened
+        .vector_search(&request)
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.node_id)
+        .collect();
+    assert_eq!(ids, vec![kept]);
+    reopened.close().unwrap();
+}
+
+#[test]
 fn test_vector_search_dense_label_filter_supports_single_any_all_multi_label() {
     let dir = TempDir::new().unwrap();
     let opts = DbOptions {

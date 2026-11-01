@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Fixed
+
+- Dense vector search no longer returns a deleted node after the deletion is flushed
+  into a segment that holds no node records. Point lookups were already correct.
+
 ## [0.18.0] - 2026-10-26
 
 ### Changed
