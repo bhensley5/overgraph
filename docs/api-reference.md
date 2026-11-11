@@ -305,6 +305,18 @@ db = OverGraph.open(
 
 Shuts down the database cleanly.
 
+An immediate open of the same directory needs no caller-provided delay or retry loop.
+With the default concurrent engine, open waits for the preceding session's remaining
+native cleanup within `ConcurrencyOptions.admission_timeout_ms` (Rust),
+`concurrency.admissionTimeoutMs` (Node.js), or `concurrency_options['admission_timeout_ms']`
+(Python), default 1,000 ms. Keep the same concurrency options when reopening. A live
+session or configuration conflict is still refused immediately. Cleanup timeout is a
+retryable resource-limit error with resource `directory_admission`.
+
+Close completion does not require every retained snapshot or transaction to be released;
+reopen can reuse their live reclamation domain. Reclamation `drained` statistics are
+not a substitute for acquiring directory admission.
+
 **Rust**
 ```rust
 db.close()?;

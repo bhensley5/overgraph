@@ -232,6 +232,15 @@ GQL is available across Rust, Node.js, and Python. It supports params, read curs
 
 Both Python and Node.js connectors include full async variants of every API. Python provides `AsyncOverGraph`, an asyncio wrapper that runs sync operations in a thread pool via `asyncio.to_thread()`. Node.js methods have `Async` suffixed variants (e.g. `upsertNodeAsync`, `vectorSearchAsync`).
 
+### Closing and reopening
+
+After closing a database, you can immediately open the same directory again. In the
+default concurrent engine, open waits for any remaining native cleanup within the
+configured admission deadline (1,000 ms by default). Keep the same concurrency options
+when reopening. A cleanup timeout is a retryable resource-limit error for
+`directory_admission`; a live session or conflicting configuration is still refused.
+See the [close API reference](docs/api-reference.md#close) for options in each language.
+
 ## Features
 
 ### Vector search

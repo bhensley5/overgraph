@@ -6,7 +6,7 @@ use crate::error::EngineError;
 use crate::types::ConcurrencyOptions;
 use std::collections::LinkedList;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
@@ -142,6 +142,8 @@ struct Detached {
 
 struct Core {
     inventory: Mutex<Inventory>,
+    admission_epoch: AtomicU64,
+    admission_changed: Condvar,
     epoch: AtomicU64,
     worker: OnceLock<Thread>,
 }
@@ -155,6 +157,8 @@ impl Core {
                 role: Role::Coordinator,
                 detached: None,
             }),
+            admission_epoch: AtomicU64::new(1),
+            admission_changed: Condvar::new(),
             epoch: AtomicU64::new(1),
             worker: OnceLock::new(),
         };
@@ -164,6 +168,15 @@ impl Core {
                 .unwrap_or_else(|_| invariant("private inventory poisoned")),
         );
         core
+    }
+    // Call only while holding inventory. The epoch is read before attach, then
+    // checked under that same mutex when waiting, so no readiness wake is lost.
+    // Only lifecycle transitions notify this condition, never reads or writes.
+    fn notify_admission(&self) {
+        self.admission_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .unwrap_or_else(|_| invariant("admission epoch exhausted"));
+        self.admission_changed.notify_all();
     }
     fn notify(&self) {
         self.epoch
@@ -316,6 +329,51 @@ pub(super) fn creation_guard() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|_| invariant("directory creation gate poisoned"));
     CREATION_READY.store(true, Ordering::Release);
     guard
+}
+
+/// Root-free observation taken before an admission attempt. Waiting never owns
+/// the creation gate, a directory session, or a reclaimable storage graph.
+pub(super) struct AdmissionProgress {
+    core: &'static Core,
+    epoch: u64,
+}
+
+pub(super) fn admission_progress() -> Result<AdmissionProgress, StartError> {
+    let core = &SERVICE.get()?.core;
+    Ok(AdmissionProgress {
+        epoch: core.admission_epoch.load(Ordering::Acquire),
+        core,
+    })
+}
+
+impl AdmissionProgress {
+    pub(super) fn wait(
+        self,
+        deadline: super::concurrency_lifecycle::Deadline,
+    ) -> Result<(), EngineError> {
+        let mut inventory = self
+            .core
+            .inventory
+            .lock()
+            .unwrap_or_else(|_| invariant("inventory poisoned"));
+        loop {
+            let remaining = deadline.remaining().ok_or(EngineError::ResourceLimit {
+                resource: "directory_admission",
+                requested: 1,
+                limit: 0,
+                retryable: true,
+            })?;
+            if self.core.admission_epoch.load(Ordering::Acquire) != self.epoch {
+                return Ok(());
+            }
+            inventory = self
+                .core
+                .admission_changed
+                .wait_timeout(inventory, remaining)
+                .unwrap_or_else(|_| invariant("inventory poisoned"))
+                .0;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -536,6 +594,7 @@ impl DirectorySession {
         attachment.active = None;
         attachment.shutting_down = false;
         entry.removing.store(true);
+        self.registration.service.core.notify_admission();
         drop(inventory);
         drop(domain);
         self.registration.service.core.notify();
@@ -1038,6 +1097,7 @@ fn scan(core: &Core) -> Option<Work> {
         let record = &mut domain.records[role as usize];
         if record.phase == Phase::Joining && record.tail.read() {
             record.phase = Phase::Vacant;
+            core.notify_admission();
         }
         if record.phase == Phase::Running
             && record
@@ -1136,6 +1196,7 @@ fn finish_join(core: &Core, joining: Joining) {
     }
     if record.tail.read() {
         record.phase = Phase::Vacant;
+        core.notify_admission();
     }
     inventory.advance();
 }
@@ -1172,6 +1233,7 @@ fn finish_domain_disposal(core: &Core, mut domain: Domain) {
         invariant("detached identity changed");
     }
     inventory.detached = None;
+    core.notify_admission();
     drop(inventory);
     core.notify();
 }
@@ -1676,5 +1738,164 @@ mod review_completion_safety {
         // Closed session and numeric stats have intentionally survived native completion.
         drop(session);
         drop(stats);
+    }
+
+    #[cfg(feature = "production-concurrency")]
+    #[test]
+    fn directory_admission_waits_for_native_tls_without_blocking_other_directories() {
+        let _serial = REVIEW_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        crate::engine::post45_read_tests::ready_participants_for_fixture();
+        for retained_payload in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let options = ConcurrencyOptions::default();
+            let (configured, mut session) = directory(dir.path(), &options);
+            let stats = configured.domain.stats();
+            let payload = if retained_payload {
+                let owner = configured
+                    .domain
+                    .build::<SessionPayload>(ResourceClass::Generation)
+                    .unwrap()
+                    .into_owner()
+                    .unwrap();
+                Some(owner.read())
+            } else {
+                None
+            };
+            let (entered, entry) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let go = ReleaseOnDrop(release);
+            configured
+                .registration
+                .spawn(Role::Coordinator, "reopen-held-tls", move |_| {
+                    HELD_TLS.with(|tls| {
+                        *tls.borrow_mut() = Some(HeldTls {
+                            entered,
+                            release: released,
+                        })
+                    });
+                })
+                .unwrap();
+            entry.recv_timeout(Duration::from_secs(10)).unwrap();
+            wait_until(|| phase(&configured.registration, Role::Coordinator) == Phase::Joining);
+            session.close();
+            drop(configured);
+            let path = dir.path().to_owned();
+            let (send, receive) = mpsc::channel();
+            let opener = thread::spawn(move || {
+                send.send(crate::DatabaseEngine::open(
+                    &path,
+                    &crate::DbOptions::default(),
+                ))
+                .unwrap();
+            });
+            assert!(receive.recv_timeout(Duration::from_millis(25)).is_err());
+            // If the Busy wait retained the creation gate this open could not complete.
+            let other = tempfile::tempdir().unwrap();
+            let other_path = other.path().to_owned();
+            let (other_send, other_receive) = mpsc::channel();
+            let unrelated = thread::spawn(move || {
+                other_send
+                    .send(crate::DatabaseEngine::open(
+                        &other_path,
+                        &crate::DbOptions::default(),
+                    ))
+                    .unwrap();
+            });
+            let unrelated_db = other_receive
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap()
+                .unwrap();
+            unrelated_db.close().unwrap();
+            unrelated.join().unwrap();
+            drop(go);
+            let reopened = receive
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            opener.join().unwrap();
+            if retained_payload {
+                assert!(
+                    !stats.read().exited,
+                    "reopen must reuse the still-live domain"
+                );
+                assert!(payload.as_ref().unwrap().get().0.is_empty());
+            }
+            drop(payload);
+            reopened.close().unwrap();
+        }
+    }
+
+    #[cfg(feature = "production-concurrency")]
+    #[test]
+    fn directory_admission_timeout_is_structured_and_does_not_mutate_files() {
+        let _serial = REVIEW_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        crate::engine::post45_read_tests::ready_participants_for_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let options = ConcurrencyOptions::default().with_admission_timeout_ms(30);
+        let (configured, mut session) = directory(dir.path(), &options);
+        let (entered, entry) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let go = ReleaseOnDrop(release);
+        configured
+            .registration
+            .spawn(Role::Coordinator, "reopen-timeout", move |_| {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            })
+            .unwrap();
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        session.close();
+        // Immutable configuration conflicts are not silently retried as Busy.
+        let conflict = crate::DatabaseEngine::open(dir.path(), &crate::DbOptions::default());
+        assert!(
+            matches!(conflict, Err(EngineError::InvalidOperation(message))
+            if message == "candidate directory admission: ConfigurationConflict")
+        );
+        let error = crate::DatabaseEngine::open_with_concurrency_options(
+            dir.path(),
+            &crate::DbOptions::default(),
+            &options,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(
+            error,
+            EngineError::ResourceLimit {
+                resource: "directory_admission",
+                requested: 1,
+                limit: 0,
+                retryable: true,
+            }
+        ));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        drop(go);
+        drop(configured);
+    }
+
+    #[test]
+    fn directory_admission_observes_prior_notification_and_keeps_original_deadline() {
+        let progress = admission_progress().unwrap();
+        {
+            let _inventory = progress.core.inventory.lock().unwrap();
+            progress.core.notify_admission();
+        }
+        progress
+            .wait(super::super::concurrency_lifecycle::Deadline::new(1_000).unwrap())
+            .unwrap();
+        let deadline = super::super::concurrency_lifecycle::Deadline::new(1).unwrap();
+        thread::sleep(Duration::from_millis(2));
+        let progress = admission_progress().unwrap();
+        {
+            let _inventory = progress.core.inventory.lock().unwrap();
+            progress.core.notify_admission();
+        }
+        assert!(matches!(
+            progress.wait(deadline),
+            Err(EngineError::ResourceLimit {
+                resource: "directory_admission",
+                retryable: true,
+                ..
+            })
+        ));
     }
 }
