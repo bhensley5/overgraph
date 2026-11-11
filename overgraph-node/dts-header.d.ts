@@ -68,12 +68,13 @@ export type DatabaseScrubSeverity = 'info' | 'warning' | 'error'
 export type ManifestScrubSource = 'Current' | 'Tmp' | 'Prev'
 export type WalScrubRole = 'Active' | 'FrozenPendingFlush' | 'PublishedPendingRetire'
 
-/** Candidate logical limits. Explicit configuration requires a candidate artifact. */
+/** Logical concurrency limits, supported by ordinary production builds. */
 export interface ConcurrencyOptions {
   maxBatchOperations?: number
   maxBatchBytes?: number
   generationOperationLimit?: number
   generationWalBytes?: number
+  /** Deadline for write admission and transient directory cleanup during open. Default: 1000 ms. */
   admissionTimeoutMs?: number
 }
 export type DiagnosticAmount = number | bigint

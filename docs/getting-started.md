@@ -421,6 +421,12 @@ db.close();
 db.close()?;
 ```
 
+You can open the same directory immediately after close without adding a fixed delay.
+The default concurrent engine waits for transient native cleanup within the configured
+admission timeout (1,000 ms by default). Use the same concurrency options on reopen.
+If cleanup exceeds the deadline, open returns a retryable `directory_admission`
+resource-limit error. See [close](api-reference.md#close) for each language's options.
+
 ## Async
 
 **Python** - use `AsyncOverGraph`:

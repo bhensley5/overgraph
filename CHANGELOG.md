@@ -6,7 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-11-11
+
 ### Fixed
+
+- Immediate reopen after close now waits for transient native directory cleanup within
+  the configured admission deadline. Cleanup timeout returns a structured retryable
+  resource-limit error instead of an untyped directory Busy error.
 
 - Dense vector search no longer returns a deleted node after the deletion is flushed
   into a segment that holds no node records. Point lookups were already correct.
@@ -587,6 +593,8 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
+[Unreleased]: https://github.com/bhensley5/overgraph/compare/v0.18.1...HEAD
+[0.18.1]: https://github.com/bhensley5/overgraph/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/bhensley5/overgraph/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/bhensley5/overgraph/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/bhensley5/overgraph/compare/v0.16.0...v0.17.0

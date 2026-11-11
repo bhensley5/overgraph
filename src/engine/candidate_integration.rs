@@ -52,62 +52,76 @@ impl DatabaseEngine {
                 ));
             }
         }
-        let creation = completion::creation_guard();
-        let (domain, registration, admission) = if path.exists() {
-            let pin = directory_identity::DirectoryPin::open(path)?;
-            if let Some(session) =
-                completion::DirectorySession::attach(pin, limits).map_err(candidate_start_error)?
-            {
-                let domain = session.domain().clone();
-                let registration = session.registration_handle();
-                (
-                    domain,
-                    registration,
-                    preflight::DirectoryAdmission::Existing(session),
-                )
+        let deadline = concurrency_lifecycle::Deadline::new(limits.admission_timeout_ms)
+            .map_err(EngineError::from)?;
+        loop {
+            let creation = completion::creation_guard();
+            let (domain, registration, admission) = if path.exists() {
+                let pin = directory_identity::DirectoryPin::open(path)?;
+                let progress = completion::admission_progress().map_err(candidate_start_error)?;
+                let attached = match completion::DirectorySession::attach(pin, limits) {
+                    Err(completion::StartError::Busy) => {
+                        // Native close completion can trail logical close. Let the
+                        // completion service settle it without blocking unrelated
+                        // directory creation or retaining any session authority.
+                        drop(creation);
+                        progress.wait(deadline)?;
+                        continue;
+                    }
+                    result => result.map_err(candidate_start_error)?,
+                };
+                if let Some(session) = attached {
+                    let domain = session.domain().clone();
+                    let registration = session.registration_handle();
+                    (
+                        domain,
+                        registration,
+                        preflight::DirectoryAdmission::Existing(session),
+                    )
+                } else {
+                    let configured = reclamation::ReclaimDomain::configured(
+                        limits,
+                        Some(directory_identity::DirectoryPin::open(path)?),
+                    )?;
+                    let session = configured
+                        .registration
+                        .bind_directory(configured.domain.clone(), limits)
+                        .map_err(candidate_start_error)?;
+                    (
+                        configured.domain,
+                        configured.registration,
+                        preflight::DirectoryAdmission::Existing(session),
+                    )
+                }
             } else {
-                let configured = reclamation::ReclaimDomain::configured(
+                fn existing_parent(path: &Path) -> &Path {
+                    path.parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or(Path::new("."))
+                }
+                let mut parent = existing_parent(path);
+                while !parent.exists() {
+                    parent = existing_parent(parent);
+                }
+                let configured = reclamation::ReclaimDomain::configured(limits, None)?;
+                let admission = preflight::DirectoryAdmission::Missing {
+                    parent: directory_identity::open_directory(parent)?,
+                    gate: creation,
+                };
+                return Self::finish_candidate_open(
+                    path,
+                    options,
                     limits,
-                    Some(directory_identity::DirectoryPin::open(path)?),
-                )?;
-                let session = configured
-                    .registration
-                    .bind_directory(configured.domain.clone(), limits)
-                    .map_err(candidate_start_error)?;
-                (
                     configured.domain,
                     configured.registration,
-                    preflight::DirectoryAdmission::Existing(session),
-                )
-            }
-        } else {
-            fn existing_parent(path: &Path) -> &Path {
-                path.parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or(Path::new("."))
-            }
-            let mut parent = existing_parent(path);
-            while !parent.exists() {
-                parent = existing_parent(parent);
-            }
-            let configured = reclamation::ReclaimDomain::configured(limits, None)?;
-            let admission = preflight::DirectoryAdmission::Missing {
-                parent: directory_identity::open_directory(parent)?,
-                gate: creation,
+                    admission,
+                );
             };
-            return Self::finish_candidate_open(
-                path,
-                options,
-                limits,
-                configured.domain,
-                configured.registration,
-                admission,
-            );
-        };
-        // Existing directories are already pinned by their session. Serializing
-        // attach/construction does not authorize a pathname alias to bypass it.
-        drop(creation);
-        Self::finish_candidate_open(path, options, limits, domain, registration, admission)
+            // Existing directories are already pinned by their session. Serializing
+            // attach/construction does not authorize a pathname alias to bypass it.
+            drop(creation);
+            return Self::finish_candidate_open(path, options, limits, domain, registration, admission);
+        }
     }
 
     fn finish_candidate_open(

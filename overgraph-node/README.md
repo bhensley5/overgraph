@@ -296,3 +296,14 @@ also carry `resource`, `requested`, `limit`, and `retryable`. An accepted commit
 must not be blindly retried as if no write happened. Candidate `closeAsync()` requests
 native close immediately and shares one pending Promise; native completion does not
 wait for libuv capacity or Promise delivery. The first accepted close mode wins.
+
+
+After `close()` or awaited `closeAsync()`, you can immediately call `OverGraph.open()`
+on the same directory without adding a sleep or retry loop. Open waits for any remaining
+native cleanup within `concurrency.admissionTimeoutMs` (default 1,000 ms). Use the same
+concurrency options when reopening; a still-active session or conflicting configuration
+is refused immediately. A cleanup timeout has `code: 'resource_limit'`,
+`resource: 'directory_admission'`, and `retryable: true`.
+
+Close does not wait for all retained snapshots or transactions to be released.
+`reclamationStats().closeState` is a reclamation diagnostic, not an admission barrier.

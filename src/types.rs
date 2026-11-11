@@ -4565,6 +4565,7 @@ pub struct ConcurrencyOptions {
     pub max_batch_bytes: usize,
     pub generation_operation_limit: usize,
     pub generation_wal_bytes: usize,
+    /// Deadline for write admission and transient directory cleanup during open.
     pub admission_timeout_ms: u64,
 }
 impl Default for ConcurrencyOptions {
