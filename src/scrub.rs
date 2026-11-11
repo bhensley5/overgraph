@@ -3215,7 +3215,11 @@ mod tests {
             .open(&core_path)
             .unwrap();
         file.seek(SeekFrom::Start(56)).unwrap();
-        file.write_all(&[0xAA]).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xFF;
+        file.seek(SeekFrom::Start(56)).unwrap();
+        file.write_all(&byte).unwrap();
         file.sync_all().unwrap();
 
         let report = db.scrub().unwrap();

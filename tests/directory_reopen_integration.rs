@@ -1,6 +1,17 @@
 use overgraph::*;
+use std::path::Path;
+use std::sync::Mutex;
 #[cfg(feature = "production-concurrency")]
 use std::sync::{Arc, Barrier};
+
+fn open_fixture(path: &Path) -> DatabaseEngine {
+    // Parallel fixture opens can race the process-wide participant pool
+    // initialization and legitimately get a retryable resource refusal.
+    // Serialize setup only; the immediate reopens below stay direct.
+    static FIXTURE_OPEN: Mutex<()> = Mutex::new(());
+    let _setup = FIXTURE_OPEN.lock().unwrap();
+    DatabaseEngine::open(path, &DbOptions::default()).unwrap()
+}
 
 #[test]
 fn immediate_reopen_after_normal_and_fast_close_preserves_data() {
@@ -8,7 +19,7 @@ fn immediate_reopen_after_normal_and_fast_close_preserves_data() {
     for fast in [false, true] {
         let path = root.path().join(if fast { "fast" } else { "normal" });
         for iteration in 0..12 {
-            let db = DatabaseEngine::open(&path, &DbOptions::default()).unwrap();
+            let db = open_fixture(&path);
             db.upsert_node("N", &iteration.to_string(), UpsertNodeOptions::default())
                 .unwrap();
             if fast { db.close_fast() } else { db.close() }.unwrap();
@@ -30,7 +41,7 @@ fn immediate_reopen_with_retained_transaction_and_competing_openers() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("db");
     // Initialize process participants before racing opens on separate threads.
-    let db = DatabaseEngine::open(&path, &DbOptions::default()).unwrap();
+    let db = open_fixture(&path);
     db.upsert_node("N", "persisted", UpsertNodeOptions::default())
         .unwrap();
     let mut retained = db.begin_write_txn().unwrap();
