@@ -10542,7 +10542,8 @@ fn test_connected_components_sees_immutable() {
     // S6: connected_components must find edges in immutable memtables.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("cc_imm");
-    let db = DatabaseEngine::open(&db_path, &DbOptions::default()).unwrap();
+    // This tests graph visibility, not transient pre-acceptance admission.
+    let db = open_after_native_shutdown(&db_path, &DbOptions::default()).unwrap();
 
     let a = db
         .upsert_node("Person", "a", UpsertNodeOptions::default())
