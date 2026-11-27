@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.18.2] - 2026-11-27
+
+### Fixed
+
+- Dense and scoped vector searches no longer report corruption when a newer segment
+  contains a node whose vectors were cleared. The older embeddings stay hidden.
+
 ## [0.18.1] - 2026-11-11
 
 ### Fixed
@@ -593,7 +600,8 @@ Initial release.
 - Cross-platform CI: macOS, Linux, Windows
 - Benchmark CI with regression detection and cross-language parity validation
 
-[Unreleased]: https://github.com/bhensley5/overgraph/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/bhensley5/overgraph/compare/v0.18.2...HEAD
+[0.18.2]: https://github.com/bhensley5/overgraph/compare/v0.18.1...v0.18.2
 [0.18.1]: https://github.com/bhensley5/overgraph/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/bhensley5/overgraph/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/bhensley5/overgraph/compare/v0.17.0...v0.17.1

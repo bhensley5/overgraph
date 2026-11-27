@@ -28,6 +28,31 @@
 //!
 //! Native bindings for Node.js (napi-rs) and Python (PyO3) with full API parity.
 
+// Rustdoc compiles these as external consumers of the exact library Cargo
+// built. Keep one import per case so exposing any private module fails its test.
+#![cfg_attr(all(doctest, feature = "production-concurrency"), doc = r#"
+```
+use overgraph::engine::DatabaseEngine;
+let _ = std::mem::size_of::<DatabaseEngine>();
+```
+
+```compile_fail,E0603
+use overgraph::engine::participant;
+```
+
+```compile_fail,E0603
+use overgraph::engine::reclamation;
+```
+
+```compile_fail,E0603
+use overgraph::engine::append_slice;
+```
+
+```compile_fail,E0603
+use overgraph::engine::durable_transition;
+```
+"#)]
+
 // Public API: the types and engine that library users interact with.
 pub mod engine;
 pub mod error;

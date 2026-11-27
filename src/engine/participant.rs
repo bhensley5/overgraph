@@ -1724,7 +1724,7 @@ mod tests {
     }
 
     #[test]
-    fn p45a1_collector_guard_unwind_failstop_and_private_api_compile_check() {
+    fn p45a1_collector_guard_unwind_failstop() {
         if std::env::var_os("OVERGRAPH_P45A1_GUARD_CHILD").is_some() {
             let a = ParticipantAdmission::new(1).unwrap();
             let _ = std::panic::catch_unwind(|| {
@@ -1734,88 +1734,13 @@ mod tests {
             panic!("session unwind returned instead of aborting");
         }
         let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let output = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", "engine::participant::tests::p45a1_collector_guard_unwind_failstop_and_private_api_compile_check", "--nocapture"]).env("OVERGRAPH_P45A1_GUARD_CHILD", "1").output().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", "engine::participant::tests::p45a1_collector_guard_unwind_failstop", "--nocapture"]).env("OVERGRAPH_P45A1_GUARD_CHILD", "1").output().unwrap();
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("participant session unwound"));
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
             assert_eq!(output.status.signal(), Some(6));
-        }
-        let executable = std::env::current_exe().unwrap();
-        let deps = executable.parent().unwrap();
-        let fingerprints = deps.parent().unwrap().join(".fingerprint");
-        let read_fingerprint = |path: &std::path::Path| {
-            std::fs::read(path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        };
-        let current = read_fingerprint(
-            &fingerprints
-                .join(executable.file_stem().unwrap())
-                .join("test-lib-overgraph.json"),
-        )
-        .expect("running test Cargo fingerprint");
-        let rlib = std::fs::read_dir(&fingerprints)
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter_map(|path| {
-                let library = read_fingerprint(&path.join("lib-overgraph.json"))?;
-                // Concurrent default/candidate/doc builds share this directory.
-                // Match the actual test's features and compiler/target identity;
-                // mtime alone can choose a default library with no private modules.
-                if ![
-                    "features",
-                    "rustc",
-                    "target",
-                    "path",
-                    "rustflags",
-                    "config",
-                    "compile_kind",
-                ]
-                .iter()
-                .all(|key| library[*key] == current[*key])
-                {
-                    return None;
-                }
-                let name = path.file_name()?.to_str()?.strip_prefix("overgraph-")?;
-                let library = deps.join(format!("libovergraph-{name}.rlib"));
-                library.is_file().then_some(library)
-            })
-            .max_by_key(|p| p.metadata().unwrap().modified().unwrap())
-            .expect("library matching running test Cargo features");
-        let dir = tempfile::TempDir::new().unwrap();
-        for module in [
-            "participant",
-            "reclamation",
-            "append_slice",
-            "durable_transition",
-        ] {
-            let source = dir.path().join("escape.rs");
-            std::fs::write(
-                &source,
-                format!("use overgraph::engine::{module}; fn main() {{}}\n"),
-            )
-            .unwrap();
-            let result = std::process::Command::new("rustc")
-                .arg("--edition=2021")
-                .arg("--emit=metadata")
-                .arg(&source)
-                .arg("--extern")
-                .arg(format!("overgraph={}", rlib.display()))
-                .arg("-L")
-                .arg(format!("dependency={}", deps.display()))
-                .arg("-o")
-                .arg(dir.path().join("escape.rmeta"))
-                .output()
-                .unwrap();
-            assert!(!result.status.success());
-            assert!(
-                String::from_utf8_lossy(&result.stderr).contains("is private"),
-                "{}",
-                String::from_utf8_lossy(&result.stderr)
-            );
         }
         let pool = ParticipantPool::try_global().unwrap();
         assert_eq!(pool.slots.len(), 256);
