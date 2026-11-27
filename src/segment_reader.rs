@@ -2639,6 +2639,80 @@ impl SegmentReader {
         Ok(())
     }
 
+    /// A vectorless segment still hides older versions of its nodes. Forward
+    /// only IDs that have neither a record nor a tombstone in this segment.
+    #[cold]
+    fn forward_unshadowed_vector_candidates(
+        &self,
+        ids: &[u64],
+        remaining_out: &mut Vec<u64>,
+    ) -> Result<(), EngineError> {
+        let node_meta = &self.node_meta_mmap[..];
+        let layout = parse_node_meta_layout(node_meta)?.filter(|layout| layout.node_count != 0);
+        let Some(layout) = layout else {
+            remaining_out.extend(
+                ids.iter()
+                    .copied()
+                    .filter(|id| !self.deleted_nodes.contains_key(id)),
+            );
+            return Ok(());
+        };
+        let (Some(&min_id), Some(&max_id)) = (ids.first(), ids.last()) else {
+            return Ok(());
+        };
+        let unique_ids = 1 + ids.windows(2).filter(|pair| pair[0] != pair[1]).count();
+        let decision = choose_batch_read_decision(
+            node_meta,
+            layout.fixed_entries_offset,
+            layout.node_count,
+            layout.fixed_entry_size,
+            0,
+            unique_ids,
+            min_id,
+            max_id,
+        )?;
+
+        if decision.strategy == BatchReadStrategy::SeekPerKey {
+            let mut previous = None;
+            for &id in ids {
+                if self.deleted_nodes.contains_key(&id) {
+                    continue;
+                }
+                let found = if let Some((_, found)) = previous.filter(|(prev, _)| *prev == id) {
+                    found
+                } else {
+                    let found = binary_search_node_meta_index(node_meta, layout, id)?.is_some();
+                    previous = Some((id, found));
+                    found
+                };
+                if !found {
+                    remaining_out.push(id);
+                }
+            }
+        } else {
+            let mut index = decision.span_start;
+            for &id in ids {
+                if self.deleted_nodes.contains_key(&id) {
+                    continue;
+                }
+                let mut found = false;
+                while index < layout.node_count {
+                    let offset = layout.fixed_entries_offset + index * layout.fixed_entry_size;
+                    let indexed_id = read_u64_at(node_meta, offset)?;
+                    if indexed_id >= id {
+                        found = indexed_id == id;
+                        break;
+                    }
+                    index += 1;
+                }
+                if !found {
+                    remaining_out.push(id);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Batch dense scoring over sorted candidate IDs. Found candidates are scored
     /// immediately without hydrating full `NodeRecord`s. Unfound candidates are
     /// appended to `remaining_out` in sorted order for older segments.
@@ -2661,6 +2735,9 @@ impl SegmentReader {
         }
         let node_meta = &self.node_meta_mmap[..];
         let vector_meta = &self.node_vector_meta_mmap[..];
+        if vector_meta.is_empty() {
+            return self.forward_unshadowed_vector_candidates(ids, remaining_out);
+        }
         let Some(node_meta_layout) = parse_node_meta_layout(node_meta)? else {
             remaining_out.extend(
                 ids.iter()
@@ -2822,6 +2899,9 @@ impl SegmentReader {
         }
         let node_meta = &self.node_meta_mmap[..];
         let vector_meta = &self.node_vector_meta_mmap[..];
+        if vector_meta.is_empty() {
+            return self.forward_unshadowed_vector_candidates(ids, remaining_out);
+        }
         let sparse_blob = &self.node_sparse_vectors_mmap[..];
         let Some(node_meta_layout) = parse_node_meta_layout(node_meta)? else {
             remaining_out.extend_from_slice(ids);
@@ -15345,6 +15425,62 @@ pub(crate) mod tests {
                 .optional_component_availability_for_test(SegmentComponentKind::EdgeUpdatedAtIndex),
             ComponentAvailability::Available
         );
+    }
+
+    #[test]
+    fn vectorless_segment_forwards_only_unshadowed_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("seg_0001");
+        let mt = Memtable::new();
+        for id in [10, 12, 14] {
+            mt.apply_op(&WalOp::UpsertNode(make_node(id, 1, &format!("n{id}"))), id);
+        }
+        mt.apply_op(
+            &WalOp::DeleteNode {
+                id: 13,
+                deleted_at: 1,
+            },
+            20,
+        );
+        let info = write_segment(&seg_dir, 1, &mt, None).unwrap();
+        let reader = SegmentReader::open_with_info(&seg_dir, &info, None, &[]).unwrap();
+        assert!(reader.node_vector_meta_mmap.is_empty());
+
+        // Two unique IDs force seek; the dense range drives the merge walk.
+        for (ids, expected) in [
+            (&[10, 11, 11][..], &[11, 11][..]),
+            (&[9, 10, 11, 12, 13, 14, 15][..], &[9, 11, 15][..]),
+        ] {
+            let mut remaining = Vec::new();
+            let mut dense_hits = Vec::new();
+            reader
+                .score_dense_candidates_sorted(
+                    ids,
+                    &[1.0],
+                    DenseMetric::Cosine,
+                    None,
+                    |_, _, _| panic!("a vectorless candidate must not be scored"),
+                    &mut dense_hits,
+                    &mut remaining,
+                )
+                .unwrap();
+            assert!(dense_hits.is_empty());
+            assert_eq!(remaining, expected);
+
+            remaining.clear();
+            let mut sparse_hits = Vec::new();
+            reader
+                .score_sparse_candidates_sorted(
+                    ids,
+                    &[(1, 1.0)],
+                    |_, _, _| panic!("a vectorless candidate must not be scored"),
+                    &mut sparse_hits,
+                    &mut remaining,
+                )
+                .unwrap();
+            assert!(sparse_hits.is_empty());
+            assert_eq!(remaining, expected);
+        }
     }
 
     #[test]

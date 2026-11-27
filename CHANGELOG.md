@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Fixed
+
+- Dense and scoped vector searches no longer report corruption when a newer segment
+  contains a node whose vectors were cleared. The older embeddings stay hidden.
+
 ## [0.18.1] - 2026-11-11
 
 ### Fixed

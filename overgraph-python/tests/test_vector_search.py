@@ -197,3 +197,69 @@ class TestVectorSearchScope:
         assert ids[2] not in hit_ids  # depth 2
         assert ids[3] not in hit_ids  # disconnected
         db.close()
+
+
+class TestVectorlessReplacement:
+    @pytest.mark.parametrize("clear_count", [1, 64])
+    def test_hnsw_hides_old_vectors_after_flush_and_reopen(self, tmp_path, clear_count):
+        path = str(tmp_path / "vectorless-hnsw")
+        opts = dict(dense_vector_dimension=4, compact_after_n_flushes=100)
+        query = [1.0, 0.0, 0.0, 0.0]
+
+        def assert_visible_hits(db):
+            hits = db.vector_search("dense", 10, dense_query=query)
+            assert [hit.node_id for hit in hits] == ids[clear_count:clear_count + 10]
+
+        with OverGraph.open(path, **opts) as db:
+            ids = [db.upsert_node("Fragment", f"n{i}") for i in range(64)]
+            db.flush()
+            for i in range(len(ids)):
+                db.upsert_node("Fragment", f"n{i}", dense_vector=query)
+            db.flush()
+            assert list(tmp_path.rglob("dense_hnsw_graph.dat"))
+            assert [hit.node_id for hit in db.vector_search(
+                "dense", 10, dense_query=query
+            )] == ids[:10]
+
+            for i in range(clear_count):
+                db.upsert_node("Fragment", f"n{i}", props={"scope": "backfill"})
+            db.flush()
+            assert db.get_node(ids[0]).dense_vector is None
+            assert_visible_hits(db)
+
+        with OverGraph.open(path, **opts) as db:
+            assert_visible_hits(db)
+
+    def test_scoped_search_ignores_cleared_and_deleted_vectors(self, tmp_path):
+        dense = [1.0, 0.0, 0.0, 0.0]
+        sparse = [(1, 1.0)]
+        path = str(tmp_path / "vectorless-scope")
+        opts = dict(dense_vector_dimension=4, compact_after_n_flushes=100)
+
+        def assert_visible_hits(db):
+            for mode, query in (
+                ("dense", {"dense_query": dense}),
+                ("sparse", {"sparse_query": sparse}),
+                ("hybrid", {"dense_query": dense, "sparse_query": sparse}),
+            ):
+                hits = db.vector_search(
+                    mode, 10, scope_start_node_id=ids[0], scope_max_depth=1,
+                    **query,
+                )
+                assert {hit.node_id for hit in hits} == {ids[0], ids[2]}
+
+        with OverGraph.open(path, **opts) as db:
+            ids = [
+                db.upsert_node("Fragment", f"n{i}", dense_vector=dense, sparse_vector=sparse)
+                for i in range(4)
+            ]
+            for node in ids[1:]:
+                db.upsert_edge(ids[0], node, "PATH")
+            db.flush()
+            db.upsert_node("Fragment", "n1")
+            db.delete_node(ids[3])
+            db.flush()
+            assert_visible_hits(db)
+
+        with OverGraph.open(path, **opts) as db:
+            assert_visible_hits(db)
